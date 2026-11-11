@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod cache;
 pub mod cancel;
+pub mod describe;
 pub mod carry;
 pub mod drives;
 pub mod files;

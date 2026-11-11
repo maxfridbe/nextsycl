@@ -142,6 +142,14 @@ impl Home {
                 Some(why) => Err(bad(why)),
                 None => Ok(()),
             },
+            // the target, the settings and the describer known now; the picture decodes (wait: false too)
+            "image.describe" => {
+                let (family, target_model) = super::api::describe_target(b["target"].as_str().unwrap_or(""), all)?;
+                crate::describe::Ask::from_body(b, family, target_model).map_err(bad)?;
+                self.describer(b, all)?;
+                let bytes = crate::http::unbase64(b["image"].as_str().unwrap_or("")).map_err(|e| bad(format!("image: {e}")))?;
+                crate::image::picture(&bytes, "image").map(|_| ()).map_err(bad)
+            }
             "audio.speak" => self.precheck_speak(b, all),
             "audio.voices.enroll" => self.precheck_enroll(b, all),
             "audio.generate" => {

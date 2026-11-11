@@ -37,7 +37,7 @@ type Fail = (u16, String);
 pub(super) const VIDEO_UP_S: u64 = 120;
 
 /// The methods that run a model: what takes `rsvp_s` and `max_willing_to_wait_s` and what `system.eta` answers for
-pub(super) const RUNS_MODEL: &[&str] = &["llm.chat", "image.generate", "image.edit", "image.upscale", "image.vectorize", "image.remove_background", "image.ocr", "video.upscale", "video.generate", "video.engines.list",
+pub(super) const RUNS_MODEL: &[&str] = &["llm.chat", "image.generate", "image.edit", "image.upscale", "image.vectorize", "image.remove_background", "image.ocr", "image.describe", "video.upscale", "video.generate", "video.engines.list",
     "audio.generate", "audio.speak", "audio.transcribe", "audio.voices.design", "audio.voices.enroll", "model3d.generate", "model3d.rig"];
 
 /// The fields of the backplane that are the door's, not a server's
@@ -301,6 +301,10 @@ impl Home {
         if method == "video.generate" {
             return clip_model(b, all).unwrap_or_default();
         }
+        // a describe's chat model, as image.describe picks it
+        if method == "image.describe" {
+            return super::api::describe_pick(all, self.chat_loaded(all).as_deref()).unwrap_or_default();
+        }
         let can: Vec<String> = all.iter().filter(|m| m["enabled"] != false && super::life::capabilities(m).1.contains(&method)).map(|m| s(m, "id")).collect();
         let loaded = |id: &String| match all.iter().find(|m| m["id"] == id.as_str()).map_or("", registry::kind_of) {
             "llm" => self.chat_loaded(all).as_deref() == Some(id.as_str()),
@@ -375,7 +379,8 @@ impl Home {
     pub(crate) fn eta_for(&self, method: &str, b: &Value, exclude: Option<&str>) -> Value {
         let all = self.models();
         let model = self.request_model(method, b, &all);
-        let kind = super::jobs::kind_of_method(method);
+        // image.describe waits in the image queue but runs on a chat model: hot when that one is loaded
+        let kind = if method == "image.describe" { "llm" } else { super::jobs::kind_of_method(method) };
         let (hot, ahead) = match kind {
             "image" | "audio" | "model3d" => {
                 let sv = self.servers(kind);

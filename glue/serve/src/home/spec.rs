@@ -53,6 +53,25 @@ const CUT_OUT: &str = r#"{"type": "object", "properties": {"created": {"type": "
     "width": {"type": "integer", "description": "the picture's own size"}, "height": {"type": "integer"}, "model": {"type": "string", "description": "the model that made it"}}}},
   "nextsycl": {"type": "object", "properties": {"seconds": {"type": "number"}}}}}"#;
 
+/// image.describe's answer (docs/api/image-describe.md: the same shape on nextcuda)
+const DESCRIBED: &str = r#"{"type": "object", "properties": {
+  "prompt": {"type": "string", "description": "the prompt that would draw the picture, written the target's way"},
+  "negative_prompt": {"type": "string", "nullable": true, "description": "include_negative and a target that reads one; else null"},
+  "target": {"type": "string", "description": "the prompt family it was written for: natural, qwen-image, z-image, h3, hunyuanimage, moss-image, ming-image, tags"},
+  "target_model": {"type": "string", "nullable": true, "description": "the image model the target named, when it named one"},
+  "model": {"type": "string", "description": "the describer: the chat model that read the picture"},
+  "detail": {"type": "string"}, "language": {"type": "string"}, "words": {"type": "integer", "description": "the prompt's words (tags: its tags)"},
+  "width": {"type": "integer", "description": "the picture as sent"}, "height": {"type": "integer"},
+  "seen": {"type": "object", "description": "the size it was shown at (max_pixels)", "properties": {"width": {"type": "integer"}, "height": {"type": "integer"}}},
+  "suggested_size": {"type": "object", "description": "a canvas for the target at the picture's aspect (its best area, sides its multiple)", "properties": {"width": {"type": "integer"}, "height": {"type": "integer"}, "size": {"type": "string", "description": "WxH, as image.generate's size"}}},
+  "tokens": {"type": "object", "properties": {"prompt": {"type": "integer", "description": "the describer's prompt: instruction and picture"}, "reused": {"type": "integer", "description": "of those, from the prompt cache (the instruction)"}, "generated": {"type": "integer"}}},
+  "timings": {"type": "object", "properties": {"pp_tok_s": {"type": "number", "nullable": true, "description": "prompt processing (the vision tower included), tokens a second"},
+    "tg_tok_s": {"type": "number", "nullable": true, "description": "token generation, tokens a second"}, "prompt_seconds": {"type": "number", "nullable": true}, "generate_seconds": {"type": "number", "nullable": true},
+    "seconds": {"type": "number", "description": "the whole describe: the swap to the describer when it was not loaded, the reading, the writing"}}},
+  "finish": {"type": "string", "description": "stop, or length (max_tokens reached)"}, "energy_wh": {"type": "number", "nullable": true},
+  "notes": {"type": "array", "items": {"type": "string"}, "description": "what was not done as asked (a negative the target does not read ...)"},
+  "rsvp_granted_s": {"type": "number"}}}"#;
+
 const PICTURES: &str = r#"{"type": "object", "properties": {"created": {"type": "integer"},
   "data": {"type": "array", "items": {"type": "object", "properties": {"url": {"type": "string", "description": "response_format url (the default here): GET it with the token"},
     "b64_json": {"type": "string", "description": "response_format b64_json: the PNG"}, "revised_prompt": {"type": "string"}, "seed": {"type": "integer"},
@@ -153,7 +172,7 @@ const MODEL_STATE: &str = r#"{"type": "object", "properties": {"id": {"type": "s
   "spans": {"type": "boolean", "description": "a chat model spread over every card (its model card: gpus all): its cards are not a choice"},
   "measured": {"type": "boolean"}, "headroom_mb": {"type": "object", "additionalProperties": {"type": "integer"}}, "headroom_given": {"type": "boolean"},
   "page": {"type": "integer", "description": "the port of its own page"},
-  "capabilities": {"type": "array", "items": {"type": "string"}, "description": "what it does, in neutral words: chat, stream, tools; generate, edit, compose, img2img, loras, few_step; ocr, read_pages, pdf; song, lyrics, instrumental; speech, builtin_voices, clone, saved_voices, enrolled_voices, continue_from, voice_design, voice_direction, vocal_events; text_to_video, image_to_video, sound, chain, first_last_frame, voice_reference, controlnet, inpaint, reference_images, reference_videos"},
+  "capabilities": {"type": "array", "items": {"type": "string"}, "description": "what it does, in neutral words: chat, stream, tools, vision, describe; generate, edit, compose, img2img, loras, few_step; ocr, read_pages, pdf; song, lyrics, instrumental; speech, builtin_voices, clone, saved_voices, enrolled_voices, continue_from, voice_design, voice_direction, vocal_events; text_to_video, image_to_video, sound, chain, first_last_frame, voice_reference, controlnet, inpaint, reference_images, reference_videos"},
   "methods": {"type": "array", "items": {"type": "string"}, "description": "the /rpc methods that take it as model"}}}"#;
 
 /// video.status (and video.wait)
@@ -341,6 +360,8 @@ pub fn result(method: &str) -> Option<String> {
   "label": {"type": "string"}, "reentrant_id": {"type": "string", "nullable": true}, "jobs": {"type": "array", "items": {"type": "string"}},
   "already_ended": {"type": "boolean", "description": "the job named had ended before the cancel (nothing stopped; state says how it ended) - a cancel is safe to repeat"},
   "state": {"type": "string", "description": "already_ended: done, failed or cancelled"}}}"#.into(),
+        "image.describe" => format!(r#"{{"oneOf": [{{"allOf": [{DESCRIBED}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the prompt, and the job"}},
+  {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (image.status {{label}} for the rest)"}}]}}"#),
         "image.ocr" => r#"{"type": "object", "properties": {"created": {"type": "integer"}, "model": {"type": "string"}, "text": {"type": "string", "description": "the reading: Markdown, tables as HTML, LaTeX; pages after a <PAGE> mark each"},
   "prompt": {"type": "string", "description": "the instruction used"}, "pages": {"type": "integer"}, "tokens": {"type": "integer", "description": "tokens written"}, "prompt_tokens": {"type": "integer"},
   "prompt_seconds": {"type": "number"}, "read_tok_s": {"type": "number"}, "write_seconds": {"type": "number"}, "tok_s": {"type": "number"}, "seconds": {"type": "number"}, "wh": {"type": "number", "nullable": true}}}"#.into(),
@@ -457,7 +478,7 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
         "system.models.pull" => &[(404, "not_found", "no model card of that id"), (409, "conflict", "it is downloaded already"),
                                   (503, "no_room", "no models folder has the room for it (with 1% of the drive, at least 4 GiB, kept free)")],
         "system.models.pull.cancel" => &[(409, "conflict", "no download of that model is under way")],
-        "image.generate" | "image.edit" | "image.ocr" | "image.upscale" | "image.vectorize" | "image.remove_background" | "video.upscale" | "audio.generate" | "audio.speak" | "audio.transcribe" | "audio.voices.design" | "audio.voices.enroll" | "model3d.generate" | "model3d.rig" =>
+        "image.generate" | "image.edit" | "image.ocr" | "image.upscale" | "image.vectorize" | "image.remove_background" | "image.describe" | "video.upscale" | "audio.generate" | "audio.speak" | "audio.transcribe" | "audio.voices.design" | "audio.voices.enroll" | "model3d.generate" | "model3d.rig" =>
             &[(400, "invalid_params", "a value refused, when the job is submitted (wait false too): steps a few-step model does not run, a size, a sampler, a picture that does not decode, a voice or language the speech model does not have, a model that cannot do it (image.remove_background: \"<id> does not remove backgrounds (birefnet, isnet-general-use do)\"), a priority outside -9..9 ..."),
               (404, "not_found", "no such model; a continue_from or upload:<name> that is not here (error.field names which)"), (409, "conflict", "the model is disabled, or none that can do it is enabled (never retry as is)"),
               (409, "busy", "queue: false and the job would not start at once (retryable)"),
@@ -511,7 +532,7 @@ pub const LABELS: &str = "Every job-making request takes a title (120 characters
 Video labels: \"<series> NN/MM: text\" (\"Harbour 03/12: the lamp\"). NN orders video.timeline (the edit order); \
 the series (the text before NN) is where the anchors prev / prev_cam / first / first_cam look, and the project when the request names none. \
 video.cancel, video.queue.move and video.queue.remove name clips by label.\n\n\
-Jobs: image.generate, image.edit, image.upscale, image.vectorize, image.remove_background, video.upscale (in the image queue), audio.generate, audio.speak and audio.transcribe run as jobs here - the call can drop and the job goes on; \
+Jobs: image.generate, image.edit, image.upscale, image.vectorize, image.remove_background, image.describe, video.upscale (in the image queue), audio.generate, audio.speak and audio.transcribe run as jobs here - the call can drop and the job goes on; \
 label one (else its id is its label), read it with <kind>.status {label} (stage and waiting_for say what it waits for), list them with <kind>.jobs, \
 stop it with <kind>.cancel {label}; wait: false answers at once. A kind makes as many jobs at once as it has servers (one a card); the rest wait \
 in a queue as video's: priority, held, project and batch on submit, <kind>.queue.list / move / pause / resume. \

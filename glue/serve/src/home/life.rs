@@ -195,6 +195,11 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
             if m["tools"] == true {
                 c.push("tools");
             }
+            // a vision tower: pictures in chat, and image.describe (a picture to its prompt)
+            if super::api::reads_pictures(m) {
+                c.extend(["vision", "describe"]);
+                return (c, vec!["llm.chat", "image.describe"]);
+            }
             (c, vec!["llm.chat"])
         }
         "image" if arch.contains("ocr") => (vec!["ocr", "read_pages", "pdf"], vec!["image.ocr"]),

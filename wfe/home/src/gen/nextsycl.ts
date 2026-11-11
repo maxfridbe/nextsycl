@@ -544,6 +544,9 @@ export interface AudioVoicesRemoveReq {
 /** How a clip carries on from the last: video | png | latent | none */
 export type ChainMode = "video" | "png" | "latent" | "none";
 
+/** How long a prompt image.describe writes: short | medium | long */
+export type DescribeDetail = "short" | "medium" | "long";
+
 /** A file's kind (where it lives): image | audio | video | model3d */
 export type FileKind = "image" | "audio" | "video" | "model3d";
 
@@ -572,6 +575,126 @@ export interface ImageCanvasesListReq {
 export interface ImageDescribePromptGuideMdReq {
   /** the model's registry id (system.models) */
   model: string;
+  /** other keys */
+  [key: string]: unknown;
+}
+
+/** What image.describe takes. */
+export interface ImageDescribeReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
+  /**
+   * a group inside the project
+   * @maxLength 60
+   */
+  batch?: string | null;
+  /** how long a prompt: short (~35 words, 12 tags), medium (default: ~90 words, 25 tags), long (~170 words, 45 tags) */
+  detail?: DescribeDetail | null;
+  /**
+   * queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch
+   * @default false
+   */
+  held?: boolean | null;
+  /** the picture: PNG, JPEG or WebP as base64, a data: URL or upload:<name> (image.upload); at most 40 MP */
+  image: string;
+  /**
+   * true: a negative prompt too (negative_prompt), for the targets that read one (natural, qwen-image, hunyuanimage, moss-image, tags); the others get none and a note
+   * @default false
+   */
+  include_negative?: boolean | null;
+  /**
+   * more for the describer to heed, in words ("focus on the lighting", "the person is a child"); 2,000 characters at most
+   * @maxLength 2000
+   */
+  instructions?: string | null;
+  /**
+   * names the job for <kind>.status and <kind>.cancel (default: its id)
+   * @maxLength 120
+   */
+  label?: string | null;
+  /**
+   * the language the prompt is written in, by name (default English; Chinese reads well for qwen-image, z-image, hunyuanimage)
+   * @maxLength 40
+   */
+  language?: string | null;
+  /**
+   * the picture is shown to the describer at most this large, pixels (default 1048576: ~1,024 of its vision positions; up to 4194304, slower to read)
+   * @minimum 65536
+   * @maximum 4194304
+   * @default 1048576
+   */
+  max_pixels?: number | null;
+  /**
+   * the answer's tokens at most (default: twice max_words and a margin)
+   * @minimum 16
+   * @maximum 4096
+   */
+  max_tokens?: number | null;
+  /**
+   * the words (or tags) aimed for, in place of detail's
+   * @minimum 8
+   * @maximum 400
+   */
+  max_words?: number | null;
+  /** the describer: a chat model that reads pictures (qwen3.8-27b-q4-describe, qwen3.8-27b-q4 ...); default the loaded chat model when it reads pictures, else the enabled one that takes the least memory */
+  model?: string | null;
+  /**
+   * a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)
+   * @minimum -9
+   * @maximum 9
+   * @default 0
+   */
+  priority?: number | null;
+  /**
+   * a group of jobs held or released together (<kind>.queue.pause / resume), listed with <kind>.jobs {project}
+   * @maxLength 60
+   */
+  project?: string | null;
+  /**
+   * false: refused at once (409 busy, retryable) when the job would not start now - a server free and no runnable job waiting before it; true (default): it waits its turn
+   * @default true
+   */
+  queue?: boolean | null;
+  /**
+   * idempotent submit (as image.generate)
+   * @maxLength 200
+   */
+  reentrant_id?: string | null;
+  /**
+   * the describer's sampling seed (with temperature above 0)
+   * @minimum 0
+   */
+  seed?: number | null;
+  /**
+   * the image model the prompt is for, which sets how it is written: a family (natural - the default -, qwen-image, z-image, h3, hunyuanimage, moss-image, ming-image, tags) or an image model's id (z-image-turbo, minimax-h3-image, p-h3-image, qwen-image-2.1-q8 ...: its family)
+   * @maxLength 120
+   */
+  target?: string | null;
+  /**
+   * 0 (default): the most likely words, the same prompt every time; up to 2 for variety
+   * @minimum 0
+   * @maximum 2
+   * @default 0
+   */
+  temperature?: number | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
+  /**
+   * true: answer when it ends; false: answer at once with the job
+   * @default true
+   */
+  wait?: boolean | null;
   /** other keys */
   [key: string]: unknown;
 }
@@ -2520,6 +2643,12 @@ export interface Methods {
    */
   "image.ocr": { req: ImageOcrReq; resp: any };
   /**
+   * A picture to the prompt that would draw it (Midjourney's /describe): a chat model that reads pictures writes it the way the target image model reads prompts (target: a family or an image model's id), a negative prompt for the targets that take one, a canvas at the picture's aspect for the target; timings as pp / tg. A job in the image queue like image.upscale (wait, label, reentrant_id, image.status, image.cancel)
+   * @tags image
+   * @example {"detail":"medium","image":"upload:up_1792400000_harbour.png","label":"harbour-prompt","target":"z-image-turbo"}
+   */
+  "image.describe": { req: ImageDescribeReq; resp: any };
+  /**
    * The model's defaults, samplers, schedules, options and LoRAs (loaded: from the server)
    * @tags image
    * @example {}
@@ -3158,6 +3287,12 @@ export function client(post: Post, raw?: PostRaw) {
      * @example {"images":["data:image/png;base64,iVBORw0..."],"prompt":"document parsing."}
      */
     "image.ocr": (req: ImageOcrReq): Promise<any> => post("image.ocr", req),
+    /**
+     * A picture to the prompt that would draw it (Midjourney's /describe): a chat model that reads pictures writes it the way the target image model reads prompts (target: a family or an image model's id), a negative prompt for the targets that take one, a canvas at the picture's aspect for the target; timings as pp / tg. A job in the image queue like image.upscale (wait, label, reentrant_id, image.status, image.cancel)
+     * @tags image
+     * @example {"detail":"medium","image":"upload:up_1792400000_harbour.png","label":"harbour-prompt","target":"z-image-turbo"}
+     */
+    "image.describe": (req: ImageDescribeReq): Promise<any> => post("image.describe", req),
     /**
      * The model's defaults, samplers, schedules, options and LoRAs (loaded: from the server)
      * @tags image

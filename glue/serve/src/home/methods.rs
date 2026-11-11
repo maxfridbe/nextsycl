@@ -67,6 +67,12 @@ impl Method {
     pub fn full(&self) -> &'static str {
         self.info.name
     }
+
+    /// The kind whose model runs it (what must be enabled for it): its own, but image.describe's describer is a chat
+    /// model that reads pictures
+    pub fn runs_on(&self) -> &'static str {
+        if self.full() == "image.describe" { "llm" } else { self.kind }
+    }
 }
 
 /// Every method, in the order declared (the document's).
@@ -117,6 +123,17 @@ pub enum FileKind {
     Video,
     #[serde(rename = "model3d")]
     Model3d,
+}
+
+/// How long a prompt image.describe writes: short | medium | long
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Rpc)]
+pub enum DescribeDetail {
+    #[serde(rename = "short")]
+    Short,
+    #[serde(rename = "medium")]
+    Medium,
+    #[serde(rename = "long")]
+    Long,
 }
 
 /// How a picture comes back: a URL, or the bytes as base64 (OpenAI's names): url | b64_json
@@ -1125,6 +1142,103 @@ pub struct ImageOcrReq {
     /// one page: read its 640-pixel tiles too (default true)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tiles: Option<bool>,
+    /// what else the caller sent: passed on as it came
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
+}
+
+/// What image.describe takes.
+#[derive(Deserialize, Serialize, Rpc)]
+#[allow(non_snake_case)]
+pub struct ImageDescribeReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
+    /// a group inside the project
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 60)]
+    pub batch: Option<String>,
+    /// how long a prompt: short (~35 words, 12 tags), medium (default: ~90 words, 25 tags), long (~170 words, 45 tags)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<DescribeDetail>,
+    /// queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = false)]
+    pub held: Option<bool>,
+    /// the picture: PNG, JPEG or WebP as base64, a data: URL or upload:<name> (image.upload); at most 40 MP
+    pub image: String,
+    /// true: a negative prompt too (negative_prompt), for the targets that read one (natural, qwen-image, hunyuanimage, moss-image, tags); the others get none and a note
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = false)]
+    pub include_negative: Option<bool>,
+    /// more for the describer to heed, in words ("focus on the lighting", "the person is a child"); 2,000 characters at most
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 2000)]
+    pub instructions: Option<String>,
+    /// names the job for <kind>.status and <kind>.cancel (default: its id)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub label: Option<String>,
+    /// the language the prompt is written in, by name (default English; Chinese reads well for qwen-image, z-image, hunyuanimage)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 40)]
+    pub language: Option<String>,
+    /// the picture is shown to the describer at most this large, pixels (default 1048576: ~1,024 of its vision positions; up to 4194304, slower to read)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = 65536, max = 4194304, default = 1048576)]
+    pub max_pixels: Option<i64>,
+    /// the answer's tokens at most (default: twice max_words and a margin)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = 16, max = 4096)]
+    pub max_tokens: Option<i64>,
+    /// the words (or tags) aimed for, in place of detail's
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = 8, max = 400)]
+    pub max_words: Option<i64>,
+    /// the describer: a chat model that reads pictures (qwen3.8-27b-q4-describe, qwen3.8-27b-q4 ...); default the loaded chat model when it reads pictures, else the enabled one that takes the least memory
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = -9, max = 9, default = 0)]
+    pub priority: Option<i64>,
+    /// a group of jobs held or released together (<kind>.queue.pause / resume), listed with <kind>.jobs {project}
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 60)]
+    pub project: Option<String>,
+    /// false: refused at once (409 busy, retryable) when the job would not start now - a server free and no runnable job waiting before it; true (default): it waits its turn
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = true)]
+    pub queue: Option<bool>,
+    /// idempotent submit (as image.generate)
+    #[serde(rename = "reentrant_id", default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 200)]
+    pub reentrant_id: Option<String>,
+    /// the describer's sampling seed (with temperature above 0)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = 0)]
+    pub seed: Option<i64>,
+    /// the image model the prompt is for, which sets how it is written: a family (natural - the default -, qwen-image, z-image, h3, hunyuanimage, moss-image, ming-image, tags) or an image model's id (z-image-turbo, minimax-h3-image, p-h3-image, qwen-image-2.1-q8 ...: its family)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub target: Option<String>,
+    /// 0 (default): the most likely words, the same prompt every time; up to 2 for variety
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0, max = 2, default = 0)]
+    pub temperature: Option<f64>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
+    /// true: answer when it ends; false: answer at once with the job
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = true)]
+    pub wait: Option<bool>,
     /// what else the caller sent: passed on as it came
     #[serde(flatten)]
     pub rest: serde_json::Map<String, serde_json::Value>,
@@ -2974,6 +3088,12 @@ fn image_ocr(h: &Arc<Home>, req: ImageOcrReq) -> Answer {
     h.legacy("image.ocr", req)
 }
 
+/// A picture to the prompt that would draw it (Midjourney's /describe): a chat model that reads pictures writes it the way the target image model reads prompts (target: a family or an image model's id), a negative prompt for the targets that take one, a canvas at the picture's aspect for the target; timings as pp / tg. A job in the image queue like image.upscale (wait, label, reentrant_id, image.status, image.cancel)
+#[rpc(name = "image.describe", tags = "image", example = r#"{"image": "upload:up_1792400000_harbour.png", "target": "z-image-turbo", "detail": "medium", "label": "harbour-prompt"}"#)]
+fn image_describe(h: &Arc<Home>, req: ImageDescribeReq) -> Answer {
+    h.legacy("image.describe", req)
+}
+
 /// The model's defaults, samplers, schedules, options and LoRAs (loaded: from the server)
 #[rpc(name = "image.info", tags = "image", example = r#"{}"#)]
 fn image_info(h: &Arc<Home>, req: ImageInfoReq) -> Answer {
@@ -3394,7 +3514,7 @@ rpcgen::rpc_methods![sync Arc<Home>, RpcFail;
     system_gpus, system_disable, system_load, system_unload, system_pin, system_unpin, system_eta, system_config, system_config_set,
     system_restart, system_maintenance, system_drives, system_drive_measure, system_move, system_move_cancel,
     llm_chat, llm_requests, llm_models, llm_describe_prompt_guide_md, image_generate, image_edit,
-    image_upscale, image_vectorize, image_remove_background, video_upscale, image_ocr, image_info, image_status,
+    image_upscale, image_vectorize, image_remove_background, video_upscale, image_ocr, image_describe, image_info, image_status,
     image_jobs, image_queue_list, image_queue_move, image_queue_pause, image_queue_resume, image_upload,
     image_cancel, image_canvases_list, image_progress, image_history, image_describe_prompt_guide_md, audio_generate,
     audio_speak, audio_transcribe, audio_voices_list, audio_voices_add, audio_voices_design, audio_voices_enroll, audio_voices_remove,

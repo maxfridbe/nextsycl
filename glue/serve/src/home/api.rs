@@ -44,6 +44,7 @@ const FEATURES: &[&str] = &[
     "video.slots.cards", "video.running_clips", "video.status.clip", "video.cancel.name", "video.reentry.before_limit", "video.reentry.label", "jobs.title", "video.speed",
     "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars", "image.loras.request", "video.soundtrack", "video.exposure_fix",
     "backplane", "system.busy.engines", "models.profile", "system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long", "jobs.eta", "video.on_demand", "video.multi_guide",
+    "image.describe",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -258,6 +259,22 @@ impl Home {
             .ok_or_else(|| (409, format!("no {kind} model is enabled (system.enable)")))
     }
 
+    /// image.describe's describer: the chat model named (it must read pictures), else the loaded chat model when it reads
+    /// pictures, else the enabled one that takes the least memory (describe_pick)
+    pub(super) fn describer(&self, b: &Value, all: &[Value]) -> Result<String, Fail> {
+        if let Some(id) = b["model"].as_str().filter(|x| !x.is_empty()) {
+            return match all.iter().find(|m| m["id"] == id) {
+                Some(m) if !reads_pictures(m) => Err((400, format!("{id} does not read pictures: image.describe needs a chat model with a vision tower (qwen3.8-27b-q4-describe)"))),
+                Some(m) if m["enabled"] == false => Err((409, format!("{id} is disabled (system.enable)"))),
+                Some(_) => Ok(id.to_string()),
+                None if self.not_downloaded(id).is_some() => self.need_downloaded(id, b["request_id"].as_str(), true).map(|_| id.to_string()),
+                None => Err((404, format!("no model {id} (system.models)"))),
+            };
+        }
+        describe_pick(all, self.chat_loaded(all).as_deref())
+            .ok_or_else(|| (409, "no chat model that reads pictures is enabled (system.enable qwen3.8-27b-q4-describe)".to_string()))
+    }
+
     /// The saved voices (beside the audio server's output: NS_AUDIO_OUT)
     pub(crate) fn voices(&self) -> crate::voices::Library {
         let out = self.o.cfg.get("NS_AUDIO_OUT").unwrap_or_else(|| format!("{}/.local/share/nextsycl/audio", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())));
@@ -427,8 +444,8 @@ impl Home {
                 return Ok(m);
             }
         }
-        if !self.kinds_on(all).contains(&m.kind) {
-            return Err((409, format!("no {} model is enabled (system.enable)", m.kind)));
+        if !self.kinds_on(all).contains(&m.runs_on()) {
+            return Err((409, format!("no {} model is enabled (system.enable)", m.runs_on())));
         }
         Ok(m)
     }
@@ -680,7 +697,7 @@ impl Home {
             }
             ("system", "version") => {
                 let on = self.kinds_on(&all);
-                let methods: Vec<String> = table::methods().iter().filter(|m| on.contains(&m.kind)).map(|m| m.full().to_string()).collect();
+                let methods: Vec<String> = table::methods().iter().filter(|m| on.contains(&m.runs_on())).map(|m| m.full().to_string()).collect();
                 Ok(json!({"version": crate::VERSION, "api": API_VERSION, "kinds": on, "features": FEATURES, "methods": methods,
                           "maintenance": self.maintenance().map(|n| super::maint::public(&n))}))
             }
@@ -787,6 +804,21 @@ impl Home {
                 let mut body = b.clone();
                 body["model"] = json!(id);
                 relay(&t, "POST", "/v1/ocr", Some(&body), 3600)
+            }
+            ("image", "describe") => {
+                // the describer (a chat model that reads pictures), the prompt's style (the target's family), the picture
+                let id = self.describer(b, &all)?;
+                let (family, target_model) = describe_target(&s(b, "target"), &all)?;
+                let ask = crate::describe::Ask::from_body(b, family, target_model).map_err(|e| (400, e))?;
+                let picture = http::unbase64(&s(b, "image")).map_err(|e| (400, format!("image: {e}")))?;
+                let job = b["request_id"].as_str().map(str::to_string);
+                // the switcher swaps the describer in when another chat model is loaded (room made first, as any load)
+                let t = self.chat_target(Some(&id))?;
+                self.request_on(&id);
+                self.sent(job.as_deref());
+                // image.cancel {label}: the stream closed, the chat server stops at its next token
+                let cancelled = || job.as_deref().is_some_and(|j| self.job_cancelled(j));
+                crate::describe::describe(&t, &id, &ask, &picture, &cancelled)
             }
             ("image", "generate") | ("image", "edit") => {
                 let id = if b["model"].as_str().is_some_and(|x| !x.is_empty()) {
@@ -1155,7 +1187,7 @@ impl Home {
             "audio.generate" => ("audio", &[("audio", false)]),
             "audio.voices.add" => ("audio", &[("sample", false)]),
             "model3d.generate" => ("model3d", &[("image", false), ("images", true)]),
-            "image.upscale" | "image.vectorize" | "image.remove_background" => ("image", &[("image", false)]),
+            "image.upscale" | "image.vectorize" | "image.remove_background" | "image.describe" => ("image", &[("image", false)]),
             "model3d.rig" | "model3d.tool" => ("model3d", &[("mesh", false)]),
             _ => ("", &[]),
         }
@@ -1488,7 +1520,7 @@ impl Home {
             Vec::new()
         };
         let mut paths = Map::new();
-        for m in table::methods().iter().filter(|m| on.contains(&m.kind)) {
+        for m in table::methods().iter().filter(|m| on.contains(&m.runs_on())) {
             let mut props = Map::new();
             let mut required = Vec::new();
             for fd in &m.fields {
@@ -1652,6 +1684,47 @@ pub(super) fn speaks(m: &Value, voice: &str) -> bool {
     own.is_empty() || own.contains(&voice.to_lowercase())
 }
 
+/// A chat model that reads pictures: its vision tower among its files (a card's `vision` file), or beside its model by
+/// convention (a `sidecars` pattern naming one)
+pub(crate) fn reads_pictures(m: &Value) -> bool {
+    registry::kind_of(m) == "llm"
+        && (m["files"]["vision"].is_string()
+            || m["sidecars"].as_array().is_some_and(|a| a.iter().filter_map(|x| x.as_str()).any(|x| x.contains("vision") || x.contains("mmproj"))))
+}
+
+/// The describer when the request names none: the loaded chat model when it reads pictures, else of the enabled ones
+/// that do, the one its card says takes the least memory (a card made for describing, with a short context, before
+/// the long-context chat cards), the registry's order between equals
+pub(super) fn describe_pick(all: &[Value], loaded: Option<&str>) -> Option<String> {
+    let on: Vec<&Value> = all.iter().filter(|m| m["enabled"] != false && reads_pictures(m)).collect();
+    if let Some(l) = loaded.filter(|l| on.iter().any(|m| m["id"] == *l)) {
+        return Some(l.to_string());
+    }
+    let mem = |m: &Value| m["vram_gib"].as_f64().unwrap_or(f64::MAX);
+    on.iter().copied().reduce(|a, b| if mem(b) < mem(a) { b } else { a }).map(|m| s(m, "id"))
+}
+
+/// image.describe's target: a family's name, or an image model's id (its family from its architecture; one that
+/// does not draw is refused); none: natural sentences. The model named, when one was
+pub(super) fn describe_target(t: &str, all: &[Value]) -> Result<(crate::describe::Family, Option<String>), Fail> {
+    use crate::describe::{Family, FAMILIES};
+    let t = t.trim();
+    if let Some(m) = all.iter().find(|m| m["id"] == t && !t.is_empty()) {
+        if registry::kind_of(m) != "image" {
+            return Err((400, format!("target {t}: a {} model; a target is an image model that draws (or a prompt family)", registry::kind_of(m))));
+        }
+        let f = Family::of_arch(&s(m, "arch")).ok_or_else(|| (400, format!("target {t}: it does not draw pictures from prompts (arch {})", s(m, "arch"))))?;
+        return Ok((f, Some(t.to_string())));
+    }
+    let f = Family::named(t).ok_or_else(|| {
+        let names: Vec<&str> = FAMILIES.iter().map(|f| f.name()).collect();
+        (400, format!("target {t:?}: a prompt family ({}) or an image model's id", names.join(", ")))
+    })?;
+    // a model's id not registered here (a card's, another box's: its family by its prefix) keeps its name
+    let named = Family::alias(t).is_none();
+    Ok((f, named.then(|| t.to_string())))
+}
+
 /// A registry entry that upscales (an upscaler's architecture) rather than draws or reads
 pub(super) fn upscales(m: &Value) -> bool {
     matches!(s(m, "arch").as_str(), "realesrgan" | "waifu2x" | "seedvr2" | "flashvsr")
@@ -1675,7 +1748,45 @@ pub(super) fn not_a_remover(id: &str, all: &[Value]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{code_of, enrolled_for, rpc_error, speaks, table};
+    use super::{code_of, describe_pick, describe_target, enrolled_for, reads_pictures, rpc_error, speaks, table};
+    use crate::describe::Family;
+    use serde_json::json;
+
+    #[test]
+    fn a_describer_reads_pictures_the_loaded_first_else_the_smallest() {
+        let all = vec![
+            json!({"id": "glm", "kind": "llm", "files": {"model": "/m/glm.gguf"}, "vram_gib": 20.0}),
+            json!({"id": "q8", "kind": "llm", "files": {"model": "/m/q8.gguf", "vision": "/m/mmproj.gguf"}, "vram_gib": 31.0}),
+            json!({"id": "q4", "kind": "llm", "files": {"model": "/m/q4.gguf", "vision": "/m/mmproj.gguf"}, "vram_gib": 29.0}),
+            json!({"id": "q4d", "kind": "llm", "files": {"model": "/m/q4.gguf", "vision": "/m/mmproj.gguf"}, "vram_gib": 19.5, "enabled": false}),
+            json!({"id": "ds", "kind": "llm", "sidecars": ["*.vision.gguf"]}),
+            json!({"id": "olm", "kind": "image", "arch": "olmocr2", "files": {"vision": "/m/x.gguf"}}),
+        ];
+        assert!(!reads_pictures(&all[0]) && reads_pictures(&all[1]) && reads_pictures(&all[4]) && !reads_pictures(&all[5]));
+        assert_eq!(describe_pick(&all, Some("q8")).as_deref(), Some("q8"), "the loaded one when it reads pictures");
+        assert_eq!(describe_pick(&all, Some("glm")).as_deref(), Some("q4"), "else the least memory (a disabled one never)");
+        assert_eq!(describe_pick(&all[..1], None), None);
+        // the capabilities say so (system.models), and the method follows
+        let (c, m) = super::super::life::capabilities(&all[2]);
+        assert!(c.contains(&"describe") && m.contains(&"image.describe"));
+        assert!(!super::super::life::capabilities(&all[0]).1.contains(&"image.describe"));
+    }
+
+    #[test]
+    fn a_describe_target_is_a_family_or_a_model_that_draws() {
+        let all = vec![json!({"id": "zt", "kind": "image", "arch": "z-image"}), json!({"id": "ocr", "kind": "image", "arch": "unlimited-ocr"}),
+                       json!({"id": "chat", "kind": "llm"})];
+        assert_eq!(describe_target("", &all).unwrap(), (Family::Natural, None));
+        assert_eq!(describe_target("zt", &all).unwrap(), (Family::ZImage, Some("zt".into())), "a registered model: its architecture's");
+        assert_eq!(describe_target("H3", &all).unwrap(), (Family::H3, None));
+        assert_eq!(describe_target("minimax-h3-image-q8", &all).unwrap(), (Family::H3, Some("minimax-h3-image-q8".into())), "a card's id, not here");
+        for bad in ["ocr", "chat", "dall-e-3"] {
+            assert_eq!(describe_target(bad, &all).unwrap_err().0, 400, "{bad}");
+        }
+        // it runs on a chat model: enabled with the llm kind, listed by system.version when one is
+        assert_eq!(table::find("image.describe").unwrap().runs_on(), "llm");
+        assert_eq!(table::find("image.ocr").unwrap().runs_on(), "image");
+    }
 
     #[test]
     fn nextsycls_methods_are_all_declared() {

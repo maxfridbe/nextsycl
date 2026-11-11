@@ -7,7 +7,9 @@
 //! GET  /status                 {"busy": bool, "prompt_cache": ...}
 //! POST /v1/chat/completions    messages, max_tokens (none: --max-tokens, else the rest of the context),
 //!                              temperature, top_p, stream, reasoning_effort (or
-//!                              chat_template_kwargs.reasoning_effort): low | medium | high | max; logprobs, top_logprobs
+//!                              chat_template_kwargs.reasoning_effort): low | medium | high | max; logprobs, top_logprobs;
+//!                              think_budget (both routes): this request's thinking at most that many tokens (the server's
+//!                              NS_THINK_BUDGET for it), 0 the thinking closed before it starts (Qwen's non-thinking form)
 //!                              (the answer's tokens, as OpenAI's choices[0].logprobs.content); usage.energy_wh;
 //!                              logprob_chain: true - each entry also "chain": its logprob chained through the
 //!                              attention to this turn's own earlier tokens (see chain_entry), and each
@@ -138,6 +140,8 @@ struct Ask {
     chain: bool,
     /// the request's `seed`: the same seed and prompt give the same text where the engine draws on the GPU
     seed: Option<u64>,
+    /// `think_budget`: the thinking's tokens at most (0: closed at once); none: the server's NS_THINK_BUDGET
+    think: Option<usize>,
 }
 
 /// LogProbChain on one generated token's entry: for its token and each alternative, the logprob plus, over this
@@ -497,6 +501,15 @@ fn content_of(m: &Value, marker: Option<&str>) -> Result<(String, Vec<Vec<u8>>),
     Ok((text, images))
 }
 
+/// A prompt that ends in an opened `<think>` with the thinking closed: an empty thought, then the answer
+pub(crate) fn close_thinking(mut text: String) -> String {
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("\n</think>\n\n");
+    text
+}
+
 fn text_of(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -773,7 +786,8 @@ impl Server {
                      _ if chain => Some(req["top_logprobs"].as_u64().unwrap_or(5).min(20) as usize),
                      _ => None,
                  },
-                 chain, seed: req["seed"].as_u64().or_else(|| req["seed"].as_i64().map(|s| s as u64)) })
+                 chain, seed: req["seed"].as_u64().or_else(|| req["seed"].as_i64().map(|s| s as u64)),
+                 think: req["think_budget"].as_u64().map(|n| n as usize) })
     }
 
     // ------------------------------------------------------------------ the engine thread
@@ -1229,7 +1243,11 @@ impl Server {
         let messages: Vec<Message> = ask.messages.iter()
             .map(|m| Message { role: &m.role, content: &m.content, reasoning: m.reasoning.as_deref(), calls: &m.calls }).collect();
         let tools: Vec<String> = ask.tools.iter().map(py_json).collect();
-        let text = (self.chat)(&messages, ask.effort, &tools);
+        let mut text = (self.chat)(&messages, ask.effort, &tools);
+        // think_budget 0: a prompt that opens the thinking has it closed (`<think>\n\n</think>\n\n`, Qwen's non-thinking form)
+        if ask.think == Some(0) && text.trim_end().ends_with("<think>") {
+            text = close_thinking(text);
+        }
         // the answer starts in its thinking when the prompt opens it (a template's non-thinking mode closes it there)
         let opens_thinking = text.trim_end().ends_with("<think>");
         // Muse Glimmer's channels: the answer after `<|start|>assistant` is a to=self message, then the to=user one
@@ -1293,7 +1311,8 @@ impl Server {
         self.inflight.fetch_add(1, Ordering::SeqCst);
         self.queue.lock().unwrap().push_back(Job { id: rid, ids: ids.clone(), max, temp, top_p, logprobs: ask.logprobs, chain: ask.chain,
                                                      seed: ask.seed.unwrap_or_else(|| fresh_seed(rid)), tx,
-                                                   cancel: cancel.clone(), think: self.think_budget.filter(|_| opens_thinking) });
+                                                   cancel: cancel.clone(),
+                                                   think: ask.think.filter(|n| *n > 0 && self.think_end.is_some()).or(self.think_budget).filter(|_| opens_thinking) });
         self.wake.notify_one();
         // its prompt read
         let (from, source, prefill, saved) = match rx.recv() {
@@ -1518,8 +1537,14 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::cors_headers;
-    use super::{calls_of, content_of, py_json, safe_end, typed_args};
+    use super::{calls_of, close_thinking, content_of, py_json, safe_end, typed_args};
     use serde_json::json;
+
+    #[test]
+    fn a_closed_thinking_is_qwens_non_thinking_form() {
+        assert_eq!(close_thinking("<|im_start|>assistant\n<think>\n".into()), "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        assert_eq!(close_thinking("<｜Assistant｜><think>".into()), "<｜Assistant｜><think>\n\n</think>\n\n");
+    }
 
     #[test]
     fn pictures_take_the_markers_place() {

@@ -16,6 +16,10 @@ nextsycl image serve [MODEL] [--port 8086] [--host 127.0.0.1] [--gpu N] [--lora 
                      [--wfe] [--out DIR] [--cors ORIGIN]
 nextsycl image start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
 nextsycl image ocr PICTURE|PDF... [--one-pass] [--no-columns] [--model ID|FILE.gguf] [--prompt TEXT] [--no-tiles] [--no-figures] [--max N] [--temp T] [--out FILE] [--gpu N] [--dump-views DIR]
+nextsycl image describe PICTURE [--target FAMILY|IMAGE_MODEL] [--detail short|medium|long] [--words N] [--negative] [--language L]
+                        [--instructions TEXT] [--max-pixels N] [--temperature T] [--seed N] [--model ID] [--server HOST:PORT] [--json]
+                   (the prompt that would draw PICTURE, by a chat model that reads pictures: the box's switcher, NS_SWITCH_PORT,
+                    or a `nextsycl llm serve` at --server; families: natural qwen-image z-image h3 hunyuanimage moss-image ming-image tags)
 nextsycl image check <dump dir> [--model ID|FILE.gguf] [--stages te,dit,steps,vae (p-h3-image: + venc)] [--lora NAME[:SCALE]]... [--tokens N] [--gpu N]
                    (seedvr2: --stages resize,enc,dit,dec,colorfix --variant seedvr2-3b|seedvr2-7b --frames PNG_DIR;
                     flashvsr: reference/flashvsr/ref.py's dumps, every stage)
@@ -174,6 +178,43 @@ fn size(args: &[String], d: (u32, u32)) -> Result<(u32, u32), String> {
 
 fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
     gen_or_edit(cfg, args, false)
+}
+
+/// `nextsycl image describe PICTURE`: the prompt that would draw it (glue/serve's describe, as image.describe runs it),
+/// from the chat server at --server (default the box's switcher, which swaps --model in)
+fn describe_cmd(cfg: &Config, args: &[String]) -> Result<(), String> {
+    use nextsycl_serve::describe::{describe, Ask, Family};
+    let pic = args.first().filter(|a| !a.starts_with("--")).ok_or(USAGE)?;
+    let bytes = std::fs::read(pic).map_err(|e| format!("{pic}: {e}"))?;
+    let target = opt(args, "--target").unwrap_or("");
+    let family = Family::named(target).ok_or_else(|| format!("--target {target}: a family (natural, qwen-image, z-image, h3, hunyuanimage, moss-image, ming-image, tags) or an image model's id"))?;
+    let num = |k: &str| -> Result<Value, String> {
+        opt(args, k).map_or(Ok(Value::Null), |v| v.parse::<f64>().map(|x| if x.fract() == 0.0 { serde_json::json!(x as i64) } else { serde_json::json!(x) }).map_err(|_| format!("{k} {v}: a number")))
+    };
+    let body = serde_json::json!({
+        "detail": opt(args, "--detail"), "max_words": num("--words")?, "include_negative": args.iter().any(|a| a == "--negative"),
+        "language": opt(args, "--language"), "instructions": opt(args, "--instructions"), "max_pixels": num("--max-pixels")?,
+        "temperature": num("--temperature")?, "seed": num("--seed")?, "max_tokens": num("--max-tokens")?,
+    });
+    let ask = Ask::from_body(&body, family, Family::alias(target).is_none().then(|| target.to_string())).map_err(|e| e.to_string())?;
+    let server = opt(args, "--server").map(str::to_string)
+        .unwrap_or_else(|| format!("127.0.0.1:{}", cfg.get("NS_SWITCH_PORT").unwrap_or_else(|| "8001".into())));
+    let model = opt(args, "--model").unwrap_or("qwen3.8-27b-q4-describe");
+    let never = || false;
+    let r = describe(&nextsycl_serve::http::Target::Tcp(server), model, &ask, &bytes, &never).map_err(|(st, m)| format!("{st}: {m}"))?;
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+        return Ok(());
+    }
+    println!("{}", r["prompt"].as_str().unwrap_or(""));
+    if let Some(n) = r["negative_prompt"].as_str() {
+        println!("negative: {n}");
+    }
+    let t = &r["timings"];
+    eprintln!("[{} -> {}: {} prompt tokens ({} reused), pp {} tok/s; {} written, tg {} tok/s; {:.2} s in all; size {}]", r["target"], r["model"],
+              r["tokens"]["prompt"], r["tokens"]["reused"], t["pp_tok_s"], r["tokens"]["generated"], t["tg_tok_s"], t["seconds"].as_f64().unwrap_or(0.0),
+              r["suggested_size"]["size"].as_str().unwrap_or(""));
+    Ok(())
 }
 
 /// `nextsycl image ocr PICTURE...`: the pages read here (an OCR model), the text streamed to stdout (and --out)
@@ -839,6 +880,7 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("vectorize") => vectorize_cmd(cfg, rest),
         Some("remove-background") => remove_background_cmd(cfg, rest),
         Some("ocr") => ocr(cfg, rest),
+        Some("describe") => describe_cmd(cfg, rest),
         Some("serve") => serve(cfg, rest),
         Some("start") => SERVED.start(cfg, rest, |d| run(cfg, rest, d)),
         Some("ps") => SERVED.ps(cfg, rest),
