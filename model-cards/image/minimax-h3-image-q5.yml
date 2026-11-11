@@ -9,7 +9,7 @@ license_note: 'MiniMax-H3-Image Community License Agreement (MiniMax, 2026-11-10
 title: 'MiniMax-H3-Image Q5_K_M (closer to bf16 than Q4_K_M; Rust + SYCL)'
 about: 'as minimax-h3-image with Hearthscale''s Q5_K_M GGUF (Q5_K matrices, 12.3 GiB on the card)'
 gpus: '0,1'
-vram_gib: VRAMQ5
+vram_gib: 17.0                  # B70, 4096x4096: 16.5 GiB peak (13.4 after load)
 defaults:
   steps: 6
   cfg: 1.0

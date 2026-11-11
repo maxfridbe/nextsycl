@@ -9,7 +9,7 @@ license_note: 'MiniMax-H3-Image Community License Agreement (MiniMax, 2026-11-10
 title: 'MiniMax-H3-Image Q8_0 (the closest GGUF to bf16; Rust + SYCL)'
 about: 'as minimax-h3-image with Hearthscale''s Q8_0 GGUF (Q8_0 matrices expanded to bf16 a matrix at a time, 19.1 GiB on the card); the GGUF maker lists Q8_0 as the closest to the bf16 weights'
 gpus: '0,1'
-vram_gib: VRAMQ8
+vram_gib: 23.5                  # B70, 4096x4096: 22.9 GiB peak (20.1 after load)
 defaults:
   steps: 6
   cfg: 1.0
