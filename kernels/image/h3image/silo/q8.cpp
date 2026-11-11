@@ -13,6 +13,7 @@
 #include <oneapi/dnnl/dnnl.hpp>
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -106,20 +107,27 @@ int ns_image_h3i_silo_linear(ns_gpu* g, const void* x, int64_t M, int64_t K, con
     if (M <= 0) return 0;
     std::lock_guard<std::mutex> lk(mu);
     Dnn& d = dnn(g);
-    memory::desc src({M, K}, dt::bf16, memory::format_tag::ab);
     memory::desc wei({K, N}, dt::bf16, memory::format_tag::ba);   // the [N, K] matrix, read transposed
-    memory::desc dst({M, N}, dt::bf16, memory::format_tag::ab);
-    // keyed apart from the Q8_0 products: K negated
-    auto key = std::make_tuple(M, -K, N);
-    auto it = d.prims.find(key);
-    if (it == d.prims.end()) {
-        if (d.prims.size() >= 256) {
-            g->q.wait();
-            d.prims.clear();
+    // 8,192 rows a product, as the shared nsd_linear: one product over all 16,434 rows of a 16.8 MP picture measured
+    // 0.4 s slower a picture (B70, Q4_K_M: 50.73 against 50.21 s), though alone it was 2.4 ms a block faster
+    constexpr int64_t kRows = 8192;
+    for (int64_t r0 = 0; r0 < M; r0 += kRows) {
+        const int64_t rows = std::min(kRows, M - r0);
+        memory::desc src({rows, K}, dt::bf16, memory::format_tag::ab);
+        memory::desc dst({rows, N}, dt::bf16, memory::format_tag::ab);
+        // keyed apart from the Q8_0 products: K negated
+        auto key = std::make_tuple(rows, -K, N);
+        auto it = d.prims.find(key);
+        if (it == d.prims.end()) {
+            if (d.prims.size() >= 256) {
+                g->q.wait();
+                d.prims.clear();
+            }
+            it = d.prims.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(d.eng, src, wei, dst))).first;
         }
-        it = d.prims.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(d.eng, src, wei, dst))).first;
+        it->second.execute(d.st, {{DNNL_ARG_SRC, usm(src, d.eng, static_cast<const uint16_t*>(x) + r0 * K)}, {DNNL_ARG_WEIGHTS, usm(wei, d.eng, w)},
+                                  {DNNL_ARG_DST, usm(dst, d.eng, static_cast<uint16_t*>(out) + r0 * N)}});
     }
-    it->second.execute(d.st, {{DNNL_ARG_SRC, usm(src, d.eng, x)}, {DNNL_ARG_WEIGHTS, usm(wei, d.eng, w)}, {DNNL_ARG_DST, usm(dst, d.eng, out)}});
     return 0;
 } catch (const std::exception& e) {
     return ns_fail(std::string("h3image silo linear: ") + e.what());
