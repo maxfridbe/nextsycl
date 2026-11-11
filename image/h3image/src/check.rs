@@ -121,7 +121,14 @@ pub fn run(e: &H3Image, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)
         if stages.contains(&"dit") {
             worst = worst.max(note("txt", &text.to_f32().map_err(h3e)?, &d.f32("txt")?.1, log));
             worst = worst.max(note("noise", &nextsycl_h3::noise::Mt19937::new(seed).randn(24 * lh * lw), &noise, log));
-            let mut run = net::Run::new(&e.blocks, &e.outer, e.refine(&cond)?, Some(tags.clone()), lh, lw, &[], seed).map_err(h3e)?;
+            let text = e.refine(&cond)?;
+            let loras = e.loras.lock().unwrap_or_else(|p| p.into_inner());
+            let mut run = net::Run::new(&e.blocks, &e.outer, text, Some(tags.clone()), lh, lw, &[], seed).map_err(h3e)?;
+            run.lora = loras.set.as_ref();
+            run.first_head = e.first_head;
+            if let Some(s) = loras.set.as_ref() {
+                log(format!("lora           {} layers on the blocks and the refiner", s.layers));
+            }
             let (_, pos) = d.f32("pos")?;
             worst = worst.max(note("pos", &run.layout.positions.iter().map(|v| *v as f32).collect::<Vec<_>>(), &pos, log));
             if d.has("rows") {
@@ -138,7 +145,7 @@ pub fn run(e: &H3Image, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)
                 let secs = t0.elapsed().as_secs_f64();
                 if d.has(&format!("head_{i}")) {
                     let want = d.f32(&format!("head_{i}"))?.1;
-                    let got = net::head_weights((sig[i] * 1000.0) / 1000.0, sig[i + 1]);
+                    let got = if e.first_head { [1.0, 0.0, 0.0, 0.0, 0.0, 0.0] } else { net::head_weights((sig[i] * 1000.0) / 1000.0, sig[i + 1]) };
                     worst = worst.max(note(&format!("head_{i}"), &got, &want, log));
                 }
                 if i == 0 && d.has("blk_49") {
@@ -150,7 +157,7 @@ pub fn run(e: &H3Image, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)
         }
         if stages.contains(&"steps") {
             let t0 = std::time::Instant::now();
-            let lat = e.sample(text, &tags, &[], lh, lw, seed, &sig, &mut |_| Ok(()))?;
+            let lat = e.sample(text, &tags, &[], None, e.first_head, lh, lw, seed, &sig, &mut |_| Ok(()))?;
             log(format!("steps          {:.1} s", t0.elapsed().as_secs_f64()));
             worst = worst.max(note("lat_final", &lat, &d.f32("lat_final")?.1, log));
             let out = dir.join("lat_engine.npy");
@@ -159,6 +166,9 @@ pub fn run(e: &H3Image, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)
     }
     if stages.contains(&"expand") {
         worst = worst.max(expansions(e, log)?);
+    }
+    if stages.contains(&"live") {
+        live(e, dir, log)?;
     }
     if stages.contains(&"vae") {
         let (s, lat) = d.f32("lat_final")?;
@@ -180,6 +190,64 @@ pub fn run(e: &H3Image, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)
         log(format!("wrote {}", out.display()));
     }
     Ok(worst)
+}
+
+/// One request of the `live` stage: what it is and how it differs from the one before
+pub struct LiveStep {
+    pub what: &'static str,
+    pub prompt: String,
+    pub seed: u64,
+    /// the picture it edits (an earlier step's output, by index), and whether as a reference (an edit) or only as the
+    /// start (an img2img polish)
+    pub source: Option<(usize, bool)>,
+    pub strength: f32,
+    pub start_sigma: Option<f32>,
+    pub steps: Option<u32>,
+}
+
+/// A live editor's requests in order (`prompt`: the first prompt): a frame, the same prompt at another seed, a small
+/// prompt edit, an edit of frame 0, the same edit again, the edit's prompt changed, a polish of frame 0 from sigma 0.5
+pub fn live_steps(prompt: &str) -> Vec<LiveStep> {
+    let s = |what, prompt: &str, seed, source, strength, start_sigma, steps| LiveStep { what, prompt: prompt.to_string(), seed, source, strength, start_sigma, steps };
+    let edit = "Keep the composition and the subject; make it a snowy winter night, the light warm from the windows.";
+    vec![
+        s("frame, cold", prompt, 1, None, 1.0, None, None),
+        s("same prompt, next seed", prompt, 2, None, 1.0, None, None),
+        s("prompt edited", &format!("{prompt} At dusk."), 2, None, 1.0, None, None),
+        s("edit of frame 0, cold", edit, 3, Some((0, true)), 1.0, None, None),
+        s("same edit, next seed", edit, 4, Some((0, true)), 1.0, None, None),
+        s("edit's prompt edited", &edit.replace("night", "morning"), 4, Some((0, true)), 1.0, None, None),
+        s("polish of frame 0 from sigma 0.5 (3 steps)", prompt, 5, Some((0, false)), 1.0, Some(0.5), Some(3)),
+    ]
+}
+
+/// The `live` stage: `live_steps` through `generate` in one process at NS_H3I_LIVE_SIZE (default 1024x1024), each
+/// request's wall time; the pictures written beside the dumps (live_I.png)
+fn live(e: &H3Image, dir: &Path, log: &mut dyn FnMut(String)) -> Result<()> {
+    use nextsycl_image::{Edit, ImageEngine, ImageRequest};
+    let size = std::env::var("NS_H3I_LIVE_SIZE").unwrap_or_else(|_| "1024x1024".into());
+    let (w, h) = size.split_once('x').and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?))).ok_or_else(|| Error(format!("NS_H3I_LIVE_SIZE={size}: WxH")))?;
+    let prompt = std::fs::read_to_string(dir.join("prompt.txt")).map(|p| p.trim().to_string())
+        .unwrap_or_else(|_| "A lighthouse on a cliff above a stormy sea, a small red house beside it, gulls in the wind, late afternoon light.".into());
+    let mut made: Vec<Picture> = Vec::new();
+    for (i, s) in live_steps(&prompt).into_iter().enumerate() {
+        let mut req = ImageRequest { prompt: s.prompt.clone(), width: Some(w), height: Some(h), steps: s.steps, seed: s.seed, n: 1, ..Default::default() };
+        if let Some((k, condition)) = s.source {
+            let image = made.get(k).cloned().ok_or_else(|| Error(format!("live step {i}: no picture {k}")))?;
+            req.edit = Some(Edit { image, refs: Vec::new(), mask: None, strength: s.strength, condition });
+        }
+        if let Some(s0) = s.start_sigma {
+            req.extra.insert("start-sigma".into(), s0.to_string());
+        }
+        let t0 = std::time::Instant::now();
+        let mut pics = e.generate(&req, &mut |_| Ok(()))?;
+        let secs = t0.elapsed().as_secs_f64();
+        log(format!("live {i} {:44} {w}x{h} {} steps: {secs:.2} s", s.what, e.steps_for(&req)));
+        let p = pics.pop().ok_or_else(|| Error("no picture".into()))?;
+        p.write_png(&dir.join(format!("live_{i}.png")), &[("prompt", s.prompt.clone())]).map_err(Error)?;
+        made.push(p);
+    }
+    Ok(())
 }
 
 /// The bfloat16 values of two expansions that differ, by bit pattern (0: the same bits)

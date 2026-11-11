@@ -9,7 +9,15 @@ The text conditioning (H3's Qwen3-VL 32B: the video engine's, checked in its own
 `check` stage `te` (cond.npy [T, 5120], tags.npy), so this script needs no text encoder.
 
     python -I ref.py --dit BF16.safetensors --vae VAE.safetensors --dir DIR [--size 576x384] [--seed 3] [--steps 6]
-                     [--stages dit,vae] [--threads N]
+                     [--stages dit,vae] [--threads N] [--lora LORA.safetensors [--strength 1]] [--shift 12] [--heads bank|first]
+
+A LoRA (ComfyUI's layout: `diffusion_model.blocks.N.attn.qkv_proj.lora_A.weight` / `lora_B.weight` / `.alpha`, e.g. the
+pDMD 2-NFE LoRA's minimax_h3_pdmd_2nfe_comfyui.safetensors) is merged into each matrix in float32 as ComfyUI's patch
+computes it - W + strength * alpha / rank * B A - without its rounding back to bfloat16. `--shift S` samples on the
+schedule ComfyUI's MiniMaxH3SigmaShift (shift_video S) + BasicScheduler "simple" gives (ModelSamplingDiscreteFlow's
+1,000-entry table under time_snr_shift, read at `steps` even indices), instead of the heads' grid; the heads are still
+weighted by the PDD grid, as ComfyUI's FinalLayer does. `--heads first` takes head 0 alone (the diffusers route: its
+converted transformer keeps one head).
 
 Dumps (DIR, .npy float32 unless said):
   dit:  pos [S, 3] (float64), rows [S] (int32: each token's table row at step 0), sigmas [steps + 1], noise [24, h, w],
@@ -86,6 +94,8 @@ class SafeTensors:
             f.seek(self.base + a)
             raw = f.read(b - a)
         dt = e["dtype"]
+        if dt == "I64":
+            return torch.frombuffer(bytearray(raw), dtype=torch.int64).float().reshape(e["shape"])
         if dt == "BF16":
             t = torch.frombuffer(bytearray(raw), dtype=torch.int16).to(torch.int32).bitwise_left_shift(16).view(torch.float32)
         elif dt == "F16":
@@ -149,8 +159,25 @@ def unpatchify(rows, h, w):
     return rows.reshape(h // 2, w // 2, 24, 2, 2).permute(2, 0, 3, 1, 4).reshape(24, h, w)
 
 
+LORA_LINEARS = ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2")
+
+
+def shifted_sigmas(shift, steps):
+    """ComfyUI: ModelSamplingDiscreteFlow.set_parameters (sigmas = time_snr_shift(shift, (arange(1, 1001) / 1000 * 1000) / 1000),
+    float32) read by simple_scheduler (sigmas[-(1 + int(x * len / steps))] for x < steps, then 0)"""
+    t = (torch.arange(1, 1001, 1) / 1000) * 1000
+    t = t / 1000
+    table = shift * t / (1 + (shift - 1) * t) if shift != 1.0 else t
+    ss = len(table) / steps
+    return [float(table[-(1 + int(x * ss))]) for x in range(steps)] + [0.0]
+
+
 class Dit:
-    def __init__(self, path, threads):
+    def __init__(self, path, threads, lora=None, strength=1.0, first_head=False):
+        self.lora = SafeTensors(lora) if lora else None
+        self.strength = strength
+        self.first_head = first_head
+        self.merged = 0
         self.st = SafeTensors(path)
         self.n = 1 + max(int(k.split(".")[1]) for k in self.st.header if k.startswith("blocks."))
         g = self.st.get
@@ -164,9 +191,19 @@ class Dit:
 
     def block(self, p):
         g = self.st.get
-        return {k: g(f"{p}.{k}") for k in ("norm1.weight", "norm2.weight", "attn.q_norm.weight", "attn.k_norm.weight", "attn.qkv_proj.weight",
-                                          "attn.out_proj.weight", "mlp.fc1.weight", "mlp.fc2.weight")} | (
+        b = {k: g(f"{p}.{k}") for k in ("norm1.weight", "norm2.weight", "attn.q_norm.weight", "attn.k_norm.weight", "attn.qkv_proj.weight",
+                                       "attn.out_proj.weight", "mlp.fc1.weight", "mlp.fc2.weight")} | (
             {"adaln.w": g(f"{p}.adaln_proj.linear.weight"), "adaln.b": g(f"{p}.adaln_proj.linear.bias")} if f"{p}.adaln_proj.linear.weight" in self.st else {})
+        if self.lora is not None:
+            for l in LORA_LINEARS:
+                k = f"diffusion_model.{p}.{l}"
+                if f"{k}.lora_A.weight" not in self.lora:
+                    continue
+                a, bb = self.lora.get(f"{k}.lora_A.weight"), self.lora.get(f"{k}.lora_B.weight")
+                alpha = float(self.lora.get(f"{k}.alpha").reshape(-1)[0]) / a.shape[0] if f"{k}.alpha" in self.lora else 1.0
+                b[f"{l}.weight"] = b[f"{l}.weight"] + (self.strength * alpha) * (bb @ a)
+                self.merged += 1
+        return b
 
     def refine(self, cond):
         g = self.st.get
@@ -228,6 +265,8 @@ class Dit:
         stop = max(stop, start + 1)
         dt = [PDD_SIGMAS[kk] - PDD_SIGMAS[kk + 1] for kk in range(start, stop)]
         wts = torch.tensor(dt, dtype=torch.float32) / sum(dt)
+        if self.first_head:
+            wts = torch.zeros_like(wts)
         wrows = self.out_w.reshape(n, -1, self.out_w.shape[1])
         brows = self.out_b.reshape(n, -1)
         first = max(start, 1)
@@ -253,7 +292,7 @@ def run_dit(a, out):
     tags = torch.from_numpy(np.load(os.path.join(out, "tags.npy"))).long()
     w, h = (int(v) for v in a.size.split("x"))
     lh, lw = h // 16, w // 16
-    d = Dit(a.dit, a.threads)
+    d = Dit(a.dit, a.threads, a.lora, a.strength, a.heads == "first")
     t0 = time.time()
     txt = d.refine(cond)
     save(out, "txt", txt)
@@ -261,7 +300,9 @@ def run_dit(a, out):
     save(out, "pos", pos)
     ang = rope_angles(pos, d.inv_freq)
     n = len(PDD_SIGMAS) - 1
-    if a.steps == n:
+    if a.shift is not None:
+        sig = shifted_sigmas(a.shift, a.steps)
+    elif a.steps == n:
         sig = PDD_SIGMAS
     else:
         sig = []
@@ -285,6 +326,8 @@ def run_dit(a, out):
         x = x + (x - den) / s * (nx - s)
         print(f"step {i}: {time.time() - t0:.0f} s", flush=True)
     save(out, "lat_final", x)
+    if d.lora is not None:
+        print(f"lora: {d.merged} matrices merged at strength {a.strength}", flush=True)
 
 
 class Decoder:
@@ -421,6 +464,10 @@ def main():
     ap.add_argument("--steps", type=int, default=6)
     ap.add_argument("--stages", default="dit,vae")
     ap.add_argument("--threads", type=int, default=16)
+    ap.add_argument("--lora")
+    ap.add_argument("--strength", type=float, default=1.0)
+    ap.add_argument("--shift", type=float)
+    ap.add_argument("--heads", default="bank", choices=["bank", "first"])
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     for s in a.stages.split(","):

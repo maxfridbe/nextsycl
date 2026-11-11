@@ -15,9 +15,18 @@
 //! The denoiser is any form crates/h3 reads: ComfyUI's int8 ConvRot file (int8 products), or a stable-diffusion.cpp
 //! GGUF (Hearthscale's Q5_K_M / Q4_K_M / Q3_K_M: each matrix expanded to bfloat16 for its product; Q3_K read as the
 //! same values in Q6_K blocks).
+//!
+//! LoRAs in ComfyUI's layout ride on the blocks' products (crates/h3's side path: `out += B (A x)` after each of a
+//! block's four products, the token refiner's too): the card's (role `lora`, NS_H3I_LORA_STRENGTH), a preset's, and a
+//! request's own (stacked while requests keep naming them). The pDMD 2-NFE LoRA's recipe is a card's settings: 2 steps
+//! (NS_H3I_STEPS) on ComfyUI's shifted schedule (NS_H3I_SHIFT 12, `net::shifted_sigmas`), the heads still weighted by
+//! their grid. An init picture (an img2img / detail pass, or an edit with strength below 1) starts the denoise from its
+//! VAE latents at the schedule's first sigma; `live.rs` keeps the text encoder's and the VAE encoder's results for
+//! repeated prompts and pictures.
 
 pub mod check;
 pub mod ffi;
+pub mod live;
 pub mod net;
 pub mod vae;
 
@@ -34,13 +43,14 @@ use nextsycl_h3::jobs::{Ctl, TeFiles};
 use nextsycl_h3::noise::Mt19937;
 use nextsycl_h3::safetensors::Checkpoint;
 use nextsycl_h3::vision::{Frames, Piece};
-use nextsycl_image::{At, Defaults, EngineOption, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, ModelFiles, Picture, Result, Sampler, Schedule as Sched,
-                     SizePresets, Step};
+use nextsycl_image::{At, Defaults, EngineOption, Error, ImageEngine, ImageKind, ImageRequest, LoadOptions, LoraUse, ModelFiles, Picture, Result, Sampler,
+                     Schedule as Sched, SizePresets, Step};
 
 pub const ARCH: &str = "minimax-h3-image";
 /// the denoiser, the text encoder (H3's Qwen3-VL 32B GGUF), its tokenizer (vocab.json beside merges.txt and
-/// tokenizer_config.json), the VAE (the encoder for edits, the image decoder), the vision tower (edits)
-pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "vae", "vision"];
+/// tokenizer_config.json), the VAE (the encoder for edits, the image decoder), the vision tower (edits), a LoRA on the
+/// blocks (ComfyUI's layout: the pDMD 2-NFE LoRA)
+pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "vae", "vision", "lora"];
 
 /// canvas sides are multiples of this (the VAE's 16 x the denoiser's 2 x 2 patches)
 pub const GRID: u32 = 32;
@@ -70,7 +80,14 @@ const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "q8-product", env: "NS_H3I_Q8_PRODUCT", value: "0|1", help: "Q8_0: the silo's products read the int8 values (oneDNN weight decompression; default 1; 0: expanded to bfloat16 first)", at: At::Load },
     EngineOption { name: "keep-refiner", env: "NS_H3I_KEEP_REFINER", value: "0|1", help: "keep the token refiner on the card between pictures (default 0: loaded for each picture, 0.08 - 0.17 s; 1: kept, 1.5 GiB more on the card)", at: At::Load },
     EngineOption { name: "profile", env: "NS_H3I_PROFILE", value: "0|1", help: "debug: each step's time by stage on stderr (the queue drained between stages)", at: At::Load },
-    EngineOption { name: "sigmas", env: "", value: "S,S,..,0", help: "another sampling grid than the heads' six steps: strictly falling from 1, ending at 0", at: At::Request },
+    EngineOption { name: "sigmas", env: "", value: "S,S,..,0", help: "another sampling grid than the heads' six steps: strictly falling from 1, ending at 0 (below 1 with an init picture: the denoise starts there)", at: At::Request },
+    EngineOption { name: "lora-strength", env: "NS_H3I_LORA_STRENGTH", value: "X", help: "the strength of the card's LoRA (role lora; default 1: the pDMD 2-step LoRA's distillation as trained, other values scale it)", at: At::Load },
+    EngineOption { name: "steps", env: "NS_H3I_STEPS", value: "N", help: "the default number of steps (default 6: the heads' grid; the pDMD 2-step card and LoRA: 2; a request's steps first)", at: At::Both },
+    EngineOption { name: "shift", env: "NS_H3I_SHIFT", value: "S", help: "sample on ComfyUI's shifted flow schedule (MiniMaxH3SigmaShift shift_video S + the simple scheduler) instead of the heads' grid (the pDMD 2-step card and LoRA: 12; a request's shift first)", at: At::Both },
+    EngineOption { name: "heads", env: "NS_H3I_HEADS", value: "bank|first", help: "the output heads: the bank weighted by the grid (default, as ComfyUI) or head 0 alone (the diffusers route's single head)", at: At::Both },
+    EngineOption { name: "text-cache", env: "NS_H3I_TEXT_CACHE", value: "N", help: "keep the text encoder's result (and the token refiner's) for the last N prompts (+ their pictures): a repeat skips the 32B encoder (default 0: off; the 2-step card: 8)", at: At::Load },
+    EngineOption { name: "image-cache", env: "NS_H3I_IMAGE_CACHE", value: "N", help: "keep the VAE latents of the last N pictures (an edit's references, an img2img start) at each size: an edit of the same picture skips the VAE encoder (default 0: off; the 2-step card: 8)", at: At::Load },
+    EngineOption { name: "start-sigma", env: "", value: "S", help: "an init picture's denoise starts at sigma S exactly (the demo Space's detail pass: S, 0.943 S, 0.733 S, 0 at 3 steps); without it a strength below 1 is ComfyUI's denoise", at: At::Request },
 ];
 
 pub fn kind() -> ImageKind {
@@ -114,6 +131,68 @@ pub fn parse_sigmas(s: &str) -> Result<Vec<f32>> {
     Ok(v)
 }
 
+/// What a request samples: its grid, whether it starts from its first picture's latents (an img2img / detail pass,
+/// or an edit at a strength below 1), whether its pictures condition the model as an edit's references
+#[derive(Clone, Debug, PartialEq)]
+pub struct Plan {
+    pub sigmas: Vec<f32>,
+    pub init: bool,
+    pub condition: bool,
+    /// head 0 alone (the request's `heads` option; none: the engine's)
+    pub first_head: Option<bool>,
+}
+
+/// A request option as a number
+fn extra_number<T: std::str::FromStr>(req: &ImageRequest, name: &str) -> Result<Option<T>> {
+    req.extra.get(name).map(|v| v.trim().parse::<T>().map_err(|_| Error(format!("{name} {v}: a number")))).transpose()
+}
+
+/// A request's plan with the engine's default `steps` and `shift` (none: the heads' grid); the request's own fields
+/// first, then its options (`steps`, `shift`: what a request LoRA's card brings, the pDMD LoRA's 2 and 12): `sigmas` as
+/// given; else `start-sigma` S with a picture: the demo Space's grid from S; else a strength below 1: ComfyUI's
+/// BasicScheduler denoise; else the whole schedule
+pub fn plan(req: &ImageRequest, steps: usize, shift: Option<f32>) -> Result<Plan> {
+    let steps = extra_number::<usize>(req, "steps")?.unwrap_or(steps);
+    let shift = req.shift.or(extra_number::<f32>(req, "shift")?).or(shift);
+    if shift.is_some_and(|s| !(0.01..=100.0).contains(&s)) {
+        return Err(Error("shift: 0.01 to 100".into()));
+    }
+    let first_head = match req.extra.get("heads").map(|v| v.trim()) {
+        None => None,
+        Some("bank") => Some(false),
+        Some("first") => Some(true),
+        Some(v) => return Err(Error(format!("heads {v}: bank or first"))),
+    };
+    let condition = req.edit.as_ref().is_some_and(|e| e.condition);
+    let strength = req.edit.as_ref().map_or(1.0, |e| e.strength);
+    let start = req.extra.get("start-sigma").map(|v| v.trim().parse::<f32>().map_err(|_| Error(format!("start-sigma {v}: a number")))).transpose()?;
+    if start.is_some_and(|s| !(s > 0.0 && s <= 1.0)) {
+        return Err(Error("start-sigma: above 0, at most 1".into()));
+    }
+    if start.is_some() && req.edit.is_none() {
+        return Err(Error(format!("{ARCH}: start-sigma needs a picture to start from")));
+    }
+    let init = req.edit.is_some() && (strength < 1.0 || start.is_some());
+    if req.edit.is_some() && !condition && !init {
+        return Err(Error(format!("{ARCH}: a picture that is not a reference needs a strength below 1 or a start-sigma (an img2img)")));
+    }
+    let sigmas = match (req.extra.get("sigmas"), start) {
+        (Some(_), Some(_)) => return Err(Error("sigmas or start-sigma, not both".into())),
+        (Some(s), None) => parse_sigmas(s)?,
+        (None, _) => {
+            let n = req.steps.map_or(steps, |s| s as usize);
+            if !(1..=50).contains(&n) {
+                return Err(Error(format!("{ARCH}: {n} steps (1 to 50; the heads are distilled for {STEPS}, the pDMD LoRA for 2)")));
+            }
+            match start {
+                Some(s0) => net::start_grid(s0, &net::schedule(n, shift, 1.0)),
+                None => net::schedule(n, shift, if init { strength } else { 1.0 }),
+            }
+        }
+    };
+    Ok(Plan { sigmas, init, condition, first_head })
+}
+
 /// The text side's result: the conditioning [T, 5120] and per token its modality tag (1 text, 0 a vision token)
 pub struct Encoded {
     pub rows: Vec<f32>,
@@ -139,6 +218,30 @@ pub struct H3Image {
     refiner: Option<TextRefiner>,
     /// the Q8_0 block matrices were rewritten for the silo's product (the shared expansion cannot read them)
     pub q8_repacked: bool,
+    /// the LoRAs on the blocks (the card's, a preset's, a request's on top)
+    pub loras: Mutex<live::Loras>,
+    /// the default steps (NS_H3I_STEPS) and the shifted schedule's shift (NS_H3I_SHIFT; none: the heads' grid)
+    pub steps: usize,
+    pub shift: Option<f32>,
+    /// head 0 alone (NS_H3I_HEADS=first)
+    pub first_head: bool,
+    /// the text encoder's results by prompt (NS_H3I_TEXT_CACHE), the pictures' latents (NS_H3I_IMAGE_CACHE)
+    texts: Mutex<live::Lru<TextEntry>>,
+    latents: Mutex<live::Lru<Arc<Vec<f32>>>>,
+}
+
+/// An edit's picture as conditioning: its normalized latents [24, lh, lw], lh, lw
+pub type RefLatent = (Vec<f32>, usize, usize);
+
+/// A prompt's text-encoder result and the token refiner's output under the LoRAs it was refined with (their key)
+struct TextEntry {
+    enc: Arc<Encoded>,
+    refined: Option<(u64, Tensor)>,
+}
+
+/// A setting as a number, refused when it does not read as one
+fn number<T: std::str::FromStr>(o: &LoadOptions, name: &str) -> Result<Option<T>> {
+    o.setting(name).filter(|v| !v.trim().is_empty()).map(|v| v.trim().parse::<T>().map_err(|_| Error(format!("{name}={v}: a number")))).transpose()
 }
 
 fn role<'f>(files: &'f ModelFiles, r: &str) -> Result<&'f Path> {
@@ -215,8 +318,53 @@ impl H3Image {
                 log(format!("{ARCH}: profile: {}", expansion_profile(&dev, &gpu, &blocks.cfg, kind, silo).map_err(h3e)?));
             }
         }
+        // the card's LoRA (role lora) at NS_H3I_LORA_STRENGTH, then a preset's, on the side path
+        let strength: f32 = number(o, "NS_H3I_LORA_STRENGTH")?.unwrap_or(1.0);
+        let mut uses: Vec<LoraUse> = files.get("lora").map(|p| LoraUse { name: "lora".into(), path: p.clone(), scale: strength }).into_iter().collect();
+        uses.extend(o.merge_loras.iter().cloned());
+        let refiners = refiner_blocks(&ck);
+        let mut set: Option<nextsycl_h3::lora::LoraSet> = None;
+        for l in &uses {
+            let before = dev.mem_used();
+            let add = nextsycl_h3::lora::LoraSet::load(&dev, &Checkpoint::open(&l.path).map_err(h3e)?, l.scale, blocks.blocks.len(), refiners).map_err(h3e)?;
+            if add.max_rank > nextsycl_h3::dit::MAX_LORA_RANK {
+                return Err(Error(format!("{ARCH}: {} has rank {} (at most {})", l.path.display(), add.max_rank, nextsycl_h3::dit::MAX_LORA_RANK)));
+            }
+            log(format!("{ARCH}: LoRA {} x {}: {} layers, rank up to {}, {:.2} GiB on the card", l.path.display(), l.scale, add.layers, add.max_rank,
+                        (dev.mem_used() - before) as f64 / (1u64 << 30) as f64));
+            match set.as_mut() {
+                Some(s) => s.stack(add),
+                None => set = Some(add),
+            }
+        }
+        let steps: usize = number(o, "NS_H3I_STEPS")?.unwrap_or(STEPS);
+        if !(1..=50).contains(&steps) {
+            return Err(Error(format!("NS_H3I_STEPS={steps}: 1 to 50")));
+        }
+        let shift: Option<f32> = number(o, "NS_H3I_SHIFT")?;
+        if shift.is_some_and(|s| !(0.01..=100.0).contains(&s)) {
+            return Err(Error("NS_H3I_SHIFT: 0.01 to 100 (ComfyUI's MiniMaxH3SigmaShift range)".into()));
+        }
+        let first_head = match o.setting("NS_H3I_HEADS").as_deref() {
+            None | Some("") | Some("bank") => false,
+            Some("first") => true,
+            Some(v) => return Err(Error(format!("NS_H3I_HEADS={v}: bank or first"))),
+        };
+        let texts = live::Lru::new(number(o, "NS_H3I_TEXT_CACHE")?.unwrap_or(0));
+        let latents = live::Lru::new(number(o, "NS_H3I_IMAGE_CACHE")?.unwrap_or(0));
+        log(format!("{ARCH}: {steps} steps by default on {}{}; caches: {} prompts, {} pictures' latents", match shift {
+            Some(s) => format!("the shifted schedule (shift {s})"),
+            None => "the heads' grid".into(),
+        }, if first_head { ", head 0 alone" } else { "" }, texts.cap(), latents.cap()));
         Ok(H3Image { gpu, dev, ck, blocks, outer, decoder, files: files.clone(), threads, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64(),
-                     busy: Mutex::new(()), profile, refiner, q8_repacked })
+                     busy: Mutex::new(()), profile, refiner, q8_repacked, loras: Mutex::new(live::Loras::new(set)), steps, shift, first_head,
+                     texts: Mutex::new(texts), latents: Mutex::new(latents) })
+    }
+
+    /// The default schedule of `steps` steps at `denoise` (1: from noise): the shifted one when the card sets a
+    /// shift (or the request does), else the heads' grid
+    pub fn sigmas(&self, steps: usize, shift: Option<f32>, denoise: f32) -> Vec<f32> {
+        net::schedule(steps, shift.or(self.shift), denoise)
     }
 
     /// The tokenizer's directory (vocab.json, merges.txt, tokenizer_config.json)
@@ -249,46 +397,108 @@ impl H3Image {
         Ok(Encoded { rows, tags: presented.tags, seconds })
     }
 
-    /// The conditioning rows [T, 5120] through the denoiser's projection and token refiner: bfloat16 [T, hidden]
+    /// The conditioning rows [T, 5120] through the denoiser's projection and token refiner (with the LoRAs on the
+    /// refiner's blocks): bfloat16 [T, hidden]
     pub fn refine(&self, cond: &[f32]) -> Result<Tensor> {
         let k = self.ck.get("condition_proj.weight").map_err(h3e)?.shape[1];
         let t = cond.len() / k;
         let c = Tensor::from_bytes(&self.dev, DType::BF16, &[t, k], &bf16_bytes(cond)).map_err(h3e)?;
+        let loras = self.loras.lock().unwrap_or_else(|p| p.into_inner());
+        let lora = loras.set.as_ref().map(|s| s.refiner.as_slice());
         let out = match &self.refiner {
-            Some(r) => r.run(&self.blocks.cfg, &c, None).map_err(h3e)?,
-            None => TextRefiner::load(&self.dev, &self.ck, self.threads).map_err(h3e)?.run(&self.blocks.cfg, &c, None).map_err(h3e)?,
+            Some(r) => r.run(&self.blocks.cfg, &c, lora).map_err(h3e)?,
+            None => TextRefiner::load(&self.dev, &self.ck, self.threads).map_err(h3e)?.run(&self.blocks.cfg, &c, lora).map_err(h3e)?,
         };
         self.dev.wait().map_err(h3e)?;
         Ok(out)
     }
 
+    /// The text side of a request, from the text cache when it holds the prompt and its pictures: the encoder's result
+    /// and the refined text (a copy the picture's run owns); and what was cached (encoder, refiner)
+    pub fn text(&self, prompt: &str, pics: &[Picture], log: &mut dyn FnMut(String)) -> Result<(Arc<Encoded>, Tensor, (bool, bool))> {
+        let key = live::text_key(prompt, &pics.iter().map(live::picture_key).collect::<Vec<_>>());
+        let lkey = self.loras.lock().unwrap_or_else(|p| p.into_inner()).extra_key();
+        let mut texts = self.texts.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(e) = texts.get(key) {
+            let enc = e.enc.clone();
+            if let Some((_, t)) = e.refined.as_ref().filter(|(k, _)| *k == lkey) {
+                return Ok((enc, copy(t).map_err(h3e)?, (true, true)));
+            }
+            let refined = self.refine(&enc.rows)?;
+            e.refined = Some((lkey, copy(&refined).map_err(h3e)?));
+            return Ok((enc, refined, (true, false)));
+        }
+        drop(texts);
+        let enc = Arc::new(self.encode(prompt, pics, log)?);
+        let refined = self.refine(&enc.rows)?;
+        let mut texts = self.texts.lock().unwrap_or_else(|p| p.into_inner());
+        if texts.cap() > 0 {
+            texts.put(key, TextEntry { enc: enc.clone(), refined: Some((lkey, copy(&refined).map_err(h3e)?)) });
+        }
+        Ok((enc, refined, (false, false)))
+    }
+
+    /// H3's VAE encoder (the conv encoder in the VAE file)
+    fn encoder(&self) -> Result<nextsycl_h3::venc::VideoEncoder> {
+        nextsycl_h3::venc::VideoEncoder::load(&self.dev, &Checkpoint::open(role(&self.files, "vae")?).map_err(h3e)?).map_err(h3e)
+    }
+
+    /// A picture's latents [24, h/16, w/16] at `w` x `h` (resized with Lanczos when it is another size): the posterior
+    /// sampled under ComfyUI's IMAGE_ENCODE_SEED and normalized, as MiniMaxH3ImageVAE.encode gives them; from the picture
+    /// cache when it holds them (`purpose` keys the use); `enc` is loaded on the first miss
+    fn latents_of(&self, p: &Picture, w: u32, h: u32, purpose: &str, enc: &mut Option<nextsycl_h3::venc::VideoEncoder>) -> Result<(Arc<Vec<f32>>, bool)> {
+        let key = live::latent_key(live::picture_key(p), w, h, purpose);
+        if let Some(l) = self.latents.lock().unwrap_or_else(|p| p.into_inner()).get(key) {
+            return Ok((l.clone(), true));
+        }
+        if enc.is_none() {
+            *enc = Some(self.encoder()?);
+        }
+        let e = enc.as_ref().ok_or("no encoder")?;
+        let (mean, std) = e.latent_stats();
+        let rgb = p.rgb();
+        let shown = if (w, h) == (rgb.width, rgb.height) { rgb } else { rgb.resize_lanczos(w, h) };
+        let px: Vec<f32> = shown.data.iter().map(|v| *v as f32 / 255.0).collect();
+        let m = e.moments_of_picture(&px, h as usize, w as usize, &mut || Ok(())).map_err(h3e)?;
+        let noise = Mt19937::new(ENCODE_SEED).randn(24 * (h as usize / 16) * (w as usize / 16));
+        let l = Arc::new(vae::condition_latent(&m, &noise, mean, std));
+        self.latents.lock().unwrap_or_else(|p| p.into_inner()).put(key, l.clone());
+        Ok((l, false))
+    }
+
     /// An edit's pictures as conditioning latents [24, h, w] (normalized), each at its VAE size (short edge within
     /// 1,024 .. 2,048)
-    pub fn reference_latents(&self, pics: &[Picture]) -> Result<Vec<(Vec<f32>, usize, usize)>> {
-        let enc = nextsycl_h3::venc::VideoEncoder::load(&self.dev, &Checkpoint::open(role(&self.files, "vae")?).map_err(h3e)?).map_err(h3e)?;
-        let (mean, std) = enc.latent_stats();
+    pub fn reference_latents(&self, pics: &[Picture]) -> Result<Vec<RefLatent>> {
+        let mut enc = None;
+        Ok(self.references(pics, &mut enc)?.0)
+    }
+
+    /// As `reference_latents`, sharing an encoder; and how many came from the cache
+    fn references(&self, pics: &[Picture], enc: &mut Option<nextsycl_h3::venc::VideoEncoder>) -> Result<(Vec<RefLatent>, usize)> {
         let mut out = Vec::with_capacity(pics.len());
+        let mut hits = 0;
         for p in pics {
-            let rgb = p.rgb();
-            let (w, h) = size_short_edge(rgb.width, rgb.height, REF_SHORT_EDGE, REF_VAE_MAX_SHORT_EDGE);
-            let shown = if (w, h) == (rgb.width, rgb.height) { rgb } else { rgb.resize_lanczos(w, h) };
-            let px: Vec<f32> = shown.data.iter().map(|v| *v as f32 / 255.0).collect();
-            let m = enc.moments_of_picture(&px, h as usize, w as usize, &mut || Ok(())).map_err(h3e)?;
-            let (lh, lw) = (h as usize / 16, w as usize / 16);
-            let noise = Mt19937::new(ENCODE_SEED).randn(24 * lh * lw);
-            out.push((vae::condition_latent(&m, &noise, mean, std), lh, lw));
+            let (w, h) = size_short_edge(p.width, p.height, REF_SHORT_EDGE, REF_VAE_MAX_SHORT_EDGE);
+            let (l, hit) = self.latents_of(p, w, h, "ref", enc)?;
+            hits += hit as usize;
+            out.push((l.as_ref().clone(), h as usize / 16, w as usize / 16));
         }
-        Ok(out)
+        Ok((out, hits))
     }
 
     /// The latents [24, lh, lw] of one picture: the refined text `text` with `tags`, the edit's latents `refs`, the
-    /// noise from `seed`, the grid `sigmas`; `step(i)` after each step (an error stops)
+    /// noise from `seed`, the grid `sigmas`; the start x = s0 noise + (1 - s0) init (ComfyUI's CONST noise scaling at the
+    /// first sigma s0; no init: s0 noise); `step(i)` after each step (an error stops)
     #[allow(clippy::too_many_arguments)]
-    pub fn sample(&self, text: Tensor, tags: &[i32], refs: &[(Vec<f32>, usize, usize)], lh: usize, lw: usize, seed: u64, sigmas: &[f32],
+    pub fn sample(&self, text: Tensor, tags: &[i32], refs: &[(Vec<f32>, usize, usize)], init: Option<&[f32]>, first_head: bool, lh: usize, lw: usize, seed: u64, sigmas: &[f32],
                   step: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
         let mut x = Mt19937::new(seed).randn(net::LATENT_C * lh * lw);
+        start_latent(&mut x, init, sigmas[0])?;
         let t_run = Instant::now();
+        let loras = self.loras.lock().unwrap_or_else(|p| p.into_inner());
         let mut run = net::Run::new(&self.blocks, &self.outer, text, Some(tags.to_vec()), lh, lw, refs, seed).map_err(h3e)?;
+        run.lora = loras.set.as_ref();
+        run.first_head = first_head;
         if self.profile {
             self.dev.wait().map_err(h3e)?;
             eprintln!("profile: the picture's buffers and conditioning rows {:.0} ms", t_run.elapsed().as_secs_f64() * 1e3);
@@ -303,14 +513,47 @@ impl H3Image {
     }
 }
 
+/// The denoise's start from the noise `x` at the first sigma `s0`: s0 x + (1 - s0) init (ComfyUI's CONST
+/// noise_scaling; no init: an empty latent); at s0 = 1 the noise as drawn
+pub fn start_latent(x: &mut [f32], init: Option<&[f32]>, s0: f32) -> Result<()> {
+    match init {
+        Some(l) if l.len() != x.len() => Err(Error(format!("an init latent of {} values for {}", l.len(), x.len()))),
+        Some(l) => {
+            x.iter_mut().zip(l).for_each(|(n, l)| *n = s0 * *n + (1.0 - s0) * *l);
+            Ok(())
+        }
+        None if s0 != 1.0 => {
+            x.iter_mut().for_each(|n| *n *= s0);
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+/// A device copy of a tensor
+fn copy(t: &Tensor) -> nextsycl_h3::Result<Tensor> {
+    let out = Tensor::new(t.buf.device(), t.dtype, &t.shape)?;
+    out.copy_rows(0, t, 0, t.shape[0])?;
+    Ok(out)
+}
+
+/// The token refiner's block count (`token_refiner.blocks.N`)
+pub fn refiner_blocks(ck: &Checkpoint) -> usize {
+    ck.entries.keys().filter_map(|k| k.strip_prefix("token_refiner.blocks.")).filter_map(|r| r.split('.').next()?.parse::<usize>().ok()).max().map_or(0, |m| m + 1)
+}
+
 impl ImageEngine for H3Image {
     fn arch(&self) -> &'static str {
         ARCH
     }
     fn defaults(&self) -> Defaults {
-        Defaults { width: DEFAULT_SIDE, height: DEFAULT_SIDE, steps: STEPS as u32, cfg: 1.0, sampler: Sampler::Euler, schedule: Sched::Simple, shift: 1.0 }
+        Defaults { width: DEFAULT_SIDE, height: DEFAULT_SIDE, steps: self.steps as u32, cfg: 1.0, sampler: Sampler::Euler, schedule: Sched::Simple,
+                   shift: self.shift.unwrap_or(1.0) }
     }
     fn edits(&self) -> bool {
+        true
+    }
+    fn side_loras(&self) -> bool {
         true
     }
     fn samplers(&self) -> Vec<Sampler> {
@@ -326,7 +569,7 @@ impl ImageEngine for H3Image {
         GRID
     }
     fn shift(&self) -> bool {
-        false
+        true
     }
     fn size_presets(&self) -> Option<SizePresets> {
         Some(SizePresets { ratios: RATIOS, pixels: PIXELS })
@@ -335,10 +578,9 @@ impl ImageEngine for H3Image {
         OPTIONS
     }
     fn steps_for(&self, req: &ImageRequest) -> u32 {
-        match (req.extra.get("sigmas"), req.steps) {
-            (Some(s), _) => s.split(',').count().saturating_sub(1) as u32,
-            (None, Some(s)) => s,
-            (None, None) => STEPS as u32,
+        match plan(req, self.steps, self.shift) {
+            Ok(p) => (p.sigmas.len() - 1) as u32,
+            Err(_) => req.steps.unwrap_or(self.steps as u32),
         }
     }
     fn load_seconds(&self) -> f64 {
@@ -350,15 +592,13 @@ impl ImageEngine for H3Image {
         let pics: Vec<Picture> = match &req.edit {
             None => Vec::new(),
             Some(e) => {
-                if !e.condition || e.strength < 1.0 {
-                    return Err(Error(format!("{ARCH}: edits read the pictures as references at strength 1 (no img2img: describe the change instead)")));
-                }
                 if e.mask.is_some() {
                     return Err(Error(format!("{ARCH}: masks are not part of this model's edits (say what to keep instead)")));
                 }
                 std::iter::once(e.image.clone()).chain(e.refs.iter().cloned()).collect()
             }
         };
+        let plan = plan(req, self.steps, self.shift)?;
         if pics.len() > MAX_PICTURES {
             return Err(Error(format!("{ARCH}: an edit takes at most {MAX_PICTURES} pictures, got {}", pics.len())));
         }
@@ -375,32 +615,51 @@ impl ImageEngine for H3Image {
         if w as u64 * h as u64 > MAX_PIXELS || w < 256 || h < 256 {
             return Err(Error(format!("{w}x{h}: from 256 a side to 16 MP (4096x4096, 5024x3360 ...); the model is tuned for 2048x2048")));
         }
-        let sigmas = match (req.extra.get("sigmas"), req.steps) {
-            (Some(s), _) => parse_sigmas(s)?,
-            (None, Some(s)) if (1..=50).contains(&s) => net::sigmas(s as usize),
-            (None, Some(s)) => return Err(Error(format!("{ARCH}: {s} steps (1 to 50; the heads are distilled for {STEPS})"))),
-            (None, None) => net::sigmas(STEPS),
-        };
+        let sigmas = plan.sigmas;
         let of = (sigmas.len() - 1) as u32;
         progress(Step { picture: 0, at: 0, of, seconds: t0.elapsed().as_secs_f64() })?;
         let mut log = |l: String| eprintln!("{l}");
-        let cond = self.encode(&req.prompt, &pics, &mut log)?;
+        // a request's own LoRAs on top of the engine's (none: back to the engine's)
+        self.loras.lock().unwrap_or_else(|p| p.into_inner())
+            .want(&self.dev, &req.loras, self.blocks.blocks.len(), refiner_blocks(&self.ck), nextsycl_h3::dit::MAX_LORA_RANK, &mut log).map_err(h3e)?;
+        // the pictures condition the model (an edit) or only start the denoise (an img2img: the prompt alone guides it)
+        let shown: &[Picture] = if plan.condition { &pics } else { &[] };
+        let (cond, text, (te_hit, refined_hit)) = self.text(&req.prompt, shown, &mut log)?;
+        let mut text = Some(text);
         let t_text = t0.elapsed().as_secs_f64();
-        let refs = if pics.is_empty() { Vec::new() } else { self.reference_latents(&pics)? };
+        let mut enc = None;
+        let (refs, ref_hits) = if plan.condition { self.references(&pics, &mut enc)? } else { (Vec::new(), 0) };
+        let init = match plan.init {
+            true => Some(self.latents_of(&pics[0], w, h, "init", &mut enc)?),
+            false => None,
+        };
+        drop(enc);
         let t_refs = t0.elapsed().as_secs_f64() - t_text;
         let (lh, lw) = (h as usize / 16, w as usize / 16);
         let mut out = Vec::new();
-        for p in 0..req.n.max(1) {
+        let n = req.n.max(1);
+        for p in 0..n {
             let t1 = Instant::now();
-            let text = self.refine(&cond.rows)?;
-            let t_refine = t1.elapsed().as_secs_f64();
+            // the refined text is the same for every picture: a copy for each run but the last
+            let mine = match (p + 1 < n, text.take()) {
+                (true, Some(t)) => {
+                    let c = copy(&t).map_err(h3e)?;
+                    text = Some(t);
+                    c
+                }
+                (false, Some(t)) => t,
+                (_, None) => return Err(Error("the refined text was used up".into())),
+            };
             let mut step = |i: usize| progress(Step { picture: p, at: i as u32 + 1, of, seconds: t0.elapsed().as_secs_f64() });
-            let lat = self.sample(text, &cond.tags, &refs, lh, lw, req.seed + p as u64, &sigmas, &mut step)?;
-            let t_steps = t1.elapsed().as_secs_f64() - t_refine;
+            let lat = self.sample(mine, &cond.tags, &refs, init.as_ref().map(|(l, _)| l.as_slice()), plan.first_head.unwrap_or(self.first_head), lh, lw, req.seed + p as u64, &sigmas, &mut step)?;
+            let t_steps = t1.elapsed().as_secs_f64();
             let rgb = self.decoder.decode(&lat, lh, lw, &mut |_, _| Ok(())).map_err(h3e)?;
-            log(format!("{ARCH} {w}x{h} picture {p}: text {:.2} s ({} tokens, {} pictures), pictures' latents {:.2} s, refiner {t_refine:.2} s, {of} steps {t_steps:.2} s, decode {:.2} s",
-                        if p == 0 { t_text } else { 0.0 }, cond.tags.len(), pics.len(), if p == 0 { t_refs } else { 0.0 },
-                        t1.elapsed().as_secs_f64() - t_refine - t_steps));
+            let cached = |hit: bool| if hit { " (cached)" } else { "" };
+            log(format!("{ARCH} {w}x{h} picture {p}: text + refiner {:.2} s ({} tokens, {} pictures; encoder{}, refiner{}), pictures' latents {:.2} s ({} of {} cached{}), \
+                         {of} steps from sigma {:.3} {t_steps:.2} s, decode {:.2} s",
+                        if p == 0 { t_text } else { 0.0 }, cond.tags.len(), shown.len(), cached(te_hit), cached(refined_hit), if p == 0 { t_refs } else { 0.0 },
+                        ref_hits + init.as_ref().is_some_and(|(_, h)| *h) as usize, refs.len() + init.is_some() as usize,
+                        if init.is_some() { ", one the start" } else { "" }, sigmas[0], t1.elapsed().as_secs_f64() - t_steps));
             out.push(Picture { width: w, height: h, channels: 3, data: rgb });
         }
         Ok(out)
@@ -558,6 +817,98 @@ mod tests {
         for k in [GType::Q8_0, GType::Q4K, GType::Q5K] {
             assert_eq!(ffi::gguf_code(k), k.quant_code());
         }
+    }
+
+    fn pic() -> Picture {
+        Picture { width: 64, height: 64, channels: 3, data: vec![9; 64 * 64 * 3] }
+    }
+
+    fn edit(strength: f32, condition: bool) -> Option<nextsycl_image::Edit> {
+        Some(nextsycl_image::Edit { image: pic(), refs: Vec::new(), mask: None, strength, condition })
+    }
+
+    #[test]
+    fn a_request_plans_its_grid() {
+        // text to image on the card's 2-step shifted schedule (pDMD: shift 12)
+        let req = ImageRequest { prompt: "x".into(), ..Default::default() };
+        let p = plan(&req, 2, Some(12.0)).unwrap();
+        assert_eq!(p, Plan { sigmas: net::shifted_sigmas(12.0, 2), init: false, condition: false, first_head: None });
+        // a request's steps and shift come first; no shift anywhere: the heads' grid
+        let p = plan(&ImageRequest { steps: Some(4), shift: Some(3.0), ..req.clone() }, 2, Some(12.0)).unwrap();
+        assert_eq!(p.sigmas, net::shifted_sigmas(3.0, 4));
+        assert_eq!(plan(&req, 6, None).unwrap().sigmas, net::PDD_SIGMAS.to_vec());
+        // a request LoRA's card brings its steps and shift as options (the pDMD LoRA on the plain 6-step card)
+        let mut r = req.clone();
+        r.extra.insert("steps".into(), "2".into());
+        r.extra.insert("shift".into(), "12".into());
+        r.extra.insert("heads".into(), "first".into());
+        let p = plan(&r, 6, None).unwrap();
+        assert_eq!((p.sigmas.clone(), p.first_head), (net::shifted_sigmas(12.0, 2), Some(true)));
+        // the request's own fields win over them
+        let p = plan(&ImageRequest { steps: Some(3), shift: Some(5.0), ..r.clone() }, 6, None).unwrap();
+        assert_eq!(p.sigmas, net::shifted_sigmas(5.0, 3));
+        r.extra.insert("heads".into(), "all".into());
+        assert!(plan(&r, 6, None).is_err());
+        // an edit at strength 1: from noise, the picture a reference
+        let p = plan(&ImageRequest { edit: edit(1.0, true), ..req.clone() }, 2, Some(12.0)).unwrap();
+        assert!(p.condition && !p.init && p.sigmas[0] == 1.0);
+        // an img2img (not a reference) at 0.5: ComfyUI's denoise (3 steps of the 6-step schedule)
+        let p = plan(&ImageRequest { edit: edit(0.5, false), steps: Some(3), ..req.clone() }, 2, Some(12.0)).unwrap();
+        assert!(!p.condition && p.init);
+        assert_eq!(p.sigmas, net::schedule(3, Some(12.0), 0.5));
+        // start-sigma: the Space's grid from exactly there, the picture the start
+        let mut r = ImageRequest { edit: edit(1.0, false), steps: Some(3), ..req.clone() };
+        r.extra.insert("start-sigma".into(), "0.55".into());
+        let p = plan(&r, 2, Some(12.0)).unwrap();
+        assert!(p.init && !p.condition && (p.sigmas[0] - 0.55).abs() < 1e-6 && p.sigmas.len() == 4);
+        // an edit that keeps its picture as a reference and starts from it
+        let mut r = ImageRequest { edit: edit(1.0, true), ..req.clone() };
+        r.extra.insert("start-sigma".into(), "0.5".into());
+        let p = plan(&r, 2, Some(12.0)).unwrap();
+        assert!(p.init && p.condition && p.sigmas[0] == 0.5);
+    }
+
+    #[test]
+    fn a_request_plan_refuses_what_it_cannot_do() {
+        let req = ImageRequest { prompt: "x".into(), ..Default::default() };
+        // a picture that is neither a reference nor a start
+        assert!(plan(&ImageRequest { edit: edit(1.0, false), ..req.clone() }, 2, None).is_err());
+        let mut r = req.clone();
+        r.extra.insert("start-sigma".into(), "0.5".into());
+        assert!(plan(&r, 2, None).is_err(), "start-sigma without a picture");
+        let mut r = ImageRequest { edit: edit(1.0, false), ..req.clone() };
+        r.extra.insert("start-sigma".into(), "1.5".into());
+        assert!(plan(&r, 2, None).is_err());
+        r.extra.insert("start-sigma".into(), "0.5".into());
+        r.extra.insert("sigmas".into(), "0.5,0".into());
+        assert!(plan(&r, 2, None).is_err(), "both grids");
+        assert!(plan(&ImageRequest { steps: Some(0), ..req.clone() }, 2, None).is_err());
+        assert!(plan(&ImageRequest { steps: Some(51), ..req }, 2, None).is_err());
+    }
+
+    #[test]
+    fn the_start_mixes_noise_and_picture_at_the_first_sigma() {
+        let mut x = vec![1.0f32, -1.0];
+        start_latent(&mut x, Some(&[0.5, 0.25]), 0.4).unwrap();
+        assert!((x[0] - (0.4 + 0.6 * 0.5)).abs() < 1e-6 && (x[1] - (-0.4 + 0.6 * 0.25)).abs() < 1e-6);
+        let mut x = vec![2.0f32];
+        start_latent(&mut x, None, 1.0).unwrap();
+        assert_eq!(x, vec![2.0]);
+        start_latent(&mut x, None, 0.5).unwrap();
+        assert_eq!(x, vec![1.0]);
+        assert!(start_latent(&mut x, Some(&[1.0, 2.0]), 0.5).is_err());
+    }
+
+    #[test]
+    fn the_refiner_blocks_are_counted() {
+        use nextsycl_h3::safetensors::Entry;
+        let mut ck = Checkpoint { path: "x".into(), entries: Default::default(), metadata: Default::default(), file_bytes: 0 };
+        for n in ["token_refiner.blocks.0.mlp.fc1.weight", "token_refiner.blocks.1.norm1.weight", "token_refiner.final_norm.weight", "blocks.7.mlp.fc1.weight"] {
+            ck.entries.insert(n.into(), Entry { name: n.into(), dtype: DType::BF16, shape: vec![1], offset: 0, bytes: 2, kquant: None, stored: None });
+        }
+        assert_eq!(refiner_blocks(&ck), 2);
+        ck.entries.clear();
+        assert_eq!(refiner_blocks(&ck), 0);
     }
 
     #[test]

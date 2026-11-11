@@ -75,6 +75,61 @@ pub fn sigmas(steps: usize) -> Vec<f32> {
         .collect()
 }
 
+/// The schedule ComfyUI's MiniMaxH3SigmaShift (shift_video `shift`) + BasicScheduler "simple" gives at `steps` steps
+/// (the pDMD 2-step LoRA's recipe: shift 12, 2 steps -> 1, 0.923, 0): ModelSamplingDiscreteFlow's 1,000-entry table,
+/// sigma(t) = shift t / (1 + (shift - 1) t) at t = (i / 1000 * 1000) / 1000 in float32, read by simple_scheduler at
+/// index 999 - floor(x * 1000 / steps) for x < steps, then 0. The heads are still weighted by their own grid
+/// (`head_weights`), as ComfyUI's FinalLayer does.
+pub fn shifted_sigmas(shift: f32, steps: usize) -> Vec<f32> {
+    // Python's (alpha - 1) is a double, cast to float32 where it meets the table
+    let less = (shift as f64 - 1.0) as f32;
+    let table = |i: usize| -> f32 {
+        let t = (i as f32 / 1000.0) * 1000.0 / 1000.0;
+        if shift == 1.0 {
+            t
+        } else {
+            shift * t / (1.0 + less * t)
+        }
+    };
+    let ss = 1000.0 / steps as f64;
+    let mut out: Vec<f32> = (0..steps).map(|x| table(1000 - (x as f64 * ss) as usize)).collect();
+    out.push(0.0);
+    out
+}
+
+/// ComfyUI's BasicScheduler: `steps` steps of a schedule at `denoise` (below 1: the last steps + 1 points of the
+/// schedule made for floor(steps / denoise) steps - the img2img start). `shift`: the shifted flow schedule
+/// (`shifted_sigmas`); none: the heads' grid (`sigmas`). The denoise is read as the decimal it was written as (a
+/// request's 0.6 is 0.6, not float32's 0.60000002, which would make 3 / 0.6 fall to 4).
+pub fn schedule(steps: usize, shift: Option<f32>, denoise: f32) -> Vec<f32> {
+    let total = if denoise < 1.0 {
+        let d = (denoise as f64 * 1e6).round() / 1e6;
+        ((steps as f64 / d) as usize).max(steps)
+    } else {
+        steps
+    };
+    let full = match shift {
+        Some(s) => shifted_sigmas(s, total),
+        None => sigmas(total),
+    };
+    full[full.len() - steps - 1..].to_vec()
+}
+
+/// The demo Space's detail pass (akhaliq/minimax-h3-image-2step app.py `_refine_grid`): the refiner's own 3-step grid
+/// 0.909375, 0.857143, 0.666667 scaled to start at `sigma0`, its ratios kept, then 0. Another step count: `full`, the
+/// schedule of that many steps from 1, scaled the same way (the Space only runs 3).
+pub fn start_grid(sigma0: f32, full: &[f32]) -> Vec<f32> {
+    const BASE: [f32; 3] = [0.909_375, 0.857_143, 0.666_667];
+    let steps = full.len() - 1;
+    let mut g: Vec<f32> = if steps == BASE.len() {
+        BASE.iter().map(|b| sigma0 * (b / BASE[0])).collect()
+    } else {
+        full[..steps].iter().map(|s| sigma0 * (s / full[0])).collect()
+    };
+    g.push(0.0);
+    g
+}
+
 /// One Euler step as ComfyUI's sampler takes it: denoised = x - v sigma, d = (x - denoised) / sigma, x += d (next - sigma)
 pub fn euler(x: &mut [f32], v: &[f32], sigma: f32, next: f32) {
     for (x, v) in x.iter_mut().zip(v) {
@@ -245,6 +300,11 @@ pub struct Run<'a> {
     pub w: usize,
     /// each step's time by stage, printed (NS_H3I_PROFILE)
     pub profile: bool,
+    /// LoRAs on the blocks' products (the side path: `out += B (A x)` after each), if any
+    pub lora: Option<&'a nextsycl_h3::lora::LoraSet>,
+    /// head 0 alone at every step (NS_H3I_HEADS=first: the diffusers route, whose converted transformer keeps one head);
+    /// false: the bank weighted by the grid, as ComfyUI
+    pub first_head: bool,
 }
 
 impl<'a> Run<'a> {
@@ -279,7 +339,7 @@ impl<'a> Run<'a> {
         }
         let s = layout.tokens();
         Ok(Run { x: Tensor::new(&dev, DType::BF16, &[s, cfg.hidden])?, scratch: Scratch::new(&dev, cfg, s, DType::BF16)?, blocks, outer, layout, text, tags, cond_rows, h, w,
-                 profile: false })
+                 profile: false, lora: None, first_head: false })
     }
 
     pub fn tokens(&self) -> usize {
@@ -355,11 +415,12 @@ impl<'a> Run<'a> {
         lap(&mut prof, &mut clock, "embed")?;
         for i in 0..self.blocks.blocks.len() {
             between(i)?;
+            let lora = self.lora.and_then(|l| l.blocks.get(i));
             if profiling {
                 let mut tap = |name: &str, _: &Tensor| lap(&mut prof, &mut clock, stage_of(name));
-                self.blocks.block(i, &self.x, &step, &self.scratch, None, Some(&mut tap))?;
+                self.blocks.block(i, &self.x, &step, &self.scratch, lora, Some(&mut tap))?;
             } else {
-                self.blocks.block(i, &self.x, &step, &self.scratch, None, None)?;
+                self.blocks.block(i, &self.x, &step, &self.scratch, lora, None)?;
             }
         }
         let v = self.head_out(&ts, &t_emb, img.start, n, sigma_in, next)?;
@@ -379,7 +440,7 @@ impl<'a> Run<'a> {
         let r = ts.values.len();
         let shift = f32_tensor(&dev, &[r, cfg.hidden], &shift)?;
         let scale = f32_tensor(&dev, &[r, cfg.hidden], &scale)?;
-        let head = o.head(&dev, &head_weights(sigma, next))?;
+        let head = o.head(&dev, &if self.first_head { [1.0, 0.0, 0.0, 0.0, 0.0, 0.0] } else { head_weights(sigma, next) })?;
         let t_row = ts.video_index as i32;
         let mut out = Vec::with_capacity(n * head.outputs());
         let mut done = 0;
@@ -456,6 +517,51 @@ mod tests {
         assert_eq!((s12[0], s12[12]), (1.0, 0.0));
         assert!((s12[1] - (1.0 + PDD_SIGMAS[1]) / 2.0).abs() < 1e-6);
         assert!(s12.windows(2).all(|w| w[1] < w[0]));
+    }
+
+    #[test]
+    fn the_shifted_schedule_is_comfyuis_simple_one() {
+        // pDMD's 2 steps at shift 12: 1, sigma(t = 0.5) = 6 / 6.5, 0
+        let s = shifted_sigmas(12.0, 2);
+        assert_eq!(s.len(), 3);
+        assert_eq!((s[0], s[2]), (1.0, 0.0));
+        assert!((s[1] - 12.0 * 0.5 / 6.5).abs() < 1e-6, "{s:?}");
+        // 3 steps: simple reads index 999 - floor(x * 333.33): t = 1, 0.667, 0.334 (not 2/3, 1/3)
+        let s = shifted_sigmas(12.0, 3);
+        let at = |t: f32| 12.0 * t / (1.0 + 11.0 * t);
+        assert!((s[1] - at(0.667)).abs() < 1e-6 && (s[2] - at(0.334)).abs() < 1e-6, "{s:?}");
+        // shift 1 is the plain table
+        assert_eq!(shifted_sigmas(1.0, 4), vec![1.0, 0.75, 0.5, 0.25, 0.0]);
+        for n in 1..=8 {
+            let s = shifted_sigmas(12.0, n);
+            assert!(s.len() == n + 1 && s.windows(2).all(|w| w[1] < w[0]));
+        }
+    }
+
+    #[test]
+    fn a_denoise_below_1_starts_partway_down_a_longer_schedule() {
+        // ComfyUI's BasicScheduler(simple, 3, denoise 0.5) at shift 12: the last 4 points of the 6-step schedule
+        let s = schedule(3, Some(12.0), 0.5);
+        let full = shifted_sigmas(12.0, 6);
+        assert_eq!(s, full[3..].to_vec());
+        assert!((s[0] - 12.0 * 0.5 / 6.5).abs() < 1e-6, "denoise 0.5 starts at sigma 0.923 under shift 12: {s:?}");
+        // 3 / 0.6 is 5 in Python's doubles; float32's 0.6 would give 4
+        assert_eq!(schedule(3, Some(12.0), 0.6), shifted_sigmas(12.0, 5)[2..].to_vec());
+        // no shift: the heads' grid; denoise 1: the whole schedule
+        assert_eq!(schedule(6, None, 1.0), PDD_SIGMAS.to_vec());
+        assert_eq!(schedule(2, Some(12.0), 1.0), shifted_sigmas(12.0, 2));
+        assert_eq!(schedule(2, None, 0.5), sigmas(4)[2..].to_vec());
+    }
+
+    #[test]
+    fn the_spaces_detail_grid_starts_at_sigma0() {
+        let g = start_grid(0.5, &shifted_sigmas(12.0, 3));
+        assert_eq!(g.len(), 4);
+        assert!((g[0] - 0.5).abs() < 1e-7 && g[3] == 0.0);
+        assert!((g[1] / g[0] - 0.857_143 / 0.909_375).abs() < 1e-6 && (g[2] / g[0] - 0.666_667 / 0.909_375).abs() < 1e-6);
+        let g = start_grid(0.4, &shifted_sigmas(12.0, 2));
+        assert_eq!(g.len(), 3);
+        assert!((g[0] - 0.4).abs() < 1e-7 && (g[1] - 0.4 * 12.0 * 0.5 / 6.5).abs() < 1e-6 && g[2] == 0.0);
     }
 
     #[test]

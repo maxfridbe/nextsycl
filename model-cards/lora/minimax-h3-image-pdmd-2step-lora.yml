@@ -1,0 +1,21 @@
+# MiniMax-H3-Image pDMD 2-NFE LoRA (2 steps instead of 6; rank 128 on attention + FFN of all 50 blocks; Apache-2.0)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-h3-image-pdmd-2step-lora
+kind: lora
+arch: minimax-h3-image
+license: apache-2.0
+commercial: false
+license_note: 'The pDMD 2-NFE LoRA (pdmd2026/pdmd_2NFE_lora, arXiv 2609.35768) is Apache-2.0; ComfyUI-layout conversion by Iwannapose, mirrored by akhaliq/minimax-h3-image-pdmd-2step. It only runs on MiniMax-H3-Image, and everything rendered with it stays under the MiniMax-H3-Image Community License Agreement (not licensed in the European Union, the United Kingdom, South Korea or the United States; written authorization from MiniMax before a hosted service to third parties or above US$1 million yearly revenue; its outputs may not improve another model).'
+title: 'MiniMax-H3-Image pDMD 2-step LoRA (rank 128; Apache-2.0)'
+about: 'pDMD''s 2-NFE distillation for MiniMax-H3-Image in ComfyUI''s layout (fused block-diagonal qkv at rank 384, SwiGLU halves as ComfyUI''s): 208 matrices, the 50 blocks'' and the token refiner''s; at strength 1 with its preset - 2 steps on the shift-12 schedule (1, 0.923, 0), no guidance. Fits the pruned denoiser every minimax-h3-image card has (GGUFs and int8) as it is'
+base: minimax-h3-image
+env:
+  NS_H3I_STEPS: '2'
+  NS_H3I_SHIFT: '12'
+files:
+  lora:
+    key: h3i-pdmd-2step-lora
+    url: https://huggingface.co/akhaliq/minimax-h3-image-pdmd-2step/resolve/ef1e3b9a237fc7a57ba4d07174ecca397d695d8a/minimax_h3_pdmd_2nfe_comfyui.safetensors
+    size: 1956194168
+    sha256: 5feaeef13df31f98f36364a95e7ce9e8ff0afd71570d1c53d7c3be599e3a0f22
+    path: minimax-h3-image-pdmd-2step/loras/minimax_h3_pdmd_2nfe_comfyui.safetensors

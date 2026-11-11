@@ -1,0 +1,35 @@
+# MiniMax-H3-Image in 2 steps (int8 ConvRot + the pDMD 2-step LoRA: the live editor's card; Rust + SYCL)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-h3-image-2step
+kind: image
+arch: minimax-h3-image
+license: minimax-h3-image-community
+commercial: false
+license_note: 'MiniMax-H3-Image Community License Agreement (MiniMax, 2026-11-10): not licensed in the European Union, the United Kingdom, South Korea or the United States; written authorization from MiniMax (platform.minimax.io/license) before offering it as a hosted service to third parties or above US$1 million yearly revenue; commercial products show "MiniMax-H3-Image"; its Acceptable Use Policy binds every user; its outputs may not improve another model; redistributed copies carry the agreement and a NOTICE. The pDMD LoRA is Apache-2.0; the text encoder is MiniMax H3''s (its own license).'
+title: 'MiniMax-H3-Image in 2 steps (int8 + the pDMD 2-step LoRA; Rust + SYCL)'
+about: 'minimax-h3-image-int8 with the pDMD 2-NFE LoRA on the side path at strength 1: 2 steps on ComfyUI''s shift-12 schedule (1, 0.923, 0) instead of the heads'' six, no guidance; edits as the base model''s; an init picture (img2img, the detail pass) starts from its latents at a start sigma; the text encoder''s and the VAE encoder''s results kept for the last 8 prompts and pictures and the token refiner kept on the card, so a repeated prompt or picture costs only the denoise'
+gpus: '0,1'
+vram_gib: 25.5                  # provisional: int8 18.7 GiB after load + the LoRA 1.8 + the refiner 1.5 + 16 MP work
+defaults:
+  steps: 2
+  cfg: 1.0
+  sampler: euler
+  schedule: simple
+  size: 2048x2048
+env:
+  NS_H3I_STEPS: '2'
+  NS_H3I_SHIFT: '12'
+  NS_H3I_LORA_STRENGTH: '1'
+  NS_H3I_TEXT_CACHE: '8'
+  NS_H3I_IMAGE_CACHE: '8'
+  NS_H3I_KEEP_REFINER: '1'
+files:
+  denoiser: h3i-denoiser-int8
+  lora: h3i-pdmd-2step-lora
+  text-encoder: h3-te-32b-q4km
+  tokenizer: h3-tokenizer-vocab
+  tokenizer-merges: h3-tokenizer-merges
+  tokenizer-config: h3-tokenizer-config
+  vision: h3-te-visual
+  vae: h3i-vae
+guide: guides/minimax-h3-image.md
