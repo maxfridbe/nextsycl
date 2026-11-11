@@ -1,0 +1,33 @@
+# MiniMax-H3-Image Q8_0 (the closest GGUF to bf16; Rust + SYCL)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-h3-image-q8
+kind: image
+arch: minimax-h3-image
+license: minimax-h3-image-community
+commercial: false
+license_note: 'MiniMax-H3-Image Community License Agreement (MiniMax, 2026-11-10): not licensed in the European Union, the United Kingdom, South Korea or the United States; written authorization from MiniMax (platform.minimax.io/license) before offering it as a hosted service to third parties or above US$1 million yearly revenue; commercial products show "MiniMax-H3-Image"; its Acceptable Use Policy binds every user; its outputs may not improve another model; redistributed copies carry the agreement and a NOTICE. The text encoder is MiniMax H3''s (its own license).'
+title: 'MiniMax-H3-Image Q8_0 (the closest GGUF to bf16; Rust + SYCL)'
+about: 'as minimax-h3-image with Hearthscale''s Q8_0 GGUF (Q8_0 matrices expanded to bf16 a matrix at a time, 19.1 GiB on the card); the GGUF maker lists Q8_0 as the closest to the bf16 weights'
+gpus: '0,1'
+vram_gib: VRAMQ8
+defaults:
+  steps: 6
+  cfg: 1.0
+  sampler: euler
+  schedule: simple
+  size: 2048x2048
+env: {}
+files:
+  denoiser:
+    key: h3i-denoiser-q8
+    url: https://huggingface.co/Hearthscale/MiniMax-H3-Image-GGUF/resolve/2cd99b1e7307385b61def10c5caf0cbbef3aaaa2/minimax_h3_image_pruned-Q8_0.gguf
+    size: 21447217248
+    sha256: 311889a1d8e28122c6b9bd1322d7e46e9d56a60bb1b75b269c87f2855c051640
+    path: minimax-h3-image/diffusion_models/minimax_h3_image_pruned-Q8_0.gguf
+  text-encoder: h3-te-32b-q4km
+  tokenizer: h3-tokenizer-vocab
+  tokenizer-merges: h3-tokenizer-merges
+  tokenizer-config: h3-tokenizer-config
+  vision: h3-te-visual
+  vae: h3i-vae
+guide: guides/minimax-h3-image.md

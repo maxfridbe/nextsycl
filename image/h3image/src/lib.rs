@@ -17,6 +17,7 @@
 //! same values in Q6_K blocks).
 
 pub mod check;
+pub mod ffi;
 pub mod net;
 pub mod vae;
 
@@ -64,7 +65,7 @@ const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "threads", env: "NS_H3I_THREADS", value: "N", help: "threads reading the checkpoints at load (default 8)", at: At::Load },
     EngineOption { name: "vae-batch", env: "NS_H3I_VAE_BATCH", value: "N", help: "the decoder's tiles decoded together (default 16)", at: At::Load },
     EngineOption { name: "te-pin", env: "H3_TE_PIN", value: "0|1", help: "keep the text encoder in pinned host memory between requests (default 1 when the host has the room)", at: At::Load },
-    EngineOption { name: "sage-min-s", env: "NSD_SAGE_MIN_S", value: "TOKENS", help: "the shortest sequence the shared kernels' SageAttention takes (default 8192)", at: At::Load },
+    EngineOption { name: "sage-min-s", env: "NS_H3I_SAGE_MIN_S", value: "TOKENS", help: "the shortest denoiser sequence the silo's SageAttention takes (default 1024; shorter: oneDNN's)", at: At::Load },
     EngineOption { name: "sigmas", env: "", value: "S,S,..,0", help: "another sampling grid than the heads' six steps: strictly falling from 1, ending at 0", at: At::Request },
 ];
 
@@ -147,7 +148,14 @@ impl H3Image {
         // SAFETY: the core's GPU (its queue's owner) is kept in the engine beside the device.
         let dev = unsafe { Device::on_queue(gpu.queue(), gpu.index) }.map_err(h3e)?;
         let ck = Checkpoint::open(role(files, "denoiser")?).map_err(h3e)?;
-        let blocks = nextsycl_h3::dit::Blocks::load(&dev, &ck, None, threads).map_err(h3e)?;
+        let mut blocks = nextsycl_h3::dit::Blocks::load(&dev, &ck, None, threads).map_err(h3e)?;
+        // the silo's attention (dist/silo/libnextsycl-h3image.so: P-H3-Image's, copied) from NS_H3I_SAGE_MIN_S tokens;
+        // without it, or below that, the shared kernels' (SageAttention from 8,192 tokens, oneDNN's below)
+        if let Some(s) = ffi::silo().map_err(|e| Error(e.0))? {
+            let min_s = o.setting("NS_H3I_SAGE_MIN_S").and_then(|v| v.parse().ok()).unwrap_or(1024);
+            blocks.attention = Some(ffi::attention(&gpu, s, min_s));
+            log(format!("{ARCH}: the {} silo's attention from {min_s} tokens", ffi::SILO));
+        }
         let outer = net::Outer::load(&dev, &ck, &blocks.cfg).map_err(h3e)?;
         let form = match ck.entries.values().find(|e| e.name == "blocks.0.mlp.fc1.weight") {
             Some(e) if e.stored.is_some() => format!("{:?} as {:?}", e.stored.unwrap(), e.kquant.unwrap()),

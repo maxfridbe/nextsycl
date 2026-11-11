@@ -223,7 +223,7 @@ Qwen3.8-27B dense (`llm/qwen35`, its silo `kernels/llm/qwen35/silo`).
 
 ## Image
 
-Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`), P-H3-Image (`image/ph3image`).
+Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`), P-H3-Image (`image/ph3image`), MiniMax-H3-Image (`image/h3image`).
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
@@ -268,6 +268,10 @@ Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`),
 | `NS_PH3_VAE_BATCH` | 16 | P-H3-Image's decoder tiles (256 px, 261 tokens each) decoded together: their products shared (--opt-vae-batch) | image ph3image |
 | `NS_PH3_TE_RESIDENT` | auto | P-H3-Image's text encoder (~5 GiB) kept on the card between requests: auto when the card has room for it beside an 8 MP picture's work after the denoiser and the decoder, 1 always, 0 loaded for each request (--opt-te-resident) | image ph3image |
 | `NS_PH3_CHECK_SEED` | 3 | Debug: the seed `image check` draws P-H3-Image's noise from (the reference's `--seed`) | image ph3image (check) |
+| `NS_H3I_THREADS` | 8 | MiniMax-H3-Image's readers of the denoiser and the VAE at load (--opt-threads) | image h3image |
+| `NS_H3I_VAE_BATCH` | 16 | MiniMax-H3-Image's decoder tiles (256 px, 261 tokens each) decoded together: their products shared (--opt-vae-batch) | image h3image |
+| `NS_H3I_SAGE_MIN_S` | 1024 | the shortest denoiser sequence MiniMax-H3-Image's silo runs SageAttention for (int8 q, k); shorter ones on the shared kernels' attention (oneDNN, bf16) (--opt-sage-min-s) | image h3image |
+| `NS_H3I_CHECK_SEED` | 3 | Debug: the seed `image check` draws MiniMax-H3-Image's noise from (reference/h3-image/ref.py's `--seed`) | image h3image (check) |
 | `NS_QI_*` | - | every NS_QI_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
 | `NS_QI_DUMP` | off | Debug: a directory: what the denoiser is given (embeds, pads, cond latents, noise) written there as raw float32 files | image qwenimage21 |
 | `NS_QI_INT8` | 0 | 1: the DiT's block matrices in int8 ConvRot (~1.4x a step, half the VRAM) (--opt-int8) | image qwenimage21 |

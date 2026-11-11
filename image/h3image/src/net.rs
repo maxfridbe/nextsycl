@@ -105,8 +105,13 @@ impl Outer {
         if ck.entries.contains_key("audio_patch_proj.weight") {
             return Err(Error(format!("{}: a MiniMax H3 video denoiser (it has an audio stream); MiniMax-H3-Image's has none", ck.path.display())));
         }
-        let video_patch = Linear { weight: f32_tensor(dev, &ck.get("video_patch_proj.weight")?.shape, &host(ck, "video_patch_proj.weight")?)?,
-                                   bias: Some(small(dev, ck, "video_patch_proj.bias")?) };
+        // float32 as stored, or (the Q8_0 GGUF's input projection) a quant expanded on the card
+        let pe = ck.get("video_patch_proj.weight")?;
+        let weight = match pe.kquant {
+            Some(kind) => ops::expand(&Tensor::from_bytes(dev, DType::U8, &[pe.bytes], &ck.read(&pe.name)?)?, kind, &pe.shape, DType::F32)?,
+            None => f32_tensor(dev, &pe.shape, &host(ck, "video_patch_proj.weight")?)?,
+        };
+        let video_patch = Linear { weight, bias: Some(small(dev, ck, "video_patch_proj.bias")?) };
         let per = LATENT_C * PATCH * PATCH;
         let heads_w = host(ck, "final_layer.video_out.weight")?;
         let heads_b = host(ck, "final_layer.video_out.bias")?;
