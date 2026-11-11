@@ -821,7 +821,12 @@ impl Home {
                     // an image model's text encoder: served by an image server as any image model (room made first)
                     let t = self.ensure_for(&c.id, job.as_deref())?;
                     self.sent(job.as_deref());
-                    crate::describe::describe_native(&t, &c.id, &c.model, &ask, &picture)?
+                    let r = crate::describe::describe_native(&t, &c.id, &c.model, &ask, &picture)?;
+                    // the reading has no stop between tokens: a cancel meanwhile ends the job cancelled when it is done
+                    if job.as_deref().is_some_and(|j| self.job_cancelled(j)) {
+                        return Err((499, "cancelled".into()));
+                    }
+                    r
                 } else {
                     // the switcher swaps the describer in when another chat model is loaded (room made first, as any load)
                     let t = self.chat_target(Some(&c.id))?;
@@ -1817,7 +1822,7 @@ mod tests {
         let d = json!({"id": "qwen-image-2.1-te-describe", "kind": "image", "arch": crate::describe::NATIVE_ARCH});
         let (c, m) = super::super::life::capabilities(&d);
         assert!(c.contains(&"describe") && m == vec!["image.describe"]);
-        assert_eq!(describe_target("qwen-image-2.1-te-describe", &[d.clone()]).unwrap_err().0, 400);
+        assert_eq!(describe_target("qwen-image-2.1-te-describe", std::slice::from_ref(&d)).unwrap_err().0, 400);
         assert!(!reads_pictures(&d), "best stays a chat model");
         // describe_native: an image model whose encoder a native describer card reads
         let all = vec![json!({"id": "qi", "kind": "image", "arch": "qwen-image-2.1"}), json!({"id": "zt", "kind": "image", "arch": "z-image"}), d];
