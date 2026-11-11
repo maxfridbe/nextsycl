@@ -1,0 +1,33 @@
+# MiniMax-H3-Image Q5_K_M (closer to bf16 than Q4_K_M; Rust + SYCL)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-h3-image-q5
+kind: image
+arch: minimax-h3-image
+license: minimax-h3-image-community
+commercial: false
+license_note: 'MiniMax-H3-Image Community License Agreement (MiniMax, 2026-11-10): not licensed in the European Union, the United Kingdom, South Korea or the United States; written authorization from MiniMax (platform.minimax.io/license) before offering it as a hosted service to third parties or above US$1 million yearly revenue; commercial products show "MiniMax-H3-Image"; its Acceptable Use Policy binds every user; its outputs may not improve another model; redistributed copies carry the agreement and a NOTICE. The text encoder is MiniMax H3''s (its own license).'
+title: 'MiniMax-H3-Image Q5_K_M (closer to bf16 than Q4_K_M; Rust + SYCL)'
+about: 'as minimax-h3-image with Hearthscale''s Q5_K_M GGUF (Q5_K matrices, 12.3 GiB on the card)'
+gpus: '0,1'
+vram_gib: VRAMQ5
+defaults:
+  steps: 6
+  cfg: 1.0
+  sampler: euler
+  schedule: simple
+  size: 2048x2048
+env: {}
+files:
+  denoiser:
+    key: h3i-denoiser-q5km
+    url: https://huggingface.co/Hearthscale/MiniMax-H3-Image-GGUF/resolve/167c5e18db87d188575330ca76325e37cc2b28a4/minimax_h3_image_pruned-Q5_K_M.gguf
+    size: 13934375520
+    sha256: ffa23930b28cbc44946c4e07039810b35a0c8f3437bf7acae919182f8f644d57
+    path: minimax-h3-image/diffusion_models/minimax_h3_image_pruned-Q5_K_M.gguf
+  text-encoder: h3-te-32b-q4km
+  tokenizer: h3-tokenizer-vocab
+  tokenizer-merges: h3-tokenizer-merges
+  tokenizer-config: h3-tokenizer-config
+  vision: h3-te-visual
+  vae: h3i-vae
+guide: guides/minimax-h3-image.md

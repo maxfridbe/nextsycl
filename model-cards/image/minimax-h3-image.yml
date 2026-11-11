@@ -1,0 +1,38 @@
+# MiniMax-H3-Image Q4_K_M (text to image and edits up to 16 MP, 6 steps; Rust + SYCL)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-h3-image
+kind: image
+arch: minimax-h3-image
+license: minimax-h3-image-community
+commercial: false
+license_note: 'MiniMax-H3-Image Community License Agreement (MiniMax, 2026-11-10): not licensed in the European Union, the United Kingdom, South Korea or the United States; written authorization from MiniMax (platform.minimax.io/license) before offering it as a hosted service to third parties or above US$1 million yearly revenue; commercial products show "MiniMax-H3-Image"; its Acceptable Use Policy binds every user; its outputs may not improve another model; redistributed copies carry the agreement and a NOTICE. The text encoder is MiniMax H3''s (its own license).'
+title: 'MiniMax-H3-Image Q4_K_M (text to image and edits up to 16 MP, 6 steps; Rust + SYCL)'
+about: 'MiniMax''s image model on H3''s 50-block denoiser (Hearthscale''s Q4_K_M GGUF of Comfy-Org''s pruned bf16 file: Q4_K matrices expanded to bf16 a matrix at a time, 10.1 GiB on the card), its six-head bank on a six-step grid, H3''s Qwen3-VL 32B text encoder streamed from pinned memory, the 2D transformer VAE decoder; prompts rendered as written (no prompt enhancer)'
+gpus: '0,1'
+vram_gib: VRAMQ4
+defaults:
+  steps: 6
+  cfg: 1.0
+  sampler: euler
+  schedule: simple
+  size: 2048x2048
+env: {}
+files:
+  denoiser:
+    key: h3i-denoiser-q4km
+    url: https://huggingface.co/Hearthscale/MiniMax-H3-Image-GGUF/resolve/167c5e18db87d188575330ca76325e37cc2b28a4/minimax_h3_image_pruned-Q4_K_M.gguf
+    size: 11429589600
+    sha256: 13fc0add19eaf268ac4ad38704e312c634627feb443ffa89c9a4dce6301926d2
+    path: minimax-h3-image/diffusion_models/minimax_h3_image_pruned-Q4_K_M.gguf
+  text-encoder: h3-te-32b-q4km
+  tokenizer: h3-tokenizer-vocab
+  tokenizer-merges: h3-tokenizer-merges
+  tokenizer-config: h3-tokenizer-config
+  vision: h3-te-visual
+  vae:
+    key: h3i-vae
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3-Image/resolve/892de7cb61df49753bf15145a711154803a355cb/vae/minimax_h3_image_vae_fp16.safetensors
+    size: 1168505312
+    sha256: d80e9c2e5cfc9844869961ff5a58c9a9e52182df6bfb30b26018dd7f348721af
+    path: minimax-h3-image/vae/minimax_h3_image_vae_fp16.safetensors
+guide: guides/minimax-h3-image.md

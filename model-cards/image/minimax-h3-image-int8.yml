@@ -1,0 +1,33 @@
+# MiniMax-H3-Image int8 ConvRot (the fastest: int8 products; Rust + SYCL)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: minimax-h3-image-int8
+kind: image
+arch: minimax-h3-image
+license: minimax-h3-image-community
+commercial: false
+license_note: 'MiniMax-H3-Image Community License Agreement (MiniMax, 2026-11-10): not licensed in the European Union, the United Kingdom, South Korea or the United States; written authorization from MiniMax (platform.minimax.io/license) before offering it as a hosted service to third parties or above US$1 million yearly revenue; commercial products show "MiniMax-H3-Image"; its Acceptable Use Policy binds every user; its outputs may not improve another model; redistributed copies carry the agreement and a NOTICE. The text encoder is MiniMax H3''s (its own license).'
+title: 'MiniMax-H3-Image int8 ConvRot (the fastest: int8 products; Rust + SYCL)'
+about: 'as minimax-h3-image with Comfy-Org''s int8 ConvRot file of the pruned denoiser (int8 matrices, products on the int8 engine, 19.5 GiB on the card)'
+gpus: '0,1'
+vram_gib: VRAMI8
+defaults:
+  steps: 6
+  cfg: 1.0
+  sampler: euler
+  schedule: simple
+  size: 2048x2048
+env: {}
+files:
+  denoiser:
+    key: h3i-denoiser-int8
+    url: https://huggingface.co/Comfy-Org/MiniMax-H3-Image/resolve/892de7cb61df49753bf15145a711154803a355cb/diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors
+    size: 20979314802
+    sha256: 83eb140f1ff95c068f8a6886e6d3f3d0d4ab2e07bb2fe6d2ef992a51146ee622
+    path: minimax-h3-image/diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors
+  text-encoder: h3-te-32b-q4km
+  tokenizer: h3-tokenizer-vocab
+  tokenizer-merges: h3-tokenizer-merges
+  tokenizer-config: h3-tokenizer-config
+  vision: h3-te-visual
+  vae: h3i-vae
+guide: guides/minimax-h3-image.md
