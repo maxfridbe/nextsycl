@@ -93,7 +93,7 @@ without reading nextsycl's code.
   same for the same settings).
 - `timings` - `pp_tok_s` prompt processing including the vision tower, `tg_tok_s` generation, `seconds` the whole
   describe (a swap to the describer, when it was not loaded, is in it).
-- `finish` - `stop`, or `length` when `max_tokens` cut the answer (a note says so).
+- `finish` - `stop`, or `length` when `max_tokens` cut the answer (a note says so). Qwen sometimes goes on after a whole prompt (writes `PROMPT:` and the prompt again until the cap): the prompt is cut where it first ended and `finish` is `stop`, with a note that the describer kept writing.
 - `rsvp_granted_s` when the request asked for `rsvp_s`.
 
 `wait: false` answers the job (`{"id", "label", "state": "queued", ...}`); `image.status {"label"}` gives it with the

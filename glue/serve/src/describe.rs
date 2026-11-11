@@ -352,20 +352,30 @@ impl Ask {
 /// The answer cut into the prompt and the negative: `PROMPT:` / `NEGATIVE:` labels (any case, bold or not), else the
 /// whole text as the prompt; quotes around the whole, code fences and Markdown emphasis dropped
 pub fn parse_answer(text: &str) -> (String, Option<String>) {
+    let (prompt, negative, _) = parse_answer_ran_on(text);
+    (prompt, negative)
+}
+
+/// `parse_answer`, and whether the describer kept writing after the prompt (a second `PROMPT:` label, or the prompt
+/// written first and again after the label): such an answer is whole even when it ran to the token cap
+pub fn parse_answer_ran_on(text: &str) -> (String, Option<String>, bool) {
     let mut t = text.replace("```", "").replace("**", "").replace("__", "");
     let lower = t.to_ascii_lowercase();
     // "prompt:" not the end of "negative prompt:"
     let mut labels = lower.match_indices("prompt:").filter(|(i, _)| !lower[..*i].ends_with("negative ")).map(|(i, k)| (i, i + k.len()));
     let p = labels.next();
     // the describer sometimes writes the prompt, then "PROMPT:" and the same again until the token cap: stop at the second label
+    let mut ran_on = false;
     if let Some((ss, _)) = labels.next() {
         t.truncate(ss);
+        ran_on = true;
     }
     let lower = t.to_ascii_lowercase();
     let find = |k: &str| lower.find(k).map(|i| (i, i + k.len()));
     let n = find("negative prompt:").or_else(|| find("negative:"));
     // a label after at least eight unlabelled words: those words are the prompt
-    let lead = p.filter(|(ps, _)| n.map_or(true, |(ns, _)| ns > *ps) && t[..*ps].split_whitespace().count() >= 8);
+    let lead = p.filter(|(ps, _)| n.is_none_or(|(ns, _)| ns > *ps) && t[..*ps].split_whitespace().count() >= 8);
+    ran_on |= lead.is_some();
     let (prompt, negative) = match (p, n) {
         (Some((ps, _)), Some((_, ne))) if lead.is_some() => (&t[..ps], Some(&t[ne..])),
         (Some((ps, _)), None) if lead.is_some() => (&t[..ps], None),
@@ -382,7 +392,7 @@ pub fn parse_answer(text: &str) -> (String, Option<String>) {
     };
     let prompt = clean(prompt);
     let negative = negative.map(clean).filter(|n| !n.is_empty());
-    (prompt, negative)
+    (prompt, negative, ran_on)
 }
 
 /// A canvas for the target at the picture's aspect: the family's best area, sides its multiple, within its limits
@@ -541,7 +551,7 @@ pub fn stream_chat(t: &Target, body: &Value, cancelled: &dyn Fn() -> bool, limit
 
 /// The describe's answer from what the chat server wrote
 pub fn answer(ask: &Ask, model: &str, s: &Streamed, size: (u32, u32), shown: (u32, u32), seconds: f64) -> Value {
-    let (prompt, negative) = parse_answer(&s.content);
+    let (prompt, negative, ran_on) = parse_answer_ran_on(&s.content);
     let negative = negative.filter(|_| ask.negative);
     let (sw, sh) = suggested_size(size.0, size.1, ask.family);
     let d = &s.done;
@@ -559,8 +569,12 @@ pub fn answer(ask: &Ask, model: &str, s: &Streamed, size: (u32, u32), shown: (u3
     if !ask.family.takes_negative() {
         notes.push(format!("{} takes no negative prompt (no guidance): none written", ask.family.name()));
     }
-    if d["finish"] == "length" {
+    // the cap cut the describer's run-on after a whole prompt: that is a stop, not a short prompt
+    let finish = if d["finish"] == "length" && ran_on && !prompt.is_empty() { json!("stop") } else { d["finish"].clone() };
+    if finish == "length" {
         notes.push("the answer reached max_tokens: the prompt may be cut short".into());
+    } else if d["finish"] == "length" {
+        notes.push("the describer kept writing after the prompt until max_tokens: the prompt is whole and was cut where it ended".into());
     }
     if prompt.is_empty() {
         notes.push("the describer wrote no prompt".into());
@@ -580,7 +594,7 @@ pub fn answer(ask: &Ask, model: &str, s: &Streamed, size: (u32, u32), shown: (u3
         "tokens": {"prompt": prompt_tokens, "reused": reused, "generated": generated},
         "timings": {"pp_tok_s": pp, "tg_tok_s": tg, "prompt_seconds": read.map(|x| round(x, 1000.0)), "generate_seconds": gen.map(|x| round(x, 1000.0)),
                     "seconds": round(seconds, 1000.0)},
-        "finish": d["finish"],
+        "finish": finish,
         "energy_wh": d["energy_wh"],
         "notes": notes,
     })
@@ -682,6 +696,25 @@ mod tests {
         // a short lead is not a prompt: the labelled text is
         assert_eq!(parse_answer("Sure! PROMPT: a red fox in snow"), ("a red fox in snow".into(), None));
         assert_eq!(parse_answer(&format!("{p}\nPROMPT: {p}\nNEGATIVE: blur")), (p.into(), Some("blur".into())));
+    }
+
+    #[test]
+    fn a_run_on_after_a_whole_prompt_is_a_stop() {
+        let p = "A flat vector graphic of a red barn on a green field under a pale blue sky";
+        assert!(parse_answer_ran_on(&format!("{p}\nPROMPT: {p}\nPROMPT: {p}")).2);
+        assert!(parse_answer_ran_on("PROMPT: a fox\nPROMPT: a fox").2);
+        assert!(!parse_answer_ran_on("PROMPT: a red fox in snow").2);
+        assert!(!parse_answer_ran_on("PROMPT: a fox\nNEGATIVE: blur").2);
+        let ask = ask(json!({}), Family::ZImage);
+        let cut = |content: &str| {
+            let s = Streamed { content: content.into(), done: json!({"finish": "length", "generated": 99}), ..Default::default() };
+            answer(&ask, "m", &s, (64, 64), (64, 64), 1.0)
+        };
+        let r = cut(&format!("{p}\nPROMPT: {p}"));
+        assert_eq!((r["finish"].as_str(), r["prompt"].as_str()), (Some("stop"), Some(p)));
+        assert!(r["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("kept writing")));
+        let r = cut("PROMPT: a red fox in the");
+        assert_eq!(r["finish"], "length");
     }
 
     #[test]
