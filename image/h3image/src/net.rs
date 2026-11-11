@@ -115,6 +115,18 @@ pub fn schedule(steps: usize, shift: Option<f32>, denoise: f32) -> Vec<f32> {
     full[full.len() - steps - 1..].to_vec()
 }
 
+/// An img2img from `sigma0` on the shifted schedule (the live editor's contract: a strength below 1 is the start sigma):
+/// sigma0 taken back to the shift's time t0 = s0 / (shift - (shift - 1) s0), `steps` even steps of t from t0 to 0, each
+/// shifted again - 0.55 at shift 12 and 2 steps: 0.55, 0.367, 0
+pub fn shifted_from(sigma0: f32, steps: usize, shift: f32) -> Vec<f32> {
+    let (s, a) = (sigma0 as f64, shift as f64);
+    let t0 = s / (a - (a - 1.0) * s);
+    (0..=steps).map(|i| {
+        let t = t0 * (1.0 - i as f64 / steps as f64);
+        (a * t / (1.0 + (a - 1.0) * t)) as f32
+    }).collect()
+}
+
 /// The demo Space's detail pass (akhaliq/minimax-h3-image-2step app.py `_refine_grid`): the refiner's own 3-step grid
 /// 0.909375, 0.857143, 0.666667 scaled to start at `sigma0`, its ratios kept, then 0. Another step count: `full`, the
 /// schedule of that many steps from 1, scaled the same way (the Space only runs 3).
@@ -551,6 +563,17 @@ mod tests {
         assert_eq!(schedule(6, None, 1.0), PDD_SIGMAS.to_vec());
         assert_eq!(schedule(2, Some(12.0), 1.0), shifted_sigmas(12.0, 2));
         assert_eq!(schedule(2, None, 0.5), sigmas(4)[2..].to_vec());
+    }
+
+    #[test]
+    fn an_img2img_runs_down_from_its_start_in_the_shifts_time() {
+        let g = shifted_from(0.55, 2, 12.0);
+        assert_eq!(g.len(), 3);
+        assert!((g[0] - 0.55).abs() < 1e-6 && (g[1] - 0.367).abs() < 1e-3 && g[2] == 0.0, "{g:?}");
+        // from 1 it is the 2-step schedule itself
+        let g = shifted_from(1.0, 2, 12.0);
+        assert!((g[0] - 1.0).abs() < 1e-6 && (g[1] - 12.0 * 0.5 / 6.5).abs() < 1e-6);
+        assert!(shifted_from(0.3, 4, 12.0).windows(2).all(|w| w[1] < w[0]));
     }
 
     #[test]

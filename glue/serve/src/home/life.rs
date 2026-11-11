@@ -820,6 +820,11 @@ impl Home {
     /// Unload `id` if it is loaded (after the requests it is answering): a tool's say (a pin brings it back)
     pub(crate) fn unload(&self, id: &str) -> Result<(), (u16, String)> {
         let m = self.entry(id)?;
+        // an explicit unload ends the model's hold too (rsvp_s or keep): else the hold outlives the unload and other
+        // work keeps waiting on it
+        if self.end_hold(id) {
+            eprintln!("unload {id}: its hold ended");
+        }
         let kind = registry::kind_of(&m);
         match kind {
             "image" | "audio" | "model3d" => {

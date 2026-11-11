@@ -229,6 +229,11 @@ impl Home {
         self.change_holds(|h| hold::grant_rsvp(h, id, secs, max, now()))
     }
 
+    /// Ends `id`'s hold (system.unload): whether it had one
+    pub(crate) fn end_hold(&self, id: &str) -> bool {
+        self.change_holds(|h| hold::end(h, id))
+    }
+
     /// A chat request's keep (X-Keep-Up-S / keep_up_s)
     pub(crate) fn keep_chat(&self, id: &str, secs: u64) {
         let max = self.max_rsvp();

@@ -65,6 +65,8 @@ pub const REF_VAE_MAX_SHORT_EDGE: u32 = 2048;
 pub const MAX_PICTURES: usize = 16;
 /// the seed an edit's VAE posterior is sampled under, whatever the request's (ComfyUI's IMAGE_ENCODE_SEED)
 const ENCODE_SEED: u64 = 42;
+/// a cancel is looked for after this many blocks of a step (5 checks a step of 50 blocks)
+pub const POLL_BLOCKS: usize = 10;
 /// the heads' own number of steps
 pub const STEPS: usize = 6;
 
@@ -149,8 +151,9 @@ fn extra_number<T: std::str::FromStr>(req: &ImageRequest, name: &str) -> Result<
 
 /// A request's plan with the engine's default `steps` and `shift` (none: the heads' grid); the request's own fields
 /// first, then its options (`steps`, `shift`: what a request LoRA's card brings, the pDMD LoRA's 2 and 12): `sigmas` as
-/// given; else `start-sigma` S with a picture: the demo Space's grid from S; else a strength below 1: ComfyUI's
-/// BasicScheduler denoise; else the whole schedule
+/// given; else `start-sigma` S with a picture: the demo Space's grid from S; else
+/// a strength below 1: on a shifted schedule the start sigma itself (`net::shifted_from`: the live editor's contract), on the heads' grid
+/// ComfyUI's BasicScheduler denoise; else the whole schedule
 pub fn plan(req: &ImageRequest, steps: usize, shift: Option<f32>) -> Result<Plan> {
     let steps = extra_number::<usize>(req, "steps")?.unwrap_or(steps);
     let shift = req.shift.or(extra_number::<f32>(req, "shift")?).or(shift);
@@ -186,6 +189,7 @@ pub fn plan(req: &ImageRequest, steps: usize, shift: Option<f32>) -> Result<Plan
             }
             match start {
                 Some(s0) => net::start_grid(s0, &net::schedule(n, shift, 1.0)),
+                None if init && shift.is_some() => net::shifted_from(strength, n, shift.unwrap_or(1.0)),
                 None => net::schedule(n, shift, if init { strength } else { 1.0 }),
             }
         }
@@ -491,7 +495,7 @@ impl H3Image {
     /// first sigma s0; no init: s0 noise); `step(i)` after each step (an error stops)
     #[allow(clippy::too_many_arguments)]
     pub fn sample(&self, text: Tensor, tags: &[i32], refs: &[(Vec<f32>, usize, usize)], init: Option<&[f32]>, first_head: bool, lh: usize, lw: usize, seed: u64, sigmas: &[f32],
-                  step: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
+                  step: &mut dyn FnMut(Option<usize>) -> Result<()>) -> Result<Vec<f32>> {
         let mut x = Mt19937::new(seed).randn(net::LATENT_C * lh * lw);
         start_latent(&mut x, init, sigmas[0])?;
         let t_run = Instant::now();
@@ -505,9 +509,10 @@ impl H3Image {
             run.profile = true;
         }
         for i in 0..sigmas.len() - 1 {
-            let v = run.net(&x, sigmas[i], sigmas[i + 1], &mut |_| Ok(())).map_err(h3e)?;
+            // a cancel is looked for every POLL_BLOCKS blocks too (a superseded live frame stops within a fifth of a step)
+            let v = run.net(&x, sigmas[i], sigmas[i + 1], &mut |b| if b > 0 && b % POLL_BLOCKS == 0 { step(None).map_err(|e| nextsycl_h3::Error(e.0)) } else { Ok(()) }).map_err(h3e)?;
             net::euler(&mut x, &v, sigmas[i], sigmas[i + 1]);
-            step(i)?;
+            step(Some(i))?;
         }
         Ok(x)
     }
@@ -650,7 +655,13 @@ impl ImageEngine for H3Image {
                 (false, Some(t)) => t,
                 (_, None) => return Err(Error("the refined text was used up".into())),
             };
-            let mut step = |i: usize| progress(Step { picture: p, at: i as u32 + 1, of, seconds: t0.elapsed().as_secs_f64() });
+            let mut done = 0u32;
+            let mut step = |i: Option<usize>| {
+                if let Some(i) = i {
+                    done = i as u32 + 1;
+                }
+                progress(Step { picture: p, at: done, of, seconds: t0.elapsed().as_secs_f64() })
+            };
             let lat = self.sample(mine, &cond.tags, &refs, init.as_ref().map(|(l, _)| l.as_slice()), plan.first_head.unwrap_or(self.first_head), lh, lw, req.seed + p as u64, &sigmas, &mut step)?;
             let t_steps = t1.elapsed().as_secs_f64();
             let rgb = self.decoder.decode(&lat, lh, lw, &mut |_, _| Ok(())).map_err(h3e)?;
@@ -855,7 +866,9 @@ mod tests {
         // an img2img (not a reference) at 0.5: ComfyUI's denoise (3 steps of the 6-step schedule)
         let p = plan(&ImageRequest { edit: edit(0.5, false), steps: Some(3), ..req.clone() }, 2, Some(12.0)).unwrap();
         assert!(!p.condition && p.init);
-        assert_eq!(p.sigmas, net::schedule(3, Some(12.0), 0.5));
+        assert_eq!(p.sigmas, net::shifted_from(0.5, 3, 12.0));
+        let p = plan(&ImageRequest { edit: edit(0.5, false), steps: Some(3), ..req.clone() }, 6, None).unwrap();
+        assert_eq!(p.sigmas, net::schedule(3, None, 0.5));
         // start-sigma: the Space's grid from exactly there, the picture the start
         let mut r = ImageRequest { edit: edit(1.0, false), steps: Some(3), ..req.clone() };
         r.extra.insert("start-sigma".into(), "0.55".into());

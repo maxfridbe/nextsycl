@@ -105,9 +105,25 @@ pub fn grant_keep(holds: &mut Holds, id: &str, secs: u64, max: f64, now: f64) {
     h.keep_until = h.keep_until.max(now + (secs as f64).min(max));
 }
 
+/// Ends `id`'s hold, rsvp_s and keep alike (system.unload: an explicit unload outranks a hold, a live editor's own
+/// 15-minute rsvp included); whether there was one
+pub fn end(holds: &mut Holds, id: &str) -> bool {
+    holds.remove(id).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unload_ends_the_hold() {
+        let mut h = Holds::new();
+        grant_rsvp(&mut h, "live", 900.0, 86400.0, 1000.0);
+        grant_keep(&mut h, "chat", 300, 86400.0, 1000.0);
+        assert!(end(&mut h, "live"));
+        assert!(!h.contains_key("live") && h.contains_key("chat"));
+        assert!(!end(&mut h, "live"), "nothing left to end");
+    }
 
     #[test]
     fn rsvp_is_clamped_never_shortened_and_zero_releases_what_nothing_holds() {
