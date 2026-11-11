@@ -14,7 +14,7 @@ title: 'P-H3-Image text encoder (Qwen3-VL-4B) as a describer'
 about: 'the Qwen3-VL-4B text encoder P-H3-Image conditions on, loaded whole (its head tied to the embedding, vision tower) to write prompts from pictures: image.describe describer native for p-h3-image; int8 ConvRot, shared kernels, no prompt cache'
 base_model: Qwen3-VL-4B
 gpus: '0,1'
-vram_gib: 8.0                    # an estimate until measured: 4.6 GiB int8 weights + the tower in float32 + the cache
+vram_gib: 10.5                   # measured (B65): 4.9 GiB loaded, ~6.5 at 1 MP; 10.1 GiB after a 4 MP picture (the cache, ~0.9 MB a row)
 env: {}
 files:
   text-encoder: ph3-te-int8

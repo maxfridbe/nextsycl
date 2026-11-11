@@ -170,12 +170,12 @@ are fixed, the rest is this list.
     {"id": "qwen3.8-27b-q4-describe", "name": "Qwen3.8-27B UD-Q4_K_M, pictures to prompts (16K)", "base_model": "Qwen3.8-27B",
      "kind": "chat", "size_gb": 18.76, "vram_gib": 20.0, "image_models": [], "downloaded": true, "enabled": true, "best": true},
     {"id": "qwen3-vl-8b-instruct", "name": "Qwen-Image 2.1 text encoder (Qwen3-VL-8B-Instruct) as a describer",
-     "base_model": "Qwen3-VL-8B-Instruct", "kind": "native", "size_gb": 9.36, "vram_gib": 14.0,
+     "base_model": "Qwen3-VL-8B-Instruct", "kind": "native", "size_gb": 9.36, "vram_gib": 13.5,
      "image_models": ["qwen-image-2.1-q4km", "qwen-image-2.1-q6k", "qwen-image-2.1-q8", "qwen-image-2.1-turbo-q8",
                       "qwen-image-2.1-uncensored-q4km", "qwen-image-2.1-uncensored-q8"],
      "downloaded": true, "enabled": true, "best": false},
     {"id": "qwen3-vl-4b-instruct", "name": "P-H3-Image text encoder (Qwen3-VL-4B) as a describer", "base_model": "Qwen3-VL-4B",
-     "kind": "native", "size_gb": 5.13, "vram_gib": 8.0, "image_models": ["p-h3-image", "p-h3-image-lora", "p-h3-image-q8"],
+     "kind": "native", "size_gb": 5.13, "vram_gib": 10.5, "image_models": ["p-h3-image", "p-h3-image-lora", "p-h3-image-q8"],
      "downloaded": false, "enabled": false, "best": false}
   ]}}
 ```
@@ -397,3 +397,54 @@ ends some text-free prompts with "no other text" - harmless to the model, not wh
 Reproduce (on a box with the method deployed): `tests/api/test-describe.py --target z-image-turbo --render
 z-image-turbo --judge <chat server>`; on a box where the describer and the image model share one card,
 `--stage render|describe|draw|score` runs the parts one at a time.
+
+### Native describers (hardac1, 2026-11-11)
+
+Through `nextsycl image describe --native ID --json` (the same `describe::describe_native` the front door runs) against
+the build copy's `nextsycl image serve ID` (`qwen3-vl-8b-instruct`, `qwen3-vl-4b-instruct`), on the **B65** (the B70
+was running production work); the front door's routing, listing and errors are covered by unit tests, not run on the
+box. Pictures: the five round-trip pictures above, `detail: medium`, target the describer's own image model; speed rows:
+the barn (2368 x 1760) shown at `max_pixels` 0.26 / 1 / 4.2 MP, `target: natural`. Times are whole describes with the
+describer loaded (its load: 10.7 s for the 4B, 13.6 s for the 8B, not included); no prompt cache, so "again" costs the
+same as cold.
+
+| describer | picture | prompt tokens | pp tok/s | tg tok/s | written | whole describe |
+|---|---|---|---|---|---|---|
+| `qwen3-vl-4b-instruct` (target p-h3-image) | the five pictures, ~1 MP | 1,118-1,374 | 361-513 | 48-60 | 46-81 | 3.1-4.8 s |
+| | 512 x 512 (0.26 MP) | 443 | 887 | 63.4 | 75 | 1.74 s |
+| | 1 MP | 1,208 | 455 | 60.0 | 74 | 3.96 s |
+| | 4 MP | 4,279 | 163 | 39.7 | 77 | 28.2 s |
+| `qwen3-vl-8b-instruct` (target qwen-image-2.1-q8) | the five pictures, ~1 MP | 1,049-1,305 | 330-458 | 36-42 | 53-88 | 4.1-5.9 s |
+| | 512 x 512 | 443 | 707 | 45.0 | 41 | 1.59 s |
+| | 1 MP | 1,208 | 410 | 35.4 | 46 | 4.32 s |
+| | 4 MP | 4,279 | 151 | 31.5 | 47 | 30.0 s |
+| `best` (qwen3.8-27b-q4-describe, B70, from the tables above) | 1 MP, cold | 1,326 | 582 | 48.9 | 114 | 4.15 s (2.2 s again, cached) |
+| | 4 MP | 4,398 | 451 | 47.1 | 111 | 11.5 s |
+
+- Memory on the card: the 4B 4.9 GiB loaded, ~6.5 GiB after 1 MP describes, 10.1 GiB after a 4 MP one; the 8B 8.6
+  GiB loaded, 13.5 GiB after a 4 MP one (the cache is float32 q | k | v rows, ~0.9 MB a row over 36 layers, plus the
+  prompt pass's work). Host: 0.4-0.8 GB. The cards say 10.5 / 13.5 GiB (the 4 MP peaks).
+- tg: a written token's attention runs on the engine's silo (flash decoding over chunks of 256 cached rows,
+  `kernels/image/vldescribe/silo`); on the shared attention by rows alone the 4B wrote 13-16 tok/s at 1 MP and 4.9 at 4
+  MP (B70, before the silo) - the silo is 3.7x / 8x that.
+- pp is the weak spot at 4 MP (150-163 tok/s against best's 451): the prompt's causal attention is the shared kernel
+  that gives each query row one work-group walking its keys - fine for ~1,200 rows, slow for 4,300. Not tuned: the
+  default `max_pixels` is 1 MP, where a native describe is as fast as best's cold one.
+- At 1 MP a native describe is about as fast as best's first one (3-6 s), slower than best's repeats (best keeps a
+  prompt cache; the native ones do not). Neither swaps a 20 GiB chat model in, which is the native describers' real
+  saving: they load in 11-14 s into ~5-9 GiB.
+
+Quality, the same five pictures (the prompts in full are in the build copy's run; excerpts):
+
+- **4B (`qwen3-vl-4b-instruct`, for P-H3-Image)**: right kind of picture every time, the h3 form kept (what the picture
+  is first, "no other text" at the end); short - 36-63 words where `medium` asks ~90 - and a few wrong details: the
+  barn is "a simple, stylized house" with "a single white rectangular window" (a cream door), the shapes' blue square a
+  "rectangle". The teapot and lighthouse prompts are as good as best's in content ("a glossy, light teal ceramic
+  teapot ... a white textured fabric napkin lies to its left; soft, diffused daylight from a window to the left").
+- **8B (`qwen3-vl-8b-instruct`, for Qwen-Image 2.1)**: more precise - the shapes' places ("a solid red circle
+  positioned in the upper left, a solid blue square in the upper right, and a solid green triangle centered below"),
+  the sign's "pixelated block letters" on "dark navy blue", the teapot's spout and handle, three seagulls - still
+  40-65 words for `medium`, and the barn is "a simple red house" with "a cream-colored rectangular door".
+- **best (27B)** writes the asked length (90-160 tokens), names the barn a barn, and is the better describer by eye;
+  native is the smaller, encoder-matched one. No round trip (drawing the native prompts back) was run: the image
+  models' cards were busy with production work.

@@ -14,7 +14,7 @@ title: 'Qwen-Image 2.1 text encoder (Qwen3-VL-8B-Instruct) as a describer'
 about: 'the Qwen3-VL-8B-Instruct text encoder Qwen-Image 2.1 conditions on, loaded whole (lm_head, vision tower) to write prompts from pictures: image.describe describer native for every qwen-image-2.1 model; int8 ConvRot, shared kernels, no prompt cache'
 base_model: Qwen3-VL-8B-Instruct
 gpus: '0,1'
-vram_gib: 14.0                   # an estimate until measured: 9.3 GiB int8 weights + the tower in float32 + the cache
+vram_gib: 13.5                   # measured (B65): 8.6 GiB loaded; 13.5 GiB after a 4 MP picture (4,279 cached rows, ~0.9 MB each)
 env: {}
 files:
   text-encoder: qwen-image-21-te-int8
