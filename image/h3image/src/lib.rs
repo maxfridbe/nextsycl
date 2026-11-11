@@ -56,8 +56,11 @@ pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "vae", "vi
 pub const GRID: u32 = 32;
 /// the default canvas: 2048 x 2048, the area the model is tuned for (ComfyUI's IMAGE_SIZE)
 pub const DEFAULT_SIDE: u32 = 2048;
-/// the largest canvas: 16 MP and the 16 MP presets at other aspects (5024 x 3360 is 16.88 M)
-pub const MAX_PIXELS: u64 = 4128 * 4096;
+/// the largest canvas: 20 MiPx (3872 x 5056 = 19.6 M, 5024 x 4160 = 20.9 M)
+pub const MAX_PIXELS: u64 = 20 * 1024 * 1024;
+/// the longest side (3872 x 5056 is the 20 MP workflow's portrait), the shortest is MIN_SIDE
+pub const MAX_SIDE: u32 = 5056;
+pub const MIN_SIDE: u32 = 256;
 /// an edit's pictures: the vision tower sees them at a 1,024 short edge, the VAE within a 1,024 .. 2,048 short edge
 pub const REF_SHORT_EDGE: u32 = 1024;
 pub const REF_VAE_MAX_SHORT_EDGE: u32 = 2048;
@@ -109,6 +112,11 @@ pub fn h3e(e: nextsycl_h3::Error) -> Error {
 /// Python's round (half to even) of `side / GRID`, times GRID, at least GRID
 pub fn round_side(side: f64) -> u32 {
     ((side / GRID as f64).round_ties_even() as u32 * GRID).max(GRID)
+}
+
+/// whether a canvas is within the engine's limits (sides {MIN_SIDE}..{MAX_SIDE}, at most MAX_PIXELS)
+pub fn size_ok(w: u32, h: u32) -> bool {
+    w as u64 * h as u64 <= MAX_PIXELS && (MIN_SIDE..=MAX_SIDE).contains(&w) && (MIN_SIDE..=MAX_SIDE).contains(&h)
 }
 
 /// ComfyUI's `_size_short_edge`: the aspect kept, the short edge brought into [low, high], sides rounded to the grid
@@ -617,8 +625,8 @@ impl ImageEngine for H3Image {
             (None, None, None) => (DEFAULT_SIDE, DEFAULT_SIDE),
             _ => return Err(Error(format!("{ARCH}: a width and a height together, or neither"))),
         };
-        if w as u64 * h as u64 > MAX_PIXELS || w < 256 || h < 256 {
-            return Err(Error(format!("{w}x{h}: from 256 a side to 16 MP (4096x4096, 5024x3360 ...); the model is tuned for 2048x2048")));
+        if !size_ok(w, h) {
+            return Err(Error(format!("{w}x{h}: from {MIN_SIDE} to {MAX_SIDE} a side, up to 20 MP (4096x4096, 3872x5056 ...); the model is tuned for 2048x2048")));
         }
         let sigmas = plan.sigmas;
         let of = (sigmas.len() - 1) as u32;
@@ -767,6 +775,9 @@ mod tests {
     fn the_presets_reach_16_mp() {
         assert_eq!(size_at(16_777_216, 1.0), (4096, 4096));
         assert_eq!(size_at(4_194_304, 1.0), (2048, 2048));
+        // the 20 MP workflow's sizes fit, a side past 5056 or a budget past 20 MiPx does not
+        assert!(size_ok(3872, 5056) && size_ok(5024, 4160) && size_ok(4096, 4096) && size_ok(256, 5056));
+        assert!(!size_ok(5088, 3872) && !size_ok(5024, 4192) && !size_ok(224, 1024) && !size_ok(5120, 1024));
         assert_eq!(size_at(1_048_576, 1.0), (1024, 1024));
         for r in [1.0, 4.0 / 3.0, 3.0 / 4.0, 1.5, 2.0 / 3.0, 16.0 / 9.0, 9.0 / 16.0] {
             let (w, h) = size_at(16_777_216, r);

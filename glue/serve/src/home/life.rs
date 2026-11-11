@@ -193,6 +193,17 @@ pub(crate) fn describes_native(m: &Value, all: &[Value], cards: &[Value]) -> boo
 
 /// What a model can do, in neutral words (a client picks a model by them, on any box): its tags, and the /rpc
 /// methods that take it
+/// The canvas an image model takes (`max_pixels`, `min_side`, `max_side`, `grid`), for the archs that say it: the
+/// engines' own limits (image/h3image `MAX_PIXELS` / `MAX_SIDE` / `MIN_SIDE` / `GRID`, image/ph3image `MAX_PIXELS`)
+pub(crate) fn size_limits(m: &Value) -> Option<(u64, u32, u32, u32)> {
+    let (max_pixels, max_side, grid) = match (m["kind"].as_str()?, m["arch"].as_str()?) {
+        ("image", "minimax-h3-image") => (20u64 * 1024 * 1024, 5056, 32),
+        ("image", "p-h3-image") => (8_912_896, 8_912_896 / 256, 32),
+        _ => return None,
+    };
+    Some((max_pixels, 256, max_side, grid))
+}
+
 pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) {
     let arch = s(m, "arch");
     let speech = |c: &str| m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == c));
@@ -603,6 +614,7 @@ impl Home {
                 state = "disabled";
             }
             let (mut caps, methods) = capabilities(m);
+            let limits = size_limits(m);
             if describes_native(m, all, dc) {
                 caps.push("describe_native");
             }
@@ -633,6 +645,7 @@ impl Home {
                    "spans": spans_all(m, &mc),
                    "pinned": enabled && m["pinned"] == true, "held_s": holds.get(s(m, "id").as_str()).map_or(0.0, |h| h.reserved(now()).round()),
                    "capabilities": caps, "methods": methods,
+                   "max_pixels": limits.map(|l| l.0), "min_side": limits.map(|l| l.1), "max_side": limits.map(|l| l.2), "grid": limits.map(|l| l.3),
                    "vouch_mb": vouch.iter().map(|(g, mb)| (g.to_string(), json!(mb))).collect::<serde_json::Map<String, Value>>(),
                    "measured": measured,
                    "headroom_mb": headroom.iter().map(|(g, mb)| (g.to_string(), json!(mb))).collect::<serde_json::Map<String, Value>>(),
@@ -1568,6 +1581,17 @@ mod tests {
         assert!(caps.contains(&"word_timestamps") && !caps.contains(&"speech"));
         let (_, methods) = capabilities(&json!({"id": "voxcpm2", "kind": "audio", "arch": "voxcpm2", "speech": ["clone"]}));
         assert!(methods.contains(&"audio.speak") && !methods.contains(&"audio.transcribe"));
+    }
+
+    #[test]
+    fn the_h3_image_cards_report_their_canvas() {
+        let h3 = json!({"id": "minimax-h3-image-int8", "kind": "image", "arch": "minimax-h3-image"});
+        assert_eq!(size_limits(&h3), Some((20_971_520, 256, 5056, 32)));
+        // 3872 x 5056 (the 20 MP workflow's portrait) is inside it
+        let (px, _, side, _) = size_limits(&h3).unwrap();
+        assert!(3872u64 * 5056 <= px && 5056 <= side);
+        assert!(size_limits(&json!({"id": "z", "kind": "image", "arch": "z-image"})).is_none());
+        assert!(size_limits(&json!({"id": "x", "kind": "llm", "arch": "minimax-h3-image"})).is_none());
     }
 
     #[test]

@@ -27,7 +27,7 @@ picture is only that start (an img2img: the prompt alone guides it).
 
 ## Sizes
 
-Sides are multiples of 32, from 256 to 16 MP. The ratio and budget presets give 1, 4, 8 and 16 MP at 1:1, 4:3, 3:2,
+Sides are multiples of 32, from 256 to 5056, up to 20 MP (20 MiPx; 3872x5056 fits; system.models reports max_pixels, min_side, max_side, grid). The ratio and budget presets give 1, 4, 8 and 16 MP at 1:1, 4:3, 3:2,
 16:9 and their transposes (2048 x 2048, 2912 x 2912, 4096 x 4096, 5024 x 3360 ...). Time grows faster than the area
 (attention): see docs/ports/minimax-h3-image.md for the measured times.
 

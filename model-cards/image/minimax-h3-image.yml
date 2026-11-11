@@ -1,4 +1,4 @@
-# MiniMax-H3-Image Q4_K_M (text to image and edits up to 16 MP, 6 steps; Rust + SYCL)
+# MiniMax-H3-Image Q4_K_M (text to image and edits up to 20 MP, 6 steps; Rust + SYCL)
 # model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
 id: minimax-h3-image
 kind: image
@@ -6,7 +6,7 @@ arch: minimax-h3-image
 license: minimax-h3-image-community
 commercial: false
 license_note: 'MiniMax-H3-Image Community License Agreement (MiniMax, 2026-11-10): not licensed in the European Union, the United Kingdom, South Korea or the United States; written authorization from MiniMax (platform.minimax.io/license) before offering it as a hosted service to third parties or above US$1 million yearly revenue; commercial products show "MiniMax-H3-Image"; its Acceptable Use Policy binds every user; its outputs may not improve another model; redistributed copies carry the agreement and a NOTICE. The text encoder is MiniMax H3''s (its own license).'
-title: 'MiniMax-H3-Image Q4_K_M (text to image and edits up to 16 MP, 6 steps; Rust + SYCL)'
+title: 'MiniMax-H3-Image Q4_K_M (text to image and edits up to 20 MP, 6 steps; Rust + SYCL)'
 about: 'MiniMax''s image model on H3''s 50-block denoiser (Hearthscale''s Q4_K_M GGUF of Comfy-Org''s pruned bf16 file: Q4_K matrices expanded to bf16 a matrix at a time, 10.1 GiB of blocks on the card), its six-head bank on a six-step grid, H3''s Qwen3-VL 32B text encoder streamed from pinned memory, the 2D transformer VAE decoder; prompts rendered as written (no prompt enhancer)'
 gpus: '0,1'
 vram_gib: 15.0                  # B70, 4096x4096: 14.4 GiB peak (11.1 after load: blocks 10.1, VAE 0.75); the text encoder streams from pinned host memory (14.4 GiB RAM)
