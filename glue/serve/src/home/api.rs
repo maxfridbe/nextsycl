@@ -44,7 +44,7 @@ const FEATURES: &[&str] = &[
     "video.slots.cards", "video.running_clips", "video.status.clip", "video.cancel.name", "video.reentry.before_limit", "video.reentry.label", "jobs.title", "video.speed",
     "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars", "image.loras.request", "video.soundtrack", "video.exposure_fix",
     "backplane", "system.busy.engines", "models.profile", "system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long", "jobs.eta", "video.on_demand", "video.multi_guide",
-    "image.describe",
+    "image.describe", "image.describe.describer", "image.describers",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -150,6 +150,11 @@ fn field_of(method: &str, m: &str) -> Option<String> {
     let me = table::methods().iter().find(|x| x.kind == kind && x.name == name)?;
     let first: String = m.trim_start_matches('"').chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
     let names = || me.fields.iter().map(|f| f.name.as_str()).chain(["strength", "image", "reference", "continue_from"]);
+    // describer native refused for its target ("target z-image: its text encoder (Qwen3-4B) does not read pictures; use
+    // describer best"): the describer is at fault, not the target (nextcuda's words and field)
+    if m.ends_with("use describer best") && names().any(|f| f == "describer") {
+        return Some("describer".into());
+    }
     // a field the message says is needed wins over its first word ("image.generate needs \"prompt\"" starts with
     // image, a field too): the fields' order is no longer what decided it
     names().find(|f| m.contains(&format!("needs \"{f}\""))).or_else(|| names().find(|f| first == *f)).map(str::to_string)
@@ -259,20 +264,24 @@ impl Home {
             .ok_or_else(|| (409, format!("no {kind} model is enabled (system.enable)")))
     }
 
-    /// image.describe's describer: the chat model named (it must read pictures), else the loaded chat model when it reads
-    /// pictures, else the enabled one that takes the least memory (describe_pick)
-    pub(super) fn describer(&self, b: &Value, all: &[Value]) -> Result<String, Fail> {
-        if let Some(id) = b["model"].as_str().filter(|x| !x.is_empty()) {
-            return match all.iter().find(|m| m["id"] == id) {
-                Some(m) if !reads_pictures(m) => Err((400, format!("{id} does not read pictures: image.describe needs a chat model with a vision tower (qwen3.8-27b-q4-describe)"))),
-                Some(m) if m["enabled"] == false => Err((409, format!("{id} is disabled (system.enable)"))),
-                Some(_) => Ok(id.to_string()),
-                None if self.not_downloaded(id).is_some() => self.need_downloaded(id, b["request_id"].as_str(), true).map(|_| id.to_string()),
-                None => Err((404, format!("no model {id} (system.models)"))),
-            };
+    /// image.describe's describer (docs/api/image-describe.md): `describer` best (the default: the chat model the older
+    /// `model` names, else the loaded chat model when it reads pictures, else the enabled one that takes the least
+    /// memory), native (the target image model's own text encoder) or a describer's id. One a card offers that is not
+    /// registered: model_not_downloaded (with NS_AUTO_PULL fetched - a native describer's files are its image model's)
+    pub(super) fn describer(&self, b: &Value, all: &[Value]) -> Result<crate::describe::Choice, Fail> {
+        let c = self.describer_choice(b, all)?;
+        if !c.registered {
+            self.need_downloaded(&c.id, b["request_id"].as_str(), true)?;
         }
-        describe_pick(all, self.chat_loaded(all).as_deref())
-            .ok_or_else(|| (409, "no chat model that reads pictures is enabled (system.enable qwen3.8-27b-q4-describe)".to_string()))
+        Ok(c)
+    }
+
+    /// `describer` without fetching anything
+    pub(super) fn describer_choice(&self, b: &Value, all: &[Value]) -> Result<crate::describe::Choice, Fail> {
+        let (family, target_model) = describe_target(&s(b, "target"), all)?;
+        let cards = self.o.cfg.cards();
+        let loaded = self.chat_loaded(all);
+        crate::describe::choose(b, family, target_model.as_deref(), all, &cards, &|| describe_pick(all, loaded.as_deref()))
     }
 
     /// The saved voices (beside the audio server's output: NS_AUDIO_OUT)
@@ -806,32 +815,70 @@ impl Home {
                 relay(&t, "POST", "/v1/ocr", Some(&body), 3600)
             }
             ("image", "describe") => {
-                // the describer (a chat model that reads pictures), the prompt's style (the target's family), the picture
-                let id = self.describer(b, &all)?;
+                // the describer (a chat model that reads pictures, or the target's own text encoder), the prompt's style
+                // (the target's family), the picture
+                let c = self.describer(b, &all)?;
                 let (family, target_model) = describe_target(&s(b, "target"), &all)?;
                 let ask = crate::describe::Ask::from_body(b, family, target_model).map_err(|e| (400, e))?;
                 let picture = http::unbase64(&s(b, "image")).map_err(|e| (400, format!("image: {e}")))?;
                 let job = b["request_id"].as_str().map(str::to_string);
-                // the switcher swaps the describer in when another chat model is loaded (room made first, as any load)
-                let t = self.chat_target(Some(&id))?;
-                self.request_on(&id);
-                self.sent(job.as_deref());
-                // image.cancel {label}: the stream closed, the chat server stops at its next token
-                let cancelled = || job.as_deref().is_some_and(|j| self.job_cancelled(j));
-                crate::describe::describe(&t, &id, &ask, &picture, &cancelled)
+                let mut r = if c.native {
+                    // an image model's text encoder: served by an image server as any image model (room made first)
+                    let t = self.ensure_for(&c.id, job.as_deref())?;
+                    self.sent(job.as_deref());
+                    let r = crate::describe::describe_native(&t, &c.id, &c.model, &ask, &picture)?;
+                    // the reading has no stop between tokens: a cancel meanwhile ends the job cancelled when it is done
+                    if job.as_deref().is_some_and(|j| self.job_cancelled(j)) {
+                        return Err((499, "cancelled".into()));
+                    }
+                    r
+                } else {
+                    // the switcher swaps the describer in when another chat model is loaded (room made first, as any load)
+                    let t = self.chat_target(Some(&c.id))?;
+                    self.request_on(&c.id);
+                    self.sent(job.as_deref());
+                    // image.cancel {label}: the stream closed, the chat server stops at its next token
+                    let cancelled = || job.as_deref().is_some_and(|j| self.job_cancelled(j));
+                    crate::describe::describe(&t, &c.id, &ask, &picture, &cancelled)?
+                };
+                r["describer"] = json!(c.describer);
+                r["describer_model"] = json!(c.id);
+                // the describer's memory on its card: as measured on this box once it has run, else its card's figure
+                r["memory_mb"] = json!(all.iter().find(|m| m["id"] == c.id.as_str())
+                    .and_then(|m| self.vouched_mb(m, 32768).0.values().copied().max()));
+                Ok(r)
+            }
+            ("image", "describers") => {
+                let cards = self.o.cfg.cards();
+                let loaded = self.chat_loaded(&all);
+                let best = describe_pick(&all, loaded.as_deref());
+                let size_of = |id: &str| -> Option<u64> {
+                    let files = self.o.cfg.card_files(id);
+                    if !files.is_empty() {
+                        return Some(files.iter().map(|f| f.1).sum());
+                    }
+                    // registered without a card: its files on disk
+                    let m = all.iter().find(|m| m["id"] == id)?;
+                    let paths: std::collections::BTreeSet<&str> = m["files"].as_object()?.values().filter_map(|p| p.as_str()).collect();
+                    Some(paths.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|x| x.len()).sum())
+                };
+                Ok(crate::describe::listing(&all, &cards, &size_of, best.as_deref()))
             }
             ("image", "generate") | ("image", "edit") => {
                 let id = if b["model"].as_str().is_some_and(|x| !x.is_empty()) {
                     self.pick("image", b, &all)?
                 } else {
                     // no model named: the loaded or first enabled one that draws (not a reader, not an upscaler)
-                    let draws = |m: &Value| !s(m, "arch").contains("ocr") && !upscales(m) && !vectorizes(m) && !removes_background(m);
+                    let draws = |m: &Value| !s(m, "arch").contains("ocr") && !upscales(m) && !vectorizes(m) && !removes_background(m) && !crate::describe::is_native(m);
                     let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "image" && m["enabled"] != false && draws(m)).collect();
                     self.loaded_of("image").into_iter().find(|l| on.iter().any(|m| m["id"] == l.as_str())).or_else(|| on.first().map(|m| s(m, "id")))
                         .ok_or_else(|| (409, "no image model that draws is enabled (system.enable qwen-image-2.1-q8)".to_string()))?
                 };
                 if all.iter().any(|m| m["id"] == id.as_str() && upscales(m)) {
                     return Err((400, format!("{id} upscales pictures; image.{} needs a model that draws (image.upscale for {id})", m.name)));
+                }
+                if all.iter().any(|m| m["id"] == id.as_str() && crate::describe::is_native(m)) {
+                    return Err((400, format!("{id} describes pictures; image.{} needs a model that draws (image.describe with describer {id})", m.name)));
                 }
                 if all.iter().any(|m| m["id"] == id.as_str() && vectorizes(m)) {
                     return Err((400, format!("{id} writes pictures as SVG; image.{} needs a model that draws (image.vectorize for {id})", m.name)));
@@ -1770,6 +1817,29 @@ mod tests {
         let (c, m) = super::super::life::capabilities(&all[2]);
         assert!(c.contains(&"describe") && m.contains(&"image.describe"));
         assert!(!super::super::life::capabilities(&all[0]).1.contains(&"image.describe"));
+    }
+
+    #[test]
+    fn a_describers_error_names_the_describer_field_and_a_native_one_does_not_draw() {
+        for m in ["target z-image-turbo: its text encoder (Qwen3-4B) does not read pictures; use describer best",
+                  "describer nope: no such describer here (image.describers lists them)"] {
+            assert_eq!(rpc_error("image.describe", 400, None, m)["field"], "describer", "{m}");
+        }
+        assert_eq!(rpc_error("image.describe", 400, None, "model glm: an llm model that does not read pictures")["field"], "model");
+        // a native describer reads (image.describe), it does not draw: not image.generate's, not a target
+        let d = json!({"id": "qwen3-vl-8b-instruct", "kind": "image", "arch": crate::describe::NATIVE_ARCH});
+        let (c, m) = super::super::life::capabilities(&d);
+        assert!(c.contains(&"describe") && m == vec!["image.describe"]);
+        assert_eq!(describe_target("qwen3-vl-8b-instruct", std::slice::from_ref(&d)).unwrap_err().0, 400);
+        assert!(!reads_pictures(&d), "best stays a chat model");
+        // describe_native: an image model whose encoder a native describer card reads
+        let all = vec![json!({"id": "qi", "kind": "image", "arch": "qwen-image-2.1"}), json!({"id": "zt", "kind": "image", "arch": "z-image"}), d];
+        let cards = vec![json!({"id": "qi", "kind": "image", "files": {"text-encoder": "te"}}), json!({"id": "zt", "kind": "image", "files": {"text-encoder": "zte"}}),
+                         json!({"id": "qwen3-vl-8b-instruct", "kind": "image", "arch": crate::describe::NATIVE_ARCH, "files": {"text-encoder": "te"}})];
+        assert!(super::super::life::describes_native(&all[0], &all, &cards));
+        assert!(!super::super::life::describes_native(&all[1], &all, &cards));
+        assert!(!super::super::life::describes_native(&all[2], &all, &cards), "the describer itself does not draw");
+        assert_eq!(table::find("image.describers").unwrap().runs_on(), "llm");
     }
 
     #[test]

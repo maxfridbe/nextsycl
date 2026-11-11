@@ -71,7 +71,7 @@ impl Method {
     /// The kind whose model runs it (what must be enabled for it): its own, but image.describe's describer is a chat
     /// model that reads pictures
     pub fn runs_on(&self) -> &'static str {
-        if self.full() == "image.describe" { "llm" } else { self.kind }
+        if matches!(self.full(), "image.describe" | "image.describers") { "llm" } else { self.kind }
     }
 }
 
@@ -1163,6 +1163,10 @@ pub struct ImageDescribeReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 60)]
     pub batch: Option<String>,
+    /// who reads the picture: best (default: a chat model that reads pictures - the one model names, else the loaded one when it reads pictures, else the enabled one that takes the least memory), native (the target image model's own text encoder; a family target: that family's enabled model whose encoder describer takes the least memory) or a describer's id (image.describers)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub describer: Option<String>,
     /// how long a prompt: short (~35 words, 12 tags), medium (default: ~90 words, 25 tags), long (~170 words, 45 tags)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<DescribeDetail>,
@@ -1200,7 +1204,7 @@ pub struct ImageDescribeReq {
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
     #[schema(min = 8, max = 400)]
     pub max_words: Option<i64>,
-    /// the describer: a chat model that reads pictures (qwen3.8-27b-q4-describe, qwen3.8-27b-q4 ...); default the loaded chat model when it reads pictures, else the enabled one that takes the least memory
+    /// describer's older name: a describer's id (qwen3.8-27b-q4-describe ...), the same as describer: <id> (with describer absent or best); beside describer native or another id: invalid_params
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)
@@ -1239,6 +1243,15 @@ pub struct ImageDescribeReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(default = true)]
     pub wait: Option<bool>,
+    /// what else the caller sent: passed on as it came
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
+}
+
+/// What image.describers takes.
+#[derive(Deserialize, Serialize, Rpc)]
+#[allow(non_snake_case)]
+pub struct ImageDescribersReq {
     /// what else the caller sent: passed on as it came
     #[serde(flatten)]
     pub rest: serde_json::Map<String, serde_json::Value>,
@@ -3094,6 +3107,12 @@ fn image_describe(h: &Arc<Home>, req: ImageDescribeReq) -> Answer {
     h.legacy("image.describe", req)
 }
 
+/// The box's describers for image.describe's describer (a UI's "Describe with" list): every chat model that reads pictures and every image model's text encoder that can describe, downloaded or a card's - id, name, base model, size, the image models whose encoder it is; best and native are the two words beside them
+#[rpc(name = "image.describers", tags = "image", example = r#"{}"#)]
+fn image_describers(h: &Arc<Home>, req: ImageDescribersReq) -> Answer {
+    h.legacy("image.describers", req)
+}
+
 /// The model's defaults, samplers, schedules, options and LoRAs (loaded: from the server)
 #[rpc(name = "image.info", tags = "image", example = r#"{}"#)]
 fn image_info(h: &Arc<Home>, req: ImageInfoReq) -> Answer {
@@ -3514,7 +3533,7 @@ rpcgen::rpc_methods![sync Arc<Home>, RpcFail;
     system_gpus, system_disable, system_load, system_unload, system_pin, system_unpin, system_eta, system_config, system_config_set,
     system_restart, system_maintenance, system_drives, system_drive_measure, system_move, system_move_cancel,
     llm_chat, llm_requests, llm_models, llm_describe_prompt_guide_md, image_generate, image_edit,
-    image_upscale, image_vectorize, image_remove_background, video_upscale, image_ocr, image_describe, image_info, image_status,
+    image_upscale, image_vectorize, image_remove_background, video_upscale, image_ocr, image_describe, image_describers, image_info, image_status,
     image_jobs, image_queue_list, image_queue_move, image_queue_pause, image_queue_resume, image_upload,
     image_cancel, image_canvases_list, image_progress, image_history, image_describe_prompt_guide_md, audio_generate,
     audio_speak, audio_transcribe, audio_voices_list, audio_voices_add, audio_voices_design, audio_voices_enroll, audio_voices_remove,

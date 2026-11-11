@@ -37,3 +37,6 @@ files:
     sha256: 7f5bed402dc8c77dc2e0ab1929a85d4df433b7cf7b599dfa8c353da98db0b90a
     path: ming-image-0.1/ming_image_vae_bf16.safetensors
 guide: guides/ming-image.md
+encoder:                         # its text encoder (image.describe describer native: none - it reads no pictures)
+  name: Ling-Mini-2.0
+  sees: false

@@ -3,6 +3,7 @@
 id: qwen3.8-27b-q8-256k
 kind: llm
 arch: qwen35
+base_model: Qwen3.8-27B             # image.describe: the language model it is (image.describers)
 title: Qwen3.8-27B Q8_0 (8-bit; both GPUs, 256K + 32K)
 about: 'Qwen''s dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; Unsloth''s GGUF - the most faithful; 27 GiB'
 gpus: all

@@ -3,6 +3,7 @@
 id: qwen3.8-27b-q4
 kind: llm
 arch: qwen35
+base_model: Qwen3.8-27B             # image.describe: the language model it is (image.describers)
 title: Qwen3.8-27B UD-Q4_K_M (4-bit; the B70, 128K + 32K)
 about: 'Qwen''s dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; Unsloth''s GGUF - Unsloth''s dynamic 4-bit; 15 GiB'
 gpus: '0'

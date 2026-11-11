@@ -31,3 +31,7 @@ files:
   vision: h3-te-visual
   vae: h3i-vae
 guide: guides/minimax-h3-image.md
+encoder:                         # its text encoder (image.describe describer native: none)
+  name: Qwen3-VL-32B, MiniMax H3's
+  sees: true
+  why: 'the file stops after layer 50 of the 64, with no final norm or output head: it gives hidden states and cannot write text'

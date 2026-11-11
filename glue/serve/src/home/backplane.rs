@@ -299,16 +299,16 @@ impl Home {
     /// The model a request would run on, without loading or fetching anything: the one it names, else the loaded or
     /// first enabled one that does the method ("" when none does)
     pub(super) fn request_model(&self, method: &str, b: &Value, all: &[Value]) -> String {
+        // a describe's describer, as image.describe picks it (describer best | native | an id, or model)
+        if method == "image.describe" {
+            return self.describer_choice(b, all).map(|c| c.id).unwrap_or_default();
+        }
         if let Some(id) = b["model"].as_str().filter(|x| !x.is_empty()) {
             return id.to_string();
         }
         // a clip's engine is what the request says, loaded or not
         if method == "video.generate" {
             return clip_model(b, all).unwrap_or_default();
-        }
-        // a describe's chat model, as image.describe picks it
-        if method == "image.describe" {
-            return super::api::describe_pick(all, self.chat_loaded(all).as_deref()).unwrap_or_default();
         }
         let can: Vec<String> = all.iter().filter(|m| m["enabled"] != false && super::life::capabilities(m).1.contains(&method)).map(|m| s(m, "id")).collect();
         let loaded = |id: &String| match all.iter().find(|m| m["id"] == id.as_str()).map_or("", registry::kind_of) {
@@ -384,8 +384,10 @@ impl Home {
     pub(crate) fn eta_for(&self, method: &str, b: &Value, exclude: Option<&str>) -> Value {
         let all = self.models();
         let model = self.request_model(method, b, &all);
-        // image.describe waits in the image queue but runs on a chat model: hot when that one is loaded
-        let kind = if method == "image.describe" { "llm" } else { super::jobs::kind_of_method(method) };
+        // image.describe waits in the image queue but runs on a chat model (hot when that one is loaded), or - a native
+        // describer - on an image server like any image model
+        let native = method == "image.describe" && all.iter().any(|m| m["id"] == model.as_str() && crate::describe::is_native(m));
+        let kind = if method == "image.describe" && !native { "llm" } else { super::jobs::kind_of_method(method) };
         let (hot, ahead) = match kind {
             "image" | "audio" | "model3d" => {
                 let sv = self.servers(kind);

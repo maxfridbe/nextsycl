@@ -32,3 +32,6 @@ files:
   vae: z-image-turbo-vae
   tokenizer: z-image-turbo-tokenizer
 guide: guides/z-image-turbo.md
+encoder:                         # its text encoder (image.describe describer native: none - it reads no pictures)
+  name: Qwen3-4B
+  sees: false

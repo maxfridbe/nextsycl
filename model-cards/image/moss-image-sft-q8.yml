@@ -35,3 +35,6 @@ files:
     sha256: c3bdf94dc67ec69b30ea9fe1fa8340085679cae64d019f7c7e4a9921f1a7f17a
     path: moss-image/vae/diffusion_pytorch_model.safetensors
 guide: guides/moss-image.md
+encoder:                         # its text encoder (image.describe describer native: none - its file holds no vision tower)
+  name: Qwen3.5-9B, text weights only
+  sees: false

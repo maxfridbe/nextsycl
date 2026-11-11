@@ -596,6 +596,11 @@ export interface ImageDescribeReq {
    * @maxLength 60
    */
   batch?: string | null;
+  /**
+   * who reads the picture: best (default: a chat model that reads pictures - the one model names, else the loaded one when it reads pictures, else the enabled one that takes the least memory), native (the target image model's own text encoder; a family target: that family's enabled model whose encoder describer takes the least memory) or a describer's id (image.describers)
+   * @maxLength 120
+   */
+  describer?: string | null;
   /** how long a prompt: short (~35 words, 12 tags), medium (default: ~90 words, 25 tags), long (~170 words, 45 tags) */
   detail?: DescribeDetail | null;
   /**
@@ -644,7 +649,7 @@ export interface ImageDescribeReq {
    * @maximum 400
    */
   max_words?: number | null;
-  /** the describer: a chat model that reads pictures (qwen3.8-27b-q4-describe, qwen3.8-27b-q4 ...); default the loaded chat model when it reads pictures, else the enabled one that takes the least memory */
+  /** describer's older name: a describer's id (qwen3.8-27b-q4-describe ...), the same as describer: <id> (with describer absent or best); beside describer native or another id: invalid_params */
   model?: string | null;
   /**
    * a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)
@@ -695,6 +700,12 @@ export interface ImageDescribeReq {
    * @default true
    */
   wait?: boolean | null;
+  /** other keys */
+  [key: string]: unknown;
+}
+
+/** What image.describers takes. */
+export interface ImageDescribersReq {
   /** other keys */
   [key: string]: unknown;
 }
@@ -2649,6 +2660,11 @@ export interface Methods {
    */
   "image.describe": { req: ImageDescribeReq; resp: any };
   /**
+   * The box's describers for image.describe's describer (a UI's "Describe with" list): every chat model that reads pictures and every image model's text encoder that can describe, downloaded or a card's - id, name, base model, size, the image models whose encoder it is; best and native are the two words beside them
+   * @tags image
+   */
+  "image.describers": { req: ImageDescribersReq; resp: any };
+  /**
    * The model's defaults, samplers, schedules, options and LoRAs (loaded: from the server)
    * @tags image
    * @example {}
@@ -3050,7 +3066,7 @@ export interface Methods {
 }
 
 /** The methods that take no parameters (their body may be left out). */
-export type NoParamMethods = "system.state" | "system.busy" | "system.ping" | "system.version" | "system.models" | "system.models.pulls" | "system.cards" | "system.config" | "system.drives" | "system.move.cancel" | "llm.requests" | "llm.models" | "image.queue.list" | "image.progress" | "image.history" | "audio.progress" | "audio.history" | "audio.queue.list" | "model3d.progress" | "model3d.history" | "model3d.queue.list" | "video.queue.list" | "video.projects.list" | "video.films.list" | "video.templates.list" | "video.canvases.list" | "video.summary";
+export type NoParamMethods = "system.state" | "system.busy" | "system.ping" | "system.version" | "system.models" | "system.models.pulls" | "system.cards" | "system.config" | "system.drives" | "system.move.cancel" | "llm.requests" | "llm.models" | "image.describers" | "image.queue.list" | "image.progress" | "image.history" | "audio.progress" | "audio.history" | "audio.queue.list" | "model3d.progress" | "model3d.history" | "model3d.queue.list" | "video.queue.list" | "video.projects.list" | "video.films.list" | "video.templates.list" | "video.canvases.list" | "video.summary";
 
 /** Every error's body, whatever the HTTP status: branch on `code`, never on the status (docs/RPC_RULES.md). */
 export interface RpcError {
@@ -3293,6 +3309,11 @@ export function client(post: Post, raw?: PostRaw) {
      * @example {"detail":"medium","image":"upload:up_1792400000_harbour.png","label":"harbour-prompt","target":"z-image-turbo"}
      */
     "image.describe": (req: ImageDescribeReq): Promise<any> => post("image.describe", req),
+    /**
+     * The box's describers for image.describe's describer (a UI's "Describe with" list): every chat model that reads pictures and every image model's text encoder that can describe, downloaded or a card's - id, name, base model, size, the image models whose encoder it is; best and native are the two words beside them
+     * @tags image
+     */
+    "image.describers": (req: ImageDescribersReq = {}): Promise<any> => post("image.describers", req),
     /**
      * The model's defaults, samplers, schedules, options and LoRAs (loaded: from the server)
      * @tags image

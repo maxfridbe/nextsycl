@@ -584,6 +584,7 @@ dependencies = [
  "nextsycl-image-starvector",
  "nextsycl-image-unlimitedocr",
  "nextsycl-image-upscale",
+ "nextsycl-image-vldescribe",
  "nextsycl-image-zimage",
  "nextsycl-llm",
  "nextsycl-llm-deepseek2",
@@ -974,6 +975,16 @@ dependencies = [
  "nextsycl-core",
  "nextsycl-diffusion",
  "nextsycl-image",
+]
+
+[[package]]
+name = "nextsycl-image-vldescribe"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-image",
+ "nextsycl-qwen3vl",
 ]
 
 [[package]]

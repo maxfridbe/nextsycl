@@ -184,6 +184,13 @@ impl Drop for Lease<'_> {
     }
 }
 
+/// Whether an image model that draws can describe a picture itself (image.describe `describer: native`, capability
+/// `describe_native`): a native describer card reads its card's text encoder file
+pub(crate) fn describes_native(m: &Value, all: &[Value], cards: &[Value]) -> bool {
+    registry::kind_of(m) == "image" && crate::describe::Family::of_arch(&s(m, "arch")).is_some()
+        && crate::describe::native_for_model(&s(m, "id"), all, cards).is_ok()
+}
+
 /// What a model can do, in neutral words (a client picks a model by them, on any box): its tags, and the /rpc
 /// methods that take it
 pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) {
@@ -203,6 +210,8 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
             (c, vec!["llm.chat"])
         }
         "image" if arch.contains("ocr") => (vec!["ocr", "read_pages", "pdf"], vec!["image.ocr"]),
+        // an image model's text encoder as a describer (image.describe describer native): it reads, it does not draw
+        "image" if arch == crate::describe::NATIVE_ARCH => (vec!["vision", "describe"], vec!["image.describe"]),
         "image" if arch == "realesrgan" || arch == "waifu2x" => (vec!["upscale", "upscale_video", "tiles"], vec!["image.upscale", "video.upscale"]),
         // a clip upscaled whole (frames in chunks together: steady over time)
         "image" if arch == "seedvr2" => (vec!["upscale", "upscale_video", "temporal"], vec!["image.upscale", "video.upscale"]),
@@ -548,6 +557,9 @@ impl Home {
         // the model cards, read once: for the headroom of entries registered before cards carried it
         // and whether a chat model spans every card
         let mc = if all.iter().all(|m| m.get("headroom_gib").is_some()) && !need("llm") { Vec::new() } else { self.o.cfg.cards() };
+        // and for an image model whether its text encoder describes (a native describer card reads its file)
+        let dc = if need("image") && mc.is_empty() { self.o.cfg.cards() } else { Vec::new() };
+        let dc = if mc.is_empty() { &dc } else { &mc };
         let holds = self.holds();
         all.iter().filter(|m| registry::kind_of(m) != "lora").map(|m| {
             let (id, kind) = (s(m, "id"), registry::kind_of(m).to_string());
@@ -590,7 +602,10 @@ impl Home {
             if !enabled && state == "unloaded" {
                 state = "disabled";
             }
-            let (caps, methods) = capabilities(m);
+            let (mut caps, methods) = capabilities(m);
+            if describes_native(m, all, dc) {
+                caps.push("describe_native");
+            }
             // the profile its model card says ("unmeasured" until a bench does) and the copies running now
             let prof = self.profile_of(m);
             let (concurrency, coexistence) = prof.to_json();
