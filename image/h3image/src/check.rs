@@ -204,6 +204,10 @@ fn expansions(e: &H3Image, log: &mut dyn FnMut(String)) -> Result<f64> {
         log("expand         an int8 checkpoint: nothing expanded".into());
         return Ok(0.0);
     };
+    if e.blocks.product.is_some() {
+        log("expand         the silo's own products (Q8_0 repacked): nothing expanded (NS_H3I_Q8_PRODUCT=0 to compare)".into());
+        return Ok(0.0);
+    }
     let other = Tensor::new(&e.dev, DType::BF16, &wbuf.shape).map_err(h3e)?;
     let file = Checkpoint::open(&e.ck.path).map_err(h3e)?;
     let n_blocks = e.blocks.blocks.len();

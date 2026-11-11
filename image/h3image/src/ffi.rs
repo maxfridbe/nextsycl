@@ -1,6 +1,6 @@
 //! The silo (kernels/image/h3image/silo/silo.h, `dist/silo/libnextsycl-h3image.so`: P-H3-Image's silo copied - the same
 //! H3 denoiser attention): the long-sequence attention with its own preparation passes, and the GGUF block matrices'
-//! expansion to bfloat16 (Q3_K read as stored). Without the file (or with
+//! expansion to bfloat16 (Q3_K read as stored), and Q8_0 products with no expansion. Without the file (or with
 //! NS_SILO=0) the blocks use the shared kernels'.
 
 use std::ffi::c_void;
@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use nextsycl_core::Gpu;
 use nextsycl_h3::device::Tensor;
-use nextsycl_h3::dit::{AttentionFn, ExpandFn};
+use nextsycl_h3::dit::{AttentionFn, ExpandFn, ProductFn};
 use nextsycl_h3::dtype::DType;
 use nextsycl_h3::gguf::GType;
 use nextsycl_h3::ops::KLinear;
@@ -23,6 +23,60 @@ pub struct Silo {
     pub sage: unsafe extern "C" fn(*mut c_void, *const c_void, i64, i64, i64, i64, *mut c_void) -> i32,
     pub expand_supported: unsafe extern "C" fn(i32) -> i32,
     pub expand: unsafe extern "C" fn(*mut c_void, *const c_void, i32, i64, *mut c_void) -> i32,
+    pub q8_repack: unsafe extern "C" fn(*mut c_void, *mut c_void, i64, i64, *mut c_void) -> i32,
+    pub q8_linear: unsafe extern "C" fn(*mut c_void, *const c_void, i64, i64, *const c_void, i64, *mut c_void) -> i32,
+}
+
+fn silo_error(what: &str) -> Error {
+    Error(format!("the silo's {what}: {}", nextsycl_core::api().map(|a| a.error()).unwrap_or_default()))
+}
+
+/// Every Q8_0 block matrix of `blocks` rewritten in place for the silo's product (int8 values, then the half scales
+/// [K / 32, N]: the same bytes a block), through the stack's expansion buffer; then the products are the silo's
+/// (`q8_product`) - the shared expansion can no longer read these matrices. The count rewritten.
+pub fn q8_repack(gpu: &Gpu, s: &Silo, blocks: &nextsycl_h3::dit::Blocks) -> nextsycl_h3::Result<usize> {
+    use nextsycl_h3::dit::Weight;
+    let tmp = blocks.expansion_buffer().ok_or("q8 repack: no expansion buffer")?;
+    let mut n = 0;
+    for b in &blocks.blocks {
+        for w in b.linears() {
+            let Weight::K(l) = w else { continue };
+            if l.kind != GType::Q8_0 {
+                continue;
+            }
+            if tmp.buf.len() < l.blocks.buf.len() || l.blocks.buf.len() != GType::Q8_0.bytes(l.n * l.k) {
+                return Err(Error(format!("q8 repack: {} bytes of blocks for [{}, {}], a buffer of {}", l.blocks.buf.len(), l.n, l.k, tmp.buf.len())));
+            }
+            // SAFETY: device buffers on the GPU's queue, sizes checked above; the call waits.
+            if unsafe { (s.q8_repack)(gpu.raw(), l.blocks.buf.ptr(), l.n as i64, l.k as i64, tmp.buf.ptr()) } != 0 {
+                return Err(silo_error("Q8_0 repack"));
+            }
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// The products with repacked Q8_0 block matrices (`q8_repack`) on the silo: oneDNN's int8 weight decompression,
+/// bfloat16 activations, no expansion
+pub fn q8_product(gpu: &Arc<Gpu>, s: &'static Silo) -> ProductFn {
+    let gpu = gpu.clone();
+    Box::new(move |l: &KLinear, x: &Tensor, out: &Tensor| {
+        if l.kind != GType::Q8_0 {
+            return Ok(false);
+        }
+        let m = x.elements() / l.k;
+        if x.dtype != DType::BF16 || out.dtype != DType::BF16 || x.elements() != m * l.k || out.elements() != m * l.n {
+            return Err(Error(format!("q8 product: x {:?} {:?}, out {:?} {:?} for a [{}, {}] matrix (bfloat16 only: the matrix is repacked)",
+                                     x.dtype, x.shape, out.dtype, out.shape, l.n, l.k)));
+        }
+        // SAFETY: device buffers on the GPU's queue, sizes checked above.
+        let rc = unsafe { (s.q8_linear)(gpu.raw(), x.buf.ptr().cast_const(), m as i64, l.k as i64, l.blocks.buf.ptr().cast_const(), l.n as i64, out.buf.ptr()) };
+        if rc != 0 {
+            return Err(silo_error("Q8_0 product"));
+        }
+        Ok(true)
+    })
 }
 
 /// The GGUF type code the silo's expansion takes for `kind` (None: not one it reads)
@@ -91,6 +145,8 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             sage: sym!("ns_image_h3i_silo_sage"),
             expand_supported: sym!("ns_image_h3i_silo_expand_supported"),
             expand: sym!("ns_image_h3i_silo_expand"),
+            q8_repack: sym!("ns_image_h3i_silo_q8_repack"),
+            q8_linear: sym!("ns_image_h3i_silo_q8_linear"),
         }))
     })
     .as_ref()

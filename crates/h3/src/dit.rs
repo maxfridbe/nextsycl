@@ -291,6 +291,10 @@ pub type AttentionFn = Box<dyn Fn(Rows, Rows, Rows, &Tensor) -> Result<bool> + S
 /// matrix, the buffer), used where it returns true; false (or none set) leaves it to the shared kernels' nsd_dequant
 pub type ExpandFn = Box<dyn Fn(&KLinear, &Tensor) -> Result<bool> + Send + Sync>;
 
+/// Another engine's whole product with a k-quant block matrix (the matrix, x, out), with no expansion: true when it
+/// did it; false leaves the expansion and the product to the rest
+pub type ProductFn = Box<dyn Fn(&KLinear, &Tensor, &Tensor) -> Result<bool> + Send + Sync>;
+
 /// The block stack.
 pub struct Blocks {
     pub cfg: Config,
@@ -304,6 +308,8 @@ pub struct Blocks {
     pub attention: Option<AttentionFn>,
     /// the k-quant expansion, when an engine brings its own (MiniMax-H3-Image's silo); else the shared kernels'
     pub expand: Option<ExpandFn>,
+    /// the k-quant products themselves, when an engine brings them (MiniMax-H3-Image's Q8_0); tried first
+    pub product: Option<ProductFn>,
 }
 
 impl Blocks {
@@ -336,7 +342,7 @@ impl Blocks {
             }
             None => None,
         };
-        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf, attention: None, expand: None })
+        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf, attention: None, expand: None, product: None })
     }
 
     /// `out = linear(x)` with one of the blocks' matrices.
@@ -344,6 +350,11 @@ impl Blocks {
         match w {
             Weight::I8(l) => l.forward(x, out),
             Weight::K(l) => {
+                if let Some(f) = &self.product {
+                    if f(l, x, out)? {
+                        return Ok(());
+                    }
+                }
                 let wbuf = self.wbuf.as_ref().ok_or("a k-quant matrix without its expansion buffer")?;
                 match &self.expand {
                     Some(f) if f(l, wbuf)? => l.product(x, out, wbuf),

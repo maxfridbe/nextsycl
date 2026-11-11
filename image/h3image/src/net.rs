@@ -221,6 +221,15 @@ pub fn stage_of(tap: &str) -> &'static str {
     }
 }
 
+/// A step made ready (`Run::prepare`)
+pub struct Prepared {
+    pub sigma: f32,
+    sigma_in: f32,
+    ts: Timesteps,
+    t_emb: Vec<f32>,
+    step: Step,
+}
+
 /// One picture's network: the refined text, the layout, the edit's conditioning rows and the buffers
 pub struct Run<'a> {
     pub blocks: &'a Blocks,
@@ -293,9 +302,30 @@ impl<'a> Run<'a> {
     /// The network at noise level `sigma` for a step to `next`: latents [24, h, w] in, the velocity out (the negated
     /// heads, as the reference returns them). `between(i)` before block i (an error stops).
     pub fn net(&mut self, latent: &[f32], sigma: f32, next: f32, between: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
+        let p = self.prepare(sigma)?;
+        self.net_prepared(p, latent, next, between)
+    }
+
+    /// What a step at noise level `sigma` fixes before the blocks run (the timestep rows, the tables of every block,
+    /// the rotations): host work and small uploads, which a sampler can make for the next step on another thread
+    /// while the card runs this one
+    pub fn prepare(&self, sigma: f32) -> Result<Prepared> {
+        let cfg = &self.blocks.cfg;
+        let dev = self.x.buf.device();
+        // the model gets sigma as timestep = sigma * 1000 and divides it again
+        let sigma_in = (sigma * 1000.0) / 1000.0;
+        let ts = self.timesteps(sigma_in);
+        let t_emb = ts.embeddings(&self.outer.t_table, cfg.t_dim);
+        let step = Step::new(dev, self.blocks, &ts.rows, &self.layout.positions, &self.outer.inv_freq, &t_emb)?;
+        Ok(Prepared { sigma, sigma_in, ts, t_emb, step })
+    }
+
+    /// The network for a prepared step (`prepare(sigma)`) to `next`: as `net`
+    pub fn net_prepared(&self, p: Prepared, latent: &[f32], next: f32, between: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
         let cfg = self.blocks.cfg;
         let o = self.outer;
         let dev = self.x.buf.device().clone();
+        let Prepared { sigma, sigma_in, ts, t_emb, step } = p;
         let profiling = self.profile;
         let mut prof = Profile::default();
         if profiling {
@@ -310,12 +340,6 @@ impl<'a> Run<'a> {
             }
             Ok(())
         };
-        // the model gets sigma as timestep = sigma * 1000 and divides it again
-        let sigma_in = (sigma * 1000.0) / 1000.0;
-        let ts = self.timesteps(sigma_in);
-        let t_emb = ts.embeddings(&o.t_table, cfg.t_dim);
-        let step = Step::new(&dev, self.blocks, &ts.rows, &self.layout.positions, &o.inv_freq, &t_emb)?;
-        lap(&mut prof, &mut clock, "step tables")?;
         let (tx, img) = (self.layout.segment(Kind::Text).ok_or("no text rows")?, self.layout.segment(Kind::Video).ok_or("no image rows")?);
         let n = img.stop - img.start;
         if latent.len() != LATENT_C * self.h * self.w || n * PATCH * PATCH != self.h * self.w {

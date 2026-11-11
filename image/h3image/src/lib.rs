@@ -67,6 +67,9 @@ const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "te-pin", env: "H3_TE_PIN", value: "0|1", help: "keep the text encoder in pinned host memory between requests (default 1 when the host has the room)", at: At::Load },
     EngineOption { name: "sage-min-s", env: "NS_H3I_SAGE_MIN_S", value: "TOKENS", help: "the shortest denoiser sequence the silo's SageAttention takes (default 1024; shorter: oneDNN's)", at: At::Load },
     EngineOption { name: "silo-expand", env: "NS_H3I_SILO_EXPAND", value: "0|1", help: "the silo's GGUF expansion to bfloat16, Q3_K read as stored (default 1; 0: the shared kernels', Q3_K held as Q6_K)", at: At::Load },
+    EngineOption { name: "q8-product", env: "NS_H3I_Q8_PRODUCT", value: "0|1", help: "Q8_0: the silo's products read the int8 values (oneDNN weight decompression; default 1; 0: expanded to bfloat16 first)", at: At::Load },
+    EngineOption { name: "keep-refiner", env: "NS_H3I_KEEP_REFINER", value: "0|1", help: "keep the token refiner on the card between pictures (default 1; 0: loaded for each picture)", at: At::Load },
+    EngineOption { name: "keep-encoder", env: "NS_H3I_KEEP_ENCODER", value: "0|1", help: "keep the VAE encoder on the card from the first edit on (default 1; 0: loaded for each edit)", at: At::Load },
     EngineOption { name: "profile", env: "NS_H3I_PROFILE", value: "0|1", help: "debug: each step's time by stage on stderr (the queue drained between stages)", at: At::Load },
     EngineOption { name: "sigmas", env: "", value: "S,S,..,0", help: "another sampling grid than the heads' six steps: strictly falling from 1, ending at 0", at: At::Request },
 ];
@@ -133,6 +136,11 @@ pub struct H3Image {
     busy: Mutex<()>,
     /// NS_H3I_PROFILE: each step's time by stage
     pub profile: bool,
+    /// the token refiner, loaded once (NS_H3I_KEEP_REFINER, default on); None: loaded for each picture
+    refiner: Option<TextRefiner>,
+    /// the VAE encoder of edits, kept from the first edit (NS_H3I_KEEP_ENCODER, default on)
+    encoder: Mutex<Option<nextsycl_h3::venc::VideoEncoder>>,
+    keep_encoder: bool,
 }
 
 fn role<'f>(files: &'f ModelFiles, r: &str) -> Result<&'f Path> {
@@ -166,11 +174,18 @@ impl H3Image {
             blocks.attention = Some(ffi::attention(&gpu, s, min_s));
             log(format!("{ARCH}: the {} silo's attention from {min_s} tokens", ffi::SILO));
         }
+        let on = |name: &str| o.setting(name).is_none_or(|v| v != "0");
         if let (Some(s), Some(kind)) = (expand, blocks.kquant) {
             if ffi::expands(s, kind) {
                 blocks.expand = Some(ffi::expander(&gpu, s));
                 log(format!("{ARCH}: the {} silo's {kind:?} expansion", ffi::SILO));
             }
+        }
+        // Q8_0: the silo's products read the int8 values themselves (NS_H3I_Q8_PRODUCT, default on)
+        if let Some(s) = silo.filter(|_| blocks.kquant == Some(nextsycl_h3::gguf::GType::Q8_0) && on("NS_H3I_Q8_PRODUCT")) {
+            let n = ffi::q8_repack(&gpu, s, &blocks).map_err(h3e)?;
+            blocks.product = Some(ffi::q8_product(&gpu, s));
+            log(format!("{ARCH}: the {} silo's Q8_0 products ({n} matrices repacked, no expansion)", ffi::SILO));
         }
         let outer = net::Outer::load(&dev, &ck, &blocks.cfg).map_err(h3e)?;
         let form = match ck.entries.values().find(|e| e.name == "blocks.0.mlp.fc1.weight") {
@@ -185,6 +200,15 @@ impl H3Image {
         }
         log(format!("{ARCH}: VAE decoder {:.2} GiB in {:.1} s; {:.1} GiB used on the card", decoder.load_bytes as f64 / (1u64 << 30) as f64,
                     decoder.load_seconds, dev.mem_used() as f64 / (1u64 << 30) as f64));
+        let refiner = if on("NS_H3I_KEEP_REFINER") {
+            let before = dev.mem_used();
+            let r = TextRefiner::load(&dev, &ck, threads).map_err(h3e)?;
+            log(format!("{ARCH}: token refiner {:.2} GiB, kept", (dev.mem_used() - before) as f64 / (1u64 << 30) as f64));
+            Some(r)
+        } else {
+            None
+        };
+        let keep_encoder = on("NS_H3I_KEEP_ENCODER");
         let profile = o.setting("NS_H3I_PROFILE").is_some_and(|v| v != "0" && !v.is_empty());
         if profile {
             if let Some(kind) = blocks.kquant {
@@ -192,7 +216,7 @@ impl H3Image {
             }
         }
         Ok(H3Image { gpu, dev, ck, blocks, outer, decoder, files: files.clone(), threads, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64(),
-                     busy: Mutex::new(()), profile })
+                     busy: Mutex::new(()), profile, refiner, encoder: Mutex::new(None), keep_encoder })
     }
 
     /// The tokenizer's directory (vocab.json, merges.txt, tokenizer_config.json)
@@ -230,8 +254,10 @@ impl H3Image {
         let k = self.ck.get("condition_proj.weight").map_err(h3e)?.shape[1];
         let t = cond.len() / k;
         let c = Tensor::from_bytes(&self.dev, DType::BF16, &[t, k], &bf16_bytes(cond)).map_err(h3e)?;
-        let refiner = TextRefiner::load(&self.dev, &self.ck, self.threads).map_err(h3e)?;
-        let out = refiner.run(&self.blocks.cfg, &c, None).map_err(h3e)?;
+        let out = match &self.refiner {
+            Some(r) => r.run(&self.blocks.cfg, &c, None).map_err(h3e)?,
+            None => TextRefiner::load(&self.dev, &self.ck, self.threads).map_err(h3e)?.run(&self.blocks.cfg, &c, None).map_err(h3e)?,
+        };
         self.dev.wait().map_err(h3e)?;
         Ok(out)
     }
@@ -239,7 +265,20 @@ impl H3Image {
     /// An edit's pictures as conditioning latents [24, h, w] (normalized), each at its VAE size (short edge within
     /// 1,024 .. 2,048)
     pub fn reference_latents(&self, pics: &[Picture]) -> Result<Vec<(Vec<f32>, usize, usize)>> {
-        let enc = nextsycl_h3::venc::VideoEncoder::load(&self.dev, &Checkpoint::open(role(&self.files, "vae")?).map_err(h3e)?).map_err(h3e)?;
+        let mut kept = self.encoder.lock().unwrap_or_else(|p| p.into_inner());
+        let loaded;
+        let enc = match kept.as_ref() {
+            Some(e) => e,
+            None => {
+                let e = nextsycl_h3::venc::VideoEncoder::load(&self.dev, &Checkpoint::open(role(&self.files, "vae")?).map_err(h3e)?).map_err(h3e)?;
+                if self.keep_encoder {
+                    kept.insert(e)
+                } else {
+                    loaded = e;
+                    &loaded
+                }
+            }
+        };
         let (mean, std) = enc.latent_stats();
         let mut out = Vec::with_capacity(pics.len());
         for p in pics {
@@ -268,11 +307,25 @@ impl H3Image {
             eprintln!("profile: the picture's buffers and conditioning rows {:.0} ms", t_run.elapsed().as_secs_f64() * 1e3);
             run.profile = true;
         }
-        for i in 0..sigmas.len() - 1 {
-            let v = run.net(&x, sigmas[i], sigmas[i + 1], &mut |_| Ok(())).map_err(h3e)?;
-            net::euler(&mut x, &v, sigmas[i], sigmas[i + 1]);
-            step(i)?;
-        }
+        let run = &run;
+        // the next step's tables made on another thread while the card runs this one (40 ms of host work a step)
+        std::thread::scope(|sc| -> Result<()> {
+            let mut ahead: Option<std::thread::ScopedJoinHandle<nextsycl_h3::Result<net::Prepared>>> = None;
+            for i in 0..sigmas.len() - 1 {
+                let p = match ahead.take() {
+                    Some(h) => h.join().map_err(|_| Error("the step tables' thread panicked".into()))?,
+                    None => run.prepare(sigmas[i]),
+                }
+                .map_err(h3e)?;
+                if let Some(&s) = sigmas.get(i + 1).filter(|_| i + 2 < sigmas.len()) {
+                    ahead = Some(sc.spawn(move || run.prepare(s)));
+                }
+                let v = run.net_prepared(p, &x, sigmas[i + 1], &mut |_| Ok(())).map_err(h3e)?;
+                net::euler(&mut x, &v, sigmas[i], sigmas[i + 1]);
+                step(i)?;
+            }
+            Ok(())
+        })?;
         Ok(x)
     }
 }

@@ -31,6 +31,14 @@ int ns_image_h3i_silo_expand_supported(int qtype);
  * work-item from 16-byte loads (expand.cpp) */
 int ns_image_h3i_silo_expand(ns_gpu* g, const void* src, int qtype, int64_t n, void* out);
 
+/* A Q8_0 matrix [N, K] (its GGUF blocks, in device memory) rewritten in place as the int8 values [N, K] followed by
+ * the half scales [K / 32, N] (the same 34 bytes a block), through `tmp` (at least N K 34 / 32 bytes); waits (q8.cpp) */
+int ns_image_h3i_silo_q8_repack(ns_gpu* g, void* blocks, int64_t N, int64_t K, void* tmp);
+
+/* out [M, N] = x [M, K] . W^T, x and out bfloat16, W a repacked Q8_0 matrix (q8_repack): oneDNN's weight
+ * decompression (int8, half scales every 32 along K, fpmath bf16) - no expansion pass */
+int ns_image_h3i_silo_q8_linear(ns_gpu* g, const void* x, int64_t M, int64_t K, const void* w, int64_t N, void* out);
+
 #ifdef __cplusplus
 }
 #endif
