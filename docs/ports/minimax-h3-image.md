@@ -164,9 +164,38 @@ run's end latents move more from run to run: int8 three runs 1.41e-1, 1.17e-1, 1
 | final latents | 1.2e-1 | 1.1e-1 | 2.7e-1 | 3.8e-1 | 5.3e-1 |
 | first pass: velocity / worst cosine | same digits | 2.1e-2 - 5.3e-2 / 0.99860 | 5.6e-2 - 1.2e-1 / 0.99330 | 9.2e-2 - 1.3e-1 / 0.99104 | 1.6e-1 - 2.5e-1 / 0.96938 |
 
-### Speed now (6 steps, seconds: steps / all = + refiner + decode; card GiB at 16.8 MP)
+### Speed now (6 denoiser steps, seconds; before = the first pass's tables above)
 
-TBD
+The second picture of n = 2 (no text encoder); "steps" only. Add the refiner (loaded per picture: 0.08 - 0.13 s) and the
+decode (0.09 s at 1 MP, 0.45 at 4, 0.83 at 8.5, 1.64 at 16.8 on the B70; 0.13 / 0.64 / 1.17 / 2.33 on the B65). Card
+0 had 10 - 15 GB of another, idle workload resident during these runs (the front door reported no card busy): run-to-run
+spread is about 1 %.
+
+| B70 | Q4_K_M before -> now | Q8_0 | Q5_K_M | Q3_K_M | int8 |
+|---|---|---|---|---|---|
+| 1 MP | 3.72 -> 3.68 | - -> 2.64 (expanded: 4.06) | - -> 3.72 | - -> 3.87 | 1.84 -> 1.83 |
+| 4 MP | 10.52 -> 10.44 | 10.83 -> 10.02 | 10.58 -> 10.58 | 10.66 -> 10.61 | 6.54 -> 6.50 |
+| 8.5 MP | 22.27 -> 22.22 | - -> 21.79 | - | - -> 22.30 (a) | 14.57 -> 14.55 |
+| 16.8 MP | 50.27 -> 50.17 | 50.58 -> 50.18 | 50.36 -> 50.28 | 50.08 -> 49.93 | 35.77 -> 35.69 |
+| card after load, GiB | 11.1 | 20.1 | 13.4 | 15.8 -> **8.8** | 18.7 |
+| card peak at 16.8 MP (b) | 14.4 | 22.9 (c) | 16.5 | 18.8 -> **12.1** | 21.7 |
+
+| B65 | Q4_K_M before -> now | int8 |
+|---|---|---|
+| 1 MP | 5.45 -> 5.25 | 2.75 -> 2.74 |
+| 4 MP | 15.88 -> 15.63 | 9.94 -> 9.88 |
+| 8.5 MP | 34.63 -> 34.38 | 22.34 -> 22.32 |
+| 16.8 MP | 79.01 -> 78.74 | 55.32 -> 55.30 |
+
+(a) the build with one product over all rows (8.5 MP is 10,629 rows: one chunk more); 1 MP is under 8,192 rows either
+way. (b) the front door's reading, 10^6-byte MB / 2^30 as the first pass gave it. (c) not remeasured without the kept
+refiner: the Q8_0 repack is in place (same bytes) and adds no buffer.
+
+The int8 file's code path is unchanged by this pass (its numbers are a re-measure). In short: Q8_0 is now the fastest
+GGUF up to 4 MP (-28 % at 1 MP against Q4_K_M, -7.5 % at 4 MP against its own first pass); Q3_K_M is now the smallest file
+on the card (8.8 GiB after load against Q4_K_M's 11.1) at Q4_K_M's speed; Q4_K_M and Q5_K_M gain ~1 % from the silo's
+expansion on the B70 and 0.3 - 4 % on the B65 (5.45 -> 5.25 s at 1 MP); the int8 file stays the fastest overall (1.4 - 2x the
+GGUFs).
 
 ## Kept and lost
 
