@@ -289,4 +289,20 @@ int ns_llm_glm5next_moe(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int6
     NS_CATCH
 }
 
+// down alone, from q8_1 activations the caller placed (hq [entries, n_ff / 32] blocks): the shared grouped kernels'
+// phase 1 (gate | up and the activation, faster than this file's) leaves them in its scratch, then this takes the
+// down projection those kernels do not
+int ns_llm_glm5next_moe_down(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const uint64_t* grp_ptr, const int32_t* grp_start,
+                             const int32_t* n_groups, const int32_t* ent_dst, int64_t groups, int64_t entries, const void* hq, float* out) {
+    NS_TRY
+    if (!ns_llm_glm5next_moe_supported(gu_type, d_type, n_embd, n_ff))
+        return ns_fail("ns_llm_glm5next_moe_down: types " + std::to_string(gu_type) + "/" + std::to_string(d_type) + " not supported");
+    if (groups <= 0 || entries <= 0) return 0;
+    const block_q8_1* h = (const block_q8_1*) hq;
+    if (d_type == T_IQ3_S) launch_down<T_IQ3_S>(g->q, gu_type, n_embd, n_ff, grp_ptr, grp_start, n_groups, ent_dst, groups, h, out);
+    else launch_down<T_Q6_K>(g->q, gu_type, n_embd, n_ff, grp_ptr, grp_start, n_groups, ent_dst, groups, h, out);
+    return 0;
+    NS_CATCH
+}
+
 }  // extern "C"

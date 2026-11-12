@@ -25,6 +25,20 @@ macro_rules! need {
     };
 }
 
+/// the down type handed to the shared grouped kernels when only their phase 1 runs (any down type they take)
+const STAND_IN_DOWN: i32 = 12;
+
+/// NS_SILO_MOE_GU=1: the silo's grouped experts compute gate | up too (by default the shared kernels' do)
+fn silo_gu() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NS_SILO_MOE_GU").is_ok_and(|v| v == "1"))
+}
+
+/// a byte count rounded up to 256
+pub(crate) fn align256(b: usize) -> usize {
+    (b + 255) & !255
+}
+
 #[allow(clippy::too_many_arguments)] // the kernels' own arity
 impl Ops {
     pub fn new(gpu: Arc<Gpu>) -> Result<Ops> {
@@ -636,19 +650,22 @@ impl Ops {
         self.ok(rc, "moe_combine")
     }
     /// whether the shared grouped kernels take the pair
-    fn moe_shared(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> bool {
+    pub(crate) fn moe_shared(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> bool {
         // SAFETY: a capability query.
         unsafe { (self.k.moe_grouped_supported)(gu as i32, down as i32, n_embd as i64, n_ff as i64) != 0 }
     }
     /// the silo's grouped kernels, when they take a pair the shared ones do not
-    /// (NS_SILO_MOE=0: not - such a layer's experts then take the per-expert products, a check of the silo's)
+    /// (NS_SILO_MOE=0: not - such a layer's experts then take the per-expert products, a check of the silo's). The
+    /// shared kernels must take the gate | up type with a stand-in down (their phase 1 runs it) unless the silo's
+    /// own gate | up is asked for (NS_SILO_MOE_GU=1)
     fn moe_silo(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> Option<&'static ffi::Silo> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var("NS_SILO_MOE").map_or(true, |v| v != "0")) {
             return None;
         }
+        let gu_ok = silo_gu() || self.moe_shared(gu, STAND_IN_DOWN as u32, n_embd, n_ff);
         // SAFETY: a capability query.
-        self.s.filter(|s| !self.moe_shared(gu, down, n_embd, n_ff) && unsafe { (s.moe_supported)(gu as i32, down as i32, n_embd as i64, n_ff as i64) } != 0)
+        self.s.filter(|s| gu_ok && !self.moe_shared(gu, down, n_embd, n_ff) && unsafe { (s.moe_supported)(gu as i32, down as i32, n_embd as i64, n_ff as i64) } != 0)
     }
     /// whether a layer's experts of these types run grouped (the shared kernels, else the silo's)
     pub fn moe_grouped_supported(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> bool {
@@ -681,9 +698,26 @@ impl Ops {
             let (gs, ng) = (i32s, i32s.add(groups + 1));
             let (dst, tok) = (ng.add(1), ng.add(1 + entries));
             match self.moe_silo(gu, down, n_embd, n_ff) {
-                // the silo's (its lane count is its own: a row's sums in one order at every width)
-                Some(s) => (s.moe)(self.raw(), gu as i32, down as i32, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, tok, groups as i64, entries as i64,
-                                   xq.ptr(), scratch.ptr(), out.fp(), limit, phase),
+                // the silo's whole (NS_SILO_MOE_GU=1; its lane count is its own: a row's sums in one order at every width)
+                Some(s) if silo_gu() => (s.moe)(self.raw(), gu as i32, down as i32, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, tok, groups as i64,
+                                                entries as i64, xq.ptr(), scratch.ptr(), out.fp(), limit, phase),
+                // the shared kernels' gate | up and activation (phase 1; their down projection is never run, so any
+                // down type they take stands in: Q4_K), then the silo's down from the q8_1 rows they leave in their
+                // scratch (Strata's native_expert_grouped: three float32 arrays of entries x n_ff, 256-byte aligned,
+                // then those rows)
+                Some(s) => {
+                    let mut rc = 0;
+                    if phase != 2 {
+                        rc = (self.k.moe_grouped)(self.raw(), gu as i32, STAND_IN_DOWN, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, tok, groups as i64,
+                                                  entries as i64, xq.ptr(), scratch.ptr(), out.fp(), limit, lanes as i32, 1);
+                    }
+                    if rc == 0 && phase != 1 {
+                        let hq = scratch.ptr().cast::<u8>().add(3 * align256(entries * n_ff * 4)).cast::<c_void>();
+                        rc = (s.moe_down)(self.raw(), gu as i32, down as i32, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, groups as i64, entries as i64,
+                                          hq, out.fp());
+                    }
+                    rc
+                }
                 None => (self.k.moe_grouped)(self.raw(), gu as i32, down as i32, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, tok, groups as i64,
                                              entries as i64, xq.ptr(), scratch.ptr(), out.fp(), limit, lanes as i32, phase),
             }
@@ -699,3 +733,16 @@ impl Ops {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn align256_rounds_up() {
+        assert_eq!(super::align256(0), 0);
+        assert_eq!(super::align256(1), 256);
+        assert_eq!(super::align256(256), 256);
+        // one decode token's 8 entries of n_ff 2048 float32: 64 KiB, already aligned
+        assert_eq!(super::align256(8 * 2048 * 4), 65536);
+        assert_eq!(super::align256(3 * 2048 * 4 + 4), 24832);
+    }
+}
