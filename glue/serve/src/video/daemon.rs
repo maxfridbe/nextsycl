@@ -31,7 +31,7 @@
 //!   GET  /engine/jobs                every job, newest first, without logs
 //!   GET  /engine/jobs/<id>           one job with its log and result
 //!   POST /engine/jobs                {"kind": "bench-blocks", ..., "gpu": 1 (optional)}  ->  {"id": 3}
-//!   POST /engine/jobs/<id>/cancel
+//!   POST /engine/jobs/<id>/cancel   (a worker that has not answered 180 s later is hung in a kernel: the daemon kills it)
 //!   POST /engine/jobs/<id>/remove    forget a job that is not running
 //!   POST /engine/unload              {"gpu": N} or every GPU: give it back now (after the running job)
 //!   (a job that names no GPU keeps off a card the front door's `GET /video/blocked` says a pin or hold has taken, while
@@ -120,6 +120,16 @@ fn should_move(me: Seat, seats: &[Seat], blocked: &[usize], engine_state: &str) 
 /// it has loaded nothing and would otherwise sit there until room came, loading the weights to find the cancel
 fn cancel_ends_worker(cancelled: bool, engine_state: &str) -> bool {
     cancelled && (engine_state.starts_with("waiting for the GPU: ") || engine_state == "starting the engine process")
+}
+
+/// Seconds a worker has to answer a cancel (it stops at the next block boundary, a few seconds): past that it is hung in
+/// a kernel (a job sat at one step for hours on 2026-11-12, the studio's watchdog cancelling it every 20 minutes to no
+/// effect) and the daemon kills it
+const CANCEL_GRACE_S: f64 = 180.0;
+
+/// Whether a cancel sent `since` seconds ago has gone unanswered for too long
+fn cancel_overdue(since: Option<f64>, grace: f64) -> bool {
+    since.is_some_and(|s| s > grace)
 }
 
 /// What run_job answers for a job sent back to the queue
@@ -527,12 +537,22 @@ impl Daemon {
         writeln!(p.stdin, "{}", json!({"job": id, "spec": spec})).map_err(|e| format!("the engine process does not listen: {e}"))?;
         let _ = p.stdin.flush();
         let mut cancel_sent = false;
+        let mut cancel_at: Option<std::time::Instant> = None;
         loop {
             if cancel.load(Ordering::Relaxed) && !cancel_sent {
                 let p = proc.as_mut().unwrap();
                 let _ = writeln!(p.stdin, "{}", json!({"cancel": id}));
                 let _ = p.stdin.flush();
                 cancel_sent = true;
+                cancel_at = Some(std::time::Instant::now());
+            }
+            if cancel_overdue(cancel_at.map(|t| t.elapsed().as_secs_f64()), CANCEL_GRACE_S) {
+                self.log_job(id, format!("engine : no answer {CANCEL_GRACE_S:.0} s after the cancel (a hung kernel): killing the engine process"));
+                if let Some(p) = proc.as_mut() {
+                    let _ = p.child.kill();
+                }
+                self.end_worker(k, proc, false);
+                return Err(format!("the engine process did not stop {CANCEL_GRACE_S:.0} s after the cancel and was killed"));
             }
             let ev = proc.as_ref().unwrap().events.recv_timeout(Duration::from_millis(200));
             match ev {
@@ -1088,6 +1108,14 @@ mod chat_hook_tests {
         assert!(!should_move(s[0], &[seat(0, true, false), seat(1, true, false)], &[0], waiting), "the other is busy");
         assert!(!should_move(s[0], &s, &[0], "loading"), "memory on the card: it stays");
         assert!(!should_move(s[0], &s, &[0], "waiting for the GPU lock (held: x)"), "not this wait");
+    }
+
+    #[test]
+    fn a_cancel_nobody_answers_gets_the_worker_killed() {
+        assert!(!cancel_overdue(None, CANCEL_GRACE_S), "no cancel sent: nothing to wait for");
+        assert!(!cancel_overdue(Some(5.0), CANCEL_GRACE_S), "a block boundary is seconds away");
+        assert!(!cancel_overdue(Some(CANCEL_GRACE_S), CANCEL_GRACE_S), "at the grace, not past it");
+        assert!(cancel_overdue(Some(CANCEL_GRACE_S + 0.1), CANCEL_GRACE_S), "past it: hung");
     }
 
     #[test]
