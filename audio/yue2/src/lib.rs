@@ -58,6 +58,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "cot", env: "NS_YUE2_COT", value: "full|melody|off", help: "what the model writes before the music: a score of melody and chords (full, the default), a melody alone (melody: covers), or none (off)", at: At::Both },
     EngineOption { name: "abc", env: "", value: "TEXT", help: "a score (ABC) to sing over instead of one drawn (cot melody or full): a cover's melody, or the score of an earlier song (its `score`) to sing it again with new words - same seed and style", at: At::Request },
     EngineOption { name: "sing-lead", env: "", value: "1|0", help: "a cover of an instrumental recording: its lead line (SheetSage2's Ins voice) moved to the voice YuE2 sings (on; 0: the score as transcribed - an instrumental cover)", at: At::Request },
+    EngineOption { name: "instrumental", env: "", value: "true|false", help: "a cover that is played, not sung: the recording's lead line stays in SheetSage2's Ins voice (the score as transcribed) and no lyrics are needed (any given are not used); only with a recording (source)", at: At::Request },
     EngineOption { name: "score-tokens", env: "", value: "4096", help: "the most tokens the score may take (32 to 4096; a longer score is cut and closed)", at: At::Request },
     EngineOption { name: "score-only", env: "", value: "true|false", help: "with a recording (source): only its score - SheetSage2's transcription, the melody for cot melody, melody and chords for cot full - comes back (the answer's score), no song is made", at: At::Request },
 ];
@@ -96,6 +97,22 @@ pub fn f32_bytes(v: &[f32]) -> &[u8] {
 
 const GIB: f64 = (1u64 << 30) as f64;
 
+/// An option read as on: true, 1, on or yes (empty or absent: off)
+pub fn flag(v: Option<&str>) -> bool {
+    v.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+}
+
+/// An option read as off: 0, false, off or no
+pub fn is_off(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+}
+
+/// A cover's score as sung: an instrumental recording's lead (the Ins voice) moved to the voice YuE2 sings, unless the
+/// cover is instrumental (the lead stays in Ins, played) or `sing-lead` is off (the score as transcribed)
+pub fn cover_score(abc: &str, instrumental: bool, sing_lead: Option<&str>) -> String {
+    if instrumental || sing_lead.is_some_and(is_off) { abc.to_string() } else { prompt::sung_lead(abc).0 }
+}
+
 /// What a song is made from, once the request is read
 #[derive(Clone, Debug)]
 pub struct Song {
@@ -104,6 +121,8 @@ pub struct Song {
     pub lyrics: String,
     /// the score given (its text), cot melody or full
     pub abc: Option<String>,
+    /// a cover that is played: the lead stays in the Ins voice, no lyrics
+    pub instrumental: bool,
     pub seed: u64,
     /// the semantic phase's guidance (1: one branch)
     pub cfg: f32,
@@ -215,7 +234,15 @@ impl Yue2 {
         if style.is_empty() {
             return Err(Error("the style (instructions) is empty: genre, mood, voice, instruments".into()));
         }
-        let lyrics = req.lyrics.clone().unwrap_or_default();
+        let instrumental = flag(self.opt(req, "instrumental", "").as_deref());
+        if instrumental && req.source.is_none() {
+            return Err(Error("instrumental: an option of a cover - give the recording (source) whose lead line is played".into()));
+        }
+        if instrumental && self.opt(req, "sing-lead", "").is_some_and(|v| !is_off(&v)) {
+            return Err(Error("instrumental and sing-lead 1 contradict: the lead line is played or sung".into()));
+        }
+        // an instrumental has no words to sing: lyrics given are left out of the prompt
+        let lyrics = if instrumental { String::new() } else { req.lyrics.clone().unwrap_or_default() };
         let seconds = req.seconds.unwrap_or(MAX_SECONDS);
         if !(1.0..=MAX_SECONDS).contains(&seconds) {
             return Err(Error(format!("{seconds} s: from 1 to {MAX_SECONDS} s (the song may end sooner: the model decides)")));
@@ -228,7 +255,7 @@ impl Yue2 {
         if !(0.0..=20.0).contains(&cfg) {
             return Err(Error(format!("cfg {cfg}: 0 to 20")));
         }
-        Ok(Song { cot, style, lyrics, abc, seed: req.seed, cfg, max_codes: ((seconds * FPS).ceil() as usize).clamp(1, sample::SEMANTIC.max_tokens), max_score,
+        Ok(Song { cot, style, lyrics, abc, instrumental, seed: req.seed, cfg, max_codes: ((seconds * FPS).ceil() as usize).clamp(1, sample::SEMANTIC.max_tokens), max_score,
                   steps: req.steps.unwrap_or(ODE_STEPS).clamp(1, 200) as usize })
     }
 
@@ -482,7 +509,8 @@ impl AudioEngine for Yue2 {
             let abc = s.abc.clone().ok_or_else(|| Error(format!("the recording's score: {}", s.error.as_deref().unwrap_or("none was made"))))?;
             // an instrumental recording's tune is in the Ins voice: moved to the Vocal voice, the one YuE2 sings (else it
             // makes an instrumental: measured on a bluegrass Jingle Bells, Whisper heard no words in any of three styles)
-            let abc = if self.opt(req, "sing-lead", "").is_some_and(|v| matches!(v.trim(), "0" | "false" | "off")) { abc } else { prompt::sung_lead(&abc).0 };
+            // (instrumental: the lead stays in the Ins voice and is played; sing-lead 0 keeps the score the same way)
+            let abc = cover_score(&abc, song.instrumental, self.opt(req, "sing-lead", "").as_deref());
             *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(abc.clone());
             if self.opt(req, "score-only", "").is_some_and(|v| v.trim() == "true" || v.trim() == "1") {
                 return Ok(Audio { rate: RATE, channels: 2, samples: Vec::new() });
@@ -520,3 +548,33 @@ impl AudioEngine for Yue2 {
 
 /// HIDDEN re-exported for the check
 pub const WIDTH: usize = HIDDEN;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INS_SCORE: &str = "X:1\nV: Vocal clef=treble name=\"Vocal Melody\"\nV: Ins clef=treble name=\"Ins Melody\"\nK:C\n% intro\nV: Vocal\nZ2|\nV: Ins\nG4A4|c8|\n";
+
+    #[test]
+    fn the_instrumental_flag_reads() {
+        assert!(flag(Some("true")) && flag(Some(" 1 ")) && flag(Some("On")));
+        assert!(!flag(Some("false")) && !flag(Some("")) && !flag(None) && !flag(Some("0")));
+    }
+
+    #[test]
+    fn an_instrumental_cover_keeps_the_lead_in_ins() {
+        // sung (the default): the Ins line moves to Vocal; instrumental: the score is as transcribed
+        assert_ne!(cover_score(INS_SCORE, false, None), INS_SCORE);
+        assert_eq!(cover_score(INS_SCORE, true, None), INS_SCORE);
+        assert_eq!(cover_score(INS_SCORE, false, Some("0")), INS_SCORE);
+        assert_eq!(cover_score(INS_SCORE, true, Some("0")), INS_SCORE);
+    }
+
+    #[test]
+    fn instrumental_is_a_listed_request_option() {
+        let o = OPTIONS.iter().find(|o| o.name == "instrumental").expect("listed");
+        assert!(matches!(o.at, At::Request));
+        assert!(o.env.is_empty());
+        assert!(kind().options.iter().any(|o| o.name == "instrumental"));
+    }
+}

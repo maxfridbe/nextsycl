@@ -58,6 +58,10 @@ score in the new style; the recording itself is never played back into the song.
   every verse and chorus it holds. Words under tags the score lacks are scatted, not sung.
 - **An instrumental recording**: SheetSage2 writes a played lead line as the score's `Ins` voice; the engine moves it to
   the `Vocal` voice, the one YuE2 sings (`sing-lead: 0` keeps the score as transcribed - an instrumental cover).
+- **`instrumental: true`** (`--opt-instrumental true`): a cover that is **played, not sung**. The recording's lead line
+  stays in the `Ins` voice (the score as transcribed, nothing moved to `Vocal`), no lyrics are needed and any given are
+  left out of the prompt. Only with a recording (`audio`); it contradicts `sing-lead: 1`. The new style (`instructions`)
+  should name instruments, not a voice.
 - **New words over the recording's tune**: give your own lyrics instead of its; keep their lines and syllables close to
   the original's, section for section, so the notes have words to carry.
 - The score comes back (`score` in the answer); sing it again with `abc` and the same seed and style to make the song
