@@ -64,9 +64,48 @@ if (app === "audio") {
   state.results = [pic, { ...pic, seed: 8 }];
   state.history = [pic];
   state.zoom = pic;
+  await describeChecks(state);
 }
 let panels = 0, nodes = 0;
 const walkTree = (n) => { nodes++; if (n.sel?.startsWith("section") && n.data?.class?.panel) panels++; for (const c of n.children ?? []) if (typeof c === "object" && c) walkTree(c); };
 walkTree(App());
 console.log(`${app}: rendered ${nodes} nodes, ${panels} panels`);
 if (bad || panels < 3) process.exit(1);
+
+// the image page's Describe panel: its rules (describe.ts) and the panel rendered from a made-up answer
+async function describeChecks(state) {
+  const D = await import(join(root, `${app}/src/describe.js`));
+  const eq = (a, b, what) => { if (JSON.stringify(a) !== JSON.stringify(b)) { console.log("DESCRIBE FAIL", what, JSON.stringify(a), "!=", JSON.stringify(b)); process.exit(1); } };
+  const z = { model: "z-image-turbo", arch: "z-image", guidance: false, grid: 16 };
+  const h3 = { model: "minimax-h3-image", arch: "minimax-h3-image", guidance: false, grid: 32 };
+  const qi = { model: "qwen-image-2.1-q8", arch: "qwen-image-2.1", guidance: true, grid: 16 };
+  eq(D.targetOf("", z), "z-image-turbo", "the page's model is the default target");
+  eq(D.targetOf("tags", z), "tags", "a chosen family");
+  eq([D.familyOf("z-image-turbo", z), D.familyOf("h3", z), D.familyOf("qwen-image-2.1-q8", qi), D.familyOf("some-other-model", z)], ["z-image", "h3", "qwen-image", "natural"], "families");
+  eq([D.takesNegative("z-image-turbo", z), D.takesNegative("qwen-image-2.1-q8", qi), D.takesNegative("natural", z), D.takesNegative("h3", z), D.takesNegative("tags", z)],
+     [false, true, true, false, true], "negative prompts");
+  // the size is applied only for this page's model or family, on its grid
+  eq(D.sizeToApply({ width: 1184, height: 880 }, "z-image-turbo", z), [1184, 880], "size on the grid");
+  eq(D.sizeToApply({ width: 1184, height: 896 }, "h3", h3), [1184, 896], "size on the h3 grid (32)");
+  eq(D.sizeToApply({ width: 1184, height: 880 }, "h3", h3), null, "off the h3 grid (32)");
+  eq(D.sizeToApply({ width: 1024, height: 1024 }, "qwen-image", z), null, "another family's size is not ours");
+  eq(D.sizeToApply(null, "z-image-turbo", z), null, "no suggestion");
+  eq(D.errorText({ code: "conflict", message: "target h3: no model of the family is enabled here" }).includes("409"), true, "conflict explained");
+  eq(D.errorText({ code: "invalid_params", message: "x", field: "describer" }), "invalid_params: x (field describer)", "refusal shape");
+  eq(D.errorText({ code: "cancelled", message: "cancelled" }), "cancelled", "cancelled");
+  eq(D.jobStage({ state: "queued", waiting_for: "2 jobs ahead" }, 1), "waiting: 2 jobs ahead", "queued");
+  eq(D.jobStage({ state: "running", stage: "loading" }, 20).includes("45 s"), true, "cold note");
+  // the panel itself, with an answer to show
+  const d = state.describe;
+  d.list = { default: "best", best: "qwen3.8-27b-q4-describe", describers: [{ id: "qwen3.8-27b-q4-describe", name: "q", kind: "chat", size_gb: 18, vram_gib: 20, image_models: [], downloaded: true, enabled: true, best: true }] };
+  d.picture = { url: "data:image/png;base64,AA==", name: "barn.png", w: 1024, h: 768 };
+  d.result = { prompt: "A red barn.", negative_prompt: null, target: "z-image", target_model: "z-image-turbo", describer: "best", describer_model: "q", model: "q", words: 3, width: 1024, height: 768,
+               suggested_size: { width: 1184, height: 880, size: "1184x880" }, timings: { pp_tok_s: 797, tg_tok_s: 60, seconds: 3.2 }, finish: "stop", notes: [] };
+  d.prompt = d.result.prompt;
+  state.panels.describe = true;
+  const A = await import(join(root, `${app}/src/actions.js`));
+  state.info = { ...state.info, ...z };
+  A.useDescription();
+  eq([state.form.prompt, state.form.width, state.form.height], ["A red barn.", 1184, 880], "use as prompt fills the form");
+  eq(Object.keys(A.describeBody()).sort(), ["detail", "image", "target"], "the request carries only what differs");
+}
