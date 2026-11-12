@@ -116,3 +116,69 @@ export interface Given {
   w: number;
   h: number;
 }
+
+/** What the front door answers the page's Describe panel (glue/serve/src/home/describe_page.rs; the contract is
+ *  docs/api/image-describe.md). */
+
+/** One of image.describers' list: who can read a picture. */
+export interface Describer {
+  id: string;
+  name: string;
+  /** a chat model, or an image model's own text encoder */
+  kind: "chat" | "native";
+  size_gb: number | null;
+  vram_gib: number | null;
+  image_models: string[];
+  downloaded: boolean;
+  enabled: boolean;
+  /** the one "best" runs now */
+  best: boolean;
+}
+
+export interface Describers {
+  default: string;
+  best: string | null;
+  describers: Describer[];
+}
+
+export interface Described {
+  prompt: string;
+  negative_prompt: string | null;
+  target: string;
+  target_model: string | null;
+  describer: string;
+  describer_model: string | null;
+  model: string;
+  words: number;
+  width: number;
+  height: number;
+  suggested_size: { width: number; height: number; size: string } | null;
+  timings: { pp_tok_s?: number; tg_tok_s?: number; seconds: number };
+  /** "stop", or "length" when max_tokens cut the answer */
+  finish: string;
+  notes: string[];
+}
+
+/** image.status's view of the job (the part the panel shows). */
+export interface DescribeJob {
+  label: string;
+  state: "queued" | "running" | "done" | "failed" | "cancelled";
+  stage?: string;
+  waiting_for?: string | null;
+  position?: number;
+  result?: Described;
+  error?: { code: string; message: string; field?: string | null };
+}
+
+/** The Describe panel's fields (the request) and its answer. */
+export interface DescribeForm {
+  /** "" the model this page serves; else a family or a model's id */
+  target: string;
+  /** best, native or a describer's id */
+  describer: string;
+  detail: "short" | "medium" | "long";
+  maxWords: number | null;
+  negative: boolean;
+  language: string;
+  instructions: string;
+}

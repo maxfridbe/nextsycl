@@ -4,6 +4,7 @@ import { jsx } from "../jsx.js";
 import { state } from "../state.js";
 import { Spinner } from "./Spinner.js";
 import { Create } from "./Create.js";
+import { Describe } from "./Describe.js";
 import { Gallery, Results, Zoom } from "./Gallery.js";
 import { Panel } from "./Panel.js";
 import { Progress } from "./Progress.js";
@@ -45,6 +46,9 @@ export function App() {
       {info && (info.upscale ?? []).length ? <pre class="err">{`${info.model} enlarges pictures (POST /v1/images/upscale, image.upscale); this page draws them (serve a drawing model)`}</pre> : null}
       <Panel id="create" icon="&#xf040;" title="Create" hint={info?.arch ?? (info?.loading ? "loading the model…" : "")}>
         <Create />
+      </Panel>
+      <Panel id="describe" icon="&#xf002;" title="Describe" hint="a picture to the prompt that would draw it">
+        <Describe />
       </Panel>
       <Progress />
       {state.results.length

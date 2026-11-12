@@ -157,8 +157,29 @@ The prompt that would draw a picture, written the way the target image model rea
 qwen-image, z-image, h3, hunyuanimage, moss-image, ming-image, tags), with a negative prompt for the models that read
 one and a canvas at the picture's aspect for the target. The describer is a chat model that reads pictures
 (`qwen3.8-27b-q4-describe`: Qwen3.8-27B and its vision tower, a short context); the front door's `image.describe` runs it
-as a job in the image queue (label, cancel), the home page's Describe tab calls it. The contract, the measured speeds and
+as a job in the image queue (label, cancel), the home page's Describe tab calls it, and so does the image page's
+Describe panel (below). The contract, the measured speeds and
 a round trip (describe, draw the prompt again, compare) are in [docs/api/image-describe.md](api/image-describe.md).
+
+### The image page's Describe panel
+
+The image page (`wfe/image`) has a **Describe** panel (closed until opened; "describe" on a picture in its history opens it
+with that picture): drop, pick or paste (Ctrl+V) a picture, choose what the prompt is for (the model the page serves,
+by default, or a family: natural, qwen-image, z-image, h3, hunyuanimage, moss-image, ming-image, tags) and who reads it
+(`best`, `native`, or a describer from `image.describers`), the length (or the words), the language, an optional
+negative prompt (offered where the target's models read one) and more instructions for the describer. **Describe** runs
+`image.describe` as a job - the first one after a while loads the describer (about 45 s cold, said on the panel) - with
+a **cancel** (by the job's label: `page-describe-<ms>`). The prompt arrives in an editable box with **copy** and **Use as
+prompt**, which fills the page's prompt (and negative, when this model takes one) and sets width and height to the
+`suggested_size` when the description is for this page's model or family and the sides fit the page's grid. Errors are
+shown as the server words them (409: no model of the family or no describer enabled; the refusal shapes in
+[image-describe.md](api/image-describe.md)).
+
+The page's own server has no token and no chat model, so the panel talks to the front door through
+`/open/<model>/api/describe` (`GET`: `image.describers`; `POST`: `image.describe` as a job, only the panel's fields;
+`GET .../status?label=`: `image.status`; `POST .../cancel {label}`: `image.cancel`, only for a `page-describe-` label so
+the page cannot stop anyone else's work). A server run alone (`nextsycl image serve --wfe`, port 8086) has no such
+route: the panel says so and points at the front door and `nextsycl image describe`.
 
 ## The image server and its web front end
 

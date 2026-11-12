@@ -170,3 +170,10 @@ figure.pic .acts .tbtn{margin-left:0;text-decoration:none}
 .spin.small{padding:4px 0;font-size:12px}.spin.small::before{width:12px;height:12px}
 @keyframes nsspin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.spin::before{animation-duration:2.8s}}
+
+/* --- Describe ------------------------------------------------------------------------------ */
+.describe .dpic{max-height:96px;max-width:160px;border-radius:6px;border:1px solid #2a2f3a}
+.describe textarea{height:150px}
+.describe textarea.short{height:64px}
+.describe label.wide{display:flex;flex-direction:column;gap:4px;margin:8px 0}
+.hint.warn{color:#f59e0b}

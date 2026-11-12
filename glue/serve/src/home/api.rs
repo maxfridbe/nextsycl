@@ -640,7 +640,7 @@ impl Home {
     }
 
     /// A method by its name (any case): its #[rpc] handler (methods.rs), which decodes the request into its type
-    fn rpc(self: &Arc<Self>, name: &str, b: &Value) -> Result<Value, Fail> {
+    pub(super) fn rpc(self: &Arc<Self>, name: &str, b: &Value) -> Result<Value, Fail> {
         let Some(m) = table::find(name) else {
             return Err((404, format!("no method {name} (GET /openapi.yml)")));
         };

@@ -7,7 +7,7 @@ import { eventListenersModule } from "../../vendor/snabbdom/modules/eventlistene
 import { propsModule } from "../../vendor/snabbdom/modules/props.js";
 import { styleModule } from "../../vendor/snabbdom/modules/style.js";
 import type { VNode } from "../../vendor/snabbdom/vnode.js";
-import { adoptDefaults, refreshHistory } from "./actions.js";
+import { adoptDefaults, describePicture, loadDescribers, refreshHistory } from "./actions.js";
 import { api } from "./api.js";
 import { App } from "./components/App.js";
 import { onRender, render, restorePreferences, state } from "./state.js";
@@ -64,8 +64,15 @@ async function pollGpu(): Promise<void> {
   setTimeout(() => void pollGpu(), 3000);
 }
 
+/** A picture on the clipboard goes to the Describe panel (text pastes are left alone). */
+document.addEventListener("paste", (e: ClipboardEvent) => {
+  const f = Array.from(e.clipboardData?.files ?? []).find((x) => x.type.startsWith("image/"));
+  if (f && typeof state.describe.list === "object") void describePicture(f, f.name || "pasted.png");
+});
+
 restorePreferences();
 paint();
+void loadDescribers();
 void pollInfo();
 void pollProgress();
 void pollGpu();

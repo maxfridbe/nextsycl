@@ -245,6 +245,17 @@ double quotes; about N words; the language; and the answer's shape (`PROMPT: ...
 `NEGATIVE: ...`). The exact text is `glue/serve/src/describe.rs` (`Family::style`, `Ask::instruction`). A
 reimplementation should keep the families' names and the answer's fields; the wording may differ.
 
+## The image page's routes
+
+The image page (`wfe/image`, served through the door at `/open/<model>/`) has no token, so the door answers four routes
+under `/open/<model>/api/describe` with the methods above (glue/serve/src/home/describe_page.rs; docs/images.md has the
+panel): `GET api/describe` -> `{"ok": true, "result": <image.describers>}`; `POST api/describe` (the fields `image`,
+`target`, `describer`, `detail`, `max_words`, `include_negative`, `language`, `instructions`; the job is always
+`wait: false` with a label `page-describe-<ms>`) -> the job; `GET api/describe/status?label=` -> `image.status`;
+`POST api/describe/cancel {"label"}` -> `image.cancel`, refused (400) for a label that does not start with
+`page-describe-`. Errors are the `/rpc` envelope `{"ok": false, "error": {...}}` with the error's HTTP status. Not
+part of the cross-runtime contract.
+
 ## OpenAI-compatible route
 
 There is no separate `/v1` describe route. What exists already and works: `POST /v1/chat/completions` naming a chat

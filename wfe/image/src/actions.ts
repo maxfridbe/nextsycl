@@ -1,7 +1,8 @@
 /** What the buttons do: build the request from the form, send it, keep the results. */
-import { api } from "./api.js";
-import { render, saveForm, state } from "./state.js";
-import type { Picture } from "./types.js";
+import { api, RpcError } from "./api.js";
+import { errorText, sizeToApply, takesNegative, targetOf } from "./describe.js";
+import { render, saveDescribe, saveForm, state } from "./state.js";
+import type { DescribeJob, Given, Picture } from "./types.js";
 import { fitSize, ratioOf, snap } from "./util.js";
 
 /** The first time the model is known: the form's empty fields take its defaults. */
@@ -73,6 +74,12 @@ export async function addPicture(blob: Blob, name: string): Promise<void> {
     render();
     return;
   }
+  state.pictures.push(await given(blob, name));
+  render();
+}
+
+/** A blob as a Given: read as a data: URL, its size from the decoded image. */
+async function given(blob: Blob, name: string): Promise<Given> {
   const url = await new Promise<string>((ok, fail) => {
     const r = new FileReader();
     r.onload = () => ok(String(r.result));
@@ -85,8 +92,7 @@ export async function addPicture(blob: Blob, name: string): Promise<void> {
     im.onerror = () => ok([0, 0]);
     im.src = url;
   });
-  state.pictures.push({ url, name, w: size[0], h: size[1] });
-  render();
+  return { url, name, w: size[0], h: size[1] };
 }
 
 /** A picture made here, as an edit's picture. */
@@ -172,5 +178,122 @@ export async function generate(): Promise<void> {
   }
   state.busy = false;
   state.started = null;
+  render();
+}
+
+/* -- Describe: a picture to the prompt that would draw it (the front door's image.describe, through api/describe) ----- */
+
+/** The describers the front door offers; a server run alone has no such route, and the panel says so. */
+export async function loadDescribers(): Promise<void> {
+  try {
+    state.describe.list = await api.describers();
+  } catch (e) {
+    state.describe.list = e instanceof RpcError && e.status === 404 ? "no" : state.describe.list;
+    if (state.describe.list !== "no") state.describe.error = errorText(e instanceof RpcError ? e : { message: String(e) });
+  }
+  render();
+}
+
+/** A file, a pasted or dropped image as the picture to describe. */
+export async function describePicture(blob: Blob, name: string): Promise<void> {
+  const d = state.describe;
+  d.picture = await given(blob, name);
+  d.result = null;
+  d.error = d.picture.w ? null : "that is not a picture the browser can read (PNG, JPEG or WebP)";
+  d.used = null;
+  state.panels["describe"] = true;
+  render();
+}
+
+/** A picture made here, described. */
+export async function describeMade(p: Picture): Promise<void> {
+  await describePicture(await (await fetch(p.url)).blob(), p.url.split("/").pop() ?? "picture.png");
+}
+
+/** The request the form makes: only what differs from the server's defaults is sent. */
+export function describeBody(): Record<string, unknown> {
+  const d = state.describe;
+  const f = d.form;
+  const target = targetOf(f.target, state.info);
+  const b: Record<string, unknown> = { image: d.picture?.url, target, detail: f.detail };
+  if (f.describer && f.describer !== "best") b.describer = f.describer;
+  if (f.maxWords) b.max_words = f.maxWords;
+  if (f.negative && takesNegative(target, state.info)) b.include_negative = true;
+  if (f.language.trim()) b.language = f.language.trim();
+  if (f.instructions.trim()) b.instructions = f.instructions.trim();
+  return b;
+}
+
+const ENDED = new Set(["done", "failed", "cancelled"]);
+
+/** Send the picture as a job and follow it (once a second) until it ends; one runs at a time. */
+export async function runDescribe(): Promise<void> {
+  const d = state.describe;
+  if (!d.picture || d.label) return;
+  const label = `page-describe-${Date.now()}`;
+  d.label = label;
+  d.job = null;
+  d.result = null;
+  d.error = null;
+  d.used = null;
+  d.started = performance.now();
+  saveDescribe();
+  render();
+  try {
+    let job: DescribeJob = await api.describe({ ...describeBody(), label });
+    while (d.label === label) {
+      d.job = job;
+      render();
+      if (ENDED.has(job.state)) break;
+      await new Promise((ok) => setTimeout(ok, 1000));
+      job = await api.describeJob(label);
+    }
+    if (job.state === "done" && job.result) {
+      d.result = job.result;
+      d.prompt = job.result.prompt;
+      d.negative = job.result.negative_prompt ?? "";
+    } else {
+      d.error = errorText(job.error ?? { code: job.state });
+    }
+  } catch (e) {
+    d.error = errorText(e instanceof RpcError ? e : { message: String(e) });
+  }
+  if (d.label === label) d.label = null;
+  d.started = null;
+  render();
+}
+
+/** Stop the job by its label (a bare id is refused by the server: it would stop what is not ours). The loop sees the
+ *  job end `cancelled`. */
+export async function cancelDescribe(): Promise<void> {
+  const label = state.describe.label;
+  if (!label) return;
+  try {
+    await api.describeCancel(label);
+  } catch (e) {
+    state.describe.error = errorText(e instanceof RpcError ? e : { message: String(e) });
+    render();
+  }
+}
+
+/** The description into the form: the prompt (and the negative where this model reads one), and the size it suggests
+ *  where the form's grid takes it. */
+export function useDescription(): void {
+  const d = state.describe;
+  const r = d.result;
+  if (!r) return;
+  state.form.prompt = d.prompt.trim();
+  const said = ["prompt"];
+  if (d.negative.trim() && state.info?.guidance !== false) {
+    state.form.negative = d.negative.trim();
+    said.push("negative");
+  }
+  const size = sizeToApply(r.suggested_size, targetOf(d.form.target, state.info), state.info);
+  if (size) {
+    [state.form.width, state.form.height] = size;
+    said.push(`size ${size[0]}×${size[1]}`);
+  }
+  saveForm();
+  d.used = `in the form: ${said.join(", ")}`;
   render();
 }

@@ -25,6 +25,7 @@
 mod api;
 mod backplane;
 mod config;
+mod describe_page;
 mod disks;
 mod enroll;
 mod history;
@@ -541,7 +542,8 @@ impl Home {
             return http::respond(s, 409, &err(format!("{id} is disabled: enable it to open its page")));
         }
         let query = req.target.find('?').map_or("", |i| &req.target[i..]);
-        let port = match registry::kind_of(&m) {
+        let kind = registry::kind_of(&m);
+        let port = match kind {
             "image" | "audio" | "model3d" => {
                 let Some(sub) = sub else {
                     let to = format!("/open/{id}/{query}");
@@ -550,6 +552,10 @@ impl Home {
                 // a saved voice enrolled for Voxtral: this door's job (enroll.rs), not the page's server
                 if sub == "api/voices/enroll" {
                     return self.open_enroll(s, req);
+                }
+                // the image page's Describe panel: this door's methods (describe_page.rs), not the page's server
+                if kind == "image" && sub.starts_with("api/describe") {
+                    return self.open_describe(s, req, sub);
                 }
                 let lease = match self.ensure(id) {
                     Ok(l) => l,
