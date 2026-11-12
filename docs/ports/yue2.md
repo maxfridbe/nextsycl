@@ -140,6 +140,55 @@ The split gains nothing in time on these cards; it only moves memory. A guided s
 
 A free-running song never reached the cap (long lyrics ended at 98 and 234 s). `concurrency` and `coexistence` are not on the card: not measured.
 
+## Instrumental covers (`instrumental`, 2026-11-11)
+
+Request option `instrumental` (`--opt-instrumental true`; nextcuda's name and meaning), a cover only: the recording's lead
+line stays in SheetSage2's `Ins` voice - the score as transcribed, nothing moved to `Vocal` - so it is played, not sung,
+and no lyrics are needed (any given are left out of the prompt). A sung cover moves an instrumental recording's `Ins` line
+to `Vocal` (`prompt::sung_lead`, on by default; `sing-lead: 0` already kept the score as transcribed but still sent the
+lyrics). `instrumental` without a recording, or with `sing-lead: 1`, is refused. It is listed in the engine's options
+(`system.models`, `audio gen --help` options), the card's `about` and the guide (`model-cards/guides/yue2.md`).
+Code: `audio/yue2/src/lib.rs` (`flag`, `cover_score`, `Song.instrumental`); tests `the_instrumental_flag_reads`,
+`an_instrumental_cover_keeps_the_lead_in_ins`, `instrumental_is_a_listed_request_option`.
+
+Live check (B70, direct engine run, build copy `~/src/nextsycl-yue2inst`, front door idle, 2026-11-11): a 49 s tune
+synthesised for the purpose (a plucked lead, strummed chords, bass and clicks; no recorded music), cover "bluegrass, banjo,
+fiddle, acoustic guitar, instrumental", 45 s, seed 7, no lyrics: 45.0 s of 48 kHz stereo in 13.6 s (transcription 2.3 s,
+1125 frames in 4.7 s, flow 32 steps 4.3 s, decode 2.2 s). The same recording with sung style and lyrics: the same length.
+Limit of the check: SheetSage2 put all three synthetic tunes into the `Vocal` voice (a clean synthetic tone reads as a lead
+voice, not as an instrument), so no live score had a note in `Ins`; the move itself and its absence are proved by the unit
+tests on a score with the line in `Ins`. How it differs from a sung cover: in a sung cover an `Ins`-only lead is moved to `Vocal` and the lyrics
+are sung over it; instrumental leaves it in `Ins`, YuE2 gets an empty `[Lyrics]` and an all-rest `Vocal` voice, and the
+music is played (nextcuda measured that over an all-rest `Vocal` voice a bluegrass Jingle Bells came out instrumental in
+three styles; that listening check - Whisper hearing no words - was not repeated here for want of a recording of an
+instrumental that SheetSage2 transcribes into `Ins`).
+
+## Placement of split models (audit, 2026-11-11)
+
+nextcuda's gap: a model started on cards 0,1 was placed by its start card only, while a later stage needed ~6.8 GiB on the
+other card. Here, no model is started across cards by the front door, so the gap does not exist as deployed:
+
+- `Home::start_at_` (`glue/serve/src/home/life.rs`) starts an image / audio / 3D server with one `--gpu N`; the servers
+  hold one `Arc<Gpu>` (`ImageServer.gpu`, `glue/serve/src/image.rs`). `gpus: '0,1'` on those cards lists alternative
+  cards for a whole copy: `place` (`crates/scheduler/src/place.rs`) plans every listed card with its own `want(g)` and
+  `reserve` / `may_start` (`room.rs`) check the card it picked. `vouched_mb` gives each alternative card the same
+  amount (`one_card`).
+- Models that do span cards are chat models (`gpus: all`, `spans_all`): the chat path (`life.rs`, the loop around
+  `room_plan` per `gpus` entry, `short` = every card still lacking room) plans for and frees room on every card, each with
+  its vouched share; the video daemon holds one worker a card.
+- The card key `split: true` (ming-image-0.1-design) is read only by `runs_here` (the pull verdict, `pulls.rs`); the
+  registry entry does not keep it and the front door never passes `--gpu 0,1`, so a served ming-image loads whole on the
+  start card. Its `vram_gib: 10.5` is the first card's share of a split that is not used when served: the first start
+  would ask more than planned and `learn_ask` (start card) learns the ask - an under-vouch, not an unchecked card. Not
+  changed (a card number to measure; not this task).
+- Latent: a load option naming more cards than the server's - `NS_FVSR_GPUS` (FlashVSR), `NS_SVR_GPUS` (SeedVR2), set in a
+  registry entry's `env` - would take memory on cards placement does not check. No card or registry entry sets them (checked
+  on hardac1 `models.json`); if one ever does, the start card's vouch must grow to every card named (nextcuda's
+  `split_vram_gib`) and `learn_ask` must follow the card the error names.
+
+No code change, no new test: single-card placement is covered by `crates/scheduler/tests/scenarios.rs` (s01, s10) and the
+chat-spans-all rule by `a_chat_model_split_over_every_card_has_no_choice_of_cards`.
+
 ## Known
 
 - One seed makes different songs on the B70 and the B65 (3552 and 3555 codes for one request). The VAE agrees byte for byte across them.
