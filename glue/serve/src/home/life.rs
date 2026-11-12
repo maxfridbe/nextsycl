@@ -237,6 +237,10 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
             if m["env"]["NS_QI_SIGMAS"].is_string() || h3i_steps.is_some_and(|n| n <= 4) {
                 c.push("few_step");
             }
+            // transparent pictures (rgba: true): Qwen-Image 2.1's RGBA VAE, its prompt given the alpha sentences
+            if arch == "qwen-image-2.1" {
+                c.push("rgba");
+            }
             (c, vec!["image.generate", "image.edit"])
         }
         "audio" if arch == "whisper" => (vec!["transcribe", "speech_to_text", "word_timestamps", "language_detection", "translate_to_english"], vec!["audio.transcribe"]),
@@ -1592,6 +1596,16 @@ mod tests {
         assert!(3872u64 * 5056 <= px && 5056 <= side);
         assert!(size_limits(&json!({"id": "z", "kind": "image", "arch": "z-image"})).is_none());
         assert!(size_limits(&json!({"id": "x", "kind": "llm", "arch": "minimax-h3-image"})).is_none());
+    }
+
+    #[test]
+    fn qwen_image_cards_say_they_draw_transparent_pictures() {
+        for id in ["qwen-image-2.1-q8", "qwen-image-2.1-turbo-q8"] {
+            let (caps, _) = capabilities(&json!({"id": id, "kind": "image", "arch": "qwen-image-2.1", "env": {}}));
+            assert!(caps.contains(&"rgba") && caps.contains(&"generate"), "{id}");
+        }
+        let (caps, _) = capabilities(&json!({"id": "minimax-h3-image", "kind": "image", "arch": "minimax-h3-image", "env": {}}));
+        assert!(!caps.contains(&"rgba"));
     }
 
     #[test]
