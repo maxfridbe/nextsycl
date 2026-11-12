@@ -59,6 +59,11 @@ impl Ops {
         self.ok(rc, "dequant")
     }
     /// n values of a stored matrix (bytes [at, at + bytes) of src) expanded to fp16 into dst (2 bytes a value)
+    /// whether the silo expands `ty` to half (the shared expander's types are the engine's F16_TYPES)
+    pub fn silo_f16(&self, ty: u32) -> bool {
+        // SAFETY: a capability query.
+        self.s.is_some_and(|s| unsafe { (s.dequant_f16_supported)(ty as i32) } != 0)
+    }
     pub fn dequant_f16(&self, ty: u32, src: &DevBuf, at: usize, bytes: usize, n: usize, dst: &DevBuf) -> Result<()> {
         src.bounds(at, bytes)?;
         dst.bounds(0, n * 2)?;

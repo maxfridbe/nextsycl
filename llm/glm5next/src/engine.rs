@@ -981,7 +981,7 @@ impl Part {
         let f16 = f16_min();
         let fits = |b: &DevBuf| t * w.cols * 2 <= b.len;
         if let Some(x16) = self.x16.as_ref().filter(|b| f16 > 0 && t >= f16 && t > MMVQ_COLS && fits(b))
-            .filter(|_| x.2 == w.cols && w.cols.is_multiple_of(256) && F16_TYPES.contains(&w.ty.code())) {
+            .filter(|_| x.2 == w.cols && w.cols.is_multiple_of(256) && (F16_TYPES.contains(&w.ty.code()) || self.ops.silo_f16(w.ty.code()))) {
             self.ops.to_f16(&x.0.view(x.1 * 4, t * w.cols * 4)?, x16, t * w.cols)?;
             let chunk = (SCRATCH * 2 / w.cols).max(1).min(w.rows);
             let mut r0 = 0;
@@ -2859,7 +2859,9 @@ impl<'g> Glm<'g> {
             // 2.0x slower at 512). Memory stays one expert's worth however big the chunk: its tokens gathered to
             // fp16, its outputs added into y.
             let f16_min = f16_min();
-            if f16_min > 0 && t >= f16_min && t > MMVQ_COLS {
+            // (each of the expert's types one an expander takes: Q6_K only through the silo)
+            let f16_ok = [parts.gate.2, parts.up.2, parts.down.2].iter().all(|ty| F16_TYPES.contains(&ty.code()) || o.silo_f16(ty.code()));
+            if f16_min > 0 && t >= f16_min && t > MMVQ_COLS && f16_ok {
                 if let Some((_, tk)) = copies {
                     o.await_ticket(tk)?; // experts swapped in (from the file only, in prompt passes)
                 }
