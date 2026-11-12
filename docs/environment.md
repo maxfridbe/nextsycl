@@ -123,6 +123,7 @@ GLM-5.3 (`llm/glm5next`, `kernels/llm/glm5next`; docs/glm5next.md).
 | `NS_FUSED_MAX` | 64 | Experiment: most tokens of an expert the fused gate/up kernel takes in prompt chunks (oneMKL above); 0 = never | llm glm5next |
 | `NS_SILO_MOE` | 1 | 0: the silo's grouped decode experts off (IQ3_S / Q6_K down: the REAP-50 IQ3_M and Q4_K_M files), each expert's products one at a time instead - a check of the silo's | llm glm5next |
 | `NS_SILO_MOE_GU` | 0 | 1: the silo's grouped experts compute gate \| up as well (moe.cpp); by default the shared grouped kernels' gate \| up and activation run, and the silo takes only the down projection they do not | llm glm5next |
+| `NS_FIXED_LAYERS` | 1 | 0: no layer kept whole in VRAM - by default a part's few layers whose experts are larger than the rest (the REAP-50 IQ3_M file's Q4_K-down layers 3-4) stay whole in VRAM of their own, so the expert slots fit the usual size | llm glm5next |
 | `NS_HC_FUSED` | 1 | Experiment: 0 = the hyper-connection pre-mix as separate steps, not the fused two-launch kernel | llm glm5next |
 | `NS_KDA_COLS` | by GPU size (4 at 200+ compute units, else 8) | Experiment: columns a sub-group in the KDA scan kernel: 1, 2, 4 or 8 | kernels:llm glm5next |
 | `NS_KV` | q8 | The MLA latent cache's form: q8 (544 bytes a token and layer) or f16 (1,024) (--opt-kv) | llm glm5next; cli (passes it to the container) |
@@ -803,6 +804,7 @@ Inputs of the checks and unit tests that need files outside the repository (unse
 | `NS_CHECK_PICTURE` | edit-pre check fails | edit-pre check: the original picture (PNG) resized and compared with the reference's | image qwenimage21 (check) |
 | `NS_CHECK_PROMPT` | no ids compared | edit-te check: an edit prompt whose token ids are compared with the reference's | image qwenimage21 (check) |
 | `NS_CHECK_SAVE` | off | llm check: DIR gets this engine's tensors too (<name>.f32), beside the reference's | cli (llm check) |
+| `NS_TAP_SAVE` | off | llm generate: DIR gets every named step of the prompt's pass (<name>.f32, the last chunk's) - two runs' folders compared offline | cli (llm generate) |
 | `NS_DUMP_DIR` | ns-dump | Directory llama-ns-dump writes its float32 tensors and index.tsv to | reference/llama-dump (ns-dump.cpp, llama.cpp parity tool) |
 | `NS_DUMP_RE` | the GLM layer outputs (inp_embd, attn_norm-N, l_out-N, result_output, ...) | Regex of the llama.cpp graph tensor names llama-ns-dump writes | reference/llama-dump (ns-dump.cpp, llama.cpp parity tool) |
 | `NS_DUMP_PROMPT` | unset (-p) | a file whose bytes are the prompt as they are (-p and -f drop a trailing newline) | reference/llama-dump (ns-mtmd-dump.cpp, llama.cpp mtmd parity tool) |

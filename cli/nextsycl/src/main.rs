@@ -602,8 +602,19 @@ fn generate(args: &[String]) -> Result<(), String> {
               gs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(" + "), ids.len(), eng.load_seconds());
     let mut sess = eng.session(ctx).map_err(e)?;
     let mut none = |_: &str, _: &nextsycl_core::DevBuf| -> nextsycl_core::Result<()> { Ok(()) };
+    // NS_TAP_SAVE=DIR: every named step of the prompt's pass written as DIR/<name>.f32 (the last chunk's; two runs'
+    // folders compared offline: where two numeric paths part)
+    let tap_dir = std::env::var("NS_TAP_SAVE").ok();
+    let mut save = |name: &str, b: &nextsycl_core::DevBuf| -> nextsycl_core::Result<()> {
+        if let Some(d) = &tap_dir {
+            let v = b.to_f32()?;
+            std::fs::write(Path::new(d).join(format!("{name}.f32")), v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())
+                .map_err(|x| nextsycl_core::Error(format!("{d}: {x}")))?;
+        }
+        Ok(())
+    };
     let t0 = std::time::Instant::now();
-    let logits = eng.feed(&mut sess, &ids, &mut none).map_err(e)?;
+    let logits = if tap_dir.is_some() { eng.feed(&mut sess, &ids, &mut save) } else { eng.feed(&mut sess, &ids, &mut none) }.map_err(e)?;
     let prefill = t0.elapsed().as_secs_f64();
     // --logits-out PATH: the prompt's last position's logits as float32 (a check against a reference's)
     if let Some(p) = opt("--logits-out") {
