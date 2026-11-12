@@ -37,6 +37,21 @@ pub const ROLES: &[&str] = &["transformer", "text-encoder", "vae", "tokenizer"];
 const GIB: f64 = (1u64 << 30) as f64;
 
 /// The prompt's chat turn; the system turn's tokens are dropped from the encoding
+/// What the model was trained to read for a picture with an alpha channel (a prompt that says so already is left as it is)
+const RGBA_PREFIX: &str = "This is an RGBA image with transparency. ";
+const RGBA_SUFFIX: &str = " The image has alpha channel and the background is transparent.";
+
+/// A transparent picture's prompt: without the sentences the model draws the background solid, and alpha comes out
+/// opaque (rgba on its own only keeps the decoder's fourth channel)
+pub fn rgba_prompt(prompt: &str) -> String {
+    let p = prompt.trim().trim_end_matches('.');
+    if p.to_lowercase().starts_with("this is an rgba image") {
+        prompt.to_string()
+    } else {
+        format!("{RGBA_PREFIX}{p}.{RGBA_SUFFIX}")
+    }
+}
+
 const SYSTEM: &str = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n";
 
 /// The VAE's latent statistics (diffusers' vae/config.json latents_mean / latents_std), per channel
@@ -529,7 +544,8 @@ impl ImageEngine for QwenImage21 {
                 self.encode_edit(p, &seen)
             }
         };
-        let (embeds, tokens, pads) = encode(&req.prompt)?;
+        let prompt = if req.rgba { rgba_prompt(&req.prompt) } else { req.prompt.clone() };
+        let (embeds, tokens, pads) = encode(&prompt)?;
         let negative = match (&req.negative, cfg > 1.0) {
             (Some(np), true) => Some(encode(np)?),
             _ => None,
@@ -591,5 +607,17 @@ impl ImageEngine for QwenImage21 {
     }
     fn report(&self) -> Vec<String> {
         vec![format!("{ARCH} on {} (loaded {:.0} s ago)", self.nsd.gpu.name, self.loaded.elapsed().as_secs_f64())]
+    }
+}
+
+#[cfg(test)]
+mod rgba_tests {
+    use super::rgba_prompt;
+
+    #[test]
+    fn a_transparent_prompt_gets_the_alpha_sentences_once() {
+        let p = rgba_prompt("a cute cartoon dragon sticker, thick white outline.");
+        assert_eq!(p, "This is an RGBA image with transparency. a cute cartoon dragon sticker, thick white outline. The image has alpha channel and the background is transparent.");
+        assert_eq!(rgba_prompt(&p), p);
     }
 }
