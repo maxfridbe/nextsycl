@@ -62,7 +62,7 @@ pub const OPTIONS: &[EngineOption] = &[
 
 /// This engine's registry entry
 pub fn kind() -> EngineKind {
-    EngineKind { archs: &["glm5-next", "glm5next"], name: "GLM-5.3-Flash (KDA + MLA with a DSA indexer, 288 experts, MTP)", load, info: tools::info,
+    EngineKind { archs: &["glm5-next", "glm5next"], name: "GLM-5.3-Flash (KDA + MLA with a DSA indexer, 288 experts or a REAP-pruned 144, MTP)", load, info: tools::info,
                  kernels: Some(tools::kernels), chat: nextsycl_tok::glm_chat, options: OPTIONS, prepare: None }
 }
 

@@ -636,7 +636,12 @@ impl Ops {
         unsafe { (self.k.moe_grouped_supported)(gu as i32, down as i32, n_embd as i64, n_ff as i64) != 0 }
     }
     /// the silo's grouped kernels, when they take a pair the shared ones do not
+    /// (NS_SILO_MOE=0: not - such a layer's experts then take the per-expert products, a check of the silo's)
     fn moe_silo(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> Option<&'static ffi::Silo> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("NS_SILO_MOE").map_or(true, |v| v != "0")) {
+            return None;
+        }
         // SAFETY: a capability query.
         self.s.filter(|s| !self.moe_shared(gu, down, n_embd, n_ff) && unsafe { (s.moe_supported)(gu as i32, down as i32, n_embd as i64, n_ff as i64) } != 0)
     }
