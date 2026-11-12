@@ -1169,7 +1169,7 @@ impl Home {
     }
 
     /// A kind's output directory (the servers' NS_IMAGE_OUT / NS_AUDIO_OUT / NS_MODEL3D_OUT)
-    fn out_dir(&self, kind: &str) -> std::path::PathBuf {
+    pub(super) fn out_dir(&self, kind: &str) -> std::path::PathBuf {
         let (key, def) = match kind {
             "image" => ("NS_IMAGE_OUT", "images"),
             "model3d" => ("NS_MODEL3D_OUT", "model3d"),
@@ -1464,8 +1464,18 @@ impl Home {
                 let t = self.ensure(&id)?;
                 pass(s, &t)
             }
-            ("GET", p) if p.starts_with("/v1/images/files/") => pass(s, &self.file_target("image")),
-            ("GET", p) if p.starts_with("/v1/audio/files/") => pass(s, &self.file_target("audio")),
+            ("GET", p) if p.starts_with("/v1/images/files/") || p.starts_with("/v1/audio/files/") => {
+                // from the directory when the file is there (no server need run); gone: a 404 that says so, and that a
+                // retry of the request that made it (a cached or deduplicated answer named it) may bring it back
+                let (kind, pre) = if p.starts_with("/v1/images/") { ("image", "/v1/images/files/") } else { ("audio", "/v1/audio/files/") };
+                let name = p[pre.len()..].split('?').next().unwrap_or("");
+                if !self.out_dir(kind).join(crate::files::plain(name).unwrap_or("-")).is_file() {
+                    let e = json!({"error": format!("no file {name}"), "code": "not_found", "retryable": true});
+                    http::respond(s, 404, &e);
+                    return Ok(());
+                }
+                pass(s, &self.file_target(kind))
+            }
             ("GET", p) if p.starts_with("/v1/model3d/files/") => {
                 // from the directory (a tool's result needs no 3D server running)
                 let name = p["/v1/model3d/files/".len()..].split('?').next().unwrap_or("");

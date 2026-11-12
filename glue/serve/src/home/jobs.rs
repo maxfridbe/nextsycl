@@ -241,6 +241,19 @@ impl Home {
         self.jobs.get(id).is_some_and(|j| j["cancel"] == true)
     }
 
+    /// Whether a finished job's files are still in the output directory: a deduplicated answer that names one
+    /// deleted since would send the caller to a 404, so such a job is run again
+    fn result_files_there(&self, j: &Value) -> bool {
+        if j["state"] != "done" {
+            return true;
+        }
+        let dir = |u: &str| if u.contains("/v1/images/files/") { Some(("image", "/v1/images/files/")) } else if u.contains("/v1/audio/files/") { Some(("audio", "/v1/audio/files/")) } else { None };
+        j["result"]["data"].as_array().into_iter().flatten().filter_map(|e| e["url"].as_str()).all(|u| match dir(u) {
+            Some((k, pre)) => u.split(pre).nth(1).and_then(|n| crate::files::plain(n.split('?').next().unwrap_or(""))).is_some_and(|n| self.out_dir(k).join(n).is_file()),
+            None => true,
+        })
+    }
+
     /// A request that runs as a job: its job made (or the one its reentrant_id names), queued, and with wait its answer
     pub(crate) fn submit(self: &Arc<Self>, name: &str, b: &Value) -> Result<Value, Fail> {
         let kind = kind_of_method(name);
@@ -248,7 +261,8 @@ impl Home {
         let wait = b["wait"] != false;
         let again = rid.as_deref().and_then(|r| {
             self.jobs.list.lock().unwrap().iter().rev()
-                .find(|j| j["kind"] == kind && j["reentrant_id"] == r && !matches!(j["state"].as_str(), Some("failed" | "cancelled")))
+                .find(|j| j["kind"] == kind && j["reentrant_id"] == r && !matches!(j["state"].as_str(), Some("failed" | "cancelled"))
+                    && self.result_files_there(j))
                 .cloned()
         });
         let reentered = again.is_some();
