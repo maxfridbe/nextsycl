@@ -17,6 +17,9 @@ use nextsycl_llm::{At, EngineOption};
 use nextsycl_llm::{Checkpoint, CheckpointState, Decoder, DecoderState, Engine, EngineKind, ExpertStats, GpuInfo, LoadOptions, Result, Sampler,
                  Session, SessionState, Tap};
 
+/// The silo's name (`kernels/llm/glm5next/silo`, dist/silo/libnextsycl-glm5next.so)
+pub const ARCH: &str = "glm5next";
+
 /// The model description's errors (a file's layout against what the engine needs)
 #[derive(Debug)]
 pub struct Error(pub String);

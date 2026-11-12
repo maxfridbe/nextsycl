@@ -148,6 +148,59 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
     .map_err(|e| nextsycl_core::Error(e.clone()))
 }
 
+/// The silo's kernels (kernels/llm/glm5next/silo/silo.h, dist/silo/libnextsycl-glm5next.so), when it is there: the
+/// types the REAP-50 files store that the shared kernels do not read
+pub struct Silo {
+    pub path: std::path::PathBuf,
+    pub dequant_supported: unsafe extern "C" fn(c_int) -> c_int,
+    pub dequant: unsafe extern "C" fn(Gpu, c_int, *const c_void, usize, *mut f32) -> c_int,
+    pub dequant_f16_supported: unsafe extern "C" fn(c_int) -> c_int,
+    pub dequant_f16: unsafe extern "C" fn(Gpu, c_int, *const c_void, i64, *mut u16) -> c_int,
+    pub moe_supported: unsafe extern "C" fn(c_int, c_int, i64, i64) -> c_int,
+    pub moe_scratch_bytes: unsafe extern "C" fn(i64, i64) -> usize,
+    #[allow(clippy::type_complexity)]
+    pub moe: unsafe extern "C" fn(Gpu, c_int, c_int, i64, i64, *const u64, *const i32, *const i32, *const i32, *const i32, i64, i64,
+                                  *const c_void, *mut c_void, *mut f32, f32, c_int) -> c_int,
+}
+
+// SAFETY: function pointers into the library, which stays loaded for the process.
+unsafe impl Send for Silo {}
+unsafe impl Sync for Silo {}
+
+/// The silo (None: the shared kernels for everything - the IQ2 files need no more; NS_SILO=0 leaves it closed)
+pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
+    static SILO: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
+    SILO.get_or_init(|| {
+        let Some(lib) = nextsycl_core::silo(crate::ARCH).map_err(|e| e.0)? else { return Ok(None) };
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
+                }
+                // SAFETY: the symbol is declared in silo.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Some(Silo {
+            path: lib.path.clone(),
+            dequant_supported: sym!("ns_llm_glm5next_dequant_supported"),
+            dequant: sym!("ns_llm_glm5next_dequant"),
+            dequant_f16_supported: sym!("ns_llm_glm5next_dequant_f16_supported"),
+            dequant_f16: sym!("ns_llm_glm5next_dequant_f16"),
+            moe_supported: sym!("ns_llm_glm5next_moe_supported"),
+            moe_scratch_bytes: sym!("ns_llm_glm5next_moe_scratch_bytes"),
+            moe: sym!("ns_llm_glm5next_moe"),
+        }))
+    })
+    .as_ref()
+    .map(|s| s.as_ref())
+    .map_err(|e| nextsycl_core::Error(e.clone()))
+}
+
 /// A call's return code as a result (the reason from the library)
 pub fn check(rc: c_int, what: &str) -> nextsycl_core::Result<()> {
     if rc == 0 {

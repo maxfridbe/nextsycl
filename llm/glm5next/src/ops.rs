@@ -13,6 +13,8 @@ pub struct Ops {
     pub gpu: Arc<Gpu>,
     /// this engine's kernels (`kernels/llm/glm5next/glm.h`)
     k: &'static ffi::Api,
+    /// its silo (`kernels/llm/glm5next/silo/silo.h`), when built: the REAP-50 files' types
+    s: Option<&'static ffi::Silo>,
 }
 
 macro_rules! need {
@@ -26,7 +28,7 @@ macro_rules! need {
 #[allow(clippy::too_many_arguments)] // the kernels' own arity
 impl Ops {
     pub fn new(gpu: Arc<Gpu>) -> Result<Ops> {
-        Ok(Ops { gpu, k: ffi::api()? })
+        Ok(Ops { gpu, k: ffi::api()?, s: ffi::silo()? })
     }
     fn ok(&self, rc: i32, what: &str) -> Result<()> {
         ffi::check(rc, what)
@@ -44,6 +46,13 @@ impl Ops {
     pub fn dequant(&self, ty: u32, src: &DevBuf, at: usize, bytes: usize, n: usize, dst: &DevBuf) -> Result<()> {
         need!(dst, n, "dequant");
         src.bounds(at, bytes)?;
+        // the silo's types (the REAP-50 files': none of them the shared kernel's)
+        // SAFETY: a capability query.
+        if let Some(s) = self.s.filter(|s| unsafe { (s.dequant_supported)(ty as i32) } != 0) {
+            // SAFETY: as below.
+            let rc = unsafe { (s.dequant)(self.raw(), ty as i32, src.ptr().cast::<u8>().add(at).cast::<c_void>(), n, dst.fp()) };
+            return self.ok(rc, "dequant (silo)");
+        }
         // SAFETY: the byte range is inside src (checked) and holds n values of `ty` (the caller's `bytes`); dst
         // holds n floats (checked).
         let rc = unsafe { (self.k.dequant)(self.raw(), ty as i32, src.ptr().cast::<u8>().add(at).cast::<c_void>(), n, dst.fp()) };
@@ -53,6 +62,12 @@ impl Ops {
     pub fn dequant_f16(&self, ty: u32, src: &DevBuf, at: usize, bytes: usize, n: usize, dst: &DevBuf) -> Result<()> {
         src.bounds(at, bytes)?;
         dst.bounds(0, n * 2)?;
+        // SAFETY: a capability query.
+        if let Some(s) = self.s.filter(|s| unsafe { (s.dequant_f16_supported)(ty as i32) } != 0) {
+            // SAFETY: both ranges checked.
+            let rc = unsafe { (s.dequant_f16)(self.raw(), ty as i32, src.ptr().cast::<u8>().add(at).cast::<c_void>(), n as i64, dst.ptr().cast()) };
+            return self.ok(rc, "dequant_f16 (silo)");
+        }
         // SAFETY: both ranges checked.
         let rc = unsafe { (self.k.dequant_f16)(self.raw(), ty as i32, src.ptr().cast::<u8>().add(at).cast::<c_void>(), n as i64, dst.ptr().cast()) };
         self.ok(rc, "dequant_f16")
@@ -615,13 +630,26 @@ impl Ops {
         };
         self.ok(rc, "moe_combine")
     }
-    pub fn moe_grouped_supported(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> bool {
+    /// whether the shared grouped kernels take the pair
+    fn moe_shared(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> bool {
         // SAFETY: a capability query.
         unsafe { (self.k.moe_grouped_supported)(gu as i32, down as i32, n_embd as i64, n_ff as i64) != 0 }
     }
+    /// the silo's grouped kernels, when they take a pair the shared ones do not
+    fn moe_silo(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> Option<&'static ffi::Silo> {
+        // SAFETY: a capability query.
+        self.s.filter(|s| !self.moe_shared(gu, down, n_embd, n_ff) && unsafe { (s.moe_supported)(gu as i32, down as i32, n_embd as i64, n_ff as i64) } != 0)
+    }
+    /// whether a layer's experts of these types run grouped (the shared kernels, else the silo's)
+    pub fn moe_grouped_supported(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> bool {
+        self.moe_shared(gu, down, n_embd, n_ff) || self.moe_silo(gu, down, n_embd, n_ff).is_some()
+    }
+    /// the grouped kernels' scratch for `entries` (the larger of the shared and the silo's)
     pub fn moe_scratch_bytes(&self, entries: usize, n_ff: usize) -> usize {
         // SAFETY: arithmetic only.
-        unsafe { (self.k.moe_scratch_bytes)(entries as i64, n_ff as i64) }
+        let shared = unsafe { (self.k.moe_scratch_bytes)(entries as i64, n_ff as i64) };
+        // SAFETY: arithmetic only.
+        self.s.map_or(shared, |s| shared.max(unsafe { (s.moe_scratch_bytes)(entries as i64, n_ff as i64) }))
     }
     /// A layer's experts in two launches. `table` holds, as u64: the groups' blob pointers [groups]; then as i32:
     /// grp_start [groups + 1], n_groups [1], ent_dst [entries], ent_tok [entries] (at the offsets returned by
@@ -642,8 +670,13 @@ impl Ops {
             let i32s = base.add(groups * 8).cast::<i32>();
             let (gs, ng) = (i32s, i32s.add(groups + 1));
             let (dst, tok) = (ng.add(1), ng.add(1 + entries));
-            (self.k.moe_grouped)(self.raw(), gu as i32, down as i32, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, tok, groups as i64, entries as i64,
-                                   xq.ptr(), scratch.ptr(), out.fp(), limit, lanes as i32, phase)
+            match self.moe_silo(gu, down, n_embd, n_ff) {
+                // the silo's (its lane count is its own: a row's sums in one order at every width)
+                Some(s) => (s.moe)(self.raw(), gu as i32, down as i32, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, tok, groups as i64, entries as i64,
+                                   xq.ptr(), scratch.ptr(), out.fp(), limit, phase),
+                None => (self.k.moe_grouped)(self.raw(), gu as i32, down as i32, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, tok, groups as i64,
+                                             entries as i64, xq.ptr(), scratch.ptr(), out.fp(), limit, lanes as i32, phase),
+            }
         };
         self.ok(rc, "moe_grouped")
     }

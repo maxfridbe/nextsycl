@@ -14,9 +14,11 @@
 //!   MTP:           one extra block (the ds4 file's layer 45) with nextn.{eh_proj, enorm, hnorm, shared_head_norm}
 //! ```
 //!
-//! Two converters' files exist: llama.cpp's (PR 27773; `ssm_*` for KDA, `indexer_compressor_*`, per-layer
-//! `attention.head_count_kv` for the layer pattern) and antirez ds4's (`kda_*`, `indexer.pool_*`, `layer_types`,
-//! MTP kept). `Scheme` maps the runtime's roles onto either.
+//! Three converters' files exist: llama.cpp's (PR 27773; `ssm_*` for KDA, `indexer_compressor_*`, per-layer
+//! `attention.head_count_kv` for the layer pattern), antirez ds4's (`kda_*`, `indexer.pool_*`, `layer_types`,
+//! MTP kept) and patrickbdevaney's llama.cpp fork's (the REAP-pruned files: llama.cpp's names with `hc_*` bare,
+//! `indexer.kpool_*`, `attention.hc.*` metadata, the MTP block counted in `block_count`, `ssm_a` = exp(A_log)).
+//! `Scheme` maps the runtime's roles onto each. The expert count is the file's (288, or 144 in a REAP-50 file).
 
 use nextsycl_gguf::{GType, Gguf, Tensor, Value};
 
@@ -28,6 +30,45 @@ pub enum Scheme {
     LlamaCpp,
     /// antirez ds4's names
     Ds4,
+    /// patrickbdevaney's llama.cpp fork (branch glm5_next; the GLM-5.3-Flash-REAP50 GGUFs)
+    Fork,
+}
+
+/// What a file's KDA decay tensor (`Role::KdaA`) holds; the gate wants A = -exp(A_log).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AForm {
+    /// -exp(A_log): as the gate takes it (llama.cpp's `ssm_a`)
+    NegExp,
+    /// A_log (ds4's `kda_a_log`)
+    Log,
+    /// exp(A_log) (the fork's `ssm_a`: its graph multiplies inside the sigmoid without the sign)
+    Exp,
+}
+
+impl AForm {
+    /// The stored value as the gate's A
+    pub fn to_a(self, v: f32) -> f32 {
+        match self {
+            AForm::NegExp => v,
+            AForm::Log => -v.exp(),
+            AForm::Exp => -v,
+        }
+    }
+}
+
+impl Scheme {
+    pub fn a_form(self) -> AForm {
+        match self {
+            Scheme::LlamaCpp => AForm::NegExp,
+            Scheme::Ds4 => AForm::Log,
+            Scheme::Fork => AForm::Exp,
+        }
+    }
+}
+
+/// The trunk's blocks in a fork file: its block_count counts the MTP blocks (`nextn_predict_layers`) too
+pub fn fork_trunk(blocks: u64, nextn: u64) -> Result<u64> {
+    blocks.checked_sub(nextn).filter(|t| *t > 0).ok_or_else(|| Error(format!("block_count {blocks} with {nextn} MTP blocks leaves no trunk")))
 }
 
 /// The geometry, from metadata and the tensors' shapes.
@@ -184,19 +225,21 @@ impl Role {
     /// The tensor's name suffix in a file (after `blk.N.`; the whole name for a global role).
     pub fn name(self, s: Scheme) -> &'static str {
         use Role::*;
-        let ll = s == Scheme::LlamaCpp;
+        // the fork's names are llama.cpp's but for the hyper-connections and the indexer's pool
+        let ll = s != Scheme::Ds4;
+        let fork = s == Scheme::Fork;
         match self {
             TokenEmbd => "token_embd.weight",
             OutputNorm => "output_norm.weight",
             Output => "output.weight",
             AttnNorm => "attn_norm.weight",
             FfnNorm => "ffn_norm.weight",
-            HcAttnFn => "hc_attn_fn.weight",
-            HcAttnBase => "hc_attn_base.weight",
-            HcAttnScale => "hc_attn_scale.weight",
-            HcFfnFn => "hc_ffn_fn.weight",
-            HcFfnBase => "hc_ffn_base.weight",
-            HcFfnScale => "hc_ffn_scale.weight",
+            HcAttnFn => if fork { "hc_attn_fn" } else { "hc_attn_fn.weight" },
+            HcAttnBase => if fork { "hc_attn_base" } else { "hc_attn_base.weight" },
+            HcAttnScale => if fork { "hc_attn_scale" } else { "hc_attn_scale.weight" },
+            HcFfnFn => if fork { "hc_ffn_fn" } else { "hc_ffn_fn.weight" },
+            HcFfnBase => if fork { "hc_ffn_base" } else { "hc_ffn_base.weight" },
+            HcFfnScale => if fork { "hc_ffn_scale" } else { "hc_ffn_scale.weight" },
             KdaQ => if ll { "attn_q.weight" } else { "kda_q.weight" },
             KdaK => if ll { "attn_k.weight" } else { "kda_k.weight" },
             KdaV => if ll { "attn_v.weight" } else { "kda_v.weight" },
@@ -225,8 +268,8 @@ impl Role {
             IdxKNorm => "indexer.k_norm.weight",
             IdxKNormBias => "indexer.k_norm.bias",
             IdxProj => "indexer.proj.weight",
-            IdxPoolApe => if ll { "indexer_compressor_ape.weight" } else { "indexer.pool_ape.weight" },
-            IdxPoolGate => if ll { "indexer_compressor_gate.weight" } else { "indexer.pool_gate.weight" },
+            IdxPoolApe => if fork { "indexer.kpool_ape" } else if ll { "indexer_compressor_ape.weight" } else { "indexer.pool_ape.weight" },
+            IdxPoolGate => if fork { "indexer.kpool_gate" } else if ll { "indexer_compressor_gate.weight" } else { "indexer.pool_gate.weight" },
             FfnGate => "ffn_gate.weight",
             FfnUp => "ffn_up.weight",
             FfnDown => "ffn_down.weight",
@@ -278,12 +321,19 @@ fn meta_f(f: &Gguf, keys: &[&str], default: Option<f64>) -> Result<f64> {
 
 impl<'g> Model<'g> {
     pub fn open(file: &'g Gguf) -> Result<Model<'g>> {
-        let scheme = if file.tensor("blk.0.kda_q.weight").is_some() { Scheme::Ds4 } else { Scheme::LlamaCpp };
-        let trunk = match scheme {
-            Scheme::Ds4 => meta_u(file, &["trunk_block_count"])?,
-            Scheme::LlamaCpp => meta_u(file, &["block_count"])?,
+        let scheme = if file.tensor("blk.0.kda_q.weight").is_some() {
+            Scheme::Ds4
+        } else if file.tensor("blk.0.hc_attn_fn").is_some() {
+            Scheme::Fork
+        } else {
+            Scheme::LlamaCpp
         };
         let blocks = meta_u(file, &["block_count"])?;
+        let trunk = match scheme {
+            Scheme::Ds4 => meta_u(file, &["trunk_block_count"])?,
+            Scheme::LlamaCpp => blocks,
+            Scheme::Fork => fork_trunk(blocks, meta_u(file, &["nextn_predict_layers"]).unwrap_or(0))?,
+        };
         // the layer pattern: ds4 `layer_types` (1 = MLA), llama.cpp `attention.head_count_kv` (1 = full attention)
         let pattern = file.arch_meta("layer_types").or_else(|| file.arch_meta("attention.head_count_kv")).and_then(Value::as_array)
             .ok_or_else(|| Error("neither layer_types nor attention.head_count_kv gives the layer pattern".into()))?;
@@ -316,15 +366,17 @@ impl<'g> Model<'g> {
             idx_heads: meta_u(file, &["attention.indexer.head_count"])?,
             idx_dim: meta_u(file, &["attention.indexer.key_length"])?,
             idx_top_k: meta_u(file, &["attention.indexer.top_k"])?,
-            idx_pool: meta_u(file, &["attention.indexer.pool_size", "attention.indexer.kpool"])?,
+            // the fork's files carry no pool size: the pool's position embedding is [pool, key]
+            idx_pool: meta_u(file, &["attention.indexer.pool_size", "attention.indexer.kpool"])
+                .or_else(|_| shape(&format!("blk.{mla_layer}.{}", Role::IdxPoolApe.name(scheme))).map(|s| s[0]))?,
             kda_heads: meta_u(file, &["linear_attention.head_count"]).or_else(|_| shape(&format!("blk.0.{}", Role::KdaA.name(scheme))).map(|s| s[0]))?,
             kda_dim: meta_u(file, &["linear_attention.head_dimension", "kda.head_dim"])?,
             kda_conv: meta_u(file, &["linear_attention.conv_kernel", "ssm.conv_kernel"])?,
-            kda_gate_low: meta_f(file, &["linear_attention.gate_lower_bound", "kda.gate_lower_bound"], None)?,
+            kda_gate_low: meta_f(file, &["linear_attention.gate_lower_bound", "kda.gate_lower_bound", "ssm.gate_lower_bound"], None)?,
             kda_rank: fa[0],
-            hc: meta_u(file, &["hyper_connection.count"])?,
-            hc_iters: meta_u(file, &["hyper_connection.sinkhorn_iterations"])?,
-            hc_eps: meta_f(file, &["hyper_connection.epsilon"], None)?,
+            hc: meta_u(file, &["hyper_connection.count", "attention.hc.mult"])?,
+            hc_iters: meta_u(file, &["hyper_connection.sinkhorn_iterations", "attention.hc.sinkhorn_iters"])?,
+            hc_eps: meta_f(file, &["hyper_connection.epsilon", "attention.hc.eps"], None)?,
             mla,
         };
         Ok(Model { file, scheme, g })
@@ -469,5 +521,44 @@ impl<'g> Model<'g> {
     /// One routed expert's bytes in layer `l` (gate + up + down rows).
     pub fn expert_bytes(&self, l: u64) -> u64 {
         [Role::ExpGate, Role::ExpUp, Role::ExpDown].iter().filter_map(|r| self.tensor(l, *r)).map(|t| t.bytes / self.g.n_expert).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decay_forms_give_the_gates_a() {
+        // A_log = 0.5: the gate wants A = -exp(0.5) whichever form the file stores
+        let want = -(0.5f32).exp();
+        assert_eq!(AForm::NegExp.to_a(want), want);
+        assert!((AForm::Log.to_a(0.5) - want).abs() < 1e-6);
+        assert!((AForm::Exp.to_a((0.5f32).exp()) - want).abs() < 1e-6);
+        assert_eq!(Scheme::LlamaCpp.a_form(), AForm::NegExp);
+        assert_eq!(Scheme::Ds4.a_form(), AForm::Log);
+        assert_eq!(Scheme::Fork.a_form(), AForm::Exp);
+    }
+
+    #[test]
+    fn fork_names() {
+        // the REAP-50 files' names (their header): llama.cpp's, the hyper-connections bare, the indexer's pool kpool_*
+        assert_eq!(Role::HcAttnFn.name(Scheme::Fork), "hc_attn_fn");
+        assert_eq!(Role::HcFfnScale.name(Scheme::Fork), "hc_ffn_scale");
+        assert_eq!(Role::HcAttnFn.name(Scheme::LlamaCpp), "hc_attn_fn.weight");
+        assert_eq!(Role::IdxPoolApe.name(Scheme::Fork), "indexer.kpool_ape");
+        assert_eq!(Role::IdxPoolGate.name(Scheme::Fork), "indexer.kpool_gate");
+        assert_eq!(Role::IdxPoolApe.name(Scheme::LlamaCpp), "indexer_compressor_ape.weight");
+        assert_eq!(Role::IdxPoolApe.name(Scheme::Ds4), "indexer.pool_ape.weight");
+        assert_eq!(Role::KdaQ.name(Scheme::Fork), Role::KdaQ.name(Scheme::LlamaCpp));
+        assert_eq!(Role::KdaA.name(Scheme::Fork), Role::KdaA.name(Scheme::LlamaCpp));
+    }
+
+    #[test]
+    fn fork_trunk_leaves_the_mtp_block_out() {
+        assert_eq!(fork_trunk(46, 1).unwrap(), 45);
+        assert_eq!(fork_trunk(45, 0).unwrap(), 45);
+        assert!(fork_trunk(1, 1).is_err());
+        assert!(fork_trunk(0, 1).is_err());
     }
 }

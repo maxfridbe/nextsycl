@@ -20,7 +20,7 @@ use nextsycl_core::{Arena, DevBuf, Error, Gpu, HostBuf, Result};
 
 use crate::ops::Ops;
 use nextsycl_gguf::{GType, Gguf};
-use crate::model::{Model, Role, Scheme};
+use crate::model::{AForm, Model, Role};
 
 use nextsycl_llm::{GpuInfo, Sampler, Tap};
 
@@ -723,9 +723,11 @@ impl Part {
                 if VECTORS.contains(&r) || matches!(r, Role::MlaKB | Role::MlaVB) {
                     let f = DevBuf::f32(gpu, n)?;
                     ops.dequant(t.ty.code(), &raw, 0, t.bytes as usize, n, &f)?;
-                    if r == Role::KdaA && m.scheme == Scheme::Ds4 {
-                        // ds4 stores A_log; the gate wants A = -exp(A_log) (llama.cpp's ssm_a holds that already)
-                        let v: Vec<f32> = f.to_f32()?.iter().map(|a| -a.exp()).collect();
+                    if r == Role::KdaA && m.scheme.a_form() != AForm::NegExp {
+                        // ds4 stores A_log, the fork exp(A_log); the gate wants A = -exp(A_log) (llama.cpp's ssm_a
+                        // holds that already)
+                        let form = m.scheme.a_form();
+                        let v: Vec<f32> = f.to_f32()?.iter().map(|a| form.to_a(*a)).collect();
                         f.write(0, &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
                     }
                     vecs.insert((l, r), f);
