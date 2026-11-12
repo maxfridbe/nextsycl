@@ -265,6 +265,13 @@ fn fixed_layers_of(sizes: &[(u64, usize)]) -> Vec<u64> {
     if big.len() * 4 <= sizes.len() { big } else { Vec::new() }
 }
 
+/// NS_MTP_HID=normed: the draft block reads the final hidden state after output_norm (the fork's and vLLM's input)
+/// instead of the streams' mean before it (ds4's)
+fn mtp_hid_normed() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_MTP_HID").is_ok_and(|v| v == "normed"))
+}
+
 /// The fewest VRAM expert slots a part loads with: one layer's experts and a few to spare (none for a part without
 /// experts)
 fn min_vram_slots(n_expert: usize, part_experts: usize) -> usize {
@@ -2214,8 +2221,13 @@ impl<'g> Glm<'g> {
         let mean = p.arena.f32(t * d)?;
         o.hc_mean(x, &mean, t, d)?;
         if let Some(ms) = mtp {
-            // the draft block reads these rows with the tokens that follow them
-            ms.hid.copy_within(0, &mean, 0, t * d * 4)?;
+            // the draft block reads these rows with the tokens that follow them: the streams' mean (ds4's form), or
+            // with NS_MTP_HID=normed that after output_norm (what llama.cpp's glm5-next fork and vLLM feed)
+            if mtp_hid_normed() {
+                o.rms_norm(&mean, Some(p.vec(0, Role::OutputNorm)?), &ms.hid.view(0, t * d * 4)?, t, d, eps)?;
+            } else {
+                ms.hid.copy_within(0, &mean, 0, t * d * 4)?;
+            }
             ms.rows = t;
             ms.slot0 = pos0;
             ms.next = tokens[1..].to_vec();
