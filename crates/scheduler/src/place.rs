@@ -4,7 +4,8 @@
 use std::collections::BTreeMap;
 
 use crate::host::Host;
-use crate::room::{card_free, card_of_port, extra_copy_allowed, no_room, pick_card, pick_first, room_plan, Free, Holder, ModelInfo, Server, JOB_ROOM_WAIT_S, MARGIN_MB};
+use crate::room::{card_free, card_of_port, extra_copy_allowed, no_room, pick_card, pick_first, room_plan, Free, Holder, ModelInfo, Server, Snapshot, JOB_ROOM_WAIT_S,
+                  MARGIN_MB};
 use crate::Fail;
 
 /// What to place
@@ -106,6 +107,63 @@ fn drain(host: &dyn Host, x: &Server, kind: &str, id: &str, job: Option<&str>) -
     stop_slot(host, kind, x, id)
 }
 
+/// Whether card `g`'s compute is taken by other work: a busy server of another model there (any kind's: a FlashVSR
+/// upscale, a picture), or the video worker making something while it holds memory there. A server of the model
+/// asking (`port`) does not count. Memory says nothing of this: an idle copy on a saturated card answers slowly (a
+/// song beside a film upscale made no progress for 15 minutes on hardac1, 2026-11-13, while the other card sat idle)
+pub fn card_contended(snap: &Snapshot, host: &dyn Host, g: usize, port: u16) -> bool {
+    let Some(c) = snap.cards.iter().find(|c| c.index == g) else { return false };
+    c.procs.iter().any(|p| match (p.kind.as_deref(), p.port) {
+        (Some("video"), _) => !host.video_idle(),
+        (Some(k), Some(pp)) if pp != port => snap.servers_of(k).iter().any(|x| x.port == pp && (x.busy || x.inflight > 0)),
+        _ => false,
+    })
+}
+
+/// Another copy of the model on one of `cards` (of its own, where it may have one more) that has the room now, or once
+/// idle picture and sound servers there stop; in a slot no server holds, or one an idle model holds. Placed when it
+/// started; None when there is no such card or slot, or the start failed (the caller uses the copy it has)
+fn start_copy(host: &dyn Host, req: &PlaceReq, snap: &Snapshot, mine: &[&Server], cards: &dyn Fn(usize) -> bool) -> Option<Outcome> {
+    let m = req.model;
+    let (id, kind, job) = (m.id.as_str(), m.kind.as_str(), req.job);
+    let sv = snap.servers_of(kind);
+    let kept = |x: &Server| x.model.as_ref().is_some_and(|mm| snap.kept.contains(mm));
+    let idle_other = |x: &&Server| x.model.is_some() && x.model.as_deref() != Some(id) && !kept(x) && x.idle();
+    let want = |g: usize| (req.need_mb.get(&g).copied().unwrap_or(0) + MARGIN_MB).max(req.asked_mb);
+    let on: Vec<usize> = mine.iter().filter_map(|x| card_of_port(&snap.cards, x.port)).collect();
+    // copies per card: extra ones up to the profile's recommended count (the default 1: one a card), never past its max
+    let per_card = m.profile.concurrency.recommended_copies.min(m.profile.concurrency.max_copies_per_card) as usize;
+    let spare = sv.iter().find(|x| x.model.is_none()).or_else(|| sv.iter().find(idle_other))?;
+    // (no second copy while nothing may load, or when its host memory is not there: the requests share the first)
+    let copy_plans = m.gpus.iter().copied().filter(|g| cards(*g) && extra_copy_allowed(&on, *g, per_card)).filter(|_| host.barred().is_none())
+        .map(|g| (g, card_free(&snap.cards, g), room_plan(snap, host, g, want(g), kind, true, Some(m))));
+    let (gpu, plan) = if host.first_listed_card() { pick_first(copy_plans) } else { pick_card(copy_plans) }?;
+    let ram = host.ram_plan(snap, m).ok()?;
+    let x = spare;
+    // (a plan another request's lock stands in the way of: no copy now, the requests share the first)
+    let started = free_plan(host, &plan, kind, id).and_then(|_| free_plan(host, &ram, kind, id)).and_then(|_| {
+        stop_slot(host, kind, x, id)?;
+        if !host.wait_ram(id) {
+            return Err((503, format!("host memory did not come free for {id}")));
+        }
+        if !wait_room(host, gpu, want(gpu)) {
+            return Err((503, format!("GPU {gpu} did not free the room")));
+        }
+        host.reserve(m, x.slot, x.port, gpu, want(gpu)).map_err(|e| (503, e))?;
+        host.note(job, "loading", &format!("a second copy of {id} loading on GPU {gpu} (server {})", x.slot + 1));
+        host.start(kind, id, x.slot, x.port, gpu).inspect_err(|(_, e)| {
+            host.learn_ask(id, e, gpu, want(gpu));
+        })
+    });
+    match started {
+        Ok(()) => Some(Outcome::Placed { slot: x.slot, port: x.port }),
+        Err((_, e)) => {
+            eprintln!("{id}: a second copy did not start ({e}); the requests share the first");
+            None
+        }
+    }
+}
+
 /// One try at a server for the model (the kind's lock held while it lasts): a server, or why there is none yet (no card
 /// of its has the room, even with the idle models there stopped)
 pub fn place(host: &dyn Host, req: &PlaceReq) -> Result<Outcome, Fail> {
@@ -119,8 +177,20 @@ pub fn place(host: &dyn Host, req: &PlaceReq) -> Result<Outcome, Fail> {
     let sv: Vec<Server> = snap.servers_of(kind).to_vec();
     let kept = |x: &Server| x.model.as_ref().is_some_and(|mm| snap.kept.contains(mm));
     let mine: Vec<&Server> = sv.iter().filter(|x| x.model.as_deref() == Some(id)).collect();
-    // a server of it with nothing to do
-    if let Some(x) = mine.iter().find(|x| !x.busy && x.inflight == 0) {
+    // a server of it with nothing to do - one on a card no other work saturates first; when every such server's card is
+    // taken by other work (a busy server of another model there, the video worker), a copy on a card of its that is not,
+    // where one has the room now or once idle picture and sound servers there stop: two heavy jobs do not share one
+    // card's compute while another card of the model sits idle
+    let contended = |x: &Server| !x.loading && card_of_port(&snap.cards, x.port).is_some_and(|g| card_contended(&snap, host, g, x.port));
+    let free_now: Vec<&&Server> = mine.iter().filter(|x| !x.busy && x.inflight == 0).collect();
+    if let Some(x) = free_now.iter().find(|x| !contended(x)).or_else(|| free_now.first()).copied() {
+        if contended(x) {
+            let taken: Vec<usize> = mine.iter().filter_map(|x| card_of_port(&snap.cards, x.port)).collect();
+            let quiet = |g: usize| !taken.contains(&g) && !card_contended(&snap, host, g, 0);
+            if let Some(o) = start_copy(host, req, &snap, &mine, &quiet) {
+                return Ok(o);
+            }
+        }
         if x.loading {
             host.note(job, "loading", &format!("{id} loading (server {})", x.slot + 1));
             host.wait_loaded(x.port, id)?;
@@ -132,38 +202,10 @@ pub fn place(host: &dyn Host, req: &PlaceReq) -> Result<Outcome, Fail> {
     // a server that holds another model and could go now
     let idle_other = |x: &&Server| x.model.is_some() && x.model.as_deref() != Some(id) && !kept(x) && x.idle();
     if !mine.is_empty() {
-        // its servers all have work: another copy on a card of its without one that has the room now (or once idle
-        // picture and sound servers there stop), in a slot no server holds or one an idle model holds - else the copy
-        // with the fewest requests (its server queues it)
-        let on: Vec<usize> = mine.iter().filter_map(|x| card_of_port(cards, x.port)).collect();
-        // copies per card: extra ones up to the profile's recommended count (the default 1: one a card), never past its max
-        let per_card = m.profile.concurrency.recommended_copies.min(m.profile.concurrency.max_copies_per_card) as usize;
-        let spare = sv.iter().find(|x| x.model.is_none()).or_else(|| sv.iter().find(idle_other));
-        // (no second copy while nothing may load, or when its host memory is not there: the requests share the first)
-        let copy_plans = gpus.iter().copied().filter(|g| extra_copy_allowed(&on, *g, per_card)).filter(|_| host.barred().is_none())
-            .map(|g| (g, card_free(cards, g), room_plan(&snap, host, g, want(g), kind, true, Some(m))));
-        let plan = if host.first_listed_card() { pick_first(copy_plans) } else { pick_card(copy_plans) };
-        let ram = plan.as_ref().and_then(|_| host.ram_plan(&snap, m).ok());
-        if let (Some(x), Some((gpu, plan)), Some(ram)) = (spare, plan, ram) {
-            // (a plan another request's lock stands in the way of: no copy now, the requests share the first)
-            let started = free_plan(host, &plan, kind, id).and_then(|_| free_plan(host, &ram, kind, id)).and_then(|_| {
-                stop_slot(host, kind, x, id)?;
-                if !host.wait_ram(id) {
-                    return Err((503, format!("host memory did not come free for {id}")));
-                }
-                if !wait_room(host, gpu, want(gpu)) {
-                    return Err((503, format!("GPU {gpu} did not free the room")));
-                }
-                host.reserve(m, x.slot, x.port, gpu, want(gpu)).map_err(|e| (503, e))?;
-                host.note(job, "loading", &format!("a second copy of {id} loading on GPU {gpu} (server {})", x.slot + 1));
-                host.start(kind, id, x.slot, x.port, gpu).inspect_err(|(_, e)| {
-                    host.learn_ask(id, e, gpu, want(gpu));
-                })
-            });
-            match started {
-                Ok(()) => return Ok(Outcome::Placed { slot: x.slot, port: x.port }),
-                Err((_, e)) => eprintln!("{id}: a second copy did not start ({e}); the requests share the first"),
-            }
+        // its servers all have work: another copy on a card of its that has the room now (or once idle picture and sound
+        // servers there stop) - else the copy with the fewest requests (its server queues it)
+        if let Some(o) = start_copy(host, req, &snap, &mine, &|_| true) {
+            return Ok(o);
         }
         let x = mine.iter().min_by_key(|x| x.inflight).unwrap();
         if x.loading {
