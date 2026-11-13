@@ -17,6 +17,9 @@ use nextsycl_llm::{At, EngineOption};
 use nextsycl_llm::{Checkpoint, CheckpointState, Decoder, DecoderState, Engine, EngineKind, ExpertStats, GpuInfo, LoadOptions, Result, Sampler,
                  Session, SessionState, Tap};
 
+/// The silo's name (`kernels/llm/glm5next/silo`, dist/silo/libnextsycl-glm5next.so)
+pub const ARCH: &str = "glm5next";
+
 /// The model description's errors (a file's layout against what the engine needs)
 #[derive(Debug)]
 pub struct Error(pub String);
@@ -59,7 +62,7 @@ pub const OPTIONS: &[EngineOption] = &[
 
 /// This engine's registry entry
 pub fn kind() -> EngineKind {
-    EngineKind { archs: &["glm5-next", "glm5next"], name: "GLM-5.3-Flash (KDA + MLA with a DSA indexer, 288 experts, MTP)", load, info: tools::info,
+    EngineKind { archs: &["glm5-next", "glm5next"], name: "GLM-5.3-Flash (KDA + MLA with a DSA indexer, 288 experts or a REAP-pruned 144, MTP)", load, info: tools::info,
                  kernels: Some(tools::kernels), chat: nextsycl_tok::glm_chat, options: OPTIONS, prepare: None }
 }
 

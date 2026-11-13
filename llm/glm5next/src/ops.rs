@@ -13,6 +13,8 @@ pub struct Ops {
     pub gpu: Arc<Gpu>,
     /// this engine's kernels (`kernels/llm/glm5next/glm.h`)
     k: &'static ffi::Api,
+    /// its silo (`kernels/llm/glm5next/silo/silo.h`), when built: the REAP-50 files' types
+    s: Option<&'static ffi::Silo>,
 }
 
 macro_rules! need {
@@ -23,10 +25,24 @@ macro_rules! need {
     };
 }
 
+/// the down type handed to the shared grouped kernels when only their phase 1 runs (any down type they take)
+const STAND_IN_DOWN: i32 = 12;
+
+/// NS_SILO_MOE_GU=1: the silo's grouped experts compute gate | up too (by default the shared kernels' do)
+fn silo_gu() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NS_SILO_MOE_GU").is_ok_and(|v| v == "1"))
+}
+
+/// a byte count rounded up to 256
+pub(crate) fn align256(b: usize) -> usize {
+    (b + 255) & !255
+}
+
 #[allow(clippy::too_many_arguments)] // the kernels' own arity
 impl Ops {
     pub fn new(gpu: Arc<Gpu>) -> Result<Ops> {
-        Ok(Ops { gpu, k: ffi::api()? })
+        Ok(Ops { gpu, k: ffi::api()?, s: ffi::silo()? })
     }
     fn ok(&self, rc: i32, what: &str) -> Result<()> {
         ffi::check(rc, what)
@@ -44,15 +60,53 @@ impl Ops {
     pub fn dequant(&self, ty: u32, src: &DevBuf, at: usize, bytes: usize, n: usize, dst: &DevBuf) -> Result<()> {
         need!(dst, n, "dequant");
         src.bounds(at, bytes)?;
+        // the silo's types (the REAP-50 files': none of them the shared kernel's)
+        // SAFETY: a capability query.
+        if let Some(s) = self.s.filter(|s| unsafe { (s.dequant_supported)(ty as i32) } != 0) {
+            // SAFETY: as below.
+            let rc = unsafe { (s.dequant)(self.raw(), ty as i32, src.ptr().cast::<u8>().add(at).cast::<c_void>(), n, dst.fp()) };
+            return self.ok(rc, "dequant (silo)");
+        }
         // SAFETY: the byte range is inside src (checked) and holds n values of `ty` (the caller's `bytes`); dst
         // holds n floats (checked).
         let rc = unsafe { (self.k.dequant)(self.raw(), ty as i32, src.ptr().cast::<u8>().add(at).cast::<c_void>(), n, dst.fp()) };
         self.ok(rc, "dequant")
     }
     /// n values of a stored matrix (bytes [at, at + bytes) of src) expanded to fp16 into dst (2 bytes a value)
+    /// whether the silo expands `ty` to half (the shared expander's types are the engine's F16_TYPES)
+    /// whether the silo's decode product takes this type (NS_SILO_MMV=0: never - the shared mmvq instead, to compare)
+    pub fn silo_mmv(&self, ty: u32) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // SAFETY: a capability query.
+        *ON.get_or_init(|| std::env::var("NS_SILO_MMV").map_or(true, |v| v != "0")) && self.s.is_some_and(|s| unsafe { (s.mmv_supported)(ty as i32) } != 0)
+    }
+    /// y [ncols, n_out] (floats from `y.1`) = W . x [ncols, n_in] (floats from `x.1`) through the silo's decode product:
+    /// W the stored blocks at bytes `w.1..w.1 + w_bytes` of `w.0`
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmv_silo(&self, ty: u32, w: (&DevBuf, usize), w_bytes: usize, x: (&DevBuf, usize), y: (&DevBuf, usize), n_in: usize, n_out: usize, ncols: usize) -> Result<()> {
+        let s = self.s.filter(|_| self.silo_mmv(ty)).ok_or_else(|| Error(format!("mmv: the silo does not take type {ty}")))?;
+        w.0.bounds(w.1, w_bytes)?;
+        need!(x.0, x.1 + n_in * ncols, "mmv x");
+        need!(y.0, y.1 + n_out * ncols, "mmv y");
+        // SAFETY: sizes checked (w_bytes is the caller's count of the matrix's stored bytes).
+        let rc = unsafe {
+            (s.mmv)(self.raw(), ty as i32, w.0.ptr().cast::<u8>().add(w.1).cast(), x.0.fp().add(x.1), y.0.fp().add(y.1), n_in as i64, n_out as i64, ncols as i64)
+        };
+        self.ok(rc, "mmv (silo)")
+    }
+    pub fn silo_f16(&self, ty: u32) -> bool {
+        // SAFETY: a capability query.
+        self.s.is_some_and(|s| unsafe { (s.dequant_f16_supported)(ty as i32) } != 0)
+    }
     pub fn dequant_f16(&self, ty: u32, src: &DevBuf, at: usize, bytes: usize, n: usize, dst: &DevBuf) -> Result<()> {
         src.bounds(at, bytes)?;
         dst.bounds(0, n * 2)?;
+        // SAFETY: a capability query.
+        if let Some(s) = self.s.filter(|s| unsafe { (s.dequant_f16_supported)(ty as i32) } != 0) {
+            // SAFETY: both ranges checked.
+            let rc = unsafe { (s.dequant_f16)(self.raw(), ty as i32, src.ptr().cast::<u8>().add(at).cast::<c_void>(), n as i64, dst.ptr().cast()) };
+            return self.ok(rc, "dequant_f16 (silo)");
+        }
         // SAFETY: both ranges checked.
         let rc = unsafe { (self.k.dequant_f16)(self.raw(), ty as i32, src.ptr().cast::<u8>().add(at).cast::<c_void>(), n as i64, dst.ptr().cast()) };
         self.ok(rc, "dequant_f16")
@@ -615,13 +669,34 @@ impl Ops {
         };
         self.ok(rc, "moe_combine")
     }
-    pub fn moe_grouped_supported(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> bool {
+    /// whether the shared grouped kernels take the pair
+    pub(crate) fn moe_shared(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> bool {
         // SAFETY: a capability query.
         unsafe { (self.k.moe_grouped_supported)(gu as i32, down as i32, n_embd as i64, n_ff as i64) != 0 }
     }
+    /// the silo's grouped kernels, when they take a pair the shared ones do not
+    /// (NS_SILO_MOE=0: not - such a layer's experts then take the per-expert products, a check of the silo's). The
+    /// shared kernels must take the gate | up type with a stand-in down (their phase 1 runs it) unless the silo's
+    /// own gate | up is asked for (NS_SILO_MOE_GU=1)
+    fn moe_silo(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> Option<&'static ffi::Silo> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("NS_SILO_MOE").map_or(true, |v| v != "0")) {
+            return None;
+        }
+        let gu_ok = silo_gu() || self.moe_shared(gu, STAND_IN_DOWN as u32, n_embd, n_ff);
+        // SAFETY: a capability query.
+        self.s.filter(|s| gu_ok && !self.moe_shared(gu, down, n_embd, n_ff) && unsafe { (s.moe_supported)(gu as i32, down as i32, n_embd as i64, n_ff as i64) } != 0)
+    }
+    /// whether a layer's experts of these types run grouped (the shared kernels, else the silo's)
+    pub fn moe_grouped_supported(&self, gu: u32, down: u32, n_embd: usize, n_ff: usize) -> bool {
+        self.moe_shared(gu, down, n_embd, n_ff) || self.moe_silo(gu, down, n_embd, n_ff).is_some()
+    }
+    /// the grouped kernels' scratch for `entries` (the larger of the shared and the silo's)
     pub fn moe_scratch_bytes(&self, entries: usize, n_ff: usize) -> usize {
         // SAFETY: arithmetic only.
-        unsafe { (self.k.moe_scratch_bytes)(entries as i64, n_ff as i64) }
+        let shared = unsafe { (self.k.moe_scratch_bytes)(entries as i64, n_ff as i64) };
+        // SAFETY: arithmetic only.
+        self.s.map_or(shared, |s| shared.max(unsafe { (s.moe_scratch_bytes)(entries as i64, n_ff as i64) }))
     }
     /// A layer's experts in two launches. `table` holds, as u64: the groups' blob pointers [groups]; then as i32:
     /// grp_start [groups + 1], n_groups [1], ent_dst [entries], ent_tok [entries] (at the offsets returned by
@@ -642,8 +717,30 @@ impl Ops {
             let i32s = base.add(groups * 8).cast::<i32>();
             let (gs, ng) = (i32s, i32s.add(groups + 1));
             let (dst, tok) = (ng.add(1), ng.add(1 + entries));
-            (self.k.moe_grouped)(self.raw(), gu as i32, down as i32, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, tok, groups as i64, entries as i64,
-                                   xq.ptr(), scratch.ptr(), out.fp(), limit, lanes as i32, phase)
+            match self.moe_silo(gu, down, n_embd, n_ff) {
+                // the silo's whole (NS_SILO_MOE_GU=1; its lane count is its own: a row's sums in one order at every width)
+                Some(s) if silo_gu() => (s.moe)(self.raw(), gu as i32, down as i32, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, tok, groups as i64,
+                                                entries as i64, xq.ptr(), scratch.ptr(), out.fp(), limit, phase),
+                // the shared kernels' gate | up and activation (phase 1; their down projection is never run, so any
+                // down type they take stands in: Q4_K), then the silo's down from the q8_1 rows they leave in their
+                // scratch (Strata's native_expert_grouped: three float32 arrays of entries x n_ff, 256-byte aligned,
+                // then those rows)
+                Some(s) => {
+                    let mut rc = 0;
+                    if phase != 2 {
+                        rc = (self.k.moe_grouped)(self.raw(), gu as i32, STAND_IN_DOWN, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, tok, groups as i64,
+                                                  entries as i64, xq.ptr(), scratch.ptr(), out.fp(), limit, lanes as i32, 1);
+                    }
+                    if rc == 0 && phase != 1 {
+                        let hq = scratch.ptr().cast::<u8>().add(3 * align256(entries * n_ff * 4)).cast::<c_void>();
+                        rc = (s.moe_down)(self.raw(), gu as i32, down as i32, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, groups as i64, entries as i64,
+                                          hq, out.fp());
+                    }
+                    rc
+                }
+                None => (self.k.moe_grouped)(self.raw(), gu as i32, down as i32, n_embd as i64, n_ff as i64, ptrs, gs, ng, dst, tok, groups as i64,
+                                             entries as i64, xq.ptr(), scratch.ptr(), out.fp(), limit, lanes as i32, phase),
+            }
         };
         self.ok(rc, "moe_grouped")
     }
@@ -656,3 +753,16 @@ impl Ops {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn align256_rounds_up() {
+        assert_eq!(super::align256(0), 0);
+        assert_eq!(super::align256(1), 256);
+        assert_eq!(super::align256(256), 256);
+        // one decode token's 8 entries of n_ff 2048 float32: 64 KiB, already aligned
+        assert_eq!(super::align256(8 * 2048 * 4), 65536);
+        assert_eq!(super::align256(3 * 2048 * 4 + 4), 24832);
+    }
+}

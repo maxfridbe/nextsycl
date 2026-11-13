@@ -20,7 +20,7 @@ use nextsycl_core::{Arena, DevBuf, Error, Gpu, HostBuf, Result};
 
 use crate::ops::Ops;
 use nextsycl_gguf::{GType, Gguf};
-use crate::model::{Model, Role, Scheme};
+use crate::model::{AForm, Model, Role};
 
 use nextsycl_llm::{GpuInfo, Sampler, Tap};
 
@@ -244,6 +244,40 @@ fn dense_f16() -> bool {
     *ON.get_or_init(|| std::env::var("NS_DENSE_F16").map_or(true, |v| v != "0"))
 }
 
+/// The layers of a part kept whole in VRAM outside the expert slots: those whose experts are larger than the
+/// part's usual size, when they are few (at most a quarter of its MoE layers; NS_FIXED_LAYERS=0: none) -
+/// (layer, expert bytes) in, the layers out
+fn fixed_layers(sizes: &[(u64, usize)]) -> Vec<u64> {
+    if std::env::var("NS_FIXED_LAYERS").is_ok_and(|v| v == "0") {
+        return Vec::new();
+    }
+    fixed_layers_of(sizes)
+}
+
+fn fixed_layers_of(sizes: &[(u64, usize)]) -> Vec<u64> {
+    let mut count: BTreeMap<usize, usize> = BTreeMap::new();
+    for (_, z) in sizes {
+        *count.entry(*z).or_insert(0) += 1;
+    }
+    // the usual size: the most common (the larger on a tie)
+    let Some((&usual, _)) = count.iter().max_by_key(|(z, n)| (**n, **z)) else { return Vec::new() };
+    let big: Vec<u64> = sizes.iter().filter(|(_, z)| *z > usual).map(|(l, _)| *l).collect();
+    if big.len() * 4 <= sizes.len() { big } else { Vec::new() }
+}
+
+/// NS_MTP_HID=normed: the draft block reads the final hidden state after output_norm (the fork's and vLLM's input)
+/// instead of the streams' mean before it (ds4's)
+fn mtp_hid_normed() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NS_MTP_HID").is_ok_and(|v| v == "normed"))
+}
+
+/// The fewest VRAM expert slots a part loads with: one layer's experts and a few to spare (none for a part without
+/// experts)
+fn min_vram_slots(n_expert: usize, part_experts: usize) -> usize {
+    if part_experts == 0 { 0 } else { (n_expert + 8).min(part_experts) }
+}
+
 /// The ggml types the fp16 expander (ns_dequant_f16) takes
 const F16_TYPES: [u32; 16] = [6, 7, 8, 10, 11, 12, 13, 16, 17, 18, 20, 21, 22, 23, 29, 42];
 /// the decode kernels take up to this many rows (tokens) at once
@@ -318,6 +352,8 @@ enum Loc {
     V(usize),
     /// a pinned host memory slot
     R(usize),
+    /// its layer's fixed VRAM (`Store::fixed`)
+    F,
 }
 
 /// The routed experts of one GPU's layers, in an exclusive two-level cache: VRAM slots and pinned host memory
@@ -359,6 +395,8 @@ struct Store {
     lent: bool,
     pf_issued: u64,
     pf_used: u64,
+    /// layers kept whole in VRAM outside the slots (their experts larger than the rest): each expert at ex * size
+    fixed: HashMap<u64, (DevBuf, usize)>,
 }
 
 impl Store {
@@ -723,9 +761,11 @@ impl Part {
                 if VECTORS.contains(&r) || matches!(r, Role::MlaKB | Role::MlaVB) {
                     let f = DevBuf::f32(gpu, n)?;
                     ops.dequant(t.ty.code(), &raw, 0, t.bytes as usize, n, &f)?;
-                    if r == Role::KdaA && m.scheme == Scheme::Ds4 {
-                        // ds4 stores A_log; the gate wants A = -exp(A_log) (llama.cpp's ssm_a holds that already)
-                        let v: Vec<f32> = f.to_f32()?.iter().map(|a| -a.exp()).collect();
+                    if r == Role::KdaA && m.scheme.a_form() != AForm::NegExp {
+                        // ds4 stores A_log, the fork exp(A_log); the gate wants A = -exp(A_log) (llama.cpp's ssm_a
+                        // holds that already)
+                        let form = m.scheme.a_form();
+                        let v: Vec<f32> = f.to_f32()?.iter().map(|a| form.to_a(*a)).collect();
                         f.write(0, &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
                     }
                     vecs.insert((l, r), f);
@@ -757,9 +797,16 @@ impl Part {
         gpu.sync()?;
         let q8 = DevBuf::new(gpu, ops.q8_1_bytes(MAX_COLS, MMVQ_COLS))?;
         // the store: slots of the largest layer's [gate | up | down], in chunks; VRAM, then pinned host memory
-        let moe: Vec<u64> = layers.clone().filter(|l| m.g.is_moe(*l)).chain(extra.clone()).collect();
+        let all_moe: Vec<u64> = layers.clone().filter(|l| m.g.is_moe(*l)).chain(extra.clone()).collect();
+        // a slot fits the part's largest expert; a few layers with larger experts than the rest (the REAP-50 IQ3_M
+        // file's layers 3-4: Q4_K down, 11.4 MiB against 10.3) would size every slot by them - those layers stay
+        // whole in VRAM of their own instead (`fixed_layers`) and the slots fit the rest
+        let sizes: Vec<(u64, usize)> = all_moe.iter().map(|l| (*l, (m.expert_bytes(*l) as usize).next_multiple_of(256))).collect();
+        let fixed_l = fixed_layers(&sizes);
+        let moe: Vec<u64> = all_moe.iter().copied().filter(|l| !fixed_l.contains(l)).collect();
         let n_exp = moe.len() * m.g.n_expert as usize;
-        let slot_bytes = moe.iter().map(|l| m.expert_bytes(*l) as usize).max().unwrap_or(256).next_multiple_of(256);
+        let slot_bytes = sizes.iter().filter(|(l, _)| !fixed_l.contains(l)).map(|x| x.1).max().unwrap_or(256);
+        let fixed_bytes: usize = sizes.iter().filter(|(l, _)| fixed_l.contains(l)).map(|x| x.1 * m.g.n_expert as usize).sum();
         let budget = match expert_bytes {
             Some(b) => b,
             // what is free less the arena, the forward pass's own buffers (its stream ring and work buffers, ~352 KB a
@@ -771,9 +818,19 @@ impl Part {
                 let pass = (600 << 20) + prefill_chunk() * (352 << 10);
                 (f as usize).saturating_sub(pass + arena_bytes().max(1 << 30) + SMALL_ARENA + kv_reserve)
             }),
-        };
+        }
+        .saturating_sub(fixed_bytes);
         let per_chunk = (CHUNK / slot_bytes).max(1);
         let nv = (budget / slot_bytes).min(n_exp);
+        // a layer's experts must find VRAM slots in a prompt pass (the lent arena is the prompt's then); with fewer, an
+        // expert read from the file had nowhere to go (a panic) - refuse the load instead (2026-11-12: idle image
+        // servers held 24 GiB of each card and the REAP-50 Q3_K_M loaded with 0 experts in VRAM)
+        let min_v = min_vram_slots(m.g.n_expert as usize, n_exp);
+        if nv < min_v {
+            return Err(Error(format!("{}: VRAM for {nv} expert slots of {:.1} MiB, a layer needs {min_v} ({:.1} GiB free{}) - is another process holding the card?",
+                                     gpu.name, slot_bytes as f64 / (1u64 << 20) as f64, gpu.memory()?.1.map_or(0.0, |f| f as f64 / (1u64 << 30) as f64),
+                                     if expert_bytes.is_some() { ", --expert-gib given" } else { "" })));
+        }
         // host slots: the rest of the part's experts, and one spare for the swaps - claimed from the pool the GPUs share
         // (what one leaves unused the other takes, whichever loads first)
         let want = if n_exp > nv { n_exp - nv + 1 } else { 0 };
@@ -820,7 +877,18 @@ impl Part {
         let in_v: Vec<(u64, u64)> = all.iter().take(nv).copied().collect();
         let in_r: Vec<(u64, u64)> = all.iter().skip(nv).take(nr.saturating_sub(1)).copied().collect();
         let t0 = Instant::now();
-        let lay: HashMap<u64, ExpertParts> = moe.iter().map(|l| Ok((*l, expert_parts(m, *l)?))).collect::<Result<_>>()?;
+        let lay: HashMap<u64, ExpertParts> = all_moe.iter().map(|l| Ok((*l, expert_parts(m, *l)?))).collect::<Result<_>>()?;
+        // the fixed layers: each expert's [gate | up | down] at ex * its size, read once
+        let mut fixed: HashMap<u64, (DevBuf, usize)> = HashMap::new();
+        for &(l, sz) in sizes.iter().filter(|(l, _)| fixed_l.contains(l)) {
+            let b = DevBuf::new(gpu, sz * m.g.n_expert as usize)?;
+            let mut buf = vec![0u8; sz];
+            for ex in 0..m.g.n_expert {
+                read_expert(m, l, ex, &lay[&l], &mut buf)?;
+                b.write(ex as usize * sz, &buf)?;
+            }
+            fixed.insert(l, (b, sz));
+        }
         let threads = 8;
         let failed: Mutex<Option<String>> = Mutex::new(None);
         {
@@ -866,18 +934,24 @@ impl Part {
         for (i, k) in in_r.iter().enumerate() {
             loc.insert(*k, Loc::R(i));
         }
+        for l in &fixed_l {
+            for ex in 0..m.g.n_expert {
+                loc.insert((*l, ex), Loc::F);
+            }
+        }
         let rfree: Vec<usize> = (in_r.len()..nr).collect();
         let on_file = n_exp - in_v.len() - in_r.len();
-        log(format!("{} (layers {}-{}): {:.2} GiB of weights; experts {} in VRAM ({:.1} GiB), {} in pinned host memory ({:.1} GiB), {} on the file only ({:.1} s)",
-                    gpu.name, layers.start, layers.end - 1, gib(bytes as usize), in_v.len(), gib(nv * slot_bytes), in_r.len(), gib(nr * slot_bytes), on_file,
-                    t0.elapsed().as_secs_f64()));
+        let fixed_note = if fixed_l.is_empty() { String::new() } else { format!(" + layers {fixed_l:?} whole in VRAM ({:.1} GiB)", gib(fixed_bytes)) };
+        log(format!("{} (layers {}-{}): {:.2} GiB of weights; experts {} in VRAM ({:.1} GiB, slots of {:.2} MiB){fixed_note}, {} in pinned host memory ({:.1} GiB), {} on the file only ({:.1} s)",
+                    gpu.name, layers.start, layers.end - 1, gib(bytes as usize), in_v.len(), gib(nv * slot_bytes), slot_bytes as f64 / (1u64 << 20) as f64,
+                    in_r.len(), gib(nr * slot_bytes), on_file, t0.elapsed().as_secs_f64()));
         let mut vowner = vec![None; nv];
         for (i, k) in in_v.iter().enumerate() {
             vowner[i] = Some(*k);
         }
         let store = Store { vram, host, slot_bytes, per_chunk, loc, vowner, vused: vec![0; nv], rfree, tick: 0, hits: 0, misses: 0, from_host: 0, direct: 0,
                             rwrite: HashMap::new(), down_any: None, vfill: HashMap::new(), last_up: None, prefetched: HashMap::new(), usage: HashMap::new(),
-                            pf_issued: 0, pf_used: 0, base: nv, lend: 0, lent: false };
+                            pf_issued: 0, pf_used: 0, base: nv, lend: 0, lent: false, fixed };
         // the big arena (prompt chunks) lends its memory to the store while decode runs on the small one
         let big = DevBuf::new(gpu, arena_bytes())?;
         let small = DevBuf::new(gpu, SMALL_ARENA)?;
@@ -969,6 +1043,10 @@ impl Part {
             }
             return self.ops.gemm_at(t, w.rows, w.cols, x, (&w.buf, 0), y, acc);
         }
+        // the silo's decode product (IQ3_S: the shared kernel reads its grid from global memory), float activations
+        if !acc && t <= MMVQ_COLS && x.2 == w.cols && y.2 == w.rows && self.ops.silo_mmv(w.ty.code()) {
+            return self.ops.mmv_silo(w.ty.code(), (&w.buf, 0), w.buf.len, (x.0, x.1), (y.0, y.1), w.cols, w.rows, t);
+        }
         if !acc && t <= MMVQ_COLS && x.2 == w.cols && y.2 == w.rows && w.cols <= MAX_COLS && self.ops.mmvq_supported(w.ty.code()) {
             self.ops.quantize_q8_1((x.0, x.1), &self.q8, w.cols, t)?;
             return self.ops.mmvq(w.ty.code(), (&w.buf, 0), w.buf.len, &self.q8, (y.0, y.1), w.cols, w.rows, t);
@@ -979,7 +1057,7 @@ impl Part {
         let f16 = f16_min();
         let fits = |b: &DevBuf| t * w.cols * 2 <= b.len;
         if let Some(x16) = self.x16.as_ref().filter(|b| f16 > 0 && t >= f16 && t > MMVQ_COLS && fits(b))
-            .filter(|_| x.2 == w.cols && w.cols.is_multiple_of(256) && F16_TYPES.contains(&w.ty.code())) {
+            .filter(|_| x.2 == w.cols && w.cols.is_multiple_of(256) && (F16_TYPES.contains(&w.ty.code()) || self.ops.silo_f16(w.ty.code()))) {
             self.ops.to_f16(&x.0.view(x.1 * 4, t * w.cols * 4)?, x16, t * w.cols)?;
             let chunk = (SCRATCH * 2 / w.cols).max(1).min(w.rows);
             let mut r0 = 0;
@@ -1059,6 +1137,7 @@ impl Part {
                         last = Some(last.map_or(tk, |(a, b)| (a.max(tk.0), b.max(tk.1))));
                     }
                 }
+                Some(Loc::F) => c.hits += 1,
                 Some(Loc::R(_)) if !promote => {}
                 _ => missing.push(ex),
             }
@@ -1083,6 +1162,9 @@ impl Part {
             // (NS_SWAP_WAIT=1 keeps it): the host has just read this layer's router, so what is queued is this
             // layer's own work, and a victim is never one of this layer's experts
             let after = if promote && !swap_wait() { None } else { Some(self.ops.mark()?) };
+            if order.len() < missing.len() {
+                return Err(Error(format!("layer {l}: {} experts to bring in, {} VRAM slots free for them", missing.len(), order.len())));
+            }
             for (ex, &s) in missing.iter().zip(&order) {
                 c.misses += 1;
                 if let Some(tk) = self.swap_in(m, c, l, *ex, s, after, &mut reading, &mut buf)? {
@@ -1102,6 +1184,10 @@ impl Part {
                 c.direct += 1;
                 let (rch, ro) = c.rat(r);
                 Ok((c.host[rch].device_view(ro, sb)?, true))
+            }
+            Loc::F => {
+                let (b, sz) = &c.fixed[&l];
+                Ok((b.view(*ex as usize * sz, *sz)?, false))
             }
         }).collect::<Result<Vec<_>>>()?;
         let arriving = need.iter().map(|ex| pending.contains(&(l, *ex))).collect();
@@ -1208,13 +1294,15 @@ impl Part {
     /// Several matrices on the same input x [t, cols]: one Q8_1 quantization of x serves every decode product.
     fn mm_many(&self, l: u64, roles: &[Role], x: &DevBuf, t: usize) -> Result<Vec<DevBuf>> {
         let ws: Vec<&Mat> = roles.iter().map(|r| self.mat(l, *r)).collect::<Result<_>>()?;
-        let quantized = ws.iter().filter(|w| !w.f32 && self.ops.mmvq_supported(w.ty.code())).count();
+        // the silo's types take float activations (matmul sends them there); the rest share one quantization
+        let shared = |w: &Mat| !w.f32 && !self.ops.silo_mmv(w.ty.code()) && self.ops.mmvq_supported(w.ty.code());
+        let quantized = ws.iter().filter(|w| shared(w)).count();
         let cols = ws[0].cols;
         if t <= MMVQ_COLS && quantized > 1 && ws.iter().all(|w| w.cols == cols) && cols <= MAX_COLS {
             self.ops.quantize_q8_1((x, 0), &self.q8, cols, t)?;
             return ws.iter().map(|w| {
                 let y = self.arena.f32(t * w.rows)?;
-                if !w.f32 && self.ops.mmvq_supported(w.ty.code()) {
+                if shared(w) {
                     self.ops.mmvq(w.ty.code(), (&w.buf, 0), w.buf.len, &self.q8, (&y, 0), w.cols, w.rows, t)?;
                 } else {
                     self.matmul(w, t, (x, 0, w.cols), (&y, 0, w.rows), false)?;
@@ -2139,8 +2227,13 @@ impl<'g> Glm<'g> {
         let mean = p.arena.f32(t * d)?;
         o.hc_mean(x, &mean, t, d)?;
         if let Some(ms) = mtp {
-            // the draft block reads these rows with the tokens that follow them
-            ms.hid.copy_within(0, &mean, 0, t * d * 4)?;
+            // the draft block reads these rows with the tokens that follow them: the streams' mean (ds4's form), or
+            // with NS_MTP_HID=normed that after output_norm (what llama.cpp's glm5-next fork and vLLM feed)
+            if mtp_hid_normed() {
+                o.rms_norm(&mean, Some(p.vec(0, Role::OutputNorm)?), &ms.hid.view(0, t * d * 4)?, t, d, eps)?;
+            } else {
+                ms.hid.copy_within(0, &mean, 0, t * d * 4)?;
+            }
             ms.rows = t;
             ms.slot0 = pos0;
             ms.next = tokens[1..].to_vec();
@@ -2857,7 +2950,9 @@ impl<'g> Glm<'g> {
             // 2.0x slower at 512). Memory stays one expert's worth however big the chunk: its tokens gathered to
             // fp16, its outputs added into y.
             let f16_min = f16_min();
-            if f16_min > 0 && t >= f16_min && t > MMVQ_COLS {
+            // (each of the expert's types one an expander takes: Q6_K only through the silo)
+            let f16_ok = [parts.gate.2, parts.up.2, parts.down.2].iter().all(|ty| F16_TYPES.contains(&ty.code()) || o.silo_f16(ty.code()));
+            if f16_min > 0 && t >= f16_min && t > MMVQ_COLS && f16_ok {
                 if let Some((_, tk)) = copies {
                     o.await_ticket(tk)?; // experts swapped in (from the file only, in prompt passes)
                 }
@@ -2969,6 +3064,7 @@ impl<'g> Glm<'g> {
             // NS_PROMPT_DEQUANT=1: prompt chunks take the float32 expanded-GEMM path instead (a measurement switch)
             let dequant = t > MMVQ_COLS && std::env::var("NS_PROMPT_DEQUANT").is_ok_and(|v| v == "1");
             if !dequant && parts.gate.2 == parts.up.2 && o.moe_grouped_supported(parts.gate.2.code(), parts.down.2.code(), d, f) {
+                let r0 = self.mark(p);
                 // the layer's entries by group, numbered in order (an entry's row of dn)
                 let lists: Vec<&Vec<(i32, f32)>> = by.values().collect();
                 let mut first = Vec::with_capacity(lists.len());
@@ -3021,6 +3117,7 @@ impl<'g> Glm<'g> {
                 let lanes = if t > MMVQ_COLS { pl } else { dl };
                 // the resident experts first, while the swapped ones arrive; then those (each entry's arithmetic is
                 // the same in either launch)
+                let r1 = self.lap(p, "routed experts: tables, q8_1", r0);
                 let (now, later): (Vec<usize>, Vec<usize>) = (0..lists.len()).partition(|&k| !arriving[k]);
                 for (gs, wait) in [(now, false), (later, true)] {
                     if gs.is_empty() {
@@ -3040,12 +3137,23 @@ impl<'g> Glm<'g> {
                             o.await_ticket(all)?;
                             o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, n, &xq, &scratch, &dn, lim, lanes, 0)?;
                         }
+                        // profiling: the two halves timed apart (the same launches as phase 0)
+                        None if self.prof.is_some() => {
+                            let h0 = self.mark(p);
+                            o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, n, &xq, &scratch, &dn, lim, lanes, 1)?;
+                            let h1 = self.lap(p, "routed experts: gate | up", h0);
+                            o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, n, &xq, &scratch, &dn, lim, lanes, 2)?;
+                            self.lap(p, "routed experts: down", h1);
+                        }
                         None => o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, n, &xq, &scratch, &dn, lim, lanes, 0)?,
                     }
                 }
+                let r2 = self.lap(p, "routed experts: grouped kernels", r1);
                 let cb = p.arena.bytes((t + 1 + total) * 4)?;
                 cb.write_async(0, &t_ptr.iter().chain(&ent).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
-                return o.moe_combine(&y, &dn, &cb, &wb, t, total, d);
+                o.moe_combine(&y, &dn, &cb, &wb, t, total, d)?;
+                self.lap(p, "routed experts: combine", r2);
+                return Ok(());
             }
             if let Some((_, tk)) = copies {
                 o.await_ticket(tk)?; // the paths below read every expert at once
@@ -3121,5 +3229,29 @@ impl<'g> Glm<'g> {
             self.timed(p, "expert prefetch", || p.prefetch(&self.m, l + 1, &want, pf))?;
         }
         Ok(y)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_part_loads_with_a_layers_slots() {
+        assert_eq!(super::min_vram_slots(144, 0), 0);
+        assert_eq!(super::min_vram_slots(144, 6048), 152);
+        assert_eq!(super::min_vram_slots(288, 100), 100);
+    }
+
+    #[test]
+    fn larger_experts_of_a_few_layers_stay_whole() {
+        // the IQ3_M file's B65 part: layers 3-4 with Q4_K down
+        let mut s: Vec<(u64, usize)> = (3..22).map(|l| (l, 10_800_000)).collect();
+        s[0].1 = 11_900_000;
+        s[1].1 = 11_900_000;
+        assert_eq!(super::fixed_layers_of(&s), vec![3, 4]);
+        // one size everywhere: none
+        assert!(super::fixed_layers_of(&[(3, 100), (4, 100)]).is_empty());
+        // larger in half the layers: not few, the slots fit them
+        assert!(super::fixed_layers_of(&[(3, 200), (4, 100), (5, 200), (6, 100)]).is_empty());
+        assert!(super::fixed_layers_of(&[]).is_empty());
     }
 }

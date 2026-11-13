@@ -117,6 +117,13 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
     for (name, ty, rows, cols, bytes) in picks {
         let w = DevBuf::new(&g, bytes.len()).map_err(e)?;
         w.write(0, &bytes).map_err(e)?;
+        // copies of the matrix past the caches (512 MB in all): the "cold" rates cycle through them, as a token's
+        // pass reads each matrix once (the hot rates rerun one matrix, mostly from L2)
+        let copies: Vec<DevBuf> = (0..(512 << 20) / bytes.len().max(1)).map(|_| {
+            let c = DevBuf::new(&g, bytes.len()).map_err(e)?;
+            c.write(0, &bytes).map_err(e)?;
+            Ok::<_, String>(c)
+        }).collect::<Result<_, String>>()?;
         let wf = DevBuf::f32(&g, rows * cols).map_err(e)?;
         o.dequant(ty.code(), &w, 0, bytes.len(), rows * cols, &wf).map_err(e)?;
         if !o.mmvq_supported(ty.code()) {
@@ -124,7 +131,7 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
             continue;
         }
         let mut errs = Vec::new();
-        let mut rate = 0.0;
+        let (mut rate, mut cold) = (0.0, 0.0);
         for nc in [1usize, 4] {
             let xs: Vec<f32> = (0..nc * cols).map(|_| rng.next_f32() * 2.0 - 1.0).collect();
             let x = DevBuf::from_f32(&g, &xs).map_err(e)?;
@@ -145,9 +152,47 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
                 }
                 g.sync().map_err(e)?;
                 rate = bytes.len() as f64 * n as f64 / t0.elapsed().as_secs_f64() / 1e9;
+                g.sync().map_err(e)?;
+                let t0 = std::time::Instant::now();
+                for c in &copies {
+                    o.mmvq(ty.code(), (c, 0), bytes.len(), &q, (&y, 0), cols, rows, 1).map_err(e)?;
+                }
+                g.sync().map_err(e)?;
+                cold = bytes.len() as f64 * copies.len() as f64 / t0.elapsed().as_secs_f64() / 1e9;
             }
         }
-        println!("{name:<34} {:<8} {:>12} {:>10.2e} {:>10.2e} {:>8.0} GB/s", ty.name(), format!("{rows}x{cols}"), errs[0], errs[1], rate);
+        println!("{name:<34} {:<8} {:>12} {:>10.2e} {:>10.2e} {:>8.0} GB/s hot, {cold:.0} cold", ty.name(), format!("{rows}x{cols}"), errs[0], errs[1], rate);
+        // the silo's product of the type too (float activations): its error against the exact path, its rate, and
+        // whether a 4-column call's first row equals the 1-column call (verify passes must equal one-token passes)
+        if o.silo_mmv(ty.code()) {
+            let xs: Vec<f32> = (0..4 * cols).map(|_| rng.next_f32() * 2.0 - 1.0).collect();
+            let x = DevBuf::from_f32(&g, &xs).map_err(e)?;
+            let yr = DevBuf::f32(&g, 4 * rows).map_err(e)?;
+            o.gemm(4, rows, cols, &x, &wf, &yr, false).map_err(e)?;
+            let y4 = DevBuf::f32(&g, 4 * rows).map_err(e)?;
+            o.mmv_silo(ty.code(), (&w, 0), bytes.len(), (&x, 0), (&y4, 0), cols, rows, 4).map_err(e)?;
+            let y1 = DevBuf::f32(&g, rows).map_err(e)?;
+            o.mmv_silo(ty.code(), (&w, 0), bytes.len(), (&x, 0), (&y1, 0), cols, rows, 1).map_err(e)?;
+            let (v4, v1) = (y4.to_f32().map_err(e)?, y1.to_f32().map_err(e)?);
+            let (_, rel, _) = compare(&v4, &yr.to_f32().map_err(e)?);
+            let same = v4[..rows].iter().zip(&v1).all(|(a, b)| a.to_bits() == b.to_bits());
+            g.sync().map_err(e)?;
+            let n = 50;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                o.mmv_silo(ty.code(), (&w, 0), bytes.len(), (&x, 0), (&y1, 0), cols, rows, 1).map_err(e)?;
+            }
+            g.sync().map_err(e)?;
+            let srate = bytes.len() as f64 * n as f64 / t0.elapsed().as_secs_f64() / 1e9;
+            g.sync().map_err(e)?;
+            let t0 = std::time::Instant::now();
+            for c in &copies {
+                o.mmv_silo(ty.code(), (c, 0), bytes.len(), (&x, 0), (&y1, 0), cols, rows, 1).map_err(e)?;
+            }
+            g.sync().map_err(e)?;
+            let scold = bytes.len() as f64 * copies.len() as f64 / t0.elapsed().as_secs_f64() / 1e9;
+            println!("{:<34} {:<8} {:>12} {:>10} {:>10.2e} {:>8.0} GB/s hot, {scold:.0} cold  (silo; 1 col = 4 col row 0: {same})", "", "", "", "", rel, srate);
+        }
     }
     Ok(())
 }

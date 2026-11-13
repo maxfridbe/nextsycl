@@ -1,0 +1,24 @@
+# GLM-5.3-Flash REAP-50 Q4_K_M · 64K context (both GPUs)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: glm-5.3-flash-reap50-q4km
+kind: llm
+arch: glm5-next
+title: GLM-5.3-Flash REAP-50 Q4_K_M · 64K context (both GPUs)
+about: GLM-5.3-Flash with half its routed experts pruned (REAP, 144 of 288), Q4_K_M imatrix with its MTP block (patrickbdevaney's llama.cpp fork layout), MIT
+gpus: all
+ctx: '65536'
+tools: true                     # GLM's <tool_call> form: nextsycl_tok::glm_chat / glm_tool_calls
+tasks: false
+streams: true                   # experts that fit neither card nor the pinned host tier are read from the file
+env: {}
+silo:                           # kernels/llm/glm5next/silo: Q5_0 / Q6_K expansion and the Q6_K-down grouped experts
+  name: glm5next
+  required: true
+files:
+  model:
+    key: glm53-reap50-q4km
+    url: https://huggingface.co/patrickbdevaney/GLM-5.3-Flash-REAP50-GGUF/resolve/cc7c2b5e4069365d6b7ceaea420330b4176da981/GLM-5.3-Flash-REAP50-Q4_K_M.gguf
+    size: 99330938048
+    sha256: 6ab1536dfc3a6813a510d10cc5bbf9c9301d2b415c7e73c865a01b70c223b7da
+    path: glm53-reap50/GLM-5.3-Flash-REAP50-Q4_K_M.gguf
+guide: guides/chat.md
