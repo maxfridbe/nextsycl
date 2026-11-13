@@ -163,6 +163,8 @@ pub struct Silo {
                                   *const c_void, *mut c_void, *mut f32, f32, c_int) -> c_int,
     #[allow(clippy::type_complexity)]
     pub moe_down: unsafe extern "C" fn(Gpu, c_int, c_int, i64, i64, *const u64, *const i32, *const i32, *const i32, i64, i64, *const c_void, *mut f32) -> c_int,
+    pub mmv_supported: unsafe extern "C" fn(c_int) -> c_int,
+    pub mmv: unsafe extern "C" fn(Gpu, c_int, *const c_void, *const f32, *mut f32, i64, i64, i64) -> c_int,
 }
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
@@ -197,6 +199,8 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             moe_scratch_bytes: sym!("ns_llm_glm5next_moe_scratch_bytes"),
             moe: sym!("ns_llm_glm5next_moe"),
             moe_down: sym!("ns_llm_glm5next_moe_down"),
+            mmv_supported: sym!("ns_llm_glm5next_mmv_supported"),
+            mmv: sym!("ns_llm_glm5next_mmv"),
         }))
     })
     .as_ref()

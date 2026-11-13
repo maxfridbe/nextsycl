@@ -74,6 +74,26 @@ impl Ops {
     }
     /// n values of a stored matrix (bytes [at, at + bytes) of src) expanded to fp16 into dst (2 bytes a value)
     /// whether the silo expands `ty` to half (the shared expander's types are the engine's F16_TYPES)
+    /// whether the silo's decode product takes this type (NS_SILO_MMV=0: never - the shared mmvq instead, to compare)
+    pub fn silo_mmv(&self, ty: u32) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // SAFETY: a capability query.
+        *ON.get_or_init(|| std::env::var("NS_SILO_MMV").map_or(true, |v| v != "0")) && self.s.is_some_and(|s| unsafe { (s.mmv_supported)(ty as i32) } != 0)
+    }
+    /// y [ncols, n_out] (floats from `y.1`) = W . x [ncols, n_in] (floats from `x.1`) through the silo's decode product:
+    /// W the stored blocks at bytes `w.1..w.1 + w_bytes` of `w.0`
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmv_silo(&self, ty: u32, w: (&DevBuf, usize), w_bytes: usize, x: (&DevBuf, usize), y: (&DevBuf, usize), n_in: usize, n_out: usize, ncols: usize) -> Result<()> {
+        let s = self.s.filter(|_| self.silo_mmv(ty)).ok_or_else(|| Error(format!("mmv: the silo does not take type {ty}")))?;
+        w.0.bounds(w.1, w_bytes)?;
+        need!(x.0, x.1 + n_in * ncols, "mmv x");
+        need!(y.0, y.1 + n_out * ncols, "mmv y");
+        // SAFETY: sizes checked (w_bytes is the caller's count of the matrix's stored bytes).
+        let rc = unsafe {
+            (s.mmv)(self.raw(), ty as i32, w.0.ptr().cast::<u8>().add(w.1).cast(), x.0.fp().add(x.1), y.0.fp().add(y.1), n_in as i64, n_out as i64, ncols as i64)
+        };
+        self.ok(rc, "mmv (silo)")
+    }
     pub fn silo_f16(&self, ty: u32) -> bool {
         // SAFETY: a capability query.
         self.s.is_some_and(|s| unsafe { (s.dequant_f16_supported)(ty as i32) } != 0)

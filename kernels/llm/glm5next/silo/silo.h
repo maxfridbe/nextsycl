@@ -41,6 +41,12 @@ int ns_llm_glm5next_moe(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int6
 int ns_llm_glm5next_moe_down(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const uint64_t* grp_ptr, const int32_t* grp_start,
                              const int32_t* n_groups, const int32_t* ent_dst, int64_t groups, int64_t entries, const void* hq, float* out);
 
+/* y [ncols, n_out] = W [n_out, n_in] . x [ncols, n_in] float32, ncols 1..8, n_in a multiple of 256 (mmv.cpp): the
+ * dense IQ3_S matrices at decode widths (the shared iq_mmvq reads its grid from global memory). A column's sum is in an
+ * order fixed by the kernel alone, so rows do not depend on ncols */
+int ns_llm_glm5next_mmv_supported(int type);
+int ns_llm_glm5next_mmv(ns_gpu* g, int type, const void* w, const float* x, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
+
 #ifdef __cplusplus
 }
 #endif

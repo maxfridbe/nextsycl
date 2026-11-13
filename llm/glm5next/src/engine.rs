@@ -1043,6 +1043,10 @@ impl Part {
             }
             return self.ops.gemm_at(t, w.rows, w.cols, x, (&w.buf, 0), y, acc);
         }
+        // the silo's decode product (IQ3_S: the shared kernel reads its grid from global memory), float activations
+        if !acc && t <= MMVQ_COLS && x.2 == w.cols && y.2 == w.rows && self.ops.silo_mmv(w.ty.code()) {
+            return self.ops.mmv_silo(w.ty.code(), (&w.buf, 0), w.buf.len, (x.0, x.1), (y.0, y.1), w.cols, w.rows, t);
+        }
         if !acc && t <= MMVQ_COLS && x.2 == w.cols && y.2 == w.rows && w.cols <= MAX_COLS && self.ops.mmvq_supported(w.ty.code()) {
             self.ops.quantize_q8_1((x.0, x.1), &self.q8, w.cols, t)?;
             return self.ops.mmvq(w.ty.code(), (&w.buf, 0), w.buf.len, &self.q8, (y.0, y.1), w.cols, w.rows, t);
@@ -1290,13 +1294,15 @@ impl Part {
     /// Several matrices on the same input x [t, cols]: one Q8_1 quantization of x serves every decode product.
     fn mm_many(&self, l: u64, roles: &[Role], x: &DevBuf, t: usize) -> Result<Vec<DevBuf>> {
         let ws: Vec<&Mat> = roles.iter().map(|r| self.mat(l, *r)).collect::<Result<_>>()?;
-        let quantized = ws.iter().filter(|w| !w.f32 && self.ops.mmvq_supported(w.ty.code())).count();
+        // the silo's types take float activations (matmul sends them there); the rest share one quantization
+        let shared = |w: &Mat| !w.f32 && !self.ops.silo_mmv(w.ty.code()) && self.ops.mmvq_supported(w.ty.code());
+        let quantized = ws.iter().filter(|w| shared(w)).count();
         let cols = ws[0].cols;
         if t <= MMVQ_COLS && quantized > 1 && ws.iter().all(|w| w.cols == cols) && cols <= MAX_COLS {
             self.ops.quantize_q8_1((x, 0), &self.q8, cols, t)?;
             return ws.iter().map(|w| {
                 let y = self.arena.f32(t * w.rows)?;
-                if !w.f32 && self.ops.mmvq_supported(w.ty.code()) {
+                if shared(w) {
                     self.ops.mmvq(w.ty.code(), (&w.buf, 0), w.buf.len, &self.q8, (&y, 0), w.cols, w.rows, t)?;
                 } else {
                     self.matmul(w, t, (x, 0, w.cols), (&y, 0, w.rows), false)?;
@@ -3058,6 +3064,7 @@ impl<'g> Glm<'g> {
             // NS_PROMPT_DEQUANT=1: prompt chunks take the float32 expanded-GEMM path instead (a measurement switch)
             let dequant = t > MMVQ_COLS && std::env::var("NS_PROMPT_DEQUANT").is_ok_and(|v| v == "1");
             if !dequant && parts.gate.2 == parts.up.2 && o.moe_grouped_supported(parts.gate.2.code(), parts.down.2.code(), d, f) {
+                let r0 = self.mark(p);
                 // the layer's entries by group, numbered in order (an entry's row of dn)
                 let lists: Vec<&Vec<(i32, f32)>> = by.values().collect();
                 let mut first = Vec::with_capacity(lists.len());
@@ -3110,6 +3117,7 @@ impl<'g> Glm<'g> {
                 let lanes = if t > MMVQ_COLS { pl } else { dl };
                 // the resident experts first, while the swapped ones arrive; then those (each entry's arithmetic is
                 // the same in either launch)
+                let r1 = self.lap(p, "routed experts: tables, q8_1", r0);
                 let (now, later): (Vec<usize>, Vec<usize>) = (0..lists.len()).partition(|&k| !arriving[k]);
                 for (gs, wait) in [(now, false), (later, true)] {
                     if gs.is_empty() {
@@ -3129,12 +3137,23 @@ impl<'g> Glm<'g> {
                             o.await_ticket(all)?;
                             o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, n, &xq, &scratch, &dn, lim, lanes, 0)?;
                         }
+                        // profiling: the two halves timed apart (the same launches as phase 0)
+                        None if self.prof.is_some() => {
+                            let h0 = self.mark(p);
+                            o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, n, &xq, &scratch, &dn, lim, lanes, 1)?;
+                            let h1 = self.lap(p, "routed experts: gate | up", h0);
+                            o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, n, &xq, &scratch, &dn, lim, lanes, 2)?;
+                            self.lap(p, "routed experts: down", h1);
+                        }
                         None => o.moe_grouped(parts.gate.2.code(), parts.down.2.code(), d, f, &tb, groups, n, &xq, &scratch, &dn, lim, lanes, 0)?,
                     }
                 }
+                let r2 = self.lap(p, "routed experts: grouped kernels", r1);
                 let cb = p.arena.bytes((t + 1 + total) * 4)?;
                 cb.write_async(0, &t_ptr.iter().chain(&ent).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
-                return o.moe_combine(&y, &dn, &cb, &wb, t, total, d);
+                o.moe_combine(&y, &dn, &cb, &wb, t, total, d)?;
+                self.lap(p, "routed experts: combine", r2);
+                return Ok(());
             }
             if let Some((_, tk)) = copies {
                 o.await_ticket(tk)?; // the paths below read every expert at once

@@ -123,6 +123,11 @@ GLM-5.3 (`llm/glm5next`, `kernels/llm/glm5next`; docs/glm5next.md).
 | `NS_FUSED_MAX` | 64 | Experiment: most tokens of an expert the fused gate/up kernel takes in prompt chunks (oneMKL above); 0 = never | llm glm5next |
 | `NS_SILO_MOE` | 1 | 0: the silo's grouped decode experts off (IQ3_S / Q6_K down: the REAP-50 IQ3_M and Q4_K_M files), each expert's products one at a time instead - a check of the silo's | llm glm5next |
 | `NS_SILO_MOE_GU` | 0 | 1: the silo's grouped experts compute gate \| up as well (moe.cpp); by default the shared grouped kernels' gate \| up and activation run, and the silo takes only the down projection they do not | llm glm5next |
+| `NS_SILO_MMV` | 1 | 0: the dense IQ3_S matrices (the REAP-50 IQ3_M file's attention, shared expert, dense FFN) at decode widths through the shared mmvq instead of the silo's mmv.cpp (grid in local memory, float activations) - for comparing | llm glm5next |
+| `NS_GLM_MMV_RPS` | 1 | rows a sub-group in the silo's IQ3_S decode product (1, 2 or 4; for measuring) | llm glm5next |
+| `NS_GLM_MMV_KU` | 2 | blocks decoded a step in the silo's IQ3_S decode product (1, 2 or 4; for measuring) | llm glm5next |
+| `NS_GLM_MOE_IQ3S` | (unset) | `old`: the silo's grouped experts read IQ3_S with the 16-lane kernels (ggml's vec_dot calls) instead of the 32-lane ones in mmv.cpp's layout; for comparing | llm glm5next |
+| `NS_GLM_MOE_KU` | 2 | blocks decoded a step in the silo's 32-lane IQ3_S expert kernels (1, 2 or 4; for measuring) | llm glm5next |
 | `NS_FIXED_LAYERS` | 1 | 0: no layer kept whole in VRAM - by default a part's few layers whose experts are larger than the rest (the REAP-50 IQ3_M file's Q4_K-down layers 3-4) stay whole in VRAM of their own, so the expert slots fit the usual size | llm glm5next |
 | `NS_MTP_HID` | mean | normed: the MTP draft block reads the final hidden state after output_norm (llama.cpp's glm5-next fork and vLLM) instead of the 4 streams' mean before it (ds4's form) - an acceptance A/B | llm glm5next |
 | `NS_HC_FUSED` | 1 | Experiment: 0 = the hyper-connection pre-mix as separate steps, not the fused two-launch kernel | llm glm5next |
