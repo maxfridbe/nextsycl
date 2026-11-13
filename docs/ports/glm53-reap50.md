@@ -52,3 +52,44 @@ The engine's shared kernels read what the IQ2 file stores; the silo adds what th
   expert's products one at a time through the shared mmvq: the check below).
 
 The Q3_K_M, IQ4_XS and Q4_K_S files run on the shared kernels for everything but their small dequant types.
+
+## Why decode was slow, and the fix (2026-11-13)
+
+Nearly every IQ3_M matrix is IQ3_S: attention, shared expert, dense FFN and routed experts. The shared IQ3_S decode
+kernel (Strata's `vec_dot_iq3_s_q8_1`, ggml's CUDA mmvq) gathers its grid from global memory. The uncensored IQ2 file
+hid this: its attention is Q4_K / Q8_0. Rates of one matrix (`nextsycl llm kernels`; "cold" cycles 512 MB of copies,
+as a token's pass reads each matrix once; the hot rate reruns one matrix out of L2 and overstates):
+
+| matrix | kernel | B70 cold | B65 cold |
+|---|---|---:|---:|
+| attn_q IQ3_S 8192x4096 | shared mmvq | 111 GB/s | 61 GB/s |
+| attn_q IQ3_S 8192x4096 | silo mmv.cpp | 324 GB/s | 180 GB/s |
+| expert IQ3_S 2048x4096 | shared mmvq | 105 GB/s | 52 GB/s |
+| expert IQ3_S 2048x4096 | silo mmv.cpp | 273 GB/s | 144 GB/s |
+| attn_v Q4_K 8192x4096 | shared mmvq | 342 GB/s | 198 GB/s |
+
+`mmv.cpp` (deepseek41's layout: a 32-lane sub-group a row, lane g decoding group g of each block, the grid in local
+memory, float activations) takes every dense IQ3_S product at decode widths, `mm_many` included (KDA's six input
+products, the shared expert, dense FFN, MLA - they had bypassed it). A column's sum is in a fixed order: spec-check
+exact. moe.cpp's IQ3_S expert kernels were rewritten in the same layout, but in place they do not beat the shared
+grouped gate | up (14.2 vs 15.5 ms a token), so the default stays: shared gate | up, the silo's down.
+
+IQ3_M, `--gpu 1,0` (B65 layers 0-21, B70 22-44), temp 0, 256 tokens:
+
+| run | before pp / tg | after pp / tg |
+|---|---:|---:|
+| short prompt, no MTP | - / 15.40 | - / 19.17 |
+| 1K prompt, MTP | 350.9 / 18.28 | 338.1 / 20.68 |
+| 8K prompt, MTP | 862.9 / 17.49 | 799.1 / 18.39 |
+| code answer, MTP | - / 20.11 | - / 20.92 |
+
+Perplexity (score.txt, 512 tokens) 46.92 -> 46.75. Per token (no MTP) the GPU time is about 52 ms: routed experts 20,
+KDA 15 (input products 8.6), MLA 5.3, shared expert 2.9. What is left:
+
+- the B65 reads about half the B70's rate, and the even split is still best: giving the B70 more layers pushes its
+  experts to host memory (B65 16 / 18 / 20 / 22 layers: tg 16.70 / 18.33 / 18.97 / 19.17; the experts are about
+  66 GB against about 41 GB of VRAM)
+- the routed experts read about 165 GB/s in place against 273 (B70) / 144 (B65) for one matrix
+- KDA's input products are six launches a layer; three are 64-128 rows (about 3 ms a token of launch cost)
+- ssm_f_b / ssm_g_b are IQ4_NL at 56 GB/s (B70) through the shared kernel (about 0.7 ms a token)
+- MTP gains little (+8% at 73% acceptance): a two-token verify pass reads up to 16 experts a layer, not 8
