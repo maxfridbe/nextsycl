@@ -52,5 +52,5 @@ needle answers are the code alone and are not a decode rate.
 | Q4_K_M (92.5 GiB) | 15.17 | 230 / 7.63 | 212 / 7.80 | 43.20 | 94-259 |
 
 All three are exact (spec-check: 0 of 94 rows differ). The IQ3_M rows were measured with `--gpu 1,0`. Q4_K_S scores
-8% lower perplexity at ~30% slower decode with drafts (its 13.5 MiB experts fit 2,982 in VRAM against 3,994); Q4_K_M
+8% lower perplexity at ~30% slower decode with drafts (its 13.5 MiB experts fit 3,004 in VRAM against 3,994); Q4_K_M
 spills experts to the file and halves again.
