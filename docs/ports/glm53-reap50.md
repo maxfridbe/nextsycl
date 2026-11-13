@@ -51,7 +51,9 @@ The engine's shared kernels read what the IQ2 file stores; the silo adds what th
   in an order fixed by the kernel alone, so verify rows equal one-token rows. `NS_SILO_MOE=0` turns it off (each
   expert's products one at a time through the shared mmvq: the check below).
 
-The Q3_K_M, IQ4_XS and Q4_K_S files run on the shared kernels for everything but their small dequant types.
+The Q3_K_M, IQ4_XS and Q4_K_S files run on the shared kernels for everything but their small dequant types. Q4_K_S was
+measured (the ladder doc: 8% lower perplexity, ~30% slower decode than IQ3_M) and taken off hardac1 2026-11-13; its card
+is gone (the file is archived off the box).
 
 ## Why decode was slow, and the fix (2026-11-13)
 
