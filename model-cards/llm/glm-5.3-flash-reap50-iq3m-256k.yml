@@ -1,0 +1,19 @@
+# GLM-5.3-Flash REAP-50 IQ3_M · 256K context + a 32K chat (both GPUs; a 256K prompt reads in ~5 min)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: glm-5.3-flash-reap50-iq3m-256k
+kind: llm
+arch: glm5-next
+title: GLM-5.3-Flash REAP-50 IQ3_M · 256K context + a 32K chat (both GPUs; a 256K prompt reads in ~5 min)
+about: GLM-5.3-Flash with half its routed experts pruned (REAP, 144 of 288), IQ3_M imatrix with its MTP block (patrickbdevaney's llama.cpp fork layout), MIT
+gpus: all
+ctx: 262144,32768
+tools: true                     # GLM's <tool_call> form: nextsycl_tok::glm_chat / glm_tool_calls
+tasks: false
+streams: true                   # experts that fit neither card nor the pinned host tier are read from the file
+env: {}
+silo:                           # kernels/llm/glm5next/silo: IQ3_S decode products, IQ3_S / IQ4_NL expansion, the IQ3_S-down grouped experts
+  name: glm5next
+  required: true
+files:
+  model: glm53-reap50-iq3m
+guide: guides/chat.md
