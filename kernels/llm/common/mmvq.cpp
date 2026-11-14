@@ -688,7 +688,9 @@ int ns_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, in
     const int bv = block_values(type);
     if (bv == 0) return ns_fail("ns_mmvq: ggml type " + std::to_string(type) + " has no decode kernel");
     if (n_in % bv != 0) return ns_fail("ns_mmvq: n_in " + std::to_string(n_in) + " not a multiple of the type's block");
-    if (type == 8) { q80_wide(g->q, w, x_q8_1, y, (int) n_in, (int) n_out, (int) ncols); return 0; }
+    // Q8_0: the copied wide32 kernel, but rows of fewer than 1,024 values ours (a row a few lanes: 8,192 x 128 B70 268 GB/s
+    // cold against its 187)
+    if (type == 8 && n_in >= 1024) { q80_wide(g->q, w, x_q8_1, y, (int) n_in, (int) n_out, (int) ncols); return 0; }
     if (type == 14) { q6k_wide(g->q, w, x_q8_1, y, (int) n_in, (int) n_out, (int) ncols); return 0; }
     with_type(type, [&](auto f) { mmvq_any<decltype(f)>(g->q, w, x_q8_1, y, (int) n_in, (int) n_out, (int) ncols); });
     return 0;
