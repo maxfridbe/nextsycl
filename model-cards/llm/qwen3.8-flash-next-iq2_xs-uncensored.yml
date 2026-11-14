@@ -7,6 +7,7 @@ title: Qwen3.8-Flash-Next IQ2_XS uncensored (refusal projection; either card, 12
 about: IQ2_XS with Strata's experimental speed projection (a control vector) removing refusals
 gpus: '0|1'                     # one of the cards, the B70 preferred: the whole model on whichever has the room
 streams: true                   # its PLE rows read from the file every window while it serves: keep it on the fastest drive
+vram_gib: 30.6                  # measured on the B65 2026-11-13 with its 128K + 32K sessions (31,376 MiB used); llm start picks the card by it
 ctx: 131072,32768
 tools: true
 tasks: true
