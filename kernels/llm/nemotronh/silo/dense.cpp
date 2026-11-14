@@ -14,7 +14,7 @@
 #include "ns_internal.hpp"
 #include "nhs.h"
 #include "common.hpp"
-#include "strata/kernels/q8_1_finite.hpp"
+#include "ns_q8_1.hpp"
 
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
@@ -608,15 +608,15 @@ int ns_nhs_dense_quantize(ns_gpu* g, const float* x, void* q8_1, void* xs, int64
             amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
             sum += sycl::permute_group_by_xor(sg, sum, o);
         }
-        const float dd = strata::kernels::q8_1_finite(amax / 127.0f);
-        const int8_t qv = strata::kernels::q8_1_quant(v, dd, amax);
+        const float dd = ns::q8_1_finite(amax / 127.0f);
+        const int8_t qv = ns::q8_1_quant(v, dd, amax);
         int t = qv;
 #pragma unroll
         for (int o = 8; o > 0; o >>= 1) t += sycl::permute_group_by_xor(sg, t, o);
         if (i >= n) return;
         const int64_t b = i / 32, l = i % 32;
         qs[i] = qv;
-        const sycl::half2 ds = strata::kernels::q8_1_ds(dd, sum);
+        const sycl::half2 ds = ns::q8_1_ds(dd, sum);
         if (l == 0) d[b] = ds[0];
         if (l % 16 == 0) sm[i / 16] = (int16_t) t;
         if (q) {

@@ -8,7 +8,7 @@
 #include "silo.h"
 
 #include <sycl/sycl.hpp>
-#include "strata/kernels/q8_1_finite.hpp"
+#include "ns_q8_1.hpp"
 
 namespace {
 constexpr int WG = 256, SG = 32, NSG = WG / SG;
@@ -55,10 +55,10 @@ int ns_rc_rms_q8(ns_gpu* g, const float* x, const float* w, float* y, void* q8_1
                 amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
                 sum += sycl::permute_group_by_xor(sg, sum, o);
             }
-            const float d = strata::kernels::q8_1_finite(amax / 127.0f);
+            const float d = ns::q8_1_finite(amax / 127.0f);
             Q81* b = q + (r * C + c) / 32;
-            const int8_t qv = strata::kernels::q8_1_quant(v, d, amax);
-            const sycl::half2 ds = strata::kernels::q8_1_ds(d, sum);
+            const int8_t qv = ns::q8_1_quant(v, d, amax);
+            const sycl::half2 ds = ns::q8_1_ds(d, sum);
             b->qs[lane] = qv;
             if (lane == 0) b->ds = ds;
             int t16 = qv;   // the 16-value group's sum (lanes 0-15, 16-31), every lane in the shuffles
