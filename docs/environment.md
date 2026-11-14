@@ -128,6 +128,7 @@ GLM-5.3 (`llm/glm5next`, `kernels/llm/glm5next`; docs/glm5next.md).
 | `NS_GLM_MMV_KU` | 2 | blocks decoded a step in the silo's IQ3_S decode product (1, 2 or 4; for measuring) | llm glm5next |
 | `NS_GLM_MOE_IQ3S` | (unset) | `old`: the silo's grouped experts read IQ3_S with the 16-lane kernels (ggml's vec_dot calls) instead of the 32-lane ones in mmv.cpp's layout; for comparing | llm glm5next |
 | `NS_GLM_MOE_KU` | 2 | blocks decoded a step in the silo's 32-lane IQ3_S expert kernels (1, 2 or 4; for measuring) | llm glm5next |
+| `NS_WRITE_GGUF_HEADER` | (unset) | 1: `cargo test -p nextsycl-gguf ns_gguf_header` rewrites kernels/ns/ns_gguf.h from crates/gguf formats (the GGUF block layouts and codebooks the kernels include) instead of only checking it | build (crates/gguf) |
 | `NS_FIXED_LAYERS` | 1 | 0: no layer kept whole in VRAM - by default a part's few layers whose experts are larger than the rest (the REAP-50 IQ3_M file's Q4_K-down layers 3-4) stay whole in VRAM of their own, so the expert slots fit the usual size | llm glm5next |
 | `NS_MTP_HID` | mean | normed: the MTP draft block reads the final hidden state after output_norm (llama.cpp's glm5-next fork and vLLM) instead of the 4 streams' mean before it (ds4's form) - an acceptance A/B | llm glm5next |
 | `NS_HC_FUSED` | 1 | Experiment: 0 = the hyper-connection pre-mix as separate steps, not the fused two-launch kernel | llm glm5next |
