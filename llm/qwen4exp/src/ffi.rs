@@ -130,7 +130,7 @@ pub struct Api {
     pub mtp_load: unsafe extern "C" fn(Stage, *const std::ffi::c_char, c_int, i64, c_int, *const c_void, usize) -> c_int,
     pub mtp_prefill: unsafe extern "C" fn(Stage, State, i64, i64, *const i32) -> c_int,
     pub mtp_draft: unsafe extern "C" fn(Stage, State, *const i32, i64, c_int, c_int, f32, *mut i32, *mut f32, *mut c_int) -> c_int,
-    /// Strata's grouped expert kernels take these gate/up and down formats (glm.h's ns_moe_grouped_supported)
+    /// Strata's grouped expert kernels take these gate/up and down formats (qwen.h's ns_qw_moe_grouped_supported)
     pub moe_grouped_supported: unsafe extern "C" fn(c_int, c_int, i64, i64) -> c_int,
     /// n quantized values (device) into float32 (device), waited (qwen.h ns_qw_dequant_f32)
     pub dequant_f32: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, i64, *mut f32) -> c_int,
@@ -182,7 +182,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             mtp_load: sym!("ns_qw_mtp_load"),
             mtp_prefill: sym!("ns_qw_mtp_prefill"),
             mtp_draft: sym!("ns_qw_mtp_draft"),
-            moe_grouped_supported: sym!("ns_moe_grouped_supported"),
+            moe_grouped_supported: sym!("ns_qw_moe_grouped_supported"),
             dequant_f32: sym!("ns_qw_dequant_f32"),
             set_silo: sym!("ns_qw_set_silo"),
         })

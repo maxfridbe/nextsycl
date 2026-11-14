@@ -45,6 +45,11 @@ const BLOCKS: &[Block] = &[
     Block { name: "block_q5_K", fields: "DM\n    uint8_t scales[K_SCALE_SIZE];\n    uint8_t qh[QK_K / 8];\n    uint8_t qs[QK_K / 2];", bytes: 4 + 12 + 32 + 128 },
     Block { name: "block_q6_K", fields: "    uint8_t ql[QK_K / 2];\n    uint8_t qh[QK_K / 4];\n    int8_t scales[QK_K / 16];\n    ns_half d;", bytes: 128 + 64 + 16 + 2 },
     Block { name: "block_iq1_s", fields: "    ns_half d;\n    uint8_t qs[QK_K / 8];\n    uint16_t qh[QK_K / 32];", bytes: 2 + 32 + 16 },
+    Block {
+        name: "block_iq1_m",
+        fields: "    uint8_t qs[QK_K / 8];      /* the grid indices' low 8 bits */\n    uint8_t qh[QK_K / 16];     /* a nibble a group of 8: its index's high 3 bits, its delta's sign */\n    uint8_t scales[QK_K / 32]; /* 3-bit scales a 16 values; the block's fp16 scale in the four words' top nibbles */",
+        bytes: 32 + 16 + 8,
+    },
     Block { name: "block_iq2_xxs", fields: "    ns_half d;\n    uint16_t qs[QK_K / 8];", bytes: 2 + 64 },
     Block { name: "block_iq2_xs", fields: "    ns_half d;\n    uint16_t qs[QK_K / 8];\n    uint8_t scales[QK_K / 32];", bytes: 2 + 64 + 8 },
     Block { name: "block_iq2_s", fields: "    ns_half d;\n    uint8_t qs[QK_K / 4];\n    uint8_t qh[QK_K / 32];\n    uint8_t scales[QK_K / 32];", bytes: 2 + 64 + 8 + 8 },
@@ -72,6 +77,7 @@ const MACROS: &[(&str, &str)] = &[
     ("IQ3S_N_SCALE", "(QK_K / 64)"),
     ("NGRID_IQ1S", "2048"),
     ("IQ1S_DELTA", "0.125f"),
+    ("IQ1M_DELTA", "0.125f"),
     ("QR4_0", "2"),
     ("QI4_0", "(QK4_0 / (4 * QR4_0))"),
     ("QR5_0", "2"),
@@ -179,7 +185,7 @@ mod tests {
         // bytes a block of each type, as GGUF files store them (ggml's type traits)
         let want = [
             ("block_q4_0", 18), ("block_q5_0", 22), ("block_q8_0", 34), ("block_q8_1", 36), ("block_mxfp4", 17), ("block_q2_K", 84),
-            ("block_q3_K", 110), ("block_q4_K", 144), ("block_q5_K", 176), ("block_q6_K", 210), ("block_iq1_s", 50), ("block_iq2_xxs", 66),
+            ("block_q3_K", 110), ("block_q4_K", 144), ("block_q5_K", 176), ("block_q6_K", 210), ("block_iq1_s", 50), ("block_iq1_m", 56), ("block_iq2_xxs", 66),
             ("block_iq2_xs", 74), ("block_iq2_s", 82), ("block_iq3_xxs", 98), ("block_iq3_s", 110), ("block_iq4_nl", 18), ("block_iq4_xs", 136),
         ];
         for (name, bytes) in want {

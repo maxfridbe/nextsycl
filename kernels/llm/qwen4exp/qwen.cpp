@@ -632,6 +632,10 @@ int ns_qw_dequant_f32(ns_gpu* g, int type, const void* src, int64_t n, float* ds
     NS_CATCH
 }
 
+int ns_qw_moe_grouped_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+    return strata::kernels::native_expert_supported(gu_type, d_type, n_embd, n_ff) ? 1 : 0;
+}
+
 int ns_qw_set_sampling(ns_qw* w, float temperature, float top_p, int top_k, float min_p, unsigned long long seed) {
     NS_TRY
     w->s_temp = temperature > 0.0f ? temperature : 0.0f;

@@ -138,7 +138,8 @@ GLM-5.3 (`llm/glm5next`, `kernels/llm/glm5next`; docs/glm5next.md).
 | `NS_MLA_DEC` | 1 | Experiment: 0 = decode widths take the generic MLA attention kernel, not the 512-latent decode one | kernels:llm glm5next |
 | `NS_MLA_HG` | 1 head a work-group | Experiment: 4 = 4 heads a work-group in prompt-chunk MLA attention (measured slower) | kernels:llm glm5next |
 | `NS_MLA_KERNEL` | 0 | Experiment: 1 = prompt chunks take the per-row MLA attention kernel, not the GEMM path | llm glm5next |
-| `NS_MMVQ_IQ_FIRST` | 0 | Experiment: 1 = decode mat-vec tries the IQ kernels before the tuned dense ones | kernels:llm glm5next |
+| `NS_KERNEL_TRACE` | (unset) | a file: each distinct call of the shared decode kernels (ns_quantize_q8_1, ns_mmvq, ns_dequant_f16, ns_moe_grouped: the function, its types and shape) appended to it once - which types and shapes the engines send there | kernels:llm common |
+| `NS_MMVQ_GROUPS` | 512 | work-groups of the shared decode kernels that keep a codebook in local memory (each fills it once, then strides over rows) | kernels:llm common |
 | `NS_NGRAM` | 0 | Up to K (1..4) tokens drafted from the context's repeats (prompt lookup); 0 = the draft block's (--opt-ngram) | llm glm5next |
 | `NS_PIPELINE` | 1 | 0 = a long prompt's chunks on two GPUs run in turn, not pipelined (--opt-pipeline) | llm glm5next |
 | `NS_PIPE_TRACE` | 0 | Debug: each pipeline stage's time a chunk and the GPUs' free VRAM | llm glm5next; cli (passes it to the container) |

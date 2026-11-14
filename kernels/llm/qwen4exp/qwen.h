@@ -141,6 +141,8 @@ int ns_qw_set_silo(ns_qw* w, void* i8_available, void* i8_supported, void* i8_gr
  * dequantizer (iq_dequant_f32: the i-quants, K-quants, Q4_0 / Q5_0 / Q8_0 it takes); waits. For the roles the kernels
  * read as BF16 that a file stores quantized (UkisAI's standard GGUFs: the hyper-connection projections, PLE key / value) */
 int ns_qw_dequant_f32(ns_gpu* g, int type, const void* src, int64_t n, float* dst);
+/* whether Strata's grouped expert kernels (the ones this engine runs) take these gate/up and down formats */
+int ns_qw_moe_grouped_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 
 /* a control vector (cvec.cpp; Strata's --control-vector-scaled): dir n_layer x 2560 (project: unit directions;
  * add: the offsets), s n_layer (project: the scale, add: 1; 0 = layer not steered), mode 0 project / 1 add. Set

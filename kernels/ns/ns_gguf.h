@@ -22,6 +22,7 @@ typedef sycl::half2 ns_half2;
 #define IQ3S_N_SCALE (QK_K / 64)
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f
+#define IQ1M_DELTA 0.125f
 #define QR4_0 2
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR5_0 2
@@ -158,6 +159,13 @@ typedef struct {
     uint16_t qh[QK_K / 32];
 } block_iq1_s;
 static_assert(sizeof(block_iq1_s) == 50, "block_iq1_s: 50 bytes");
+
+typedef struct {
+    uint8_t qs[QK_K / 8];      /* the grid indices' low 8 bits */
+    uint8_t qh[QK_K / 16];     /* a nibble a group of 8: its index's high 3 bits, its delta's sign */
+    uint8_t scales[QK_K / 32]; /* 3-bit scales a 16 values; the block's fp16 scale in the four words' top nibbles */
+} block_iq1_m;
+static_assert(sizeof(block_iq1_m) == 56, "block_iq1_m: 56 bytes");
 
 typedef struct {
     ns_half d;
