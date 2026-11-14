@@ -7,7 +7,7 @@
 // g decoding group g of each block (a lane's 8 weights meet 8 contiguous activations: coalesced), RPS rows at once so
 // their loads are in flight together, the grid staged in local memory by each work-group. The activations are float32
 // (no Q8_1 rounding). A column's sum runs in an order fixed by the kernel alone (the same for 1 or 8 columns), so a
-// verify pass's rows equal one-token passes bit for bit. ggml's dequantize_row_iq3_s gives the weights (ggml-common.h).
+// verify pass's rows equal one-token passes bit for bit. The IQ3_S format (ns_gguf.h) gives the weights.
 #include "ns.h"
 #include "ns_internal.hpp"
 #include "silo.h"
@@ -17,9 +17,7 @@
 #include <cstdlib>
 #include <string>
 
-#define GGML_COMMON_DECL_SYCL
-#define GGML_COMMON_IMPL_SYCL
-#include "ggml-common.h"
+#include "ns_gguf.h"
 
 namespace {
 

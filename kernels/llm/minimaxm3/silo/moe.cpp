@@ -4,7 +4,7 @@
 // sub-group a row with lane g the block's group g, the lanes' sums reduced at the end. What is new here is the shape of the work:
 // one launch takes up to four experts at once (the shared kernels take one expert and three launches each), the gate and up rows
 // of an output row are worked together and leave as the SwiGLU-OAI value, and the down product writes its weighted row into the
-// rank's plane of the sum. The grids are ggml's (ggml-common.h); the formulas are ggml's dequantize_row_*.
+// rank's plane of the sum. The grids are the GGUF formats' (ns_gguf.h); the formulas are ggml's dequantize_row_*.
 #include "ns.h"
 #include "ns_internal.hpp"
 #include "mm3s.h"
@@ -16,9 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 
-#define GGML_COMMON_DECL_SYCL
-#define GGML_COMMON_IMPL_SYCL
-#include "ggml-common.h"
+#include "ns_gguf.h"
 
 namespace {
 

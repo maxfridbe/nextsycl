@@ -8,9 +8,7 @@
 #include <sycl/sycl.hpp>
 #include <oneapi/mkl/blas.hpp>
 
-#define GGML_COMMON_DECL_SYCL
-#define GGML_COMMON_IMPL_SYCL
-#include "ggml-common.h"
+#include "ns_gguf.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -18,7 +16,7 @@
 
 namespace {
 
-inline float h2f(ggml_half h) { return (float) h; }
+inline float h2f(sycl::half h) { return (float) h; }
 
 // ---- dequantization: one work-item per block, the order and arithmetic of ggml-quants.c's dequantize_row_*
 
@@ -37,7 +35,7 @@ void deq_q8_0(const block_q8_0* x, float* y) {
 }
 
 void deq_q2_K(const block_q2_K* x, float* y) {
-    const float d = (float) x->dm[0], mn = (float) x->dm[1];   // the SYCL ggml-common.h's (d, dmin) pair
+    const float d = (float) x->dm[0], mn = (float) x->dm[1];   // ns_gguf.h's (d, dmin) pair
     const uint8_t* q = x->qs;
     int is = 0;
     for (int n = 0; n < QK_K; n += 128) {
@@ -89,7 +87,7 @@ void deq_q3_K(const block_q3_K* x, float* y) {
 
 void deq_q4_K(const block_q4_K* x, float* y) {
     const uint8_t* q = x->qs;
-    const float d = (float) x->dm[0], mn = (float) x->dm[1];   // the SYCL ggml-common.h's (d, dmin) pair
+    const float d = (float) x->dm[0], mn = (float) x->dm[1];   // ns_gguf.h's (d, dmin) pair
     int is = 0;
     uint8_t sc, m;
     for (int j = 0; j < QK_K; j += 64) {
@@ -107,7 +105,7 @@ void deq_q4_K(const block_q4_K* x, float* y) {
 void deq_q5_K(const block_q5_K* x, float* y) {
     const uint8_t* ql = x->qs;
     const uint8_t* qh = x->qh;
-    const float d = (float) x->dm[0], mn = (float) x->dm[1];   // the SYCL ggml-common.h's (d, dmin) pair
+    const float d = (float) x->dm[0], mn = (float) x->dm[1];   // ns_gguf.h's (d, dmin) pair
     int is = 0;
     uint8_t sc, m;
     uint8_t u1 = 1, u2 = 2;
