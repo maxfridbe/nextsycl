@@ -23,9 +23,7 @@
 #include <cstring>
 
 // ggml's IQ grids (iq3s_grid)
-#define GGML_COMMON_DECL_SYCL
-#define GGML_COMMON_IMPL_SYCL
-#include "ggml-common.h"
+#include "ns_gguf.h"
 
 namespace {
 using namespace nhsilo;

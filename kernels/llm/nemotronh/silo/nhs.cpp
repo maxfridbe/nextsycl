@@ -16,9 +16,7 @@
 #include <cstring>
 
 // ggml's grids (iq2xs_grid, iq2s_grid, iq3xxs_grid, kvalues_iq4nl)
-#define GGML_COMMON_DECL_SYCL
-#define GGML_COMMON_IMPL_SYCL
-#include "ggml-common.h"
+#include "ns_gguf.h"
 
 namespace {
 constexpr int QK = 256, Q8K = 32, WARPS = 4, WARP = 32;

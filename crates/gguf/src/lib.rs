@@ -5,6 +5,8 @@
 //! A model split over several files (`split.count` > 1, `<stem>-00001-of-00003.gguf`) opens as one: the
 //! metadata comes from the first shard, the tensors from all of them.
 
+pub mod format_tables;
+pub mod formats;
 pub mod pth;
 pub mod pthst;
 pub mod safetensors;

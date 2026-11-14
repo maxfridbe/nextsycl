@@ -9,16 +9,14 @@
 
 #include <sycl/sycl.hpp>
 
-#define GGML_COMMON_DECL_SYCL
-#define GGML_COMMON_IMPL_SYCL
-#include "ggml-common.h"
+#include "ns_gguf.h"
 
 #include <cstdint>
 #include <string>
 
 namespace {
 
-inline float h2f(ggml_half h) { return (float) h; }
+inline float h2f(sycl::half h) { return (float) h; }
 
 void deq_q4_0(const block_q4_0* x, float* y) {
     const float d = h2f(x->d);

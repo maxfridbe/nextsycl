@@ -6,7 +6,7 @@
 // g of a block (its scales and signs and grid read for that group alone). A decode product is a sub-group a row, lane g
 // the block's group g (a lane's 8 weights meet 8 contiguous activations: coalesced), the lanes' sums reduced at the end;
 // the dequantizing kernel is a work-item a group. The activations are float32: no Q8 layout, the one set of kernels for
-// all the types. The grids are ggml's (ggml-common.h). Formulas are ggml's dequantize_row_*.
+// all the types. The grids are the GGUF formats' (ns_gguf.h). Formulas are ggml's dequantize_row_*.
 #include "ns.h"
 #include "ns_internal.hpp"
 #include "ds41.h"
@@ -16,9 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 
-#define GGML_COMMON_DECL_SYCL
-#define GGML_COMMON_IMPL_SYCL
-#include "ggml-common.h"
+#include "ns_gguf.h"
 
 namespace {
 

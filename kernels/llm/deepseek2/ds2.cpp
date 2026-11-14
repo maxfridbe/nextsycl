@@ -8,9 +8,7 @@
 #include <cmath>
 
 // ggml's IQ1_S grid (iq1s_grid_gpu: 2048 entries of eight values in {-1, 0, 1}, each + 1 in a nibble)
-#define GGML_COMMON_DECL_SYCL
-#define GGML_COMMON_IMPL_SYCL
-#include "ggml-common.h"
+#include "ns_gguf.h"
 
 namespace {
 

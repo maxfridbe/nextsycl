@@ -5,12 +5,10 @@
 // Measured alone, the weights cold (gate | up 4096 x 4096): B70 117 us vs 202 for expanding to fp16 + oneMKL at 64
 // tokens, 135 / 214 at 128; down (4096 x 2048), 8 row tiles: B70 39 us at 64 tokens, 40 at 128, 55 at 256, B65 47 /
 // 66 / 119 (oneMKL alone on the expanded weights: 18 / 25 / 90, 31 / 62 / 61).
-#define GGML_COMMON_DECL_SYCL
-#define GGML_COMMON_IMPL_SYCL
 #include "ns.h"
 #include "glm.h"
 #include "ns_internal.hpp"
-#include "ggml-common.h"
+#include "ns_gguf.h"
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <map>

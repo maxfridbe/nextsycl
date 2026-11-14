@@ -13,9 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 
-#define GGML_COMMON_DECL_SYCL
-#define GGML_COMMON_IMPL_SYCL
-#include "ggml-common.h"
+#include "ns_gguf.h"
 
 namespace {
 using namespace q35silo;
