@@ -377,9 +377,15 @@ impl Home {
         let mut r = self.work(&method, &body);
         // no room on its card (another engine's work grew there after this one was placed): the job waits and runs
         // again, as long as its max_willing_to_wait_s (else NO_ROOM_WAIT_S) allows - not a failure the caller retries
+        // An engine that ran out of its card's memory mid-run (a request bigger than the room beside the model, e.g. a
+        // 2048 x 2048 picture) tries once more - other work there may have ended - then fails no_room (retryable: the
+        // caller may send it to another box); running it to the same failure every 10 s for half an hour helps no one
         let until = now() + j["max_willing_to_wait_s"].as_f64().unwrap_or(NO_ROOM_WAIT_S);
+        let mut oom_tries = 0;
         while let Err((503, m)) = &r {
-            if backplane_scheduler::rsvp::wait_untag(m).is_some() || self.job_cancelled(id) || now() + NO_ROOM_EVERY_S > until {
+            let oom = nextsycl_core::Error(m.clone()).is_no_room() && !m.starts_with(nextsycl_core::NO_ROOM);
+            oom_tries += oom as u32;
+            if backplane_scheduler::rsvp::wait_untag(m).is_some() || self.job_cancelled(id) || now() + NO_ROOM_EVERY_S > until || oom_tries > 1 {
                 break;
             }
             self.note(Some(id), "waiting", &format!("no room on its card now, again in {NO_ROOM_EVERY_S} s: {m}"));

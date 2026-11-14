@@ -405,7 +405,7 @@ impl Model3dServer {
         };
         *p.lock().unwrap() = json!({"busy": false});
         drop(engine);
-        let mesh = out.map_err(|e| (if e.0 == "cancelled" { 499 } else { 400 }, e.0))?;
+        let mesh = out.map_err(|e| crate::engine_status(e, 400))?;
         let glb = nextsycl_model3d::mesh::glb::write(&mesh).map_err(|e| (500u16, format!("writing the GLB: {e}")))?;
         let took = t0.elapsed().as_secs_f64();
         let wh = match (j0, self.tele.joules()) {

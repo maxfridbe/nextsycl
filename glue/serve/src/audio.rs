@@ -475,7 +475,7 @@ impl AudioServer {
                 self.retire.store(true, Ordering::Relaxed);
             }
         }
-        let t = out.map_err(|e| (if e.0 == "cancelled" { 499 } else { 400 }, e.0))?;
+        let t = out.map_err(|e| crate::engine_status(e, 400))?;
         let took = t0.elapsed().as_secs_f64();
         let wh = match (j0, self.tele.joules()) {
             (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
@@ -738,7 +738,7 @@ impl AudioServer {
                 self.retire.store(true, Ordering::Relaxed);
             }
         }
-        let audio = out.map_err(|e| (if e.0 == "cancelled" { 499 } else { 400 }, e.0))?;
+        let audio = out.map_err(|e| crate::engine_status(e, 400))?;
         let took = t0.elapsed().as_secs_f64();
         // the card's energy over the request (its counter's rise), watt-hours
         let wh = match (j0, self.tele.joules()) {

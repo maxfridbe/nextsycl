@@ -571,7 +571,7 @@ impl ImageServer {
             }
         });
         *p.lock().unwrap() = json!({"busy": false});
-        let out = out.map_err(|e| (400u16, e.0))?;
+        let out = out.map_err(|e| crate::engine_status(e, 400))?;
         let seconds = t0.elapsed().as_secs_f64();
         let wh = match (j0, self.tele.joules()) {
             (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
@@ -643,7 +643,7 @@ impl ImageServer {
             Ok(())
         });
         *p.lock().unwrap() = json!({"busy": false});
-        let out = out.map_err(|e| (if e.0 == "cancelled" { 499u16 } else { 400 }, e.0))?;
+        let out = out.map_err(|e| crate::engine_status(e, 400))?;
         let wh = match (j0, self.tele.joules()) {
             (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
             _ => None,
@@ -692,7 +692,7 @@ impl ImageServer {
                                                 "phase": "mask", "seconds": 0.0});
         let out = engine.remove_background(&pic, post);
         *self.progress.lock().unwrap() = json!({"busy": false});
-        let (rgba, mask) = out.map_err(|e| (500u16, e.0))?;
+        let (rgba, mask) = out.map_err(|e| crate::engine_status(e, 500))?;
         let seconds = t0.elapsed().as_secs_f64();
         let wh = match (j0, self.tele.joules()) {
             (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
@@ -811,7 +811,7 @@ impl ImageServer {
             Ok(())
         });
         *p.lock().unwrap() = json!({"busy": false});
-        let (pic, info) = out.map_err(|e| (if e.0 == "cancelled" { 499u16 } else { 400 }, e.0))?;
+        let (pic, info) = out.map_err(|e| crate::engine_status(e, 400))?;
         let wh = match (j0, self.tele.joules()) {
             (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
             _ => None,
@@ -907,7 +907,7 @@ impl ImageServer {
         let p = &self.progress;
         let r: Result<(), (u16, String)> = (|| {
             let mut stdout = dec.stdout.take().ok_or((500u16, "ffmpeg's output".to_string()))?;
-            let fail = |e: nextsycl_core::Error| (if e.0 == "cancelled" { 499u16 } else if e.is_no_room() { 503 } else { 400 }, e.0);
+            let fail = |e: nextsycl_core::Error| crate::engine_status(e, 400);
             // a made frame to the encoder (started on the first: its size is the frames')
             let mut put = |pic: &nextsycl_image::Picture| -> Result<(), (u16, String)> {
                 if enc.is_none() {
@@ -1128,7 +1128,7 @@ impl ImageServer {
             Ok(())
         });
         *p.lock().unwrap() = json!({"busy": false});
-        let pics = pics.map_err(|e| (if e.0 == "cancelled" { 499u16 } else { 400 }, e.0))?;
+        let pics = pics.map_err(|e| crate::engine_status(e, 400))?;
         let seconds = t0.elapsed().as_secs_f64();
         // the card's energy over the request (its counter's rise), watt-hours
         let wh = match (j0, self.tele.joules()) {
