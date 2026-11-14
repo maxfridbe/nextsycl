@@ -11,6 +11,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include <cstdint>
+#include <type_traits>
 
 #include "ns_gguf.h"
 
@@ -54,10 +55,10 @@ inline int sub_bytes(uint32_t v, uint32_t k) { return int((v + (0x80808080u - k 
 inline uint32_t sign_mask4(uint32_t b) { return ((b * 0x00204081u) & 0x01010101u) * 0xffu; }
 
 // one sub-block of a Q8_1 activation column: its 32 quants, its scale d and s = d x their sum
-struct X { sycl::int4 lo, hi; float d, s; };
+struct X { sycl::int4 lo, hi; float d, s, d1; };   // d1: the scale of hi when it is another block's half (else d)
 inline X xload(const block_q8_1* b) {
     const sycl::half2 ds = b->ds;
-    return X{load16_a4(b->qs), load16_a4(b->qs + 16), (float) ds[0], (float) ds[1]};
+    return X{load16_a4(b->qs), load16_a4(b->qs + 16), (float) ds[0], (float) ds[1], (float) ds[0]};
 }
 
 enum Off { NONE, MIN32, MIN16, IQ1 };
@@ -115,6 +116,34 @@ struct TQ6K {
     using Block = block_q6_K;
     static constexpr int LUT = 0; static constexpr Off OFF = NONE;
     static uint32_t lut(int) { return 0; }
+    // the products read it another way (half the loads): lane g = half n (g / 4), quarters ja = (g / 2) % 2 and ja + 2,
+    // positions 16 (g % 2) .. + 15 - one 16-byte run of ql (its low nibbles quarter ja, its high ones ja + 2) and one of
+    // qh; lo then holds 16 values of sub-block 4n + ja, hi 16 of 4n + ja + 2 (the activations' halves to match: xdot)
+    static constexpr bool HALVES = true;
+    static W load_dot(const Block* b, int g, const uint32_t*) {
+        W r;
+        const int n = g >> 2, ja = (g >> 1) & 1, h = g & 1;
+        const sycl::int4 l = load16_a2(b->ql + 64 * n + 32 * ja + 16 * h), q = load16_a2(b->qh + 32 * n + 16 * h);
+        int lo[4], hi[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t lw = word_of(l, i), hw = word_of(q, i);
+            lo[i] = sub_bytes((lw & 0x0f0f0f0f) | (((hw >> (2 * ja)) & 0x03030303) << 4), 32);
+            hi[i] = sub_bytes(((lw >> 4) & 0x0f0f0f0f) | (((hw >> (2 * ja + 4)) & 0x03030303) << 4), 32);
+        }
+        r.lo = i4(lo); r.hi = i4(hi);
+        const float d = (float) b->d;
+        r.d0 = d * (float) b->scales[8 * n + 2 * ja + h]; r.d1 = d * (float) b->scales[8 * n + 2 * ja + 4 + h];
+        r.m0 = r.m1 = 0.f;
+        return r;
+    }
+    // the activations lane g's values meet: half g % 2 of blocks 4n + ja and 4n + ja + 2 (x: the 256-block's 8 blocks)
+    static X xdot(const block_q8_1* x, int g) {
+        const int n = g >> 2, ja = (g >> 1) & 1, h = g & 1;
+        const block_q8_1* a = x + 4 * n + ja;
+        const block_q8_1* c = a + 2;
+        return X{load16_a4(a->qs + 16 * h), load16_a4(c->qs + 16 * h), (float) a->ds[0], 0.f, (float) c->ds[0]};
+    }
     static W load(const Block* b, int g, const uint32_t*) {
         W r;
         const int n = g >> 2, j = g & 3;
@@ -370,11 +399,25 @@ struct TIQ1M {
     }
 };
 
+// a reader's weights and activations for lane g of a product: its own form where it has one (HALVES), else sub-block g
+template <typename F, typename = void> struct halves : std::false_type {};
+template <typename F> struct halves<F, std::void_t<decltype(F::HALVES)>> : std::bool_constant<F::HALVES> {};
+template <typename F>
+inline W wdot(const typename F::Block* b, int g, const uint32_t* tab) {
+    if constexpr (halves<F>::value) return F::load_dot(b, g, tab);
+    else return F::load(b, g, tab);
+}
+template <typename F>
+inline X xdot(const block_q8_1* x, int g) {   // x: the 256-block's eight Q8_1 blocks
+    if constexpr (halves<F>::value) return F::xdot(x, g);
+    else return xload(x + g);
+}
+
 // lane g's dot with the column's sub-block (the column's quants, scale and sum)
 template <Off O>
 inline float dot(const W& r, const X& x) {
     if constexpr (O == NONE)
-        return x.d * (r.d0 * (float) dp4a4(r.lo, x.lo, 0) + r.d1 * (float) dp4a4(r.hi, x.hi, 0));
+        return r.d0 * x.d * (float) dp4a4(r.lo, x.lo, 0) + r.d1 * x.d1 * (float) dp4a4(r.hi, x.hi, 0);
     else if constexpr (O == MIN32)   // the mins against the quants' exact sum (Q8_1's s is that sum rounded to fp16)
         return x.d * (r.d0 * (float) dp4a4(r.hi, x.hi, dp4a4(r.lo, x.lo, 0)) - r.m0 * (float) (sum4(x.lo) + sum4(x.hi)));
     else if constexpr (O == MIN16)

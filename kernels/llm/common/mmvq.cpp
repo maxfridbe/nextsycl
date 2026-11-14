@@ -42,10 +42,10 @@ inline void rows_wide(const typename F::Block* const* wr, int nb, const block_q8
     for (int kb = l >> 3; kb < nb; kb += L / 8) {
         W w[R];
 #pragma unroll
-        for (int r = 0; r < R; ++r) w[r] = F::load(wr[r] + kb, g, tab);
+        for (int r = 0; r < R; ++r) w[r] = wdot<F>(wr[r] + kb, g, tab);
 #pragma unroll
         for (int j = 0; j < NC; ++j) {
-            const X x = xload(xs[j] + 8 * kb + g);
+            const X x = xdot<F>(xs[j] + 8 * kb, g);
 #pragma unroll
             for (int r = 0; r < R; ++r) acc[r * NC + j] += dot<F::OFF>(w[r], x);
         }
@@ -104,11 +104,12 @@ inline void fill_tab(uint32_t* tab, const sycl::nd_item<2>& it) {
     }
 }
 
-// ---- y [ncols, n_out] = W [n_out, n_in] . x: a sub-group 32 / L rows, 4 sub-groups a work-group; a type with a local
-// table strides its (bounded) work-groups over the rows
-template <typename F, int NC, int L>
+// ---- y [ncols, n_out] = W [n_out, n_in] . x: a sub-group 32 / L sets of P consecutive rows (a set's lanes read the
+// activations once for its rows), 4 sub-groups a work-group; a type with a local table strides its (bounded)
+// work-groups over the rows
+template <typename F, int NC, int L, int P>
 void mmvq_launch(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int n_out) {
-    constexpr int R = WARP / L;
+    constexpr int R = WARP / L * P;
     const auto* W0 = static_cast<const typename F::Block*>(w);
     const auto* X0 = static_cast<const block_q8_1*>(x);
     unsigned groups = unsigned((std::size_t(n_out) + WARPS * R - 1) / (WARPS * R));
@@ -125,29 +126,40 @@ void mmvq_launch(sycl::queue& q, const void* w, const void* x, float* y, int n_i
             for (int j = 0; j < NC; ++j) xs[j] = X0 + std::size_t(j) * (n_in / 32);
             const std::size_t bpr = std::size_t(n_in / per_block<F>());
             for (int r0 = (int(it.get_group(0)) * WARPS + int(it.get_local_id(0))) * R; r0 < n_out; r0 += int(it.get_group_range(0)) * WARPS * R) {
-                const int row = r0 + lane / L;
-                float acc[NC] = {};
-                row_dot<F, NC, L>(W0 + std::size_t(sycl::min(row, n_out - 1)) * bpr, n_in, xs, l, t, acc);
-                reduce<NC, L>(it.get_sub_group(), acc);
-                if (l == 0 && row < n_out)
+                const int row = r0 + lane / L * P;
+                const typename F::Block* wr[P];
 #pragma unroll
-                    for (int j = 0; j < NC; ++j) y[std::size_t(j) * n_out + row] = acc[j];
+                for (int p = 0; p < P; ++p) wr[p] = W0 + std::size_t(sycl::min(row + p, n_out - 1)) * bpr;
+                float acc[P * NC] = {};
+                rows_dot<F, NC, L, P>(wr, n_in, xs, l, t, acc);
+                reduce<P * NC, L>(it.get_sub_group(), acc);
+                if (l == 0)
+#pragma unroll
+                    for (int p = 0; p < P; ++p)
+                        if (row + p < n_out)
+#pragma unroll
+                            for (int j = 0; j < NC; ++j) y[std::size_t(j) * n_out + row + p] = acc[p * NC + j];
             }
         });
     });
 }
+template <typename F, int L, int P>
+void mmvq_cols_p(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int n_out, int ncols) {
+    switch (ncols) {
+        case 1: mmvq_launch<F, 1, L, P>(q, w, x, y, n_in, n_out); return;
+        case 2: mmvq_launch<F, 2, L, P>(q, w, x, y, n_in, n_out); return;
+        case 3: mmvq_launch<F, 3, L, P>(q, w, x, y, n_in, n_out); return;
+        case 4: mmvq_launch<F, 4, L, P>(q, w, x, y, n_in, n_out); return;
+        case 5: mmvq_launch<F, 5, L, P>(q, w, x, y, n_in, n_out); return;
+        case 6: mmvq_launch<F, 6, L, P>(q, w, x, y, n_in, n_out); return;
+        case 7: mmvq_launch<F, 7, L, P>(q, w, x, y, n_in, n_out); return;
+        default: mmvq_launch<F, 8, L, P>(q, w, x, y, n_in, n_out); return;
+    }
+}
 template <typename F, int L>
 void mmvq_cols(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int n_out, int ncols) {
-    switch (ncols) {
-        case 1: mmvq_launch<F, 1, L>(q, w, x, y, n_in, n_out); return;
-        case 2: mmvq_launch<F, 2, L>(q, w, x, y, n_in, n_out); return;
-        case 3: mmvq_launch<F, 3, L>(q, w, x, y, n_in, n_out); return;
-        case 4: mmvq_launch<F, 4, L>(q, w, x, y, n_in, n_out); return;
-        case 5: mmvq_launch<F, 5, L>(q, w, x, y, n_in, n_out); return;
-        case 6: mmvq_launch<F, 6, L>(q, w, x, y, n_in, n_out); return;
-        case 7: mmvq_launch<F, 7, L>(q, w, x, y, n_in, n_out); return;
-        default: mmvq_launch<F, 8, L>(q, w, x, y, n_in, n_out); return;
-    }
+    // one row a set: two (the activations read once for both) measured no faster on either card
+    mmvq_cols_p<F, L, 1>(q, w, x, y, n_in, n_out, ncols);
 }
 template <typename F>
 void mmvq_any(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int n_out, int ncols) {
@@ -193,31 +205,47 @@ std::size_t row_bytes(int type, int64_t n) {
     return b;
 }
 
-// ---- n values of a stored matrix into half: a work-item a sub-block of 32 (a 256-block's lane g, or a 32-block)
+// ---- n values of a stored matrix into half: a work-item a sub-block of 32 (a 256-block's lane g, or a 32-block); a
+// work-group's 128 sub-blocks (8 KiB of half) staged in local memory, then written out 16 bytes a work-item in turn
+// (consecutive work-items consecutive chunks - each item's own 64 bytes written directly left the stores strided)
 template <typename F>
 void dequant_launch(sycl::queue& q, const void* src, int64_t n, sycl::half* dst) {
+    constexpr int ITEMS = WARPS * WARP;
     const auto* B = static_cast<const typename F::Block*>(src);
     const std::size_t subs = std::size_t(n / 32);
-    const unsigned groups = unsigned(std::min<std::size_t>((subs + 127) / 128, F::LUT > 0 ? std::size_t(4096) : std::size_t(1) << 30));
+    const unsigned groups = unsigned(std::min<std::size_t>((subs + ITEMS - 1) / ITEMS, F::LUT > 0 ? std::size_t(lut_groups()) : std::size_t(1) << 30));
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(F::LUT > 0 ? F::LUT : 1), h);
+        sycl::local_accessor<sycl::int4, 1> stage(sycl::range<1>(ITEMS * 4), h);
         h.parallel_for(sycl::nd_range<2>(sycl::range<2>(groups * WARPS, WARP), sycl::range<2>(WARPS, WARP)),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
             uint32_t* t = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
             fill_tab<F>(t, it);
-            for (std::size_t s = it.get_global_linear_id(); s < subs; s += it.get_global_range(0) * WARP) {
-                W w;
-                if constexpr (is_small<F>()) w = F::load32(B + s, t);
-                else w = F::load(B + s / 8, int(s % 8), t);
-                sycl::vec<sycl::half, 8> v[4];
+            const int li = int(it.get_local_linear_id());
+            sycl::int4* out = reinterpret_cast<sycl::int4*>(dst);
+            for (std::size_t base = std::size_t(it.get_group(0)) * ITEMS; base < subs; base += std::size_t(it.get_group_range(0)) * ITEMS) {
+                const std::size_t s = base + li;
+                if (s < subs) {
+                    W w;
+                    if constexpr (is_small<F>()) w = F::load32(B + s, t);
+                    else w = F::load(B + s / 8, int(s % 8), t);
+                    sycl::vec<sycl::half, 8> v[4];
 #pragma unroll
-                for (int i = 0; i < 32; ++i) {
-                    if constexpr (is_small<F>()) v[i >> 3][i & 7] = (sycl::half) value<NONE>(w, i);
-                    else v[i >> 3][i & 7] = (sycl::half) value<F::OFF>(w, i);
+                    for (int i = 0; i < 32; ++i) {
+                        if constexpr (is_small<F>()) v[i >> 3][i & 7] = (sycl::half) value<NONE>(w, i);
+                        else v[i >> 3][i & 7] = (sycl::half) value<F::OFF>(w, i);
+                    }
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) stage[4 * li + k] = sycl::bit_cast<sycl::int4>(v[k]);
                 }
-                auto* o = reinterpret_cast<sycl::vec<sycl::half, 8>*>(dst + s * 32);
+                sycl::group_barrier(it.get_group());
+                const std::size_t chunks = std::min<std::size_t>(ITEMS, subs - base) * 4;
 #pragma unroll
-                for (int k = 0; k < 4; ++k) o[k] = v[k];
+                for (int k = 0; k < 4; ++k) {
+                    const std::size_t c = std::size_t(k) * ITEMS + li;
+                    if (c < chunks) out[base * 4 + c] = stage[c];
+                }
+                sycl::group_barrier(it.get_group());
             }
         });
     });
@@ -397,7 +425,19 @@ static void trace(const char* fn, int a, int b, int64_t c, int64_t d, int64_t e)
     if (FILE* f = fopen(path, "a")) { fprintf(f, "%s\n", line); fclose(f); }
 }
 
+// The types still on Strata's kernels (kernels/llm/glm5next/mmvq.cpp, ns_ref_*) until the user decides: where ours
+// measured slower on a served path (reference/shared-kernels.cpp, B70 / B65, GB/s of weights read cold):
+// - decode products of Q8_0 (2-16 MB matrices, B70: 3-8% slower, e.g. 4096 x 4096 523 against 541) and Q6_K (512 -
+//   1,024 rows: 5-13% slower; larger ones faster: 25,600 x 6,144 B70 415 against 443... mixed)
+// - expansions to half of Q2_K (B65 17% slower) and IQ2_S (13-20%)
+// NS_MMVQ_OWN=1 runs ours for these too (to measure)
+static bool own_all() {
+    static const bool v = std::getenv("NS_MMVQ_OWN") && std::getenv("NS_MMVQ_OWN")[0] == '1';
+    return v;
+}
 extern "C" {
+int ns_ref_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
+int ns_ref_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst);
 
 size_t ns_q8_1_bytes(int64_t n_in, int64_t ncols) { return (size_t) (n_in / 32) * sizeof(block_q8_1) * (size_t) ncols; }
 
@@ -438,6 +478,7 @@ int ns_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, in
     const int bv = block_values(type);
     if (bv == 0) return ns_fail("ns_mmvq: ggml type " + std::to_string(type) + " has no decode kernel");
     if (n_in % bv != 0) return ns_fail("ns_mmvq: n_in " + std::to_string(n_in) + " not a multiple of the type's block");
+    if ((type == 8 || type == 14) && !own_all()) return ns_ref_mmvq(g, type, w, x_q8_1, y, n_in, n_out, ncols);
     with_type(type, [&](auto f) { mmvq_any<decltype(f)>(g->q, w, x_q8_1, y, (int) n_in, (int) n_out, (int) ncols); });
     return 0;
     NS_CATCH
@@ -448,6 +489,7 @@ int ns_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* ds
     NS_TRY
     if (block_values(type) == 0 || n % 256 != 0) return ns_fail("ns_dequant_f16: ggml type " + std::to_string(type));
     trace("dequant_f16", type, 0, n, 0, 0);
+    if ((type == 10 || type == 22) && !own_all()) return ns_ref_dequant_f16(g, type, src, n, dst);
     with_type(type, [&](auto f) { dequant_launch<decltype(f)>(g->q, src, n, reinterpret_cast<sycl::half*>(dst)); });
     return 0;
     NS_CATCH
