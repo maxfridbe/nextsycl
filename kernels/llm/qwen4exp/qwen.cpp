@@ -621,6 +621,17 @@ int ns_qw_set_silo(ns_qw* w, void* i8_available, void* i8_supported, void* i8_gr
     return 0;
 }
 
+int ns_qw_dequant_f32(ns_gpu* g, int type, const void* src, int64_t n, float* dst) {
+    NS_TRY
+    // iq_dequant_f32 exits the process on what it does not take: refuse those here
+    if (!strata::kernels::iq_supported(type) || n <= 0 || n % 256 != 0)
+        return ns_fail("ns_qw_dequant_f32: ggml type " + std::to_string(type) + ", " + std::to_string(n) + " values");
+    strata::kernels::iq_dequant_f32(type, src, n, dst, &g->q);
+    g->q.wait();
+    return 0;
+    NS_CATCH
+}
+
 int ns_qw_set_sampling(ns_qw* w, float temperature, float top_p, int top_k, float min_p, unsigned long long seed) {
     NS_TRY
     w->s_temp = temperature > 0.0f ? temperature : 0.0f;

@@ -27,6 +27,7 @@ running in daily use here, with its speed measured. **Listed**: in the catalog, 
 | `qwen3.8-flash-next-iq2_xs-uncensored` | the same with the refusal projection (a control vector) | `qwen4exp` | 63.4 GiB | served |
 | `qwen3.8-flash-next-coder-iq1_m`, `-uncensored` | Qwen3.8-Flash-Next Coder IQ1_M | `qwen4exp` | 54.4 GiB | served |
 | `swift-1.5-iq2_xs` | Swift 1.5 IQ2_XS (short thinking) | `qwen4exp` | 63.5 GiB | served |
+| `swift-1.5-iq3_xxs` | Swift 1.5 IQ3_XXS (short thinking; UkisAI's standard GGUF, both GPUs: pp 612 / 929 at 2K / 8K, tg 53-58 with MTP; the B70 alone 538 / 836, 43-44) | `qwen4exp` | 82.0 GiB | served |
 | `qwen3.8-27b-q8` | Qwen3.8-27B Q8_0 (dense: gated DeltaNet + gated full attention), 32K, MTP drafts, pictures (its mmproj) | `qwen35` | 28.4 GiB | checked (llama.cpp), served (verify passes exact) |
 | `qwen3.8-27b-q4` | Qwen3.8-27B UD-Q4_K_M, 128K + 32K, MTP drafts, pictures (its mmproj) | `qwen35` | 16.6 GiB | checked (llama.cpp), served (verify passes exact) |
 | `qwen3.8-27b-q3` | Qwen3.8-27B UD-Q3_K_XL, 128K + 32K, MTP drafts | `qwen35` | 13.5 GiB | served |

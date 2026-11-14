@@ -403,12 +403,30 @@ fn form(r: Role) -> Option<GType> {
 }
 
 /// A tensor's bytes in `want`'s form: as stored, or F32 -> BF16 when every value is exactly BF16 (Swift 1.5's routers),
-/// F32 -> F16 rounded (the PLE conv, as Strata's loader narrows it), F16 / BF16 -> F32 widened; anything else refused
-fn in_form(f: &Gguf, t: &Tensor, want: Option<GType>) -> Result<Vec<u8>> {
+/// F32 -> F16 rounded (the PLE conv, as Strata's loader narrows it), F16 / BF16 -> F32 widened, a quantized tensor
+/// expanded on `gpu` and rounded to the form (UkisAI's standard GGUFs store the hyper-connection projections and the
+/// PLE key / value quantized: their values as the file gives them, each rounded once, as llama.cpp's own expansion
+/// reads them); anything else refused
+fn in_form(f: &Gguf, t: &Tensor, want: Option<GType>, gpu: &Arc<Gpu>, api: &ffi::Api) -> Result<Vec<u8>> {
     let b = f.read(t).map_err(|e| err(e.0))?;
     let Some(want) = want else { return Ok(b) };
     if t.ty == want {
         return Ok(b);
+    }
+    if !matches!(t.ty, GType::F32 | GType::F16 | GType::BF16) {
+        let n = t.elements() as usize;
+        let src = DevBuf::new(gpu, b.len())?;
+        src.write(0, &b)?;
+        let dst = DevBuf::f32(gpu, n)?;
+        // SAFETY: src holds the tensor's n values in its stored type, dst n floats (both allocated above).
+        ffi::check(unsafe { (api.dequant_f32)(gpu.raw(), t.ty.code() as i32, src.ptr(), n as i64, dst.fp()) }, &format!("expanding {}", t.name))?;
+        let v = dst.to_f32()?;
+        return match want {
+            GType::BF16 => Ok(v.iter().flat_map(|x| f32_to_bf16(*x).to_le_bytes()).collect()),
+            GType::F16 => Ok(v.iter().flat_map(|x| f32_to_f16(*x).to_le_bytes()).collect()),
+            GType::F32 => Ok(v.iter().flat_map(|x| x.to_le_bytes()).collect()),
+            _ => Err(err(format!("{}: {} (the kernels read {})", t.name, t.ty.name(), want.name()))),
+        };
     }
     let f32s = || b.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
     match (t.ty, want) {
@@ -427,6 +445,15 @@ fn in_form(f: &Gguf, t: &Tensor, want: Option<GType>) -> Result<Vec<u8>> {
         (GType::BF16, GType::F32) => Ok(b.chunks(2).flat_map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16).to_le_bytes()).collect()),
         _ => Err(err(format!("{}: {} (the kernels read {})", t.name, t.ty.name(), want.name()))),
     }
+}
+
+/// float -> bfloat16, round to nearest even (torch's .to(bfloat16)); NaN kept a NaN
+fn f32_to_bf16(x: f32) -> u16 {
+    let b = x.to_bits();
+    if x.is_nan() {
+        return ((b >> 16) | 0x40) as u16;
+    }
+    ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
 }
 
 /// float -> half, round to nearest even (numpy's astype(float16))
@@ -660,7 +687,7 @@ impl<'g> Qwen<'g> {
             // converted where that is exact)
             let mut bytes = Vec::with_capacity(roles.len());
             for r in &roles {
-                let b = in_form(f, m.t(l, *r), form(*r))?;
+                let b = in_form(f, m.t(l, *r), form(*r), gpu, api)?;
                 off.insert(*r, at);
                 at += (b.len() + 255) & !255;
                 bytes.push(b);
@@ -1382,5 +1409,22 @@ impl<'g> Qwen<'g> {
                           expert_slots: st.vram_slots, host_slots: st.host_slots }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::f32_to_bf16;
+
+    #[test]
+    fn bf16_rounds_to_nearest_even() {
+        assert_eq!(f32_to_bf16(1.0), 0x3f80);
+        assert_eq!(f32_to_bf16(-2.0), 0xc000);
+        // halfway cases go to the even bfloat16: 1 + 2^-8 down to 1.0, 1 + 3 * 2^-8 up to 1 + 2^-6
+        assert_eq!(f32_to_bf16(f32::from_bits(0x3f80_8000)), 0x3f80);
+        assert_eq!(f32_to_bf16(f32::from_bits(0x3f81_8000)), 0x3f82);
+        assert_eq!(f32_to_bf16(f32::from_bits(0x3f80_8001)), 0x3f81);
+        assert_eq!(f32_to_bf16(f32::INFINITY), 0x7f80);
+        assert!(f32::from_bits((f32_to_bf16(f32::NAN) as u32) << 16).is_nan());
     }
 }

@@ -1,5 +1,5 @@
 //! The per-layer embedding's host half: a token's 16 table rows from its 2- and 3-gram (Strata's `ngram_rows`,
-//! src/kernels/ngram.cpp), read from the file and decoded (IQ4_NL, 160 values a row). The GPU half is the PLE block in
+//! src/kernels/ngram.cpp), read from the file and decoded (IQ4_NL or Q4_0, 160 values a row). The GPU half is the PLE block in
 //! the glue. Rows are read with `pread` from many threads (a prompt chunk reads 16 a token from a 27 GiB table: the
 //! page cache keeps what repeats). A decode window's few rows are asked of the kernel all at once first
 //! (`posix_fadvise` WILLNEED: the reads of the rows not in the page cache go to the disk together), then read in
@@ -26,6 +26,19 @@ use crate::model::{Geometry, Model, Role};
 
 /// IQ4_NL's 16 levels (ggml's kvalues_iq4nl)
 const IQ4NL: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+/// Q4_0's: q - 8 (ggml's dequantize_row_q4_0). Both types are 18-byte blocks of 32 (an f16 scale, then 16 bytes of split
+/// halves), so a row decodes the same way through its type's levels
+const Q40: [i8; 16] = [-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7];
+
+/// the levels of a table type this reads (UkisAI's GSQ-RCO files store IQ4_NL, their standard GGUFs Q4_0)
+fn levels(ty: GType) -> Option<[f32; 16]> {
+    let l = match ty {
+        GType::IQ4NL => &IQ4NL,
+        GType::Q4_0 => &Q40,
+        _ => return None,
+    };
+    Some(l.map(|v| v as f32))
+}
 
 pub struct Table {
     file: File,
@@ -40,6 +53,7 @@ pub struct Table {
     mult: Vec<u64>,
     vocab: Vec<u64>,
     offsets: Vec<u64>,
+    levels: [f32; 16],
 }
 
 fn f16_to_f32(h: u16) -> f32 {
@@ -71,9 +85,9 @@ impl Table {
     pub fn open(m: &Model, f: &Gguf) -> nextsycl_core::Result<Table> {
         let g: &Geometry = &m.g;
         let t = m.t(0, Role::PleTable);
-        if t.ty != GType::IQ4NL {
-            return Err(nextsycl_core::Error(format!("{}: {} rows; this engine reads IQ4_NL", t.name, t.ty.name())));
-        }
+        let Some(levels) = levels(t.ty) else {
+            return Err(nextsycl_core::Error(format!("{}: {} rows; this engine reads IQ4_NL or Q4_0", t.name, t.ty.name())));
+        };
         let file = File::open(&f.paths[t.shard]).map_err(|e| nextsycl_core::Error(format!("{}: {e}", f.paths[t.shard].display())))?;
         let dim = g.ple_dim as usize;
         Ok(Table {
@@ -89,6 +103,7 @@ impl Table {
             mult: g.ple_mult.clone(),
             vocab: g.ple_vocab.clone(),
             offsets: g.ple_offsets.clone(),
+            levels,
         })
     }
 
@@ -150,8 +165,8 @@ impl Table {
                 for (b, blk) in buf.chunks(18).enumerate() {
                     let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
                     for j in 0..16 {
-                        o[b * 32 + j] = d * IQ4NL[(blk[2 + j] & 15) as usize] as f32;
-                        o[b * 32 + j + 16] = d * IQ4NL[(blk[2 + j] >> 4) as usize] as f32;
+                        o[b * 32 + j] = d * self.levels[(blk[2 + j] & 15) as usize];
+                        o[b * 32 + j + 16] = d * self.levels[(blk[2 + j] >> 4) as usize];
                     }
                 }
             }
@@ -176,7 +191,8 @@ impl Table {
 
 #[cfg(test)]
 mod tests {
-    use super::f16_to_f32;
+    use super::{f16_to_f32, levels};
+    use nextsycl_gguf::GType;
 
     #[test]
     fn halves() {
@@ -184,5 +200,15 @@ mod tests {
         assert_eq!(f16_to_f32(0xc000), -2.0);
         assert_eq!(f16_to_f32(0x0001), 5.960_464_5e-8);
         assert_eq!(f16_to_f32(0x7bff), 65504.0);
+    }
+
+    #[test]
+    fn table_types_decode_through_their_levels() {
+        // ggml: Q4_0 is d * (q - 8), IQ4_NL d * kvalues_iq4nl[q]
+        let q4 = levels(GType::Q4_0).unwrap();
+        assert_eq!((q4[0], q4[8], q4[15]), (-8.0, 0.0, 7.0));
+        let nl = levels(GType::IQ4NL).unwrap();
+        assert_eq!((nl[0], nl[8], nl[15]), (-127.0, 1.0, 113.0));
+        assert!(levels(GType::Q8_0).is_none());
     }
 }
