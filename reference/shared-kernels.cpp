@@ -6,7 +6,7 @@
 //   mm  FILE TENSOR [EXPERT]                    a decode product (1 and 4 columns, random activations)
 //   dq  FILE TENSOR [EXPERT]                    the expansion to fp16 (the first 256 x 1024 values or the matrix)
 //   moe FILE GATE FILE UP FILE DOWN TOKENS USED [LIMIT [LANES]]   a layer's grouped experts: TOKENS tokens, USED experts each
-//                                               (LANES a row, as the engine passes them; SK_LANES the default)
+//                                               (LANES a row, as the engine passes them)
 #include "ns.h"
 #include "gguf-min.hpp"
 
@@ -266,7 +266,7 @@ int main(int argc, char** argv) {
             if (op == "mm") test_mm(file(path), a, e); else test_dq(file(path), a, e);
         } else if (op == "moe") {
             std::string pu, pd;
-            int tokens = 1, used = 8, lanes = getenv("SK_LANES") ? atoi(getenv("SK_LANES")) : 0; float limit = 0;
+            int tokens = 1, used = 8, lanes = 0; float limit = 0;
             s >> a >> pu >> b >> pd >> c >> tokens >> used >> limit >> lanes;
             test_moe(file(path), a, file(pu), b, file(pd), c, tokens, used, limit, lanes);
         }
