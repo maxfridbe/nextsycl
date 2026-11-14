@@ -4,10 +4,28 @@
 #include "glm.h"
 #include "ns_internal.hpp"
 
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <set>
+#include <string>
 
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+
+// NS_KERNEL_TRACE=FILE: each distinct call of these shared kernels (function, types, shape) appended to FILE once -
+// which types and shapes the engines still send here
+static void trace(const char* fn, int a, int b, int64_t c, int64_t d, int64_t e) {
+    static const char* path = getenv("NS_KERNEL_TRACE");
+    if (!path || !*path) return;
+    static std::mutex m;
+    static std::set<std::string> seen;
+    char line[160];
+    snprintf(line, sizeof line, "%s %d %d %lld %lld %lld", fn, a, b, (long long) c, (long long) d, (long long) e);
+    std::lock_guard<std::mutex> l(m);
+    if (!seen.insert(line).second) return;
+    if (FILE* f = fopen(path, "a")) { fprintf(f, "%s\n", line); fclose(f); }
+}
 
 extern "C" {
 
@@ -21,6 +39,7 @@ int ns_mmvq_supported(int type) {
 int ns_quantize_q8_1(ns_gpu* g, const float* x, void* q8_1, int64_t n_in, int64_t ncols) {
     NS_TRY
     if (n_in % 32 != 0) return ns_fail("ns_quantize_q8_1: n_in a multiple of 32");
+    trace("q8_1", 0, 0, n_in, ncols, 0);
     strata::kernels::quantize_q8_1_rows(x, ncols, n_in, q8_1, &g->q);
     return 0;
     NS_CATCH
@@ -30,6 +49,7 @@ int ns_quantize_q8_1(ns_gpu* g, const float* x, void* q8_1, int64_t n_in, int64_
 int ns_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols) {
     NS_TRY
     if (ncols < 1 || ncols > 8) return ns_fail("ns_mmvq: 1..8 columns");
+    trace("mmvq", type, 0, n_in, n_out, ncols);
     // the tuned dense kernels first (Q8_0, Q3_K-Q6_K, ...), the IQ family for the rest (IQ2_XXS, Q2_K, ...);
     // NS_MMVQ_IQ_FIRST=1 swaps the order (for comparisons)
     static const bool iq_first = getenv("NS_MMVQ_IQ_FIRST") && getenv("NS_MMVQ_IQ_FIRST")[0] == '1';
@@ -61,6 +81,7 @@ int ns_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n
     NS_TRY
     if (!strata::kernels::native_expert_supported(gu_type, d_type, n_embd, n_ff))
         return ns_fail("ns_moe_grouped: types " + std::to_string(gu_type) + "/" + std::to_string(d_type) + " not supported");
+    trace("moe", gu_type, d_type, n_embd, n_ff, lanes * 10 + phase);
     strata::kernels::native_expert_set_swiglu_limit(limit);
     strata::kernels::native_expert_set_lanes(lanes);
     strata::kernels::native_expert_set_phase(phase);
@@ -75,6 +96,7 @@ int ns_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n
 int ns_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst) {
     NS_TRY
     if (!strata::kernels::iq_supported(type) || n % 256 != 0) return ns_fail("ns_dequant_f16: ggml type " + std::to_string(type));
+    trace("dequant_f16", type, 0, n, 0, 0);
     strata::kernels::iq_dequant_f16(type, src, n, dst, &g->q);
     return 0;
     NS_CATCH
