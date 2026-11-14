@@ -133,9 +133,16 @@ fn free_on(c: &Value, pending: &[(u16, u64)]) -> u64 {
     free.saturating_sub(to_come)
 }
 
-/// An image, audio or 3D model: it loads whole on one card (the first of its cards with room)
+/// An image, audio or 3D model, or a chat model whose cards are a choice (`gpus: '0|1'`): it loads whole on one card
+/// (the first of its cards with room)
 fn one_card(m: &Value) -> bool {
-    matches!(registry::kind_of(m), "image" | "audio" | "model3d")
+    matches!(registry::kind_of(m), "image" | "audio" | "model3d") || registry::one_of(m)
+}
+
+/// A one-of chat model's card from its cards' room plans, in its order of preference: the first it fits on now
+/// (nothing to stop), else the first it fits on once idle work there stops, else the first (it waits there)
+fn pick_card(plans: &[(usize, Option<Vec<Holder>>)]) -> usize {
+    plans.iter().position(|(_, p)| p.as_ref().is_some_and(Vec::is_empty)).or_else(|| plans.iter().position(|(_, p)| p.is_some())).unwrap_or(0)
 }
 
 /// A chat model whose model card spreads one copy over every card (`gpus: all`; its title says "both GPUs"): it
@@ -144,6 +151,11 @@ pub(crate) fn spans_all(m: &Value, model_cards: &[Value]) -> bool {
     registry::kind_of(m) == "llm"
         && model_cards.iter().find(|c| [s(m, "catalog"), s(m, "id")].iter().any(|id| !id.is_empty() && c["id"] == id.as_str()))
             .is_some_and(|c| s(c, "gpus") == "all")
+}
+
+/// An entry's `gpus` for the cards `g`: a one-of model's stay a choice ("0|1"), others are spread over them ("0,1")
+fn gpus_value(m: &Value, g: &[usize]) -> String {
+    g.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(if registry::one_of(m) { "|" } else { "," })
 }
 
 /// The cards processes of model `id` hold memory on, in the named cards
@@ -340,7 +352,8 @@ impl Home {
             if registry::kind_of(m) == "llm" && g.is_empty() { return vec![0] }
             return (0..self.ncards()).collect();
         }
-        let v: Vec<usize> = g.split([',', ' ']).filter_map(|x| x.trim().parse().ok()).collect();
+        // ("0|1": one of them, in that order of preference - see one_card)
+        let v = registry::gpu_list(&g);
         if v.is_empty() { vec![0] } else { v }
     }
 
@@ -393,7 +406,12 @@ impl Home {
             self.exec("llm stop (another model)".into(), &["llm".into(), "stop".into()]).map_err(|e| (500, e))?;
         }
         let port = self.o.ports.llm.to_string();
-        self.exec(format!("llm start {id}"), &["llm".into(), "start".into(), id.into(), "--port".into(), port]).map_err(|e| (500, e))?;
+        let mut args: Vec<String> = vec!["llm".into(), "start".into(), id.into(), "--port".into(), port];
+        // a one-of model on the card chat_room chose for it
+        if let Some(g) = self.models().iter().find(|m| m["id"] == id).filter(|m| registry::one_of(m)).and_then(|_| registry::chat_gpu(&*self.o.cfg, id)) {
+            args.extend(["--gpu".into(), g.to_string()]);
+        }
+        self.exec(format!("llm start {id}"), &args).map_err(|e| (500, e))?;
         Ok(())
     }
 
@@ -519,7 +537,13 @@ impl Home {
             }
         }
         if let Some(id) = all.iter().any(|m| registry::kind_of(m) == "llm").then(|| self.chat_loaded(all)).flatten() {
-            let gpus = all.iter().find(|m| m["id"] == id.as_str()).map(|m| self.gpus_of(m)).unwrap_or_default();
+            let m = all.iter().find(|m| m["id"] == id.as_str());
+            let mut gpus = m.map(|m| self.gpus_of(m)).unwrap_or_default();
+            // a one-of model is on one of its cards: the one it holds memory on, else the one chosen for it
+            if m.is_some_and(registry::one_of) {
+                let on = held_on(cards, &id).into_iter().find(|g| gpus.contains(g)).or_else(|| registry::chat_gpu(&*self.o.cfg, &id));
+                gpus = on.map_or(gpus, |g| vec![g]);
+            }
             v.push(json!({"kind": "llm", "slot": 0, "gpu": gpus.first(), "gpus": gpus, "model": id, "loading": false, "busy": false, "up": true}));
         }
         v
@@ -645,7 +669,7 @@ impl Home {
             }
             json!({"concurrency": concurrency, "coexistence": coexistence, "copies_now": copies_now,
                    "max_copies": max_copies, "recommended_copies": recommended_copies, "at_once": at_once,
-                   "id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "state": state,
+                   "id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "gpus_one_of": registry::one_of(m), "state": state,
                    "spans": spans_all(m, &mc),
                    "pinned": enabled && m["pinned"] == true, "held_s": holds.get(s(m, "id").as_str()).map_or(0.0, |h| h.reserved(now()).round()),
                    "capabilities": caps, "methods": methods,
@@ -701,7 +725,7 @@ impl Home {
         registry::update(&self.o.cfg, id, |e| {
             e["enabled"] = json!(true);
             if let Some(g) = &gpus {
-                e["gpus"] = json!(g.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","));
+                e["gpus"] = json!(gpus_value(&m, g));
             }
         }).map_err(|e| (500, e))?;
         if registry::kind_of(&m) == "video" {
@@ -746,7 +770,7 @@ impl Home {
         if m["enabled"] != false && matches!(state.as_str(), "loaded" | "busy" | "loading") && kind != "video" && !kept {
             self.unload(id)?;
         }
-        registry::update(&self.o.cfg, id, |e| e["gpus"] = json!(g.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","))).map_err(|e| (500, e))?;
+        registry::update(&self.o.cfg, id, |e| e["gpus"] = json!(gpus_value(&m, &g))).map_err(|e| (500, e))?;
         if kind == "video" && m["enabled"] != false {
             let me = self.clone();
             std::thread::spawn(move || {
@@ -1208,7 +1232,15 @@ impl Home {
                 c.procs.retain(|p| p.kind.as_deref() != Some("llm"));
             }
             let want = |g: usize| need.get(&g).copied().unwrap_or(0) + MARGIN_MB;
-            let plans: Vec<(usize, Option<Vec<Holder>>)> = gpus.iter().map(|g| (*g, self.room_plan(&snap, *g, want(*g), "llm", false, Some(&info)))).collect();
+            let mut plans: Vec<(usize, Option<Vec<Holder>>)> = gpus.iter().map(|g| (*g, self.room_plan(&snap, *g, want(*g), "llm", false, Some(&info)))).collect();
+            // a one-of model: one of its cards, the rest left alone; `llm start` reads the choice
+            if registry::one_of(m) && plans.len() > 1 {
+                let k = pick_card(&plans);
+                plans = vec![plans.swap_remove(k)];
+                if let Err(e) = registry::write_chat_gpu(&*self.o.cfg, id, plans[0].0) {
+                    eprintln!("{id}: the card chosen ({}) not handed to llm start: {e}", plans[0].0);
+                }
+            }
             let short: Vec<usize> = plans.iter().filter(|(_, p)| !p.as_ref().is_some_and(Vec::is_empty)).map(|(g, _)| *g).collect();
             let loaded = self.chat_loaded(&all);
             let ram = self.ram_room(&full, id, "llm", loaded.as_deref());
@@ -1653,5 +1685,31 @@ mod tests {
         assert!(!spans_all(&json!({"id": "qwen3.8-27b-q8", "kind": "llm"}), &cards), "a one-card chat model");
         assert!(!spans_all(&json!({"id": "breeze-tts-2", "kind": "audio"}), &cards), "an audio model's all is where its copies may go");
         assert!(!spans_all(&json!({"id": "my-own", "kind": "llm", "gpus": "all"}), &cards), "no model card: a choice");
+    }
+}
+
+#[cfg(test)]
+mod one_of_tests {
+    use super::{gpus_value, pick_card};
+    use backplane_scheduler::room::{Free, Holder};
+    use serde_json::json;
+
+    fn holder() -> Holder {
+        Holder { what: Free::Server("image".into(), 0), mb: 4000, model: "x".into(), order: 0 }
+    }
+
+    #[test]
+    fn a_one_of_chat_model_goes_where_it_fits_now_else_where_idle_work_can_go() {
+        assert_eq!(pick_card(&[(0, Some(vec![])), (1, Some(vec![]))]), 0, "both fit now: the first listed");
+        assert_eq!(pick_card(&[(0, Some(vec![holder()])), (1, Some(vec![]))]), 1, "the second fits without stopping anything");
+        assert_eq!(pick_card(&[(0, None), (1, Some(vec![holder()]))]), 1, "the first has no room even then");
+        assert_eq!(pick_card(&[(0, None), (1, None)]), 0, "no room anywhere: it waits on the first");
+    }
+
+    #[test]
+    fn a_one_of_entry_keeps_its_choice_when_its_cards_change() {
+        assert_eq!(gpus_value(&json!({"gpus": "0|1"}), &[0, 1]), "0|1");
+        assert_eq!(gpus_value(&json!({"gpus": "0,1"}), &[0, 1]), "0,1");
+        assert_eq!(gpus_value(&json!({"gpus": "0"}), &[1]), "1");
     }
 }

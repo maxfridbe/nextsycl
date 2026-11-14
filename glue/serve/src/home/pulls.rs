@@ -327,7 +327,7 @@ impl Home {
     fn runs_here(&self, card: &Value, bytes: u64) -> (bool, Option<String>) {
         let cards = self.cards.lock().unwrap().clone();
         let total = |g: usize| cards.get(g).and_then(|c| c["vram_total_mb"].as_u64()).unwrap_or(0);
-        let gpus: Vec<usize> = card["gpus"].as_str().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        let gpus: Vec<usize> = card["gpus"].as_str().map(registry::gpu_list)
             .or_else(|| card["gpus"].as_u64().map(|g| vec![g as usize])).unwrap_or_else(|| vec![0]);
         let present: Vec<usize> = gpus.iter().copied().filter(|g| total(*g) > 0).collect();
         if present.is_empty() {

@@ -792,7 +792,7 @@ impl Home {
             ("llm", "models") => {
                 let loaded = self.chat_loaded(&all);
                 let list: Vec<Value> = all.iter().filter(|m| registry::kind_of(m) == "llm" && m["enabled"] != false)
-                    .map(|m| json!({"id": m["id"], "title": m["title"], "gpus": m["gpus"], "loaded": loaded.as_deref() == m["id"].as_str()})).collect();
+                    .map(|m| json!({"id": m["id"], "title": m["title"], "gpus": m["gpus"], "gpus_one_of": registry::one_of(m), "loaded": loaded.as_deref() == m["id"].as_str()})).collect();
                 Ok(json!({"models": list}))
             }
             ("image", "ocr") => {
