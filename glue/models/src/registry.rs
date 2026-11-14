@@ -134,7 +134,8 @@ fn files_of(m: &Value) -> Vec<PathBuf> {
     v
 }
 
-fn bytes_of(m: &Value) -> u64 {
+/// The bytes of an entry's files on disk
+pub fn bytes_of(m: &Value) -> u64 {
     files_of(m).iter().filter_map(|p| std::fs::metadata(p).ok()).map(|x| x.len()).sum()
 }
 

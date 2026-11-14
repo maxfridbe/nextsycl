@@ -1,11 +1,11 @@
-# Qwen3.8-Flash-Next IQ2_XS uncensored (refusal projection; the B70, 128K + 32K)
+# Qwen3.8-Flash-Next IQ2_XS uncensored (refusal projection; either card, 128K + 32K)
 # model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
 id: qwen3.8-flash-next-iq2_xs-uncensored
 kind: llm
 arch: qwen4exp
-title: Qwen3.8-Flash-Next IQ2_XS uncensored (refusal projection; the B70, 128K + 32K)
+title: Qwen3.8-Flash-Next IQ2_XS uncensored (refusal projection; either card, 128K + 32K)
 about: IQ2_XS with Strata's experimental speed projection (a control vector) removing refusals
-gpus: '0'
+gpus: '0|1'                     # one of the cards, the B70 preferred: the whole model on whichever has the room
 streams: true                   # its PLE rows read from the file every window while it serves: keep it on the fastest drive
 ctx: 131072,32768
 tools: true

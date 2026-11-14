@@ -14,7 +14,8 @@ kind: llm                       # the file's folder
 arch: qwen35                    # the engine that runs it (GGUF general.architecture, or the engine's ARCH)
 title: Qwen3.8-27B UD-Q4_K_M (4-bit; the B70, 128K + 32K)
 about: Qwen's dense Qwen3.8 27B ...
-gpus: '0'                       # the GPUs it loads on: '0', '1', '0,1', or 'all' (weakest first)
+gpus: '0'                       # the GPUs it loads on: '0', '1', '0,1' (one copy over both), 'all' (weakest first), or '0|1' (one of
+                                #   them, the whole model on the first with room, in that order - llm cards that fit one card)
 vram_gib: 29.0                  # its memory on each card when it runs, as measured (the front door keeps the card
                                 #   free for it before it has measured the model itself; else from the files' sizes)
 ram_gib: 46                     # optional: its host memory when it runs, not counting reclaimable cache, as measured (pinned tiers, process); the

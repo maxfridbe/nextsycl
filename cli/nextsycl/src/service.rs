@@ -45,6 +45,29 @@ pub fn serve_foreground(cfg: &Config, raw: &[String]) -> Result<(), String> {
     run(cfg, raw, true)
 }
 
+/// A one-of entry's card (`gpus: '0|1'`): the one the front door chose for it (its chat_room, handed over beside the
+/// registry), else the first of its cards with the room for it now (its model card's vram_gib, else its files and a
+/// tenth), else the one with the most free
+fn one_of_gpu(cfg: &Config, m: &serde_json::Value, id: &str) -> usize {
+    let cands = nextsycl_serve::home::registry::gpu_list(m["gpus"].as_str().unwrap_or(""));
+    if let Some(g) = nextsycl_serve::home::registry::chat_gpu_in(&nextsycl_models::registry::registry(cfg), id).filter(|g| cands.contains(g)) {
+        return g;
+    }
+    let need = m["vram_gib"].as_f64().map_or((nextsycl_models::registry::bytes_of(m) / 10 * 11) >> 20, |g| (g * 1024.0) as u64);
+    let pcis = nextsycl_serve::gpustat::find_cards();
+    let free = |g: usize| pcis.get(g).map_or(0, |p| {
+        let r = nextsycl_serve::gpustat::Card::open(p, None).sample(Duration::from_secs(1)).0;
+        r["vram_total_mb"].as_u64().unwrap_or(0).saturating_sub(r["vram_used_mb"].as_u64().unwrap_or(0))
+    });
+    first_with_room(&cands, &free, need)
+}
+
+/// Of `cands` (in order of preference), the first with `need` MiB free, else the one with the most
+fn first_with_room(cands: &[usize], free: &dyn Fn(usize) -> u64, need: u64) -> usize {
+    let free: Vec<(usize, u64)> = cands.iter().map(|g| (*g, free(*g))).collect();
+    free.iter().find(|(_, f)| *f >= need).or_else(|| free.iter().max_by_key(|(g, f)| (*f, std::cmp::Reverse(*g)))).map_or(0, |(g, _)| *g)
+}
+
 fn run(cfg: &Config, raw: &[String], foreground: bool) -> Result<(), String> {
     // `nextsycl start <id>`: a registry entry (nextsycl models) - its file, GPUs, contexts, name and settings; the
     // flags given beside it win
@@ -67,8 +90,13 @@ fn run(cfg: &Config, raw: &[String], foreground: bool) -> Result<(), String> {
             }
         }
         if !raw.iter().any(|a| a == "--gpu") {
-            for g in get("gpus").split(',').filter(|g| !g.is_empty()) {
-                raw.extend(["--gpu".to_string(), g.to_string()]);
+            if nextsycl_serve::home::registry::one_of(&m) {
+                // one of its cards (`gpus: '0|1'`), the whole model there
+                raw.extend(["--gpu".to_string(), one_of_gpu(cfg, &m, &id).to_string()]);
+            } else {
+                for g in get("gpus").split(',').filter(|g| !g.is_empty()) {
+                    raw.extend(["--gpu".to_string(), g.to_string()]);
+                }
             }
         }
         if let Some(env) = m.get("env").and_then(|e| e.as_object()) {
@@ -257,5 +285,19 @@ pub fn logs(cfg: &Config, raw: &[String]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("no log for {SERVER} (is it running?)"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_with_room;
+
+    #[test]
+    fn a_one_of_model_takes_the_first_card_with_room_else_the_freest() {
+        let free = |g: usize| [20_000u64, 30_000][g];
+        assert_eq!(first_with_room(&[0, 1], &free, 18_000), 0, "both fit: the first listed");
+        assert_eq!(first_with_room(&[0, 1], &free, 25_000), 1, "only the second fits");
+        assert_eq!(first_with_room(&[1, 0], &free, 18_000), 1, "the order is the preference");
+        assert_eq!(first_with_room(&[0, 1], &free, 40_000), 1, "neither fits: the freest");
     }
 }

@@ -166,6 +166,7 @@ const VOICE: &str = r#"{"type": "object", "properties": {"name": {"type": "strin
 
 const MODEL_STATE: &str = r#"{"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string", "enum": ["llm", "image", "audio", "video"]},
   "title": {"type": "string"}, "arch": {"type": "string"}, "enabled": {"type": "boolean"}, "gpus": {"type": "array", "items": {"type": "integer"}},
+  "gpus_one_of": {"type": "boolean", "description": "a chat model whose gpus are a choice (card gpus '0|1'): it loads whole on one of them, the first with room (the first listed preferred); system.busy's slots show the card it is on"},
   "state": {"type": "string", "enum": ["disabled", "unloaded", "loading", "loaded", "busy", "ready", "not_downloaded"], "description": "busy: an image, audio or 3D model answering, or a video model making a clip; ready: a video model the daemon has, not loaded; not_downloaded: a card's model not here (system.models.pull)"},
   "downloaded": {"type": "boolean", "description": "false: a model a card offers that is not downloaded (enabled false; bytes, drive, folder, fits, pull say what fetching it takes)"},
   "bytes": {"type": "integer", "description": "not downloaded: its files' bytes"}, "fits": {"type": "boolean", "description": "not downloaded: the folder it would go to has the room"},
@@ -327,7 +328,7 @@ pub fn result(method: &str) -> Option<String> {
     "message": {"type": "object", "properties": {"role": {"type": "string"}, "content": {"type": "string", "nullable": true}, "reasoning_content": {"type": "string", "nullable": true}, "tool_calls": {"type": "array", "items": {"type": "object"}}}}}}},
   "usage": {"type": "object", "properties": {"prompt_tokens": {"type": "integer"}, "completion_tokens": {"type": "integer"}, "total_tokens": {"type": "integer"}}}}, "additionalProperties": true}"#.into(),
         "llm.requests" => format!(r#"{{"type": "object", "properties": {{"active": {{"type": "array", "items": {CHAT_REQUEST}}}, "done": {{"type": "array", "description": "the last 10", "items": {CHAT_REQUEST}}}}}}}"#),
-        "llm.models" => r#"{"type": "object", "properties": {"models": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "gpus": {"type": "array", "items": {"type": "integer"}}, "loaded": {"type": "boolean"}}}}}}"#.into(),
+        "llm.models" => r#"{"type": "object", "properties": {"models": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "gpus": {"type": "array", "items": {"type": "integer"}}, "gpus_one_of": {"type": "boolean", "description": "its gpus are a choice: it loads on one of them"}, "loaded": {"type": "boolean"}}}}}}"#.into(),
         "image.generate" | "image.edit" => format!(r#"{{"oneOf": [{{"allOf": [{PICTURES}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the pictures, and the job"}},
   {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (image.status {{label}} for the rest)"}}]}}"#),
         "image.vectorize" => format!(r#"{{"oneOf": [{{"allOf": [{VECTORIZED}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the SVG, and the job"}},
