@@ -316,12 +316,12 @@ inline void stage_rows(const Block* const* wr, const Block** out, uint32_t* buf,
 // group in turn; 32 / L sets a sub-group (all of one group: n_ff a multiple of them)
 template <typename F, int L>
 void gu_launch(sycl::queue& q, const uint64_t* grp_ptr, const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
-               int64_t groups, const void* xq, int n_embd, int n_ff, float* gate, float* up) {
+               int64_t groups, const void* xq, int n_embd, int n_ff, float* gate, float* up, bool may_stage) {
     constexpr int S = WARP / L;
     const auto* X0 = static_cast<const block_q8_1*>(xq);
     const std::size_t gu_row = row_bytes_t<F>(n_embd), up_off = std::size_t(n_ff) * gu_row;
     const unsigned wgs = expert_groups<F, L>(std::size_t(groups) * n_ff);
-    const int sw = L == WARP ? stage_words(gu_row) : 0;
+    const int sw = may_stage && L == WARP ? stage_words(gu_row) : 0;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(F::LUT > 0 ? F::LUT : 1), h);
         sycl::local_accessor<uint32_t, 1> stage(sycl::range<1>(sw > 0 ? WARPS * 2 * sw : 1), h);
@@ -351,12 +351,12 @@ void gu_launch(sycl::queue& q, const uint64_t* grp_ptr, const int32_t* grp_start
 // down: out [ent_dst[e], n_embd] = down . h_e, two consecutive rows a set
 template <typename F, int L>
 void down_launch(sycl::queue& q, const uint64_t* grp_ptr, const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
-                 int64_t groups, const block_q8_1* hq, int n_embd, int n_ff, std::size_t down_off, float* out) {
+                 int64_t groups, const block_q8_1* hq, int n_embd, int n_ff, std::size_t down_off, float* out, bool may_stage) {
     constexpr int S = WARP / L;
     const std::size_t d_row = row_bytes_t<F>(n_ff);
     const int sets = n_embd / 2;
     const unsigned wgs = expert_groups<F, L>(std::size_t(groups) * sets);
-    const int sw = L == WARP ? stage_words(d_row) : 0;
+    const int sw = may_stage && L == WARP ? stage_words(d_row) : 0;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(F::LUT > 0 ? F::LUT : 1), h);
         sycl::local_accessor<uint32_t, 1> stage(sycl::range<1>(sw > 0 ? WARPS * 2 * sw : 1), h);
@@ -395,22 +395,22 @@ int expert_lanes(int lanes, int n_in, int rows) {
 }
 template <typename F>
 void gu_any(int lanes, sycl::queue& q, const uint64_t* p, const int32_t* s, const int32_t* n, const int32_t* tok, int64_t groups, const void* xq,
-            int n_embd, int n_ff, float* gate, float* up) {
+            int n_embd, int n_ff, float* gate, float* up, bool may_stage) {
     switch (expert_lanes<F>(lanes, n_embd, n_ff)) {
-        case 4: if constexpr (is_small<F>()) { gu_launch<F, 4>(q, p, s, n, tok, groups, xq, n_embd, n_ff, gate, up); return; } [[fallthrough]];
-        case 8: gu_launch<F, 8>(q, p, s, n, tok, groups, xq, n_embd, n_ff, gate, up); return;
-        case 16: gu_launch<F, 16>(q, p, s, n, tok, groups, xq, n_embd, n_ff, gate, up); return;
-        default: gu_launch<F, 32>(q, p, s, n, tok, groups, xq, n_embd, n_ff, gate, up); return;
+        case 4: if constexpr (is_small<F>()) { gu_launch<F, 4>(q, p, s, n, tok, groups, xq, n_embd, n_ff, gate, up, may_stage); return; } [[fallthrough]];
+        case 8: gu_launch<F, 8>(q, p, s, n, tok, groups, xq, n_embd, n_ff, gate, up, may_stage); return;
+        case 16: gu_launch<F, 16>(q, p, s, n, tok, groups, xq, n_embd, n_ff, gate, up, may_stage); return;
+        default: gu_launch<F, 32>(q, p, s, n, tok, groups, xq, n_embd, n_ff, gate, up, may_stage); return;
     }
 }
 template <typename F>
 void down_any(int lanes, sycl::queue& q, const uint64_t* p, const int32_t* s, const int32_t* n, const int32_t* dst, int64_t groups, const block_q8_1* hq,
-              int n_embd, int n_ff, std::size_t down_off, float* out) {
+              int n_embd, int n_ff, std::size_t down_off, float* out, bool may_stage) {
     switch (expert_lanes<F>(lanes, n_ff, n_embd / 2)) {
-        case 4: if constexpr (is_small<F>()) { down_launch<F, 4>(q, p, s, n, dst, groups, hq, n_embd, n_ff, down_off, out); return; } [[fallthrough]];
-        case 8: down_launch<F, 8>(q, p, s, n, dst, groups, hq, n_embd, n_ff, down_off, out); return;
-        case 16: down_launch<F, 16>(q, p, s, n, dst, groups, hq, n_embd, n_ff, down_off, out); return;
-        default: down_launch<F, 32>(q, p, s, n, dst, groups, hq, n_embd, n_ff, down_off, out); return;
+        case 4: if constexpr (is_small<F>()) { down_launch<F, 4>(q, p, s, n, dst, groups, hq, n_embd, n_ff, down_off, out, may_stage); return; } [[fallthrough]];
+        case 8: down_launch<F, 8>(q, p, s, n, dst, groups, hq, n_embd, n_ff, down_off, out, may_stage); return;
+        case 16: down_launch<F, 16>(q, p, s, n, dst, groups, hq, n_embd, n_ff, down_off, out, may_stage); return;
+        default: down_launch<F, 32>(q, p, s, n, dst, groups, hq, n_embd, n_ff, down_off, out, may_stage); return;
     }
 }
 // h = silu(gate) x up (GLM's clamp when limit > 0: silu(min(g, limit)) x clamp(u, -limit, limit)) as float32 and Q8_1:
@@ -572,13 +572,16 @@ int ns_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n
     float* up = reinterpret_cast<float*>(base + f);
     float* hf = reinterpret_cast<float*>(base + 2 * f);
     auto* hq = reinterpret_cast<block_q8_1*>(base + 3 * f);
+    // local memory for staged rows only where groups average more than 4 entries (a prompt pass): held by every
+    // work-group, it cost a decode pass's kernels their occupancy (REAP-50 IQ3_M tg 20.8 -> 15.5)
+    const bool stage = entries > MAXE && entries > 4 * groups;
     if (phase != 2) {
-        with_type(gu_type, [&](auto t) { gu_any<decltype(t)>(0, g->q, grp_ptr, grp_start, n_groups, ent_tok, groups, x_q8_1, (int) n_embd, (int) n_ff, gate, up); });
+        with_type(gu_type, [&](auto t) { gu_any<decltype(t)>(0, g->q, grp_ptr, grp_start, n_groups, ent_tok, groups, x_q8_1, (int) n_embd, (int) n_ff, gate, up, stage); });
         swiglu_q8(g->q, gate, up, hf, hq, entries, (int) n_ff, limit);
     }
     if (phase != 1) {
         const std::size_t down_off = 2 * std::size_t(n_ff) * row_bytes(gu_type, n_embd);
-        with_type(d_type, [&](auto t) { down_any<decltype(t)>(0, g->q, grp_ptr, grp_start, n_groups, ent_dst, groups, hq, (int) n_embd, (int) n_ff, down_off, out); });
+        with_type(d_type, [&](auto t) { down_any<decltype(t)>(0, g->q, grp_ptr, grp_start, n_groups, ent_dst, groups, hq, (int) n_embd, (int) n_ff, down_off, out, stage); });
     }
     return 0;
     NS_CATCH
