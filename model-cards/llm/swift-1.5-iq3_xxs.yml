@@ -5,7 +5,7 @@ kind: llm
 arch: qwen4exp
 title: Swift 1.5 IQ3_XXS (short thinking; both GPUs, 128K + 32K)
 about: 'UkisAI''s fine-tune: much shorter thinking; their standard 3-bit GGUF (~96% of experts in VRAM over both cards, tg ~53-58 with MTP)'
-gpus: all
+gpus: '0,1'                     # the B70 first (its order as measured; 'all' puts the B65 first, where the served sessions failed to record their graphs)
 streams: true                   # its PLE rows read from the file every window while it serves: keep it on the fastest drive
 ctx: 131072,32768
 tools: true
