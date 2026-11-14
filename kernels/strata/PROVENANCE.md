@@ -31,3 +31,16 @@ New code goes in `kernels/ns/`. The changes made here, each marked `nextsycl` in
   chunk instead of once per token. Same arithmetic as the single-entry dots.
 - Since the 0.1.40 refresh: `native_expert_set_phase` sets upstream's `g_exp_phase` (its bench switch, the same
   meaning), and the opt-in S26 grouped path (`STRATA_EXPERT_V2`, Qwen shapes only) runs the SwiGLU unclamped.
+
+## Who still calls these kernels (2026-11-14)
+
+The llm engines' shared decode kernels are nextsycl's own (`kernels/llm/common`: `ns_quantize_q8_1`, `ns_mmvq`,
+`ns_dequant_f16`, `ns_moe_grouped`), checked against these on real weights (`reference/shared-kernels.cpp`). Left here:
+
+- **qwen4exp** (the Qwen3.8-Flash-Next engine on the user's own Strata B70 port): all its kernels, and its own
+  grouped-support check (`ns_qw_moe_grouped_supported`).
+- **Behind the shared ABI, until the user decides** (ours measured slower there): Q8_0 and Q6_K decode products,
+  Q2_K and IQ2_S expansions to half, and GLM-5.3's IQ2_XXS / Q2_K experts in prompt passes - `ns_ref_*` in
+  `kernels/llm/glm5next/mmvq.cpp`, chosen in `kernels/llm/common/mmvq.cpp` (`NS_MMVQ_OWN=1` runs ours instead).
+
+So `libnextsycl-llm.so` still links `strata_*.o`; once those types are ours, only qwen4exp needs them.

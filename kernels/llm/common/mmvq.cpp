@@ -467,6 +467,7 @@ static void trace(const char* fn, int a, int b, int64_t c, int64_t d, int64_t e)
 // - decode products of Q8_0 (2-16 MB matrices, B70: 3-8% slower, e.g. 4096 x 4096 523 against 541) and Q6_K (512 -
 //   1,024 rows: 5-13% slower; larger ones faster: 25,600 x 6,144 B70 415 against 443... mixed)
 // - expansions to half of Q2_K (B65 17% slower) and IQ2_S (13-20%)
+// - the grouped experts of GLM-5.3's IQ2 file (IQ2_XXS / Q2_K) in prompt passes (below)
 // NS_MMVQ_OWN=1 runs ours for these too (to measure)
 static bool own_all() {
     static const bool v = std::getenv("NS_MMVQ_OWN") && std::getenv("NS_MMVQ_OWN")[0] == '1';
@@ -475,6 +476,9 @@ static bool own_all() {
 extern "C" {
 int ns_ref_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
 int ns_ref_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst);
+int ns_ref_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const uint64_t* grp_ptr, const int32_t* grp_start,
+                       const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t groups, int64_t entries, const void* x_q8_1,
+                       void* scratch, float* out, float limit, int lanes, int phase);
 
 size_t ns_q8_1_bytes(int64_t n_in, int64_t ncols) { return (size_t) (n_in / 32) * sizeof(block_q8_1) * (size_t) ncols; }
 
@@ -556,6 +560,11 @@ int ns_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n
     if (!ns_moe_grouped_supported(gu_type, d_type, n_embd, n_ff))
         return ns_fail("ns_moe_grouped: types " + std::to_string(gu_type) + "/" + std::to_string(d_type) + " not supported");
     if (groups <= 0 || entries <= 0) return 0;
+    // GLM-5.3's IQ2_XXS / Q2_K experts in a prompt pass (many entries a group): still Strata's (with ours the IQ2 file's
+    // prompt measured 79.7 pp against 118.7 on B70 + B65); decode widths (a few entries a group) ours
+    if (gu_type == 16 && d_type == 10 && entries > 4 * groups && !own_all())
+        return ns_ref_moe_grouped(g, gu_type, d_type, n_embd, n_ff, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, groups, entries, x_q8_1, scratch, out,
+                                  limit, lanes, phase);
     trace("moe", gu_type, d_type, n_embd, n_ff, phase);
     const std::size_t f = al256(std::size_t(entries) * std::size_t(n_ff) * sizeof(float));
     auto* base = static_cast<uint8_t*>(scratch);

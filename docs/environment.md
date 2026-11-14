@@ -139,7 +139,7 @@ GLM-5.3 (`llm/glm5next`, `kernels/llm/glm5next`; docs/glm5next.md).
 | `NS_MLA_HG` | 1 head a work-group | Experiment: 4 = 4 heads a work-group in prompt-chunk MLA attention (measured slower) | kernels:llm glm5next |
 | `NS_MLA_KERNEL` | 0 | Experiment: 1 = prompt chunks take the per-row MLA attention kernel, not the GEMM path | llm glm5next |
 | `NS_KERNEL_TRACE` | (unset) | a file: each distinct call of the shared decode kernels (ns_quantize_q8_1, ns_mmvq, ns_dequant_f16, ns_moe_grouped: the function, its types and shape) appended to it once - which types and shapes the engines send there | kernels:llm common |
-| `NS_MMVQ_OWN` | 0 | 1: the shared decode kernels' own products and expansions for the types still on Strata's (Q8_0 / Q6_K products, Q2_K / IQ2_S expansions: kernels/llm/common/mmvq.cpp says why) - to measure them | kernels:llm common |
+| `NS_MMVQ_OWN` | 0 | 1: the shared decode kernels' own code for what is still on Strata's (Q8_0 / Q6_K products, Q2_K / IQ2_S expansions, GLM-5.3 IQ2_XXS / Q2_K experts in prompt passes: kernels/llm/common/mmvq.cpp says why) - to measure it | kernels:llm common |
 | `NS_MMVQ_GROUPS` | 512 | work-groups of the shared decode kernels that keep a codebook in local memory (each fills it once, then strides over rows) | kernels:llm common |
 | `NS_NGRAM` | 0 | Up to K (1..4) tokens drafted from the context's repeats (prompt lookup); 0 = the draft block's (--opt-ngram) | llm glm5next |
 | `NS_PIPELINE` | 1 | 0 = a long prompt's chunks on two GPUs run in turn, not pipelined (--opt-pipeline) | llm glm5next |
