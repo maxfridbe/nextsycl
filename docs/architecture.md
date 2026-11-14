@@ -107,7 +107,8 @@ cli/
 
 kernels/                   SYCL ONLY - one library a kind (dist/libnextsycl-<kind>.so)
   ns/                     the shared part, linked into every kind's library: GPUs, memory, queues, copies, tickets
-  strata/                 the imported Strata kernels (MIT), linked into the llm library
+  strata/                 the imported Strata kernels (MIT, the user's B70 port): qwen4exp's alone, in its own library (libnextsycl-llm-qwen4exp.so)
+  llm/common/             the llm engines' shared decode kernels (Q8_1 activations, products, expansions to half, grouped experts)
   diffusion/              the shared diffusion kernels (H3's, on oneDNN), linked into the image, video and audio libraries;
                           diffusion/flash: flash attention (ARK on sycl-tla) as libnextsycl-flash.so, loaded on use
   llm/<arch>/  image/<arch>/  video/<arch>/  audio/<arch>/  model3d/<arch>/   an engine's own kernels and its header

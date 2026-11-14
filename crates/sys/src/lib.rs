@@ -279,6 +279,25 @@ impl Api {
         Ok(Some(Silo { handle: h, path }))
     }
 
+    /// An engine's own kernel library (`libnextsycl-<name>.so`: qwen4exp's, `llm-qwen4exp`, which carries the user's
+    /// Strata port): the copy inside the binary (unless NS_LIB_FROM_DISK=1), else the file beside the kind's library.
+    /// Opened globally after the kind's library, whose shared part (ns_fail ...) its undefined symbols resolve against.
+    pub fn engine_lib(&self, name: &str) -> Result<Silo, String> {
+        let file = format!("libnextsycl-{name}.so");
+        let path = if !from_disk() && std::env::var_os("NEXTSYCL_LIB").is_none() && embedded(&file).is_some() {
+            materialize(&file)?
+        } else {
+            self.dir.join(&file)
+        };
+        let c = CString::new(path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
+        // SAFETY: dlopen with a valid C string; the handle is checked.
+        let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
+        if h.is_null() {
+            return Err(format!("{}: {}", path.display(), dl_error()));
+        }
+        Ok(Silo { handle: h, path })
+    }
+
     /// The reason of the last failed call on this thread.
     pub fn error(&self) -> String {
         // SAFETY: ns_last_error returns a C string owned by the library, valid until the next call on this thread.

@@ -1,13 +1,9 @@
-// mmvq.cpp: Strata's decode-width kernels under ns_ref_* names - the reference the shared kernels (kernels/llm/common)
-// are checked and timed against (reference/shared-kernels.cpp) while they replace them.
+// strata_ref.cpp: Strata's decode-width kernels under ns_ref_* names, in qwen4exp's library beside the rest of the
+// user's Strata port - the reference the llm engines' shared kernels (kernels/llm/common) are checked and timed against
+// (reference/shared-kernels.cpp links this library too). No engine calls these.
 #include "ns.h"
-#include "glm.h"
 #include "ns_internal.hpp"
 
-#include <cstdio>
-#include <cstdlib>
-#include <mutex>
-#include <set>
 #include <string>
 
 #include "strata/kernels/iq_kernels.hpp"
