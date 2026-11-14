@@ -25,7 +25,7 @@
 namespace {
 using namespace nsq;
 constexpr int WARP = 32, WARPS = 4;   // 4 sub-groups (rows) a work-group
-constexpr int MAXE = 8;               // entries (columns) a pass of the grouped kernels
+constexpr int MAXE = 8;               // entries (columns) a pass of the grouped kernels at most (16 spilled: 2x slower)
 
 int lut_groups() {   // NS_MMVQ_GROUPS: the work-groups of a kernel with a local table (default 512)
     static const int v = std::getenv("NS_MMVQ_GROUPS") ? std::max(1, std::atoi(std::getenv("NS_MMVQ_GROUPS"))) : 512;
@@ -256,13 +256,15 @@ void dequant_launch(sycl::queue& q, const void* src, int64_t n, sycl::half* dst)
 // n_ff] float32, each 256-byte aligned, then h as Q8_1 [entries][n_ff / 32]
 inline std::size_t al256(std::size_t b) { return (b + 255) & ~std::size_t(255); }
 
-// R rows' dots with entries [e0, e1) of their group: 8 at a time, then 4, 2, 1 (each entry's sums the same whatever its
-// chunk: rows do not depend on how many entries a launch has). xf(e) an entry's activation blocks, sf(e, r, v) its result
+// R rows' dots with entries [e0, e1) of their group, the weights decoded once for up to 16 entries: a pass of N entries
+// (the last one of a group may hold fewer, cnt: the rest of its N repeat its last entry and are not stored) - a prompt's
+// groups hold tens of entries, and each pass decodes the rows again. An entry's sums are the same in any pass, so rows do
+// not depend on how many entries a launch has. xf(e) an entry's activation blocks, sf(e, r, v) its result
 template <typename F, int L, int R, int N, typename XF, typename SF>
-inline void entry_chunk(const typename F::Block* const* wr, int n_in, int e0, XF xf, SF sf, int l, const uint32_t* t, sycl::sub_group sg) {
+inline void entry_chunk(const typename F::Block* const* wr, int n_in, int e0, int cnt, XF xf, SF sf, int l, const uint32_t* t, sycl::sub_group sg) {
     const block_q8_1* xs[N];
 #pragma unroll
-    for (int k = 0; k < N; ++k) xs[k] = xf(e0 + k);
+    for (int k = 0; k < N; ++k) xs[k] = xf(e0 + sycl::min(k, cnt - 1));
     float acc[R * N] = {};
     rows_dot<F, N, L, R>(wr, n_in, xs, l, t, acc);
     reduce<R * N, L>(sg, acc);
@@ -270,15 +272,18 @@ inline void entry_chunk(const typename F::Block* const* wr, int n_in, int e0, XF
 #pragma unroll
         for (int r = 0; r < R; ++r)
 #pragma unroll
-            for (int k = 0; k < N; ++k) sf(e0 + k, r, acc[r * N + k]);
+            for (int k = 0; k < N; ++k)
+                if (k < cnt) sf(e0 + k, r, acc[r * N + k]);
 }
 template <typename F, int L, int R, typename XF, typename SF>
 inline void entries(const typename F::Block* const* wr, int n_in, int e0, int e1, XF xf, SF sf, int l, const uint32_t* t, sycl::sub_group sg) {
     int e = e0;
-    for (; e + MAXE <= e1; e += MAXE) entry_chunk<F, L, R, MAXE>(wr, n_in, e, xf, sf, l, t, sg);
-    if (e + 4 <= e1) { entry_chunk<F, L, R, 4>(wr, n_in, e, xf, sf, l, t, sg); e += 4; }
-    if (e + 2 <= e1) { entry_chunk<F, L, R, 2>(wr, n_in, e, xf, sf, l, t, sg); e += 2; }
-    if (e < e1) entry_chunk<F, L, R, 1>(wr, n_in, e, xf, sf, l, t, sg);
+    for (; e + MAXE <= e1; e += MAXE) entry_chunk<F, L, R, MAXE>(wr, n_in, e, MAXE, xf, sf, l, t, sg);
+    const int r = e1 - e;   // the rest: one pass of the next width up
+    if (r > 4) entry_chunk<F, L, R, 8>(wr, n_in, e, r, xf, sf, l, t, sg);
+    else if (r > 2) entry_chunk<F, L, R, 4>(wr, n_in, e, r, xf, sf, l, t, sg);
+    else if (r == 2) entry_chunk<F, L, R, 2>(wr, n_in, e, 2, xf, sf, l, t, sg);
+    else if (r == 1) entry_chunk<F, L, R, 1>(wr, n_in, e, 1, xf, sf, l, t, sg);
 }
 // work-groups for `sets` row sets (4 x 32 / L a work-group), at most 4 x NS_MMVQ_GROUPS of them for a type with a local
 // table (each fills it once, then strides over the rows)
@@ -287,6 +292,24 @@ unsigned expert_groups(std::size_t sets) {
     constexpr int S = WARP / L;
     const std::size_t g = (sets + WARPS * S - 1) / (WARPS * S);
     return unsigned(F::LUT > 0 ? std::min<std::size_t>(g, std::size_t(lut_groups()) * 4) : g);
+}
+
+// Rows read again for each pass of entries (a prompt's groups: tens of entries, 8 a pass) come from local memory: the
+// sub-group copies its set's two rows there first, in aligned 4-byte words that consecutive lanes read consecutively.
+// Experts in pinned host memory are read over PCIe for every pass otherwise, and a lane's 2-byte aligned 16-byte read
+// fetches 32 (B70, IQ2_XXS gate | up, 32 tokens x 8 experts in host memory: 7.1 ms, Strata's 5.2). sw: a row's words
+// (0: rows too long to stage - more than STAGE_WORDS - or not a whole number of words)
+constexpr int STAGE_WORDS = 1024;
+inline int stage_words(std::size_t row_bytes) { return row_bytes % 4 == 0 && row_bytes / 4 <= STAGE_WORDS ? int(row_bytes / 4) : 0; }
+template <typename Block>
+inline void stage_rows(const Block* const* wr, const Block** out, uint32_t* buf, int sw, int lane, sycl::sub_group sg) {
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(wr[p]);
+        for (int i = lane; i < sw; i += WARP) buf[p * sw + i] = src[i];
+        out[p] = reinterpret_cast<const Block*>(buf + p * sw);
+    }
+    sycl::group_barrier(sg);
 }
 
 // gate | up: row r of an expert's gate and row r of its up as one set (they share the activations), the sets of every
@@ -298,22 +321,29 @@ void gu_launch(sycl::queue& q, const uint64_t* grp_ptr, const int32_t* grp_start
     const auto* X0 = static_cast<const block_q8_1*>(xq);
     const std::size_t gu_row = row_bytes_t<F>(n_embd), up_off = std::size_t(n_ff) * gu_row;
     const unsigned wgs = expert_groups<F, L>(std::size_t(groups) * n_ff);
+    const int sw = L == WARP ? stage_words(gu_row) : 0;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(F::LUT > 0 ? F::LUT : 1), h);
+        sycl::local_accessor<uint32_t, 1> stage(sycl::range<1>(sw > 0 ? WARPS * 2 * sw : 1), h);
         h.parallel_for(sycl::nd_range<2>(sycl::range<2>(std::size_t(wgs) * WARPS, WARP), sycl::range<2>(WARPS, WARP)),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
             uint32_t* t = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
             fill_tab<F>(t, it);
             const int lane = int(it.get_local_id(1)), l = lane % L;
+            uint32_t* buf = stage.template get_multi_ptr<sycl::access::decorated::no>().get() + std::size_t(it.get_local_id(0)) * 2 * sw;
             const std::size_t ns = std::size_t(*n_groups) * n_ff;
             for (std::size_t i0 = (std::size_t(it.get_group(0)) * WARPS + it.get_local_id(0)) * S; i0 < ns; i0 += std::size_t(it.get_group_range(0)) * WARPS * S) {
                 const std::size_t i = i0 + lane / L;
                 const int grp = int(i / n_ff), r = int(i % n_ff);
                 const uint8_t* blob = reinterpret_cast<const uint8_t*>(grp_ptr[grp]) + std::size_t(r) * gu_row;
                 const typename F::Block* wr[2] = {reinterpret_cast<const typename F::Block*>(blob), reinterpret_cast<const typename F::Block*>(blob + up_off)};
-                entries<F, L, 2>(wr, n_embd, grp_start[grp], grp_start[grp + 1],
+                const int e0 = grp_start[grp], e1 = grp_start[grp + 1];
+                const bool staged = sw > 0 && e1 - e0 > MAXE;   // one set a sub-group (L = 32): the same for all its lanes
+                if (staged) stage_rows(wr, wr, buf, sw, lane, it.get_sub_group());
+                entries<F, L, 2>(wr, n_embd, e0, e1,
                                  [&](int e) { return X0 + std::size_t(ent_tok[e]) * (n_embd / 32); },
                                  [&](int e, int k, float v) { (k ? up : gate)[std::size_t(e) * n_ff + r] = v; }, l, t, it.get_sub_group());
+                if (staged) sycl::group_barrier(it.get_sub_group());
             }
         });
     });
@@ -326,22 +356,29 @@ void down_launch(sycl::queue& q, const uint64_t* grp_ptr, const int32_t* grp_sta
     const std::size_t d_row = row_bytes_t<F>(n_ff);
     const int sets = n_embd / 2;
     const unsigned wgs = expert_groups<F, L>(std::size_t(groups) * sets);
+    const int sw = L == WARP ? stage_words(d_row) : 0;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(F::LUT > 0 ? F::LUT : 1), h);
+        sycl::local_accessor<uint32_t, 1> stage(sycl::range<1>(sw > 0 ? WARPS * 2 * sw : 1), h);
         h.parallel_for(sycl::nd_range<2>(sycl::range<2>(std::size_t(wgs) * WARPS, WARP), sycl::range<2>(WARPS, WARP)),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
             uint32_t* t = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
             fill_tab<F>(t, it);
             const int lane = int(it.get_local_id(1)), l = lane % L;
+            uint32_t* buf = stage.template get_multi_ptr<sycl::access::decorated::no>().get() + std::size_t(it.get_local_id(0)) * 2 * sw;
             const std::size_t ns = std::size_t(*n_groups) * sets;
             for (std::size_t i0 = (std::size_t(it.get_group(0)) * WARPS + it.get_local_id(0)) * S; i0 < ns; i0 += std::size_t(it.get_group_range(0)) * WARPS * S) {
                 const std::size_t i = i0 + lane / L;
                 const int grp = int(i / sets), row = 2 * int(i % sets);
                 const uint8_t* base = reinterpret_cast<const uint8_t*>(grp_ptr[grp]) + down_off + std::size_t(row) * d_row;
                 const typename F::Block* wr[2] = {reinterpret_cast<const typename F::Block*>(base), reinterpret_cast<const typename F::Block*>(base + d_row)};
-                entries<F, L, 2>(wr, n_ff, grp_start[grp], grp_start[grp + 1],
+                const int e0 = grp_start[grp], e1 = grp_start[grp + 1];
+                const bool staged = sw > 0 && e1 - e0 > MAXE;
+                if (staged) stage_rows(wr, wr, buf, sw, lane, it.get_sub_group());
+                entries<F, L, 2>(wr, n_ff, e0, e1,
                                  [&](int e) { return hq + std::size_t(e) * (n_ff / 32); },
                                  [&](int e, int k, float v) { out[std::size_t(ent_dst[e]) * n_embd + row + k] = v; }, l, t, it.get_sub_group());
+                if (staged) sycl::group_barrier(it.get_sub_group());
             }
         });
     });

@@ -5,8 +5,8 @@
 // `shared_kernels GPU LIST`, a line of LIST one test:
 //   mm  FILE TENSOR [EXPERT]                    a decode product (1 and 4 columns, random activations)
 //   dq  FILE TENSOR [EXPERT]                    the expansion to fp16 (the first 256 x 1024 values or the matrix)
-//   moe FILE GATE FILE UP FILE DOWN TOKENS USED [LIMIT [LANES]]   a layer's grouped experts: TOKENS tokens, USED experts each
-//                                               (LANES a row, as the engine passes them)
+//   moe FILE GATE FILE UP FILE DOWN TOKENS USED [LIMIT [LANES [HOST]]]   a layer's grouped experts: TOKENS tokens, USED experts each
+//                                               (LANES a row, as the engine passes them; HOST 1: the experts in pinned host memory)
 #include "ns.h"
 #include "gguf-min.hpp"
 
@@ -84,17 +84,17 @@ static Mat matrix(const Gguf& f, const std::string& name, int expert) {
 }
 
 typedef int (*mm_fn)(ns_gpu*, int, const void*, const void*, float*, int64_t, int64_t, int64_t);
-static void rates(mm_fn fn, const Mat& m, void* w, const std::vector<void*>& copies, void* q, float* y, double& hot, double& cold) {
+static void rates(mm_fn fn, const Mat& m, void* w, const std::vector<void*>& copies, void* q, float* y, double& hot, double& cold, int nc = 1) {
     const double bytes = (double) m.b.size();
-    for (int i = 0; i < 3; ++i) ck(fn(G, (int) m.type, w, q, y, m.cols, m.rows, 1), "mmvq");
+    for (int i = 0; i < 3; ++i) ck(fn(G, (int) m.type, w, q, y, m.cols, m.rows, nc), "mmvq");
     ck(ns_sync(G), "sync");
     const int n = 50;
     double t0 = now();
-    for (int i = 0; i < n; ++i) ck(fn(G, (int) m.type, w, q, y, m.cols, m.rows, 1), "mmvq");
+    for (int i = 0; i < n; ++i) ck(fn(G, (int) m.type, w, q, y, m.cols, m.rows, nc), "mmvq");
     ck(ns_sync(G), "sync");
     hot = bytes * n / (now() - t0) / 1e9;
     t0 = now();
-    for (void* c : copies) ck(fn(G, (int) m.type, c, q, y, m.cols, m.rows, 1), "mmvq");
+    for (void* c : copies) ck(fn(G, (int) m.type, c, q, y, m.cols, m.rows, nc), "mmvq");
     ck(ns_sync(G), "sync");
     cold = bytes * (double) copies.size() / (now() - t0) / 1e9;
 }
@@ -106,15 +106,15 @@ static void test_mm(const Gguf& f, const std::string& name, int expert) {
     for (size_t k = 0; k < std::max<size_t>(2, (512u << 20) / m.b.size()); ++k) copies.push_back(up(m.b.data(), m.b.size()));
     std::mt19937 rng(1234);
     std::normal_distribution<float> nd(0.f, 1.f);
-    std::vector<float> xs(4 * m.cols);
+    std::vector<float> xs(8 * m.cols);
     for (auto& v : xs) v = nd(rng);
     float* x = (float*) up(xs.data(), xs.size() * 4);
-    void* q = dev(ns_q8_1_bytes(m.cols, 4));
+    void* q = dev(ns_q8_1_bytes(m.cols, 8));
     void* qr = dev(ns_q8_1_bytes(m.cols, 4));
-    float* y = (float*) dev(4 * m.rows * 4);
+    float* y = (float*) dev(8 * m.rows * 4);
     float* yr = (float*) dev(4 * m.rows * 4);
     float* y1 = (float*) dev(m.rows * 4);
-    ck(ns_quantize_q8_1(G, x, q, m.cols, 4), "quantize");
+    ck(ns_quantize_q8_1(G, x, q, m.cols, 8), "quantize");
     ck(ns_ref_quantize_q8_1(G, x, qr, m.cols, 4), "ref quantize");
     const auto qa = down<uint8_t>(q, ns_q8_1_bytes(m.cols, 4)), qb = down<uint8_t>(qr, ns_q8_1_bytes(m.cols, 4));
     const bool qsame = qa == qb;
@@ -143,9 +143,17 @@ static void test_mm(const Gguf& f, const std::string& name, int expert) {
     double oh, oc, rh, rc;
     rates(ns_mmvq, m, w, copies, q, y1, oh, oc);
     rates(ns_ref_mmvq, m, w, copies, q, y1, rh, rc);
-    printf("mm  %-8s %-34s %6lldx%-6lld q8_1 %s  own-strata %.1e (%zu/%lld differ)  vs exact: own %.1e strata %.1e  1col=4col[0] %s  own %4.0f hot %4.0f cold  strata %4.0f hot %4.0f cold GB/s  %s\n",
+    // cold rates at 2, 4 and 8 columns (verify passes, a token's experts)
+    char wide[160]; int at = 0;
+    for (int nc : {2, 4, 8}) {
+        double a1, a2, b1, b2;
+        rates(ns_mmvq, m, w, copies, q, y, a1, a2, nc);
+        rates(ns_ref_mmvq, m, w, copies, q, y, b1, b2, nc);
+        at += snprintf(wide + at, sizeof wide - at, " %dc %.0f|%.0f%s", nc, a2, b2, a2 >= b2 * 0.98 ? "" : "!");
+    }
+    printf("mm  %-8s %-34s %6lldx%-6lld q8_1 %s  own-strata %.1e (%zu/%lld differ)  vs exact: own %.1e strata %.1e  1col=4col[0] %s  own %4.0f hot %4.0f cold  strata %4.0f hot %4.0f cold GB/s  %s  (own|strata cold:%s)\n",
            tname(m.type), name.c_str(), (long long) m.rows, (long long) m.cols, qsame ? "same" : "DIFF", rel, nd4, (long long) (4 * m.rows), eo / ym, er / ym,
-           col_exact ? "yes" : "NO", oh, oc, rh, rc, oc >= rc * 0.98 ? "ok" : "SLOWER");
+           col_exact ? "yes" : "NO", oh, oc, rh, rc, oc >= rc * 0.98 ? "ok" : "SLOWER", wide);
     for (void* c : copies) ns_free(G, c);
     for (void* p : {w, (void*) x, q, qr, (void*) y, (void*) yr, (void*) y1}) ns_free(G, p);
 }
@@ -179,7 +187,7 @@ static void test_dq(const Gguf& f, const std::string& name, int expert) {
 }
 
 static void test_moe(const Gguf& f, const std::string& gname, const Gguf& fu, const std::string& uname, const Gguf& fd, const std::string& dname, int tokens,
-                     int used, float limit, int lanes) {
+                     int used, float limit, int lanes, int host) {
     const GgufTensor& gt = f.tensors.at(gname);
     const int64_t n_embd = (int64_t) gt.dims[0], n_ff = (int64_t) gt.dims[1], n_exp = (int64_t) gt.dims[2];
     const uint32_t gu_type = gt.type, d_type = fd.tensors.at(dname).type;
@@ -195,7 +203,7 @@ static void test_moe(const Gguf& f, const std::string& gname, const Gguf& fu, co
         blob.insert(blob.end(), b.b.begin(), b.b.end());
         blob.insert(blob.end(), c.b.begin(), c.b.end());
         blob_bytes = blob.size();
-        blobs.push_back(up(blob.data(), blob.size()));
+        if (host) { void* hp; ck(ns_alloc_host(G, blob.size(), &hp), "alloc host"); std::memcpy(hp, blob.data(), blob.size()); blobs.push_back(hp); } else blobs.push_back(up(blob.data(), blob.size()));
         ptr.push_back((uint64_t) blobs.back());
     }
     // every token routed to every one of the experts: group k = expert k, entries (k, t) for each token t
@@ -241,7 +249,7 @@ static void test_moe(const Gguf& f, const std::string& gname, const Gguf& fu, co
     printf("moe %-8s/%-8s %4lld x %-5lld lanes %2d tokens %d x %d experts  err %.2e (%zu/%d differ)  own %7.1f us (gate|up %6.1f)  strata %7.1f us (gate|up %6.1f)  %s\n",
            tname(gu_type), tname(d_type), (long long) n_embd, (long long) n_ff, lanes, tokens, used, rel, ndf, entries * (int) n_embd, to, o1,
            tr, r1, to <= tr * 1.02 ? "ok" : "SLOWER");
-    for (void* p : blobs) ns_free(G, p);
+    for (void* p : blobs) { if (host) ns_free_host(G, p); else ns_free(G, p); }
     for (void* p : {(void*) dptr, (void*) dstart, (void*) dng, (void*) ddst, (void*) dtok, (void*) x, q, scr, (void*) oa, (void*) ob}) ns_free(G, p);
 }
 
@@ -266,9 +274,9 @@ int main(int argc, char** argv) {
             if (op == "mm") test_mm(file(path), a, e); else test_dq(file(path), a, e);
         } else if (op == "moe") {
             std::string pu, pd;
-            int tokens = 1, used = 8, lanes = 0; float limit = 0;
-            s >> a >> pu >> b >> pd >> c >> tokens >> used >> limit >> lanes;
-            test_moe(file(path), a, file(pu), b, file(pd), c, tokens, used, limit, lanes);
+            int tokens = 1, used = 8, lanes = 0, host = 0; float limit = 0;
+            s >> a >> pu >> b >> pd >> c >> tokens >> used >> limit >> lanes >> host;
+            test_moe(file(path), a, file(pu), b, file(pd), c, tokens, used, limit, lanes, host);
         }
         fflush(stdout);
     }
