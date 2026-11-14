@@ -185,8 +185,8 @@ void mmvq_cols(sycl::queue& q, const void* w, const void* x, float* y, int n_in,
 // ---- Q6_K decode products: Strata's wide Q6_K kernel, copied (the user's Strata B70 port: native_mmvq_q6k_wide_kernel
 // with its 2-byte aligned loads, kernels/strata/src/kernels/native_mmvq.dp.cpp at Strata_B70 3f37281; its bytewise
 // saturating subtract is the plain one here - the 6-bit values less 32 never saturate). Ours (TQ6K, the same 16-byte
-// runs) measured 5-13% slower on matrices of 512-1,280 rows and lost to it in 8 of 32 shapes; this one is what the
-// engines ran before. A row a sub-group, lane g a 16-byte run of ql and of qh in each of 4 blocks a step.
+// runs) measured 5-13% slower on matrices of 512-1,280 rows; this one beat the Strata entry point the engines called
+// before (native_mmvq) on 63 of 64 shapes. A row a sub-group, lane g a 16-byte run of ql and of qh in each of 4 blocks a step.
 template <int NCOLS>
 void q6k_wide_kernel(const block_q6_K* __restrict__ w, const block_q8_1* __restrict__ x, float* __restrict__ y, int n_in, int n_out,
                      const sycl::nd_item<2>& it) {
