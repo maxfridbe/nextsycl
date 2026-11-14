@@ -36,6 +36,15 @@ pub const ROLES: &[&str] = &["transformer", "text-encoder", "vae", "tokenizer"];
 
 const GIB: f64 = (1u64 << 30) as f64;
 
+/// What the load check counts beside the weights: a picture's buffers with the kernels' scratch (measured with
+/// NS_QI_MEM: 1024 x 1024 at most 2.0 GiB, its decode; 2048 x 2048 6.5 GiB whole) and 1.5 GiB kept free. Each request
+/// is checked again for its own size (`room_for`), and a decode that would not fit goes in bands
+const ACTIVATIONS: u64 = 5 << 30;
+
+/// The kernels' own scratch beside a step's buffers (oneDNN's, the attention's): `dit::step_bytes` came within
+/// 0.1 GiB of the 2.55 GiB measured at 2048 x 2048
+const SCRATCH: u64 = 1 << 29;
+
 /// The prompt's chat turn; the system turn's tokens are dropped from the encoding
 /// What the model was trained to read for a picture with an alpha channel (a prompt that says so already is left as it is)
 const RGBA_PREFIX: &str = "This is an RGBA image with transparency. ";
@@ -118,6 +127,8 @@ pub struct QwenImage21 {
     pub vae: vae::Vae,
     loaded: Instant,
     load_s: f64,
+    /// what the loaded model holds on its card (the load check's estimate)
+    resident: u64,
     /// LoRA files read for requests (their updates at strength 1), the last few kept: a request's LoRAs are put on
     /// the GPU from here (dit::Side), not read again
     lora_cache: std::sync::Mutex<Vec<(PathBuf, Arc<Vec<Delta>>)>>,
@@ -192,7 +203,7 @@ impl QwenImage21 {
         let size = |r: &str| -> Result<u64> { std::fs::metadata(role(files, r)?).map(|m| m.len()).map_err(|e| Error(format!("{r}: {e}"))) };
         let int8 = o.setting("NS_QI_INT8").is_some_and(|v| v == "1");
         let dit_b: u64 = f.tensors.iter().map(|t| t.elements() * if int8 { 1 } else { 2 }).sum();
-        let need = dit_b + size("text-encoder")? + size("vae")? + (5u64 << 30);
+        let need = dit_b + size("text-encoder")? + size("vae")? + ACTIVATIONS;
         let (total, free) = gpu.memory()?;
         let free = free.unwrap_or(total);
         if need > free {
@@ -208,8 +219,28 @@ impl QwenImage21 {
         }
         let dit = dit::Dit::load(&f, &nsd, int8, &deltas, log)?;
         let vae = vae::Vae::load(role(files, "vae")?, &nsd, (LATENT_MEAN.to_vec(), LATENT_STD.to_vec()), log)?;
-        Ok(QwenImage21 { nsd, preset, te, dit, vae, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64(),
+        Ok(QwenImage21 { nsd, preset, te, dit, vae, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64(), resident: need - ACTIVATIONS,
                          lora_cache: std::sync::Mutex::new(Vec::new()) })
+    }
+
+    /// What a `w` x `h` picture after a prefix of `p` rows needs on the card at most (the denoise's or the decode's
+    /// buffers, the kernels' scratch), and whether it has that now: a plain error when the card could never hold it
+    /// beside the model, no room when it could on an emptier card
+    pub fn room_for(&self, w: usize, h: usize, p: usize) -> Result<()> {
+        let (lh, lw) = (h / 16, w / 16);
+        let need = (self.dit.denoise_bytes(lh * lw, p) + SCRATCH).max(self.vae.min_bytes(lh, lw)) + vae::MARGIN;
+        let gpu = &self.nsd.gpu;
+        let (total, free) = gpu.memory()?;
+        let free = free.unwrap_or(total);
+        if need + self.resident > total {
+            return Err(Error(format!("{ARCH}: {w}x{h} needs {:.1} GiB on {} beside the model's {:.1} GiB, and the card has {:.1} in all: a smaller size",
+                                     need as f64 / GIB, gpu.name, self.resident as f64 / GIB, total as f64 / GIB)));
+        }
+        if need > free {
+            return Err(Error::no_room(format!("{ARCH}: {w}x{h} needs {:.1} GiB more on {} ({:.1} GiB free)", (need - free) as f64 / GIB, gpu.name,
+                                              free as f64 / GIB)));
+        }
+        Ok(())
     }
 
     /// A LoRA file's updates at strength 1: from the cache, else read (and kept, the oldest let go)
@@ -459,6 +490,7 @@ impl ImageEngine for QwenImage21 {
     fn generate(&self, req: &ImageRequest, progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Vec<Picture>> {
         let d = self.defaults();
         let t0 = Instant::now();
+        prof::mem(&self.nsd, "0 before")?;
         // an edit: the picture and its references (the pipeline's condition images, in order); the output takes the
         // last one's aspect at the model's area unless a size is given
         let pics: Vec<Picture> = match &req.edit {
@@ -546,11 +578,16 @@ impl ImageEngine for QwenImage21 {
         };
         let prompt = if req.rgba { rgba_prompt(&req.prompt) } else { req.prompt.clone() };
         let (embeds, tokens, pads) = encode(&prompt)?;
+        prof::mem(&self.nsd, "1 text encoder")?;
         let negative = match (&req.negative, cfg > 1.0) {
             (Some(np), true) => Some(encode(np)?),
             _ => None,
         };
         let conds: Vec<(&DevBuf, (usize, usize))> = lats.iter().map(|(b, s)| (b, *s)).collect();
+        // the size's room, checked before the work: a prefix at most the prompt's tokens and the pictures' latents (the
+        // negative prompt's kept beside it)
+        let pics_rows: usize = lats.iter().map(|(_, (a, b))| a * b).sum();
+        self.room_for(w, h, tokens + pics_rows + negative.as_ref().map_or(0, |(_, t, _)| t + pics_rows))?;
         if let Ok(dir) = std::env::var("NS_QI_DUMP") {
             // what the denoiser is given (a debugging aid): raw float32 files
             let raw = |name: &str, v: &[f32]| { let _ = std::fs::write(format!("{dir}/{name}"), v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()); };
@@ -563,6 +600,7 @@ impl ImageEngine for QwenImage21 {
         progress(Step { picture: 0, at: 0, of: steps as u32, seconds: t0.elapsed().as_secs_f64() })?;
         let mut out = Vec::new();
         for p in 0..req.n.max(1) {
+            let tp = Instant::now();
             let mut nz = noise(req.seed + p as u64, hw.0 * hw.1 * dit::LATENT);
             if let Some(l0) = &start {
                 // x = s0 noise + (1 - s0) picture; the samplers scale their start by s0, the GPU path takes x as is
@@ -595,6 +633,10 @@ impl ImageEngine for QwenImage21 {
             if prof::on() {
                 eprintln!("\nvae: {:.2} s", tv.elapsed().as_secs_f64());
                 prof::report(&mut |l| eprintln!("{l}"));
+            }
+            if prof::mem_on() {
+                eprintln!("\npicture {}: {:.2} s (vae {:.2} s)", p + 1, tp.elapsed().as_secs_f64(), tv.elapsed().as_secs_f64());
+                prof::mem_report(&mut |l| eprintln!("{l}"));
             }
             let pic = if req.rgba {
                 Picture { width: pw as u32, height: ph as u32, channels: 4, data: rgba }

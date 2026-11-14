@@ -59,3 +59,47 @@ pub fn report(log: &mut dyn FnMut(String)) {
         s.t.clear();
     }
 }
+
+/// NS_QI_MEM=1: the card's free memory at named points (the GPU waited for first), the lowest per phase kept;
+/// `mem_report` prints them. Measures what a size needs beside the loaded model.
+/// Each phase's (lowest free bytes, probes)
+type Lows = Mutex<BTreeMap<&'static str, (u64, u64)>>;
+
+fn mem_state() -> Option<&'static Lows> {
+    static S: OnceLock<Option<Lows>> = OnceLock::new();
+    S.get_or_init(|| std::env::var_os("NS_QI_MEM").map(|_| Mutex::new(BTreeMap::new()))).as_ref()
+}
+
+pub fn mem_on() -> bool {
+    mem_state().is_some()
+}
+
+/// The card's free bytes now (after its queue), counted toward `phase`'s lowest
+pub fn mem(nsd: &Nsd, phase: &'static str) -> Result<()> {
+    if let Some(s) = mem_state() {
+        nsd.wait()?;
+        nsd.gpu.sync()?;
+        let (total, free) = nsd.gpu.memory()?;
+        let free = free.unwrap_or(total);
+        let mut s = s.lock().unwrap();
+        let e = s.entry(phase).or_insert((u64::MAX, 0));
+        // a new low by 64 MiB or more: said now (a run that fails later still shows how far it got); NS_QI_MEM=2: every probe
+        if free + (64 << 20) < e.0 || std::env::var("NS_QI_MEM").is_ok_and(|v| v == "2") {
+            eprintln!("mem: {phase} free {:.2} GiB", free as f64 / (1u64 << 30) as f64);
+        }
+        e.0 = e.0.min(free);
+        e.1 += 1;
+    }
+    Ok(())
+}
+
+/// Each phase's lowest free memory, and clear them
+pub fn mem_report(log: &mut dyn FnMut(String)) {
+    if let Some(s) = mem_state() {
+        let mut s = s.lock().unwrap();
+        for (k, (low, n)) in s.iter() {
+            log(format!("mem: {k:<14} lowest free {:>6.2} GiB ({n} probes)", *low as f64 / (1u64 << 30) as f64));
+        }
+        s.clear();
+    }
+}

@@ -26,6 +26,20 @@ use crate::{ffi, prof};
 /// F.normalize's floor, as an epsilon on the mean square: never reached by real activations
 const EPS: f32 = 1e-24;
 
+/// Kept free on the card beside a decode (the box spills to host memory and stalls past it)
+pub const MARGIN: u64 = 3 << 29;
+
+/// What a decode holds beside its own buffers (`up_bytes`): oneDNN's convolutions, their scratch and reordered weights
+/// (0.8 GiB measured at 2048 x 2048 with NS_QI_MEM)
+pub const SLACK: u64 = 1 << 30;
+
+/// The fewest latent rows a band of the up path covers (its context rows besides)
+const MIN_BAND: usize = 4;
+
+fn gib(b: u64) -> f64 {
+    b as f64 / (1u64 << 30) as f64
+}
+
 /// A convolution: half weights [Co, Ci, k, k], float32 bias
 struct Conv {
     w: DevBuf,
@@ -227,39 +241,168 @@ impl Vae {
 
     fn conv(&self, nsd: &Nsd, c: &Conv, x: &DevBuf, h: usize, w: usize) -> Result<DevBuf> {
         let out = DevBuf::new(&self.gpu, h * w * c.co * 2)?;
+        self.conv_into(nsd, c, x, h, w, &out)?;
+        Ok(out)
+    }
+
+    /// The convolution into `out` (h x w x co halves at least)
+    fn conv_into(&self, nsd: &Nsd, c: &Conv, x: &DevBuf, h: usize, w: usize, out: &DevBuf) -> Result<()> {
         nsd.conv2d(x.ptr(), Dt::F16, 1, h, w, c.ci, c.w.ptr(), c.co, c.k, c.b.ptr(), out.ptr())?;
         prof::mark(nsd, if c.k == 1 { "vae conv 1x1" } else { "vae conv 3x3" })?;
-        Ok(out)
+        if std::env::var("NS_QI_MEM").is_ok_and(|v| v == "2") {
+            eprintln!("vae conv {h}x{w} {} -> {} k{}", c.ci, c.co, c.k);
+        }
+        prof::mem(nsd, "3 vae")
     }
 
     /// silu(rms norm(x) * gamma), a new buffer
     fn norm_silu(&self, nsd: &Nsd, x: &DevBuf, px: usize, c: usize, gamma: &DevBuf) -> Result<DevBuf> {
-        let k = ffi::api()?;
         let out = DevBuf::new(&self.gpu, px * c * 2)?;
+        self.norm_silu_into(nsd, x, px, c, gamma, &out)?;
+        Ok(out)
+    }
+
+    /// silu(rms norm(x) * gamma) into `out` (px x c halves at least)
+    fn norm_silu_into(&self, nsd: &Nsd, x: &DevBuf, px: usize, c: usize, gamma: &DevBuf, out: &DevBuf) -> Result<()> {
+        let k = ffi::api()?;
         nsd.rms_norm_mod(x.ptr(), Dt::F16, px, c, gamma.ptr(), EPS, none(), none(), none(), out.ptr(), Dt::F16)?;
         // SAFETY: px x c halves.
         ffi::check(unsafe { (k.silu)(self.gpu.raw(), out.ptr(), (px * c) as i64) }, "silu")?;
         prof::mark(nsd, "vae norm + silu")?;
-        Ok(out)
+        if std::env::var("NS_QI_MEM").is_ok_and(|v| v == "2") {
+            eprintln!("vae norm {px} x {c}");
+        }
+        prof::mem(nsd, "3 vae")
     }
 
-    fn resnet(&self, nsd: &Nsd, r: &Resnet, x: DevBuf, h: usize, w: usize) -> Result<DevBuf> {
+    /// x + conv(silu(norm(conv(silu(norm(x)))))) in a new buffer, with one more beside it: `a` holds each
+    /// convolution's input (and the shortcut's output), the result each one's output
+    fn resnet(&self, nsd: &Nsd, r: &Resnet, x: &DevBuf, h: usize, w: usize) -> Result<DevBuf> {
         let px = h * w;
-        let a = self.norm_silu(nsd, &x, px, r.conv1.ci, &r.norm1)?;
-        let a = self.conv(nsd, &r.conv1, &a, h, w)?;
-        let a = self.norm_silu(nsd, &a, px, r.conv1.co, &r.norm2)?;
-        let out = self.conv(nsd, &r.conv2, &a, h, w)?;
+        let (ci, cm, co) = (r.conv1.ci, r.conv1.co, r.conv2.co);
+        let a = DevBuf::new(&self.gpu, px * ci.max(cm).max(co) * 2)?;
+        let out = DevBuf::new(&self.gpu, px * cm.max(co) * 2)?;
+        self.norm_silu_into(nsd, x, px, ci, &r.norm1, &a)?;
+        self.conv_into(nsd, &r.conv1, &a, h, w, &out)?;
+        self.norm_silu_into(nsd, &out, px, cm, &r.norm2, &a)?;
+        self.conv_into(nsd, &r.conv2, &a, h, w, &out)?;
         let short = match &r.shortcut {
-            Some(c) => self.conv(nsd, c, &x, h, w)?,
+            Some(c) => {
+                self.conv_into(nsd, c, x, h, w, &a)?;
+                &a
+            }
             None => x,
         };
-        nsd.gate_add(out.ptr(), Dt::F16, px, r.conv2.co, short.ptr(), Dt::F16, none(), none())?;
-        // the temporaries are freed on return: the work on them first (a free does not wait for the queue)
+        nsd.gate_add(out.ptr(), Dt::F16, px, co, short.ptr(), Dt::F16, none(), none())?;
+        // `a` is freed on return (and the caller may free x): the work on them first (a free does not wait for the queue)
         nsd.wait()?;
         Ok(out)
     }
 
-    /// RGBA [H, W, 4] bytes from latents float32 [h * w, z] (as the denoiser leaves them, before the statistics)
+    /// The bytes the up blocks and the head hold at most (beside the middle's output) over `h` x `w` latents: each
+    /// resnet's input and two buffers, an upsampling block's input kept for its shortcut, the 2x copy and the
+    /// convolution's output, the head's norm and output
+    pub fn up_bytes(&self, h: usize, w: usize) -> u64 {
+        let (mut h, mut w) = (h as u64, w as u64);
+        let mut peak = 0u64;
+        for up in &self.ups {
+            let px = h * w;
+            let kept = if up.ft.is_some() { px * up.ci as u64 * 2 } else { 0 };
+            for (i, r) in up.resnets.iter().enumerate() {
+                let (ci, cm, co) = (r.conv1.ci as u64, r.conv1.co as u64, r.conv2.co as u64);
+                // the first resnet's input is the block's input
+                let input = if i == 0 && kept > 0 { 0 } else { px * ci * 2 };
+                peak = peak.max(kept + input + px * 2 * (ci.max(cm).max(co) + cm.max(co)));
+            }
+            if let Some(c) = &up.resample {
+                peak = peak.max(kept + 4 * px * 2 * (c.ci as u64 + c.co as u64));
+                h *= 2;
+                w *= 2;
+            }
+        }
+        let c = self.conv_out.ci as u64;
+        peak.max(h * w * 2 * (2 * c + self.conv_out.co as u64))
+    }
+
+    /// Latent rows of context a band of the up path needs each side to come out as the whole would: every 3 x 3
+    /// convolution after the middle reaches a row further at its own scale (a 2x upsample doubles what is reached)
+    pub fn halo(&self) -> usize {
+        let mut rows = 0usize;
+        let mut scale = 1usize;
+        for up in &self.ups {
+            rows += up.resnets.iter().map(|r| (r.conv1.k / 2) + (r.conv2.k / 2)).sum::<usize>();
+            if let Some(c) = &up.resample {
+                rows = 2 * rows + c.k / 2;
+                scale *= 2;
+            }
+        }
+        rows += self.conv_out.k / 2;
+        rows.div_ceil(scale)
+    }
+
+    /// The up blocks and the head over `x` [h, w, ci] (the middle's output, or a band of its rows): the picture as
+    /// halves [h', w', 4] in [-1, 1] and its size
+    fn up_path(&self, nsd: &Nsd, x: DevBuf, h: usize, w: usize) -> Result<(DevBuf, usize, usize)> {
+        let gpu = &self.gpu;
+        let k = ffi::api()?;
+        let (mut x, mut h, mut w) = (x, h, w);
+        for up in &self.ups {
+            // the block's input, kept for its shortcut when it upsamples (the first resnet reads it, not a copy)
+            let inp = x;
+            x = self.resnet(nsd, &up.resnets[0], &inp, h, w)?;
+            let inp = up.ft.map(|_| inp);
+            for r in &up.resnets[1..] {
+                x = self.resnet(nsd, r, &x, h, w)?;
+            }
+            if let (Some(c), Some(ft), Some(inp)) = (&up.resample, up.ft, inp) {
+                let co = c.co;
+                let u = DevBuf::new(gpu, 4 * h * w * c.ci * 2)?;
+                // SAFETY: x holds h x w x ci halves, u four times that.
+                ffi::check(unsafe { (k.up2)(gpu.raw(), x.ptr(), h as i64, w as i64, c.ci as i64, u.ptr()) }, "upsample")?;
+                prof::mark(nsd, "vae up 2x")?;
+                // x is freed before the convolution's output is made: the copy first
+                nsd.wait()?;
+                drop(x);
+                x = self.conv(nsd, c, &u, 2 * h, 2 * w)?;
+                // SAFETY: inp holds h x w x ci halves, x 2h x 2w x co.
+                ffi::check(unsafe { (k.dupup_add)(gpu.raw(), inp.ptr(), h as i64, w as i64, up.ci as i64, co as i64, ft, x.ptr()) }, "shortcut")?;
+                nsd.wait()?;
+                h *= 2;
+                w *= 2;
+            }
+        }
+        let c = self.conv_out.ci;
+        let a = self.norm_silu(nsd, &x, h * w, c, &self.out_norm)?;
+        let img = self.conv(nsd, &self.conv_out, &a, h, w)?;
+        nsd.wait()?;
+        Ok((img, h, w))
+    }
+
+    /// The least a decode of `h` x `w` latents holds at once: the middle's buffers (its attention's at the most), the
+    /// picture's bytes, and the up path in bands of the fewest rows
+    pub fn min_bytes(&self, h: usize, w: usize) -> u64 {
+        let px = (h * w) as u64;
+        let c = self.conv_in.co as u64;
+        let rows = ((256u64 << 20) / (px * 4)).clamp(1, px);
+        let mid = 6 * px * c * 2 + rows * px * 6;
+        let band = self.up_bytes((MIN_BAND + 2 * self.halo()).min(h), w);
+        mid.max(px * c * 2 + band) + px * 256 * 4 + SLACK
+    }
+
+    /// The latent rows a band of the up path covers when the card has `room` bytes for it over `h` x `w` latents: all
+    /// of them when the whole fits (one pass), else the most whose band, context rows included, fits; None when not
+    /// even a band of a few rows does
+    pub fn band_rows(&self, h: usize, w: usize, room: u64) -> Option<usize> {
+        if self.up_bytes(h, w) + SLACK <= room {
+            return Some(h);
+        }
+        let halo = self.halo();
+        (MIN_BAND..h).rev().find(|r| self.up_bytes((r + 2 * halo).min(h), w) + SLACK <= room)
+    }
+
+    /// RGBA [H, W, 4] bytes from latents float32 [h * w, z] (as the denoiser leaves them, before the statistics). The
+    /// up path runs over the whole when the card has room for it (`NS_QI_VAE_ROOM_GIB`: as if it had that much), else
+    /// a band of latent rows at a time with the rows its convolutions reach each side (the same picture, less memory)
     pub fn decode(&self, nsd: &Nsd, lat: &[f32], h: usize, w: usize) -> Result<(Vec<u8>, usize, usize)> {
         let gpu = &self.gpu;
         let k = ffi::api()?;
@@ -272,48 +415,55 @@ impl Vae {
         ffi::check(unsafe { (k.to_half)(gpu.raw(), zf.fp(), x.ptr(), zl.len() as i64) }, "to half")?;
         let x = self.conv(nsd, &self.post_quant, &x, h, w)?;
         let x = self.conv(nsd, &self.conv_in, &x, h, w)?;
-        let x = self.resnet(nsd, &self.mid[0], x, h, w)?;
+        let x = self.resnet(nsd, &self.mid[0], &x, h, w)?;
         let x = self.attention(nsd, &self.att, x, h, w, self.conv_in.co)?;
-        let mut x = self.resnet(nsd, &self.mid[1], x, h, w)?;
-        let (mut h, mut w) = (h, w);
-        for up in &self.ups {
-            // the block's input, for its shortcut
-            let keep = match up.ft {
-                Some(_) => {
-                    let b = DevBuf::new(gpu, h * w * up.ci * 2)?;
-                    b.copy_within(0, &x, 0, h * w * up.ci * 2)?;
-                    Some(b)
-                }
-                None => None,
-            };
-            for r in &up.resnets {
-                x = self.resnet(nsd, r, x, h, w)?;
+        let x = self.resnet(nsd, &self.mid[1], &x, h, w)?;
+        drop(zf);
+        let (hh, ww) = (h * 16, w * 16);
+        let rgba = DevBuf::new(gpu, hh * ww * 4)?;
+        let room = match std::env::var("NS_QI_VAE_ROOM_GIB").ok().and_then(|v| v.parse::<f64>().ok()) {
+            Some(g) => (g * (1u64 << 30) as f64) as u64,
+            None => {
+                let (total, free) = gpu.memory()?;
+                free.unwrap_or(total).saturating_sub(MARGIN)
             }
-            if let (Some(c), Some(ft), Some(inp)) = (&up.resample, up.ft, keep) {
-                let co = c.co;
-                let u = DevBuf::new(gpu, 4 * h * w * c.ci * 2)?;
-                // SAFETY: x holds h x w x ci halves, u four times that.
-                ffi::check(unsafe { (k.up2)(gpu.raw(), x.ptr(), h as i64, w as i64, c.ci as i64, u.ptr()) }, "upsample")?;
-                prof::mark(nsd, "vae up 2x")?;
-                x = self.conv(nsd, c, &u, 2 * h, 2 * w)?;
-                // SAFETY: inp holds h x w x ci halves, x 2h x 2w x co.
-                ffi::check(unsafe { (k.dupup_add)(gpu.raw(), inp.ptr(), h as i64, w as i64, up.ci as i64, co as i64, ft, x.ptr()) }, "shortcut")?;
+        };
+        let rows = self.band_rows(h, w, room).ok_or_else(|| {
+            Error::no_room(format!("qwen-image-2.1: decoding {ww}x{hh} needs {:.1} GiB more on {}", gib((self.up_bytes((MIN_BAND + 2 * self.halo()).min(h), w) + SLACK).saturating_sub(room)), gpu.name))
+        })?;
+        if prof::mem_on() {
+            eprintln!("vae: {ww}x{hh}: the up path holds {:.2} GiB whole (+{:.1} slack), {:.2} GiB of room", gib(self.up_bytes(h, w)), gib(SLACK), gib(room));
+        }
+        if rows >= h {
+            let (img, ph, pw) = self.up_path(nsd, x, h, w)?;
+            // SAFETY: ph x pw x 4 halves in, as many bytes out.
+            ffi::check(unsafe { (k.to_rgba8)(gpu.raw(), img.ptr(), ph as i64, pw as i64, rgba.ptr().cast()) }, "to rgba")?;
+            nsd.wait()?;
+        } else {
+            let halo = self.halo();
+            let row = w * self.conv_in.co * 2;
+            if prof::mem_on() {
+                eprintln!("vae: {ww}x{hh} in bands of {rows} latent rows (+{halo} each side), {:.2} GiB of room", gib(room));
+            }
+            let mut r0 = 0;
+            while r0 < h {
+                let r1 = (r0 + rows).min(h);
+                let (a, b) = (r0.saturating_sub(halo), (r1 + halo).min(h));
+                let (img, _, pw) = self.up_path(nsd, x.view(a * row, (b - a) * row)?, b - a, w)?;
+                // the band's own rows of the picture
+                let s = (r0 - a) * 16 * pw * 4;
+                let src: *const std::ffi::c_void = img.ptr().cast::<u16>().wrapping_add(s).cast();
+                let dst: *mut u8 = rgba.ptr().cast::<u8>().wrapping_add(r0 * 16 * pw * 4);
+                // SAFETY: the band's rows r0..r1 (16 picture rows each) of img, as many of rgba.
+                ffi::check(unsafe { (k.to_rgba8)(gpu.raw(), src, ((r1 - r0) * 16) as i64, pw as i64, dst) }, "to rgba")?;
                 nsd.wait()?;
-                h *= 2;
-                w *= 2;
+                r0 = r1;
             }
         }
-        let c = self.conv_out.ci;
-        let a = self.norm_silu(nsd, &x, h * w, c, &self.out_norm)?;
-        let img = self.conv(nsd, &self.conv_out, &a, h, w)?;
-        let rgba = DevBuf::new(gpu, h * w * 4)?;
-        // SAFETY: h x w x 4 halves in, as many bytes out.
-        ffi::check(unsafe { (k.to_rgba8)(gpu.raw(), img.ptr(), h as i64, w as i64, rgba.ptr().cast()) }, "to rgba")?;
-        nsd.wait()?;
         gpu.sync()?;
-        let mut out = vec![0u8; h * w * 4];
+        let mut out = vec![0u8; hh * ww * 4];
         rgba.read(0, &mut out)?;
-        Ok((out, w, h))
+        Ok((out, ww, hh))
     }
 
     /// The middle's attention: x + proj(attention(qkv(norm(x)))), one head of every channel over every pixel - as two
@@ -351,6 +501,7 @@ impl Vae {
             r0 += rows;
         }
         prof::mark(nsd, "vae attention")?;
+        prof::mem(nsd, "3 vae")?;
         nsd.linear(o.ptr(), Dt::F16, px, c, a.proj.ptr(), c, a.proj_b.ptr(), n.ptr(), Dt::F16)?;
         nsd.gate_add(x.ptr(), Dt::F16, px, c, n.ptr(), Dt::F16, none(), none())?;
         nsd.wait()?;
@@ -372,7 +523,7 @@ impl Vae {
             let keep = DevBuf::new(gpu, h * w * d.ci * 2)?;
             keep.copy_within(0, &x, 0, h * w * d.ci * 2)?;
             for r in &d.resnets {
-                x = self.resnet(nsd, r, x, h, w)?;
+                x = self.resnet(nsd, r, &x, h, w)?;
             }
             match &d.resample {
                 Some(c) => {
@@ -395,9 +546,9 @@ impl Vae {
                 }
             }
         }
-        let x = self.resnet(nsd, &e.mid[0], x, h, w)?;
+        let x = self.resnet(nsd, &e.mid[0], &x, h, w)?;
         let x = self.attention(nsd, &e.att, x, h, w, e.mid[0].conv2.co)?;
-        let x = self.resnet(nsd, &e.mid[1], x, h, w)?;
+        let x = self.resnet(nsd, &e.mid[1], &x, h, w)?;
         let a = self.norm_silu(nsd, &x, h * w, e.head.ci, &e.out_norm)?;
         let x = self.conv(nsd, &e.head, &a, h, w)?;
         let x = self.conv(nsd, &e.quant, &x, h, w)?;

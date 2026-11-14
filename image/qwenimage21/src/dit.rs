@@ -699,6 +699,13 @@ impl Dit {
         Ok(Prefix { tokens: p, kv, frame: pos })
     }
 
+    /// The bytes a request's denoise holds on the card over `n` latents after a prefix of `p` rows (the text and an
+    /// edit's pictures): the prefix's q|k|v for every block, and the larger of the prefix pass's and a step's
+    /// buffers (`step_bytes`)
+    pub fn denoise_bytes(&self, n: usize, p: usize) -> u64 {
+        (p * 3 * DIM * 2 * self.blocks.len()) as u64 + step_bytes(n, p).max(step_bytes(p, 0))
+    }
+
     /// The velocity for latents `lat` (float32 [hw.0 * hw.1, 64]) at sigma `t`, after the text `pre`: float32 [N, 64].
     /// `block0`: block 0's output rows kept there (a check), when given.
     pub fn velocity(&self, nsd: &Nsd, pre: &Prefix, lat: &DevBuf, hw: (usize, usize), t: f32, block0: Option<&DevBuf>) -> Result<DevBuf> {
@@ -745,6 +752,7 @@ impl Dit {
             prof::mark(nsd, "gate add")?;
             self.block_ffn(nsd, bi, b, &x, n, &md, 0, &zeros, &h, &gp, &act, &o)?;
             if bi == 0 {
+                prof::mem(nsd, "2 dit step")?;
                 if let Some(keep) = block0 {
                     keep.copy_within(0, &x, 0, n * DIM * 4)?;
                 }
@@ -759,9 +767,18 @@ impl Dit {
         let v = DevBuf::f32(gpu, n * LATENT)?;
         self.small(nsd, "proj_out", &self.proj_out, xn.ptr(), n, DIM, LATENT, v.ptr())?;
         prof::mark(nsd, "output")?;
+        prof::mem(nsd, "2 dit step")?;
         nsd.wait()?;
         Ok(v)
     }
+}
+
+/// The buffers `velocity` holds over `n` latents after a prefix of `p` rows: x and the output norm's float32, h | att
+/// | o | the norm's half, [prefix | image] q|k|v, the gate|up product and its activation, the positions and the
+/// output (the kernels' own scratch not counted)
+pub fn step_bytes(n: usize, p: usize) -> u64 {
+    let (n, p, d, f) = (n as u64, p as u64, DIM as u64, FFN as u64);
+    n * d * 4 * 2 + n * d * 2 * 4 + (p + n) * 3 * d * 2 + n * f * 2 * 3 + n * (HEAD as u64 + 1 + LATENT as u64) * 4
 }
 
 #[cfg(test)]

@@ -300,6 +300,8 @@ Qwen-Image 2.1 (`image/qwenimage21`), HunyuanImage 2.1 (`image/hunyuanimage21`),
 | `NS_QI_*` | - | every NS_QI_ setting in nextsycl.conf is passed to the image server | cli (image serve) |
 | `NS_QI_DUMP` | off | Debug: a directory: what the denoiser is given (embeds, pads, cond latents, noise) written there as raw float32 files | image qwenimage21 |
 | `NS_QI_INT8` | 0 | 1: the DiT's block matrices in int8 ConvRot (~1.4x a step, half the VRAM) (--opt-int8) | image qwenimage21 |
+| `NS_QI_MEM` | off | Debug: set: the card's free memory at points of a run (the GPU waited for first), each phase's lowest printed with each picture's time (what a size needs beside the loaded model); `2`: every probe, with the VAE's convolutions and norms named | image qwenimage21 |
+| `NS_QI_VAE_ROOM_GIB` | the card's free memory less 1.5 GiB | Debug: the room (GiB) the VAE decode plans for: under what the whole picture's up path needs, it decodes in bands of latent rows (with the rows its convolutions reach each side) - to check the banded decode at sizes that fit whole | image qwenimage21 |
 | `NS_QI_PROFILE` | off | Debug: set: a GPU wait after each named step, the totals printed (slower; shows where the time goes) | image qwenimage21 |
 | `NS_QI_SIGMAS` | the model's own schedule | a few-step preset: noise levels from 1 down, comma separated (their count is the steps) (--opt-sigmas; per request too) | image qwenimage21 |
 | `NS_QI_SIGMA_SHIFT` | dynamic | dynamic: the picture size's shift on the NS_QI_SIGMAS levels; none: as given (--opt-sigma-shift; per request too) | image qwenimage21 |
