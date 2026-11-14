@@ -144,15 +144,20 @@ unsafe impl Sync for Api {}
 
 static API: OnceLock<std::result::Result<Api, String>> = OnceLock::new();
 
+/// The engine's own kernel library: kernels/llm/qwen4exp and the user's Strata port (kernels/strata), apart from the
+/// llm library (libnextsycl-llm-qwen4exp.so; kernels/build.sh)
+pub const LIB: &str = "llm-qwen4exp";
+
 /// The engine's functions, bound once
 pub fn api() -> nextsycl_core::Result<&'static Api> {
     API.get_or_init(|| {
-        let lib = nextsycl_core::api().map_err(|e| e.0)?;
+        nextsycl_core::api().map_err(|e| e.0)?;   // the llm library first: the engine's resolves its shared part there
+        let lib = nextsycl_core::engine_lib(LIB).map_err(|e| e.0)?;
         macro_rules! sym {
             ($n:literal) => {{
                 let p = lib.symbol($n);
                 if p.is_null() {
-                    return Err(format!("the kernel library has no {} (built without kernels/llm/qwen4exp?)", $n));
+                    return Err(format!("{} has no {}", lib.path.display(), $n));
                 }
                 // SAFETY: the symbol is declared in qwen.h with the field's signature.
                 #[allow(clippy::missing_transmute_annotations)]

@@ -53,6 +53,27 @@ inline void rows_wide(const typename F::Block* const* wr, int nb, const block_q8
 }
 template <typename F, int NC, int L, int R>
 inline void rows_small(const typename F::Block* const* wr, int nb, const block_q8_1* const* xs, int l, const uint32_t* tab, float* acc) {
+    if constexpr (std::is_same_v<F, TQ80>) {
+        // Q8_0: two lanes a block, each its 16 quants (one 16-byte load from the 2-byte aligned block, against one
+        // aligned half of the activations' block): half a block's work a lane, twice the blocks in flight (B70,
+        // 1,536 x 4,096: 476 GB/s cold a lane a block, 501 so)
+        const int h = l & 1;
+        for (int kb = l >> 1; kb < nb; kb += L / 2) {
+            sycl::int4 q[R];
+            float d[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) { q[r] = load16_a2(wr[r][kb].qs + 16 * h); d[r] = (float) wr[r][kb].d; }
+#pragma unroll
+            for (int j = 0; j < NC; ++j) {
+                const block_q8_1* xb = xs[j] + kb;
+                const sycl::int4 u = load16_a4(xb->qs + 16 * h);
+                const float dx = (float) xb->ds[0];
+#pragma unroll
+                for (int r = 0; r < R; ++r) acc[r * NC + j] += d[r] * dx * (float) dp4a4(q[r], u, 0);
+            }
+        }
+        return;
+    }
     for (int kb = l; kb < nb; kb += L) {
         W w[R];
 #pragma unroll
@@ -161,6 +182,131 @@ void mmvq_cols(sycl::queue& q, const void* w, const void* x, float* y, int n_in,
     // one row a set: two (the activations read once for both) measured no faster on either card
     mmvq_cols_p<F, L, 1>(q, w, x, y, n_in, n_out, ncols);
 }
+// ---- Q6_K decode products: Strata's wide Q6_K kernel, copied (the user's Strata B70 port: native_mmvq_q6k_wide_kernel
+// with its 2-byte aligned loads, kernels/strata/src/kernels/native_mmvq.dp.cpp at Strata_B70 3f37281; its bytewise
+// saturating subtract is the plain one here - the 6-bit values less 32 never saturate). Ours (TQ6K, the same 16-byte
+// runs) measured 5-13% slower on matrices of 512-1,280 rows; this one beat the Strata entry point the engines called
+// before (native_mmvq) on 63 of 64 shapes. A row a sub-group, lane g a 16-byte run of ql and of qh in each of 4 blocks a step.
+template <int NCOLS>
+void q6k_wide_kernel(const block_q6_K* __restrict__ w, const block_q8_1* __restrict__ x, float* __restrict__ y, int n_in, int n_out,
+                     const sycl::nd_item<2>& it) {
+    const int lane = int(it.get_local_id(1)), sgi = int(it.get_local_id(0));
+    const int row = int(it.get_group(0)) * WARPS + sgi;
+    if (row >= n_out) return;
+    const int blocks_per_row = n_in / QK, x_stride = n_in / 32;
+    const int g = lane & 7, sub = lane >> 3;
+    const int vh_shift = 2 * ((g & 3) >> 1);
+    const int qh4_idx = 2 * (g >> 2) + (g & 1);
+    const int scale_offset = 8 * (g >> 2) + (g & 3);
+    const int bq8_offset = 4 * (g >> 2) + ((g & 3) >> 1);
+    const int u_int4 = g & 1;
+    float acc[NCOLS] = {};
+    for (int kbx = sub; kbx < blocks_per_row; kbx += 4) {
+        const int kby = kbx * (QK / 32);
+        const block_q6_K* b = w + std::size_t(row) * blocks_per_row + kbx;
+        const sycl::int4 ql4 = load16_a2(b->ql + 16 * g), qh4 = load16_a2(b->qh + 16 * qh4_idx);
+        const float d = (float) b->d;
+        const float dsc0 = d * (float) b->scales[scale_offset], dsc1 = d * (float) b->scales[scale_offset + 4];
+        int vi0[4], vi1[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const uint32_t vl = word_of(ql4, p), vh = word_of(qh4, p) >> vh_shift;
+            vi0[p] = sub_bytes((vl & 0x0f0f0f0f) | ((vh << 4) & 0x30303030), 32);
+            vi1[p] = sub_bytes(((vl >> 4) & 0x0f0f0f0f) | (((vh >> 4) << 4) & 0x30303030), 32);
+        }
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const block_q8_1* xb = x + std::size_t(j) * x_stride + kby + bq8_offset;
+            const sycl::int4 u0 = load16_a4(xb[0].qs + 16 * u_int4), u1 = load16_a4(xb[2].qs + 16 * u_int4);
+            const float ds0 = (float) xb[0].ds[0], ds1 = (float) xb[2].ds[0];
+            const int s0 = dp4a4(i4(vi0), u0, 0), s1 = dp4a4(i4(vi1), u1, 0);
+            acc[j] += ds0 * dsc0 * (float) s0 + ds1 * dsc1 * (float) s1;
+        }
+    }
+    auto sg = it.get_sub_group();
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        float v = acc[j];
+#pragma unroll
+        for (int o = WARP / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+        if (lane == 0) y[std::size_t(j) * n_out + row] = v;
+    }
+}
+template <int NCOLS>
+void q6k_wide_launch(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int n_out) {
+    const auto* W0 = static_cast<const block_q6_K*>(w);
+    const auto* X0 = static_cast<const block_q8_1*>(x);
+    const unsigned groups = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+    q.parallel_for(sycl::nd_range<2>(sycl::range<2>(groups * WARPS, WARP), sycl::range<2>(WARPS, WARP)),
+                   [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] { q6k_wide_kernel<NCOLS>(W0, X0, y, n_in, n_out, it); });
+}
+void q6k_wide(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int n_out, int ncols) {
+    switch (ncols) {
+        case 1: q6k_wide_launch<1>(q, w, x, y, n_in, n_out); return;
+        case 2: q6k_wide_launch<2>(q, w, x, y, n_in, n_out); return;
+        case 3: q6k_wide_launch<3>(q, w, x, y, n_in, n_out); return;
+        case 4: q6k_wide_launch<4>(q, w, x, y, n_in, n_out); return;
+        case 5: q6k_wide_launch<5>(q, w, x, y, n_in, n_out); return;
+        case 6: q6k_wide_launch<6>(q, w, x, y, n_in, n_out); return;
+        case 7: q6k_wide_launch<7>(q, w, x, y, n_in, n_out); return;
+        default: q6k_wide_launch<8>(q, w, x, y, n_in, n_out); return;
+    }
+}
+
+// ---- Q8_0 decode products: Strata's wide32 kernel for Q8_0, copied (the user's Strata B70 port:
+// native_mmvq_wide32_kernel with Wide32Q8, kernels/strata/src/kernels/native_mmvq.dp.cpp at Strata_B70 3f37281): a row a
+// sub-group, two lanes a block (16 quants each, a 16-byte load from the 2-byte aligned block), 16 blocks a step. The
+// same scheme in rows_small measured within the run-to-run spread of it but 2-5% under it on 1-16 MB matrices more
+// often than not (B70); this one is what the engines ran before.
+template <int NCOLS>
+void q80_wide_kernel(const block_q8_0* __restrict__ w, const block_q8_1* __restrict__ x, float* __restrict__ y, int n_in, int n_out,
+                     const sycl::nd_item<2>& it) {
+    const int lane = int(it.get_local_id(1)), sgi = int(it.get_local_id(0));
+    const int row = int(it.get_group(0)) * WARPS + sgi;
+    if (row >= n_out) return;
+    const int blocks_per_row = n_in / 32;
+    const int l = lane % 2, sub = lane / 2;
+    const block_q8_0* wr = w + std::size_t(row) * blocks_per_row;
+    float acc[NCOLS] = {};
+    for (int kb = sub; kb < blocks_per_row; kb += WARP / 2) {
+        const sycl::int4 q = load16_a2(wr[kb].qs + 16 * l);
+        const float d = (float) wr[kb].d;
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const block_q8_1* xb = x + std::size_t(j) * blocks_per_row + kb;
+            acc[j] += d * (float) xb->ds[0] * (float) dp4a4(q, load16_a4(xb->qs + 16 * l), 0);
+        }
+    }
+    auto sg = it.get_sub_group();
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        float v = acc[j];
+#pragma unroll
+        for (int o = WARP / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+        if (lane == 0) y[std::size_t(j) * n_out + row] = v;
+    }
+}
+template <int NCOLS>
+void q80_wide_launch(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int n_out) {
+    const auto* W0 = static_cast<const block_q8_0*>(w);
+    const auto* X0 = static_cast<const block_q8_1*>(x);
+    const unsigned groups = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+    q.parallel_for(sycl::nd_range<2>(sycl::range<2>(groups * WARPS, WARP), sycl::range<2>(WARPS, WARP)),
+                   [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] { q80_wide_kernel<NCOLS>(W0, X0, y, n_in, n_out, it); });
+}
+void q80_wide(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int n_out, int ncols) {
+    switch (ncols) {
+        case 1: q80_wide_launch<1>(q, w, x, y, n_in, n_out); return;
+        case 2: q80_wide_launch<2>(q, w, x, y, n_in, n_out); return;
+        case 3: q80_wide_launch<3>(q, w, x, y, n_in, n_out); return;
+        case 4: q80_wide_launch<4>(q, w, x, y, n_in, n_out); return;
+        case 5: q80_wide_launch<5>(q, w, x, y, n_in, n_out); return;
+        case 6: q80_wide_launch<6>(q, w, x, y, n_in, n_out); return;
+        case 7: q80_wide_launch<7>(q, w, x, y, n_in, n_out); return;
+        default: q80_wide_launch<8>(q, w, x, y, n_in, n_out); return;
+    }
+}
+
 template <typename F>
 void mmvq_any(sycl::queue& q, const void* w, const void* x, float* y, int n_in, int n_out, int ncols) {
     switch (lanes_for<F>(n_in)) {
@@ -205,7 +351,8 @@ std::size_t row_bytes(int type, int64_t n) {
     return b;
 }
 
-// ---- n values of a stored matrix into half: a work-item a sub-block of 32 (a 256-block's lane g, or a 32-block); a
+// ---- n values of a stored matrix into half (Q2_K and IQ2_S: the group kernels below): a work-item a sub-block of 32
+// (a 256-block's lane g, or a 32-block); a
 // work-group's 128 sub-blocks (8 KiB of half) staged in local memory, then written out 16 bytes a work-item in turn
 // (consecutive work-items consecutive chunks - each item's own 64 bytes written directly left the stores strided)
 template <typename F>
@@ -248,6 +395,42 @@ void dequant_launch(sycl::queue& q, const void* src, int64_t n, sycl::half* dst)
                 sycl::group_barrier(it.get_group());
             }
         });
+    });
+}
+
+// ---- Q2_K and IQ2_S into half a group of 8 values a work-item (32 a block, a block a sub-group), the grids read
+// from global memory: each work-item's 16 bytes next to its neighbours' (one store), no local table to fill for a
+// small matrix (B70, an IQ2_S expert 2,048 x 4,096: 38 us with the table, so 30)
+inline void q2k_group(const block_q2_K* b, int t, sycl::half* y) {
+    const int g = t >> 2, part = t & 3, n = g >> 2, j = g & 3, pos = 8 * part;   // sub-block g, values pos .. pos + 7
+    const sycl::half2 dm = b->dm;
+    const uint32_t sc = b->scales[8 * n + 2 * j + (pos >> 4)];
+    const float dl = (float) dm[0] * (float) (sc & 0xF), ml = (float) dm[1] * (float) (sc >> 4);
+    const uint32_t* q = reinterpret_cast<const uint32_t*>(b->qs + 32 * n + pos);
+    const uint32_t w0 = q[0], w1 = q[1];
+    sycl::vec<sycl::half, 8> v;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) v[k] = (sycl::half) (dl * (float) (((k < 4 ? w0 : w1) >> (8 * (k & 3) + 2 * j)) & 3) - ml);
+    *reinterpret_cast<sycl::vec<sycl::half, 8>*>(y) = v;
+}
+inline void iq2s_group(const block_iq2_s* b, int t, sycl::half* y) {
+    const int ib = t >> 2, il = t & 3;   // sub-block ib, group il
+    const uint32_t gi = b->qs[4 * ib + il] | ((uint32_t(b->qh[ib]) << (8 - 2 * il)) & 0x300);
+    const float d = (float) b->d * (0.5f + (float) ((b->scales[ib] >> (4 * (il / 2))) & 0xf)) * 0.25f;
+    const uint32_t signs = b->qs[QK_K / 8 + 4 * ib + il];
+    const uint64_t e = iq2s_grid[gi];
+    sycl::vec<sycl::half, 8> v;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) v[k] = (sycl::half) (d * (float) ((e >> (8 * k)) & 0xff) * (signs >> k & 1 ? -1.f : 1.f));
+    *reinterpret_cast<sycl::vec<sycl::half, 8>*>(y) = v;
+}
+template <typename B, typename G>
+void group_dequant(sycl::queue& q, const void* src, int64_t n, sycl::half* dst, G group) {
+    const auto* b = static_cast<const B*>(src);
+    const std::size_t items = std::size_t(n / 8);
+    q.parallel_for(sycl::nd_range<1>(sycl::range<1>((items + 255) / 256 * 256), sycl::range<1>(256)), [=](sycl::nd_item<1> it) {
+        const std::size_t i = it.get_global_id(0);
+        if (i < items) group(b + i / 32, int(i % 32), dst + 8 * i);
     });
 }
 
@@ -464,23 +647,7 @@ static void trace(const char* fn, int a, int b, int64_t c, int64_t d, int64_t e)
     if (FILE* f = fopen(path, "a")) { fprintf(f, "%s\n", line); fclose(f); }
 }
 
-// The types still on Strata's kernels (kernels/llm/glm5next/mmvq.cpp, ns_ref_*) until the user decides: where ours
-// measured slower on a served path (reference/shared-kernels.cpp, B70 / B65, GB/s of weights read cold):
-// - decode products of Q8_0 (2-16 MB matrices, B70: 3-8% slower, e.g. 4096 x 4096 523 against 541) and Q6_K (512 -
-//   1,024 rows: 5-13% slower; larger ones faster: 25,600 x 6,144 B70 415 against 443... mixed)
-// - expansions to half of Q2_K (B65 17% slower) and IQ2_S (13-20%)
-// - the grouped experts of GLM-5.3's IQ2 file (IQ2_XXS / Q2_K) in prompt passes (below)
-// NS_MMVQ_OWN=1 runs ours for these too (to measure)
-static bool own_all() {
-    static const bool v = std::getenv("NS_MMVQ_OWN") && std::getenv("NS_MMVQ_OWN")[0] == '1';
-    return v;
-}
 extern "C" {
-int ns_ref_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, int64_t n_in, int64_t n_out, int64_t ncols);
-int ns_ref_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* dst);
-int ns_ref_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const uint64_t* grp_ptr, const int32_t* grp_start,
-                       const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t groups, int64_t entries, const void* x_q8_1,
-                       void* scratch, float* out, float limit, int lanes, int phase);
 
 size_t ns_q8_1_bytes(int64_t n_in, int64_t ncols) { return (size_t) (n_in / 32) * sizeof(block_q8_1) * (size_t) ncols; }
 
@@ -521,7 +688,10 @@ int ns_mmvq(ns_gpu* g, int type, const void* w, const void* x_q8_1, float* y, in
     const int bv = block_values(type);
     if (bv == 0) return ns_fail("ns_mmvq: ggml type " + std::to_string(type) + " has no decode kernel");
     if (n_in % bv != 0) return ns_fail("ns_mmvq: n_in " + std::to_string(n_in) + " not a multiple of the type's block");
-    if ((type == 8 || type == 14) && !own_all()) return ns_ref_mmvq(g, type, w, x_q8_1, y, n_in, n_out, ncols);
+    // Q8_0: the copied wide32 kernel, but rows of fewer than 1,024 values ours (a row a few lanes: 8,192 x 128 B70 268 GB/s
+    // cold against its 187)
+    if (type == 8 && n_in >= 1024) { q80_wide(g->q, w, x_q8_1, y, (int) n_in, (int) n_out, (int) ncols); return 0; }
+    if (type == 14) { q6k_wide(g->q, w, x_q8_1, y, (int) n_in, (int) n_out, (int) ncols); return 0; }
     with_type(type, [&](auto f) { mmvq_any<decltype(f)>(g->q, w, x_q8_1, y, (int) n_in, (int) n_out, (int) ncols); });
     return 0;
     NS_CATCH
@@ -532,7 +702,8 @@ int ns_dequant_f16(ns_gpu* g, int type, const void* src, int64_t n, uint16_t* ds
     NS_TRY
     if (block_values(type) == 0 || n % 256 != 0) return ns_fail("ns_dequant_f16: ggml type " + std::to_string(type));
     trace("dequant_f16", type, 0, n, 0, 0);
-    if ((type == 10 || type == 22) && !own_all()) return ns_ref_dequant_f16(g, type, src, n, dst);
+    if (type == 10) { group_dequant<block_q2_K>(g->q, src, n, reinterpret_cast<sycl::half*>(dst), [](const block_q2_K* b, int t, sycl::half* y) { q2k_group(b, t, y); }); return 0; }
+    if (type == 22) { group_dequant<block_iq2_s>(g->q, src, n, reinterpret_cast<sycl::half*>(dst), [](const block_iq2_s* b, int t, sycl::half* y) { iq2s_group(b, t, y); }); return 0; }
     with_type(type, [&](auto f) { dequant_launch<decltype(f)>(g->q, src, n, reinterpret_cast<sycl::half*>(dst)); });
     return 0;
     NS_CATCH
@@ -562,11 +733,6 @@ int ns_moe_grouped(ns_gpu* g, int gu_type, int d_type, int64_t n_embd, int64_t n
     if (!ns_moe_grouped_supported(gu_type, d_type, n_embd, n_ff))
         return ns_fail("ns_moe_grouped: types " + std::to_string(gu_type) + "/" + std::to_string(d_type) + " not supported");
     if (groups <= 0 || entries <= 0) return 0;
-    // GLM-5.3's IQ2_XXS / Q2_K experts in a prompt pass (many entries a group): still Strata's (with ours the IQ2 file's
-    // prompt measured 79.7 pp against 118.7 on B70 + B65); decode widths (a few entries a group) ours
-    if (gu_type == 16 && d_type == 10 && entries > 4 * groups && !own_all())
-        return ns_ref_moe_grouped(g, gu_type, d_type, n_embd, n_ff, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, groups, entries, x_q8_1, scratch, out,
-                                  limit, lanes, phase);
     trace("moe", gu_type, d_type, n_embd, n_ff, phase);
     const std::size_t f = al256(std::size_t(entries) * std::size_t(n_ff) * sizeof(float));
     auto* base = static_cast<uint8_t*>(scratch);

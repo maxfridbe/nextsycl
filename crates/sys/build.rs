@@ -1,10 +1,10 @@
-//! Embeds the kernel libraries (dist/libnextsycl-<kind>.so, libnextsycl-flash.so, libdnnl.so.3; or NS_LIB_DIST) into the
+//! Embeds the kernel libraries (dist/libnextsycl-<kind>.so, qwen4exp's libnextsycl-llm-qwen4exp.so, libnextsycl-flash.so, libdnnl.so.3; or NS_LIB_DIST) into the
 //! binary: `LIBS`, each as (file name, bytes). The kernels are built before the Rust (./build.sh does); without them the
 //! set is empty and the libraries are opened from files (lib.rs). Silos stay files: they open on demand.
 use std::fmt::Write;
 use std::path::PathBuf;
 
-const LIBS: &[&str] = &["libnextsycl-llm.so", "libnextsycl-image.so", "libnextsycl-video.so", "libnextsycl-audio.so", "libnextsycl-model3d.so",
+const LIBS: &[&str] = &["libnextsycl-llm.so", "libnextsycl-llm-qwen4exp.so", "libnextsycl-image.so", "libnextsycl-video.so", "libnextsycl-audio.so", "libnextsycl-model3d.so",
                         "libnextsycl-flash.so", "libdnnl.so.3"];
 
 fn main() {

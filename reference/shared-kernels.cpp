@@ -1,6 +1,8 @@
-// Build in the oneAPI image: icpx -O2 -fsycl -Ikernels/ns reference/shared-kernels.cpp -o shared_kernels dist/libnextsycl-llm.so -Wl,-rpath,dist
+// Build in the oneAPI image: icpx -O2 -fsycl -Ikernels/ns reference/shared-kernels.cpp -o shared_kernels dist/libnextsycl-llm.so
+//   dist/libnextsycl-llm-qwen4exp.so -Wl,-rpath,dist
 // The shared decode kernels (kernels/llm/common: ns_mmvq, ns_dequant_f16, ns_moe_grouped) against Strata's (ns_ref_*,
-// while both are in the library) on real weights from GGUF files: their outputs compared, and their rates - "hot" one
+// kernels/llm/qwen4exp/strata_ref.cpp in qwen4exp's library) on real weights from GGUF files: their outputs compared,
+// and their rates - "hot" one
 // matrix rerun (mostly from L2), "cold" copies of it cycled through (512 MB in all, as a token reads each once).
 // `shared_kernels GPU LIST`, a line of LIST one test:
 //   mm  FILE TENSOR [EXPERT]                    a decode product (1 and 4 columns, random activations)

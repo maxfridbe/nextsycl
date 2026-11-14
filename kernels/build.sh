@@ -2,7 +2,7 @@
 # kernels/build.sh: the kernel libraries, one a kind - libnextsycl-llm.so, libnextsycl-image.so, libnextsycl-video.so,
 # libnextsycl-audio.so, libnextsycl-model3d.so -
 # each the shared part (kernels/ns: GPUs, memory, copies, the C ABI's core) and that kind's engines
-# (kernels/<kind>/<arch>; llm also kernels/strata, the imported Strata kernels). Runs inside the build image (oneAPI
+# (kernels/<kind>/<arch>; qwen4exp and the imported Strata kernels, kernels/strata, apart: libnextsycl-llm-qwen4exp.so). Runs inside the build image (oneAPI
 # 2026.1); ../build.sh starts it there.
 #   AOT=bmg-g31 (default: the Arc Pro B70 / B65 die; "" = SPIR-V, JIT at first use)   JOBS=8   ONLY="a.dp.cpp b..."
 set -eo pipefail
@@ -67,23 +67,29 @@ KEEP=$(all_sources | tr / _ | sed 's/$/.o/')
 for o in "$OBJ"/*.o; do
   grep -qxF "$(basename "$o")" <<< "$KEEP" || rm -f "$o" "$o.log"
 done
-# one library a kind: the shared part and that kind's engines (llm also the Strata kernels its engines use), so a
-# program of one kind never loads another kind's code. Each is linked beside its old self, then renamed over it: a
-# running server keeps the library it mapped (writing over a mapped library in place would change the code under it)
+# one library a kind: the shared part and that kind's engines, so a program of one kind never loads another kind's
+# code. Each is linked beside its old self, then renamed over it: a running server keeps the library it mapped (writing
+# over a mapped library in place would change the code under it)
 for k in $KINDS; do
   # the shared part is in every library: without it the link still succeeds and the library loads nowhere
   nsobjs=$(ls "$OBJ"/ns_*.o)
-  objs="$nsobjs $(ls "$OBJ"/${k}_*.o 2>/dev/null | grep -v '_silo_' || true)"
+  # (the llm library without qwen4exp: below)
+  objs="$nsobjs $(ls "$OBJ"/${k}_*.o 2>/dev/null | grep -v '_silo_' | grep -v '^.*/llm_qwen4exp_' || true)"
   extra=()
-  if [ "$k" = llm ]; then
-    objs="$objs $(ls "$OBJ"/strata_*.o)"
-  else
+  if [ "$k" != llm ]; then
     objs="$objs $(ls "$OBJ"/diffusion_*.o)"
     extra=(-L"$DNNL/lib" -ldnnl -Wl,-rpath,'$ORIGIN')
   fi
   echo "==> linking libnextsycl-$k.so"
   icpx "${LINK[@]}" $objs "${extra[@]}" -o "$OUT/.libnextsycl-$k.so.new" && mv -f "$OUT/.libnextsycl-$k.so.new" "$OUT/libnextsycl-$k.so"
 done
+# qwen4exp's own library: its engine (kernels/llm/qwen4exp) on the user's Strata port (kernels/strata), the only code
+# that uses the imported kernels; opened by the engine after the llm library, whose shared part it resolves against
+qwobjs="$(ls "$OBJ"/llm_qwen4exp_*.o 2>/dev/null | grep -v '_silo_' || true)"
+if [ -n "$qwobjs" ]; then
+  echo "==> linking libnextsycl-llm-qwen4exp.so"
+  icpx "${LINK[@]}" $qwobjs $(ls "$OBJ"/strata_*.o) -o "$OUT/.libnextsycl-llm-qwen4exp.so.new" && mv -f "$OUT/.libnextsycl-llm-qwen4exp.so.new" "$OUT/libnextsycl-llm-qwen4exp.so"
+fi
 # the silos: a model's kernels tuned for it alone (kernels/<kind>/<arch>/silo/) in their own library,
 # dist/silo/libnextsycl-<arch>.so, which its engine opens at load (falling back to the shared kernels without it).
 # Its undefined symbols (the shared part's) resolve against the kind's library, loaded before it.

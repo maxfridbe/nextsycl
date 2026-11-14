@@ -72,6 +72,19 @@ pub fn silo(arch: &str) -> Result<Option<&'static nextsycl_sys::Silo>> {
     Ok(s)
 }
 
+/// An engine's own kernel library (`libnextsycl-<name>.so`, beside the kind's: `nextsycl_sys::Api::engine_lib`), opened
+/// on the first ask and kept
+pub fn engine_lib(name: &str) -> Result<&'static nextsycl_sys::Silo> {
+    static LIBS: std::sync::Mutex<Vec<(String, &'static nextsycl_sys::Silo)>> = std::sync::Mutex::new(Vec::new());
+    let mut m = LIBS.lock().unwrap();
+    if let Some((_, l)) = m.iter().find(|(n, _)| n == name) {
+        return Ok(*l);
+    }
+    let l: &'static nextsycl_sys::Silo = Box::leak(Box::new(api()?.engine_lib(name).map_err(Error)?));
+    m.push((name.to_string(), l));
+    Ok(l)
+}
+
 fn check(api: &Api, rc: i32, what: &str) -> Result<()> {
     if rc == 0 {
         Ok(())
