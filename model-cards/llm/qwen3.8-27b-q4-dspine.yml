@@ -1,11 +1,11 @@
-# Qwen3.8-27B UD-Q4_K_M with Tencent's DSpine draft (7 drafts; the B70, 256K + 32K) - for code
+# Qwen3.8-27B UD-Q4_K_M with Tencent's DSpine draft (7 drafts; either card, 256K + 32K) - for code
 # model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
 id: qwen3.8-27b-q4-dspine
 kind: llm
 arch: qwen35
-title: Qwen3.8-27B UD-Q4_K_M + DSpine draft (code; the B70, 256K + 32K)
+title: Qwen3.8-27B UD-Q4_K_M + DSpine draft (code; either card, 256K + 32K)
 about: 'The Qwen3.8-27B UD-Q4_K_M card with Tencent''s DSpine-b16 draft (5 layers, 2 B) in MTP''s place, 7 drafts a step, at any context (the draft keeps a ring of its 8K window). tg 71 on code against MTP''s 55-59 (greedy, B70), but 48 on prose against 50 and 35-41 on 14K-69K-token documents against 38-50: use it for code. The XMX verify products make 5+ drafts differ from plain greedy at near-ties (NS_Q35_XMX=0 restores bytes, tg 52). 256K + 32K sessions with an 8-bit attention cache (NS_Q35_KV=auto: KL 0.0002 against half); 30.2 GiB of the card, 1.8 GiB free: the draft takes 2.6 GiB, and with half-precision caches even 128K + 32K does not fit.'
-gpus: '0'
+gpus: '0|1'                     # one of the cards, the B70 preferred: the whole model on whichever has the room
 vram_gib: 30.2                   # measured on a B70 with both sessions made (30,877 MB of 32,768); the draft's weights and tables are 2.6 GiB of it, its ring caches 0.3 GiB a session
 ctx: '262144,32768'
 tools: true

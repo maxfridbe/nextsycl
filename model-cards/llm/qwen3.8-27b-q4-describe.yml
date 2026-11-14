@@ -10,7 +10,7 @@ arch: qwen35
 base_model: Qwen3.8-27B             # image.describe: the language model it is (image.describers)
 title: Qwen3.8-27B UD-Q4_K_M, pictures to prompts (16K)
 about: 'Qwen''s dense Qwen3.8 27B with its vision tower (Qwen3-VL''s ViT): reads a picture and writes the prompt that would draw it, for image.describe; Unsloth''s dynamic 4-bit, MTP drafts, a short context; no tools, no background tasks'
-gpus: '0'
+gpus: '0|1'                     # one of the cards, the B70 preferred: the whole model on whichever has the room
 vram_gib: 20.0                   # its memory on the card when it runs (19.2 GiB measured on a B70 after describes)
 ctx: '16384,8192'
 tools: false
