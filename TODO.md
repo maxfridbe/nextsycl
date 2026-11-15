@@ -108,6 +108,19 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
       c > stream row, counting the 3 silence rows); decode the silence frames ahead and cut them. nextcuda: ~15x real
       time on an RTX 5070, 2.1 GiB, logits cos 0.9997, decoder PCM cos 1.0. The platform routes any "zonos3" id to a box
       listing it.
+- [ ] Delta (nextcuda b0f25cf): main file backbone-ptq-edit.gguf (same as the release on plain text); new roles
+      zac-encoder (zac-encoder.gguf) and ssl-teacher (ssl-teacher.gguf), rev d2d142a8, SHA-256s pinned. speaker-mode
+      reference with a recording = raw-reference cloning (first 60 s -> zac-encoder + 16-layer W2V-BERT teacher -> codec
+      codes as prefix); needs Zyphra's BF16 rounding (fp32 teacher drifts 24 %, cb0 agreement 80 %); nextcuda parity vs
+      zac-encoder-cli cb0 97.5 %, cb1 95.5 %, cb2-9 76-89 %; +5.6 GiB only during the encode, codes cached for the last
+      64 recordings. Options normalize on/off (Zyphra textnorm, Rust port), level on/off (default on: -19 dBFS speech,
+      3 s gated window, 0.5 s gain smoothing, -12..+40 dB, soft limiter; off = decoder level -3 dB). Markup [pause],
+      [pause 0.25|0.5|1|2], [start], [ipa ...], [steer ID=DOSE,...]words[/steer] (ids as zonos3-cli --request);
+      (laugh) read aloud, [laugh] / <laugh/> dropped; the text pass leaves a card's `keep` regex spans alone. Still
+      coming on nextcuda: LACI/short text, speech editing, streaming.
+- [ ] Model cards: an `annotations` list (syntax / keep / does / tested) and `annotations_note`, as nextcuda's
+      model-cards/annotations.yml (the platform shows them beside the text box per engine) - for every card, not only
+      ZONOS3.
 
 ## Done
 
