@@ -21,10 +21,10 @@ Sources checked:
 | `speridlabs/idol/decoder.safetensors` | 203,171,696 | OctreeProbabilityFixedlenDecoder (4 blocks) |
 | `speridlabs/idol/decoder_gs.safetensors` | 949,083,036 | GaussianFixedlenDecoder (16 blocks) |
 | `speridlabs/idol/birefnet.safetensors` | 444,466,856 | BiRefNet: tensor for tensor ZhengPeng7/BiRefNet's (max diff 0) minus 12 training heads - the `birefnet` key nextsycl already has is used |
-| `facebook/dinov3-vith16plus-pretrain-lvd1689m/model.safetensors` | 3,362,432,800 | **gated** (manual approval, DINOv3 License) |
-| `black-forest-labs/FLUX.2-dev/vae/diffusion_pytorch_model.safetensors` | 336,213,556 | **gated** (FLUX [dev] Non-Commercial License) |
+| `facebook/dinov3-vith16plus-pretrain-lvd1689m/model.safetensors` @c807c9ee | 3,362,432,800 | **gated** (manual approval, DINOv3 License): the card's `gated:` file, pulled with the Hugging Face token |
+| `black-forest-labs/FLUX.2-klein-4B/vae/diffusion_pytorch_model.safetensors` @e7b7dc27 | 168,120,878 | the FLUX.2 VAE (bfloat16), Apache-2.0, ungated - the one Budget3D's own encoders.py loads (its config names FLUX.2-dev) |
 
-The gated encoders are the cards' `local` parts: `NS_M3D_B3D_DINO` / `NS_M3D_B3D_VAE` in nextsycl.conf name them.
+`NS_M3D_B3D_DINO` / `NS_M3D_B3D_VAE` override either file.
 
 ## 2. Pipeline
 
@@ -85,8 +85,9 @@ The gated encoders are the cards' `local` parts: `NS_M3D_B3D_DINO` / `NS_M3D_B3D
 
 ## 4. Parity (B70, `nextsycl model3d check`, against reference/budget3d/ref.py float32 on the CPU)
 
-Without the gated encoders the condition is a seeded normal draw of their shapes (Budget3D's own parity gate does the
-same); the encoders' code is checked on seeded random weights of their exact shapes (`encoders.py`).
+The denoiser's and decoders' stages run on a seeded normal draw of the condition's shapes (Budget3D's own parity gate
+does the same); the picture side (`encoders.py`, the real DINOv3 ViT-H+ and FLUX.2-klein VAE, float32 on the CPU) on a
+1024 px photo (a fox in snow, mode real) and a 768 px render (a tin robot, mode synthetic).
 
 | stage | worst relative RMS (cosine) |
 |---|---|
@@ -101,9 +102,10 @@ same); the encoders' code is checked on seeded random weights of their exact sha
 | octree decoder logits, all 8 levels | <= 2.6e-3 |
 | Gaussian decoder features (2048 anchors) | 3.1e-3 base latent, 6.2e-3 Turbo latent (>= 0.99998) |
 | Gaussian activation | <= 5e-8 |
-| framing (BiRefNet cut-out, crop, Lanczos) of a 768 px picture | 4.7e-3; no value more than 2 levels off |
-| DINOv3 ViT-H+/16 code (random weights) | 7.0e-5 |
-| FLUX.2 VAE encoder code (random weights) | 9.4e-4 |
+| framing (BiRefNet cut-out, crop, Lanczos): robot / fox | 4.7e-3 (no value more than 2 levels off) / 5.1e-3 (110 of 3.1M, at the cut's edge) |
+| DINOv3 ViT-H+/16, real weights: robot / fox | 3.9e-4 / 2.3e-4 (cosine 1.000000) |
+| FLUX.2 VAE encoder, real weights: robot / fox | 1.2e-3 / 1.3e-3 (0.999999) |
+| (the same code on seeded random weights) | 7.0e-5, 9.4e-4 |
 
 ## 5. Speed (B70, one object, 262,144 Gaussians, seconds)
 
@@ -114,9 +116,19 @@ From the zero condition (`check --stages bench`: denoise + decode, encoders excl
 | Budget3D-Idol, 50 steps, CFG 3 | 30.5 | 17.2 | 12.0 | 2.1-2.4 GiB |
 | Budget3D-Idol-Turbo, 5 steps | 2.2 | 1.5 | 1.1 | 2.6-2.7 GiB |
 
-(The reference's H100 fp32 numbers: 63 s at 100 %, 32 s at 50 %.) The picture side - BiRefNet, the framing, DINOv3
-ViT-H+ in float32 (3.4 GB loaded for the request) and the VAE encoder - measured with random weights of the real
-shapes: about 4-5 s a request with the loads (the 3D server's whole request at budget 0.5: 22.1 s).
+(The reference's H100 fp32 numbers: 63 s at 100 %, 32 s at 50 %.)
+
+From a picture, with the real encoders (`nextsycl model3d gen`, the fox photo; BiRefNet, framing, DINOv3 ViT-H+ in
+float32 loaded for the request and the VAE included - prepare 1.2 s, encode 2.7 s; seconds an object, the card's peak):
+
+| model | card | budget 1 | 0.5 | 0.25 | peak |
+|---|---|---|---|---|---|
+| Budget3D-Idol | B70 | 34.7 | 21.5 | 16.3 | 5.0 GiB |
+| Budget3D-Idol-Turbo | B70 | 6.0 | 5.6 | 5.3 | 5.7 GiB |
+B65ROWS
+
+Renders (`nextsycl model3d tool render`, 4 sides) of every object are in hardac1:~/src/idol/renders: the fox and the
+robot are themselves from every side at every budget (0.25 visibly coarser), the backs plausible.
 
 ## 6. Licences
 
@@ -124,25 +136,15 @@ shapes: about 4-5 s a request with the loads (the 3D server's whole request at b
 - Idol's weights and idol-sdk: Apache-2.0. BiRefNet (ZhengPeng7): MIT.
 - DINOv3 ViT-H+/16: the DINOv3 License (Meta), gated with manual approval (name, date of birth, affiliation...).
 - The FLUX.2 VAE as Idol names it (`black-forest-labs/FLUX.2-dev`, `vae/`): the repository is under the FLUX [dev]
-  Non-Commercial License Agreement and BFL's Acceptable Use Policy (gated, approved on accepting). Not used here.
+  Non-Commercial License Agreement and BFL's Acceptable Use Policy (gated, approved on accepting). Not used.
   BFL's Apache-2.0, ungated FLUX.2-klein-4B carries a FLUX.2 VAE too (168 MB, bfloat16; FLUX.2-dev's is 336 MB) - Budget3D's
-  own encoders.py loads it from there by default; whether that is acceptable is the user's call, it was not used.
+  own encoders.py loads it from there by default; the user chose it, and the cards pull it.
 
 ## 7. Open
 
-- The real encoders (gated): their weights' parity, a real picture end to end, the cards' vram_gib measured with them.
 - The page's WebGL2 splat drawing is type-checked and its PLY reader run on a real result (node), not looked at in a
   browser (no WebGL in a headless one here); the CPU rasterizer (`nextsycl model3d tool render`) draws the results.
 - DINOv3 runs in float32 (Idol: bfloat16): exact but 3.4 GB loaded a request (`NS_M3D_B3D_RESIDENT` keeps it).
 - No silo yet: the blocks run on the shared linears and attention; a fused RePo / norm and graph capture are the
   obvious next steps.
 
-The whole pipeline from a 768 px picture (`nextsycl model3d gen`, BiRefNet, the encoders with random weights of the
-real shapes, loads included; B70, seconds, the card's peak):
-
-| model | budget 1 | 0.5 | 0.25 | of which prepare / encode | peak |
-|---|---|---|---|---|---|
-| Budget3D-Idol | 35.0 | 21.4 | 16.3 | 1.2 / 2.7-3.1 | 5.0 GiB |
-| Budget3D-Idol-Turbo | 5.9 | 5.5 | 5.4 | 1.2 / 2.5-2.8 | 5.7 GiB |
-
-The B65 was not measured (the box was shared with other runs).

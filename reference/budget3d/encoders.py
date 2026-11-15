@@ -1,15 +1,15 @@
 """reference/budget3d/encoders.py: Idol's picture side on the CPU - its framing (idol/preprocess.py, BiRefNet) and the
 two image encoders' code paths - dumped for `nextsycl model3d check DIR --stages pre,enc`.
 
-The real encoders are gated on Hugging Face (DINOv3 ViT-H+/16, the FLUX.2 VAE). Without them this checks the code,
-not the weights: it builds transformers' DINOv3ViTModel with ViT-H+/16's configuration (Budget3D's
+With --dino / --vae the real files (the cards': DINOv3 ViT-H+/16's model.safetensors, gated, and FLUX.2-klein-4B's
+vae/diffusion_pytorch_model.safetensors - the VAE Budget3D's own encoders.py loads) are run. Without them this checks
+the code, not the weights: it builds transformers' DINOv3ViTModel with ViT-H+/16's configuration (Budget3D's
 scripts/convert_dinov3_to_hf.py: 1280 wide, 32 layers, 20 heads, SwiGLU 5120, 4 registers) and diffusers'
 AutoencoderKLFlux2 with its default (FLUX.2) configuration, both seeded random, saves their weights as safetensors (the
 files the engine is pointed at: --opt-dino / --opt-vae) and dumps what they make of the framed picture, in float32
-(Idol runs DINOv3 and the VAE in bfloat16), the VAE's posterior mean (Budget3D's deterministic encoder). With
---dino / --vae the real files are used instead.
+(Idol runs DINOv3 and the VAE in bfloat16), the VAE's posterior mean (Budget3D's deterministic encoder).
 
-    python -I encoders.py OUT --code CODE --picture P [--birefnet model.safetensors] [--dino F] [--vae F] [--mode synthetic]
+    python -I encoders.py OUT --code CODE --picture P [--birefnet model.safetensors] [--dino F] [--vae F] [--mode synthetic|real]
 
 Dumps: picture.png (the input, as PNG), pre.npy [1024, 1024, 3] (the framed picture, 0..255), enc_dino.npy [4101, 1280], enc_vae.npy [4101, 128];
 dino.safetensors / vae.safetensors when random.
