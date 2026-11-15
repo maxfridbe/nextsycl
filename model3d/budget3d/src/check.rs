@@ -137,8 +137,13 @@ fn encoders(e: &Budget3d, d: &Path, stages: &[&str], lg: &mut Log) -> Result<f64
         lg.say(format!("pre: {} x {}, {}", pic.width, pic.height, if crate::prep::has_real_alpha(&pic) { "its own alpha" } else if r.is_some() {
             "cut out by BiRefNet" } else { "no remover: taken whole" }));
         let t0 = std::time::Instant::now();
-        let pre = crate::prep::prepare(&pic, r.as_deref(), 1.2)?;
+        let margin = std::fs::read(d.join("framing.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["margin"].as_f64()).unwrap_or(1.2) as f32;
+        let pre = crate::prep::prepare(&pic, r.as_deref(), margin)?;
         lg.say(format!("pre: framed in {:.2} s", t0.elapsed().as_secs_f64()));
+        if let Ok(png) = pre.png_bytes(&[]) {
+            let _ = std::fs::write(d.join("pre_here.png"), png);
+        }
         let got: Vec<f32> = pre.data.iter().map(|v| *v as f32).collect();
         lg.line("framed picture", &got, &want);
         let off = got.iter().zip(&want).filter(|(a, b)| (*a - *b).abs() > 2.0).count();

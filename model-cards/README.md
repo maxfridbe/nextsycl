@@ -52,6 +52,10 @@ guide: guides/chat.md           # how to prompt it (Markdown, relative to this f
 architecture's silo when one is built. `nextsycl models search` shows each model's (`-`: the shared kernels). The
 registry entry carries it as the loader's settings (`NS_SILO_NAME`, `NS_SILO_REQUIRED`, `NS_SILO=0`).
 
+A file on a gated Hugging Face repository names the page whose terms its account must accept under `gated` (`gated:
+https://huggingface.co/<repo>`): `pull` downloads it with the account's token (`HF_TOKEN`, else huggingface_hub's token
+file), and without one stops, saying which terms to accept (`model3d/budget3d-idol.yml`'s DINOv3).
+
 A file published as byte ranges of itself (`name.gguf.part01-of-40` ...) lists them under `parts`, in order, each
 with its `url`, `size` and `sha256` (the file keeps its own `size`, `sha256` and `path`, no `url`): `pull` downloads
 and checks each, joins them, checks the whole and removes the parts (`llm/deepseek-v4.1-flash-vq.yml`).

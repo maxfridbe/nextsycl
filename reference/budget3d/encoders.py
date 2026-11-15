@@ -52,6 +52,8 @@ def main():
         remover = remover.eval().float()
     pic = Image.open(a.picture)
     pic.save(os.path.join(a.out, "picture.png"))
+    with open(os.path.join(a.out, "framing.json"), "w") as f:
+        f.write('{"margin": %r}' % CROP_MARGIN[a.mode])
     pre = preprocess_image(pic, background_remover=remover, image_size=1024, crop_margin=CROP_MARGIN[a.mode])
     arr = np.array(pre).astype(np.float32)
     np.save(os.path.join(a.out, "pre.npy"), arr)
