@@ -43,12 +43,17 @@ pub struct Dino {
 impl Dino {
     pub fn load(f: &St, cx: &Ctx) -> Result<Dino> {
         let g = &cx.gpu;
-        // the transformers checkpoint, with or without a "model." prefix
-        let pre = if f.has("embeddings.cls_token") { "" } else if f.has("model.embeddings.cls_token") { "model." } else {
-            return Err(Error(format!("{}: not a DINOv3 ViT (transformers' DINOv3ViTModel)", f.path())));
+        // the transformers checkpoint: each part with or without a "model." prefix (transformers 5 names the layers
+        // model.layer.N, Meta's converted files layer.N)
+        let pre_of = |name: &str| -> Option<&'static str> {
+            if f.has(name) { Some("") } else if f.has(&format!("model.{name}")) { Some("model.") } else { None }
         };
+        let not = || Error(format!("{}: not a DINOv3 ViT (transformers' DINOv3ViTModel)", f.path()));
+        let pre = pre_of("embeddings.cls_token").ok_or_else(not)?;
+        let lpre = pre_of("layer.0.norm1.weight").ok_or_else(not)?;
+        let npre = pre_of("norm.weight").ok_or_else(not)?;
         let hidden = f.shape(&format!("{pre}embeddings.cls_token"))?.last().copied().unwrap_or(0);
-        if hidden != DIM || !f.has(&format!("{pre}layer.{}.mlp.gate_proj.weight", LAYERS - 1)) {
+        if hidden != DIM || !f.has(&format!("{lpre}layer.{}.mlp.gate_proj.weight", LAYERS - 1)) {
             return Err(Error(format!("{}: not DINOv3 ViT-H+/16 (width {hidden}; Idol reads the 1280-wide, 32-layer SwiGLU model)", f.path())));
         }
         let ln = |p: &str| -> Result<(DevBuf, DevBuf)> {
@@ -56,7 +61,7 @@ impl Dino {
         };
         let mut layers = Vec::new();
         for i in 0..LAYERS {
-            let p = format!("{pre}layer.{i}");
+            let p = format!("{lpre}layer.{i}");
             let a = format!("{p}.attention");
             let mut wq = f.vec_n(&format!("{a}.q_proj.weight"), DIM * DIM)?;
             wq.extend(f.vec_n(&format!("{a}.k_proj.weight"), DIM * DIM)?);
@@ -86,7 +91,7 @@ impl Dino {
         }
         let mut prefix = f.vec_n(&format!("{pre}embeddings.cls_token"), DIM)?;
         prefix.extend(f.vec_n(&format!("{pre}embeddings.register_tokens"), 4 * DIM)?);
-        Ok(Dino { embed: Lin::load(f, g, &format!("{pre}embeddings.patch_embeddings"), false)?, prefix, layers, norm: ln(&format!("{pre}norm"))? })
+        Ok(Dino { embed: Lin::load(f, g, &format!("{pre}embeddings.patch_embeddings"), false)?, prefix, layers, norm: ln(&format!("{npre}norm"))? })
     }
 
     /// The tokens [5 + (size / 16)^2, 1280] of a picture's planes [3, size, size] in [0, 1]
