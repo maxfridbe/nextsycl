@@ -653,9 +653,10 @@ impl<'g> Ricursive<'g> {
         let code = w.ty.code() as i32;
         // SAFETY: arithmetic only.
         let mmvq = unsafe { (k.mmvq_supported)(code) } != 0;
-        if t <= 8 && mmvq && (self.mmvq || rows > self.g.n_ff) {
-            // SAFETY: arithmetic only.
-            let silo = self.silo.filter(|s| unsafe { (s.mmvq_supported)(code, kk) } != 0);
+        // a type only the silo covers is still a decode product (the shared kernels take fewer types since 41bebbc)
+        // SAFETY: arithmetic only.
+        let silo = self.silo.filter(|s| unsafe { (s.mmvq_supported)(code, kk) } != 0);
+        if t <= 8 && (mmvq || silo.is_some()) && (self.mmvq || rows > self.g.n_ff) {
             let own;
             let qb = match xq {
                 Some(q) => q,
@@ -664,12 +665,14 @@ impl<'g> Ricursive<'g> {
                     &own
                 }
             };
-            return match (silo, &qb.split) {
+            match (silo, &qb.split) {
                 // SAFETY: the matrix in its blocks, x in both forms, y [t, rows].
-                (Some(s), Some(sp)) => ffi::check(unsafe { (s.mmvq)(self.raw(), code, wv.ptr(), qb.std.ptr(), sp.ptr(), y.fp(), kk, n, t as i64) }, "mmvq silo"),
+                (Some(s), Some(sp)) => return ffi::check(unsafe { (s.mmvq)(self.raw(), code, wv.ptr(), qb.std.ptr(), sp.ptr(), y.fp(), kk, n, t as i64) }, "mmvq silo"),
                 // SAFETY: the matrix in its blocks, x's Q8_1 blocks, y [t, rows].
-                _ => ffi::check(unsafe { (k.mmvq)(self.raw(), code, wv.ptr(), qb.std.ptr(), y.fp(), kk, n, t as i64) }, "mmvq"),
-            };
+                _ if mmvq => return ffi::check(unsafe { (k.mmvq)(self.raw(), code, wv.ptr(), qb.std.ptr(), y.fp(), kk, n, t as i64) }, "mmvq"),
+                // x without the split form the silo reads: the half product below
+                _ => {}
+            }
         }
         // the matrix expanded to half, x to half, then the half product
         let elems = rows * cols;
