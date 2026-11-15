@@ -267,13 +267,14 @@ impl Budget3d {
     }
 
     /// Free memory on the card, when the driver says, against what a stage needs (plus 1.5 GiB): the xe driver has
-    /// no out-of-memory error, so a stage that would over-commit stops here instead
+    /// no out-of-memory error, so a stage that would over-commit stops here instead - as no room (503, retryable:
+    /// the front door stops idle models on the card for "needs N GiB more" and sends the request again)
     fn room(&self, what: &str, bytes: f64) -> Result<()> {
         if let Ok((_, Some(free))) = self.cx.gpu.memory() {
             let need = bytes + 1.5 * GIB;
             if (free as f64) < need {
-                return Err(Error(format!("{what}: {:.1} GiB free on {}, {:.1} GiB needed (with 1.5 GiB to spare)", free as f64 / GIB, self.cx.gpu.name,
-                                         need / GIB)));
+                return Err(Error::no_room(format!("{what}: needs {:.1} GiB more on {} ({:.1} GiB free, {:.1} GiB needed with 1.5 GiB to spare)",
+                                                  (need - free as f64) / GIB, self.cx.gpu.name, free as f64 / GIB, need / GIB)));
             }
         }
         Ok(())

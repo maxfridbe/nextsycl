@@ -83,6 +83,28 @@ Sources checked:
   ply), and wfe/model3d draws them (`splat.ts`: EWA quads, back-to-front after a 16-bit counting sort) with a token
   budget slider (options.budget).
 
+## 3a. The camera in a result
+
+A result's `camera` is the view the picture was seen from, as Idol's `decode_camera` gives it, plus where that is in
+the PLY (glue/serve/src/model3d.rs `camera_json`):
+
+- `yaw`, `pitch`: radians. Idol's camera frame is z up; the camera sits at
+  `radius * (cos pitch * sin yaw, cos pitch * cos yaw, sin pitch)` in it and looks at the origin.
+- That frame's x, y, z are the PLY's x, z and -y (the PLY's up is -y). In PLY coordinates the camera is at
+  `eye = radius * (cos pitch * sin yaw, -sin pitch, cos pitch * cos yaw)`, `target` (0, 0, 0), `up` (0, -1, 0).
+  Found by fitting: the splats seen from each of the 48 signed axis mappings against the framed picture's silhouette, the
+  real fox photo (mode real) - base IoU 0.83 for this mapping (the next 0.80, a mirror), Turbo 0.46 (its geometry
+  is looser, the same mapping within 0.002 of the best).
+- `fov`: the vertical field of view, degrees (the framed picture is square). `radius`: in the PLY's units.
+- `radius` 1000 is Idol's orthographic camera (inverse distance under 1e-3): `projection` is then `orthographic` and
+  `half_height` = 1000 tan(fov / 2) the view's half height; else `perspective`. A picture may come out
+  orthographic - a fov near 0.09 at radius 1000 is a view about 1.6 units high, not a telephoto lens.
+- In a y-up viewer that turns the PLY upright by a half turn about x (y and z negated), the eye is
+  `radius * (cos pitch * sin yaw, sin pitch, -cos pitch * cos yaw)`: for an orbit camera at
+  `(cos p' sin y', sin p', cos p' cos y')` that is `y' = pi - yaw`, `p' = pitch`.
+- Each model samples its camera with the latent, from the seed's noise: base and Turbo (and two seeds) give
+  different cameras for one picture, as their shapes differ.
+
 ## 4. Parity (B70, `nextsycl model3d check`, against reference/budget3d/ref.py float32 on the CPU)
 
 The denoiser's and decoders' stages run on a seeded normal draw of the condition's shapes (Budget3D's own parity gate

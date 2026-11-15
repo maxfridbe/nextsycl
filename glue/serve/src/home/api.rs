@@ -1014,7 +1014,13 @@ impl Home {
                 let mut body = b.clone();
                 body["model"] = json!(id);
                 body["response_format"] = json!("url");
-                relay(&t, "POST", &format!("/v1/model3d/{}", m.name), Some(&body), 7200)
+                // the engine's own no room for a stage (Budget3D's image encoders load per request): idle work on its
+                // card stops for it, then once more
+                let path = format!("/v1/model3d/{}", m.name);
+                match relay(&t, "POST", &path, Some(&body), 7200) {
+                    Err((503, why)) if self.room_for_request(&id, &why) => relay(&t, "POST", &path, Some(&body), 7200),
+                    r => r,
+                }
             }
             ("image" | "audio" | "model3d", "info") => {
                 let id = self.pick(m.kind, b, &all)?;

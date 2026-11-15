@@ -70,6 +70,35 @@ fn f(x: f32) -> Value {
     json!(((x as f64) * 1e4).round() / 1e4)
 }
 
+/// A request's engine options as given back: a number as a number, true / false as booleans, else the text
+fn options_json(given: &nextsycl_core::options::Given) -> Value {
+    given.iter().map(|(k, v)| {
+        let t = v.trim();
+        let val = match t {
+            "true" => json!(true),
+            "false" => json!(false),
+            _ => t.parse::<f64>().ok().filter(|x| x.is_finite()).map_or_else(|| json!(v), |x| json!(x)),
+        };
+        (k.clone(), val)
+    }).collect::<serde_json::Map<String, Value>>().into()
+}
+
+/// The camera a splatting model says the picture was seen from ([yaw, pitch, radius, fov], Idol's decode_camera), with
+/// where that puts it in the PLY's own frame. Idol's camera frame is z up: camera x, y, z are the PLY's x, z and -y
+/// (the PLY's up is -y), found by fitting the picture's silhouette to the splats seen from each axis mapping. yaw and
+/// pitch: radians, the camera at radius * (cos pitch sin yaw, cos pitch cos yaw, sin pitch) in that frame, looking at
+/// the origin; fov: the vertical field of view, degrees; radius 1000: Idol's orthographic camera (a half height of
+/// 1000 tan(fov / 2))
+fn camera_json(c: [f32; 4]) -> Value {
+    let [yaw, pitch, radius, fov] = c;
+    let eye = [radius * pitch.cos() * yaw.sin(), -radius * pitch.sin(), radius * pitch.cos() * yaw.cos()];
+    let ortho = radius >= 999.0;
+    json!({"yaw": yaw, "pitch": pitch, "radius": radius, "fov": fov,
+           "projection": if ortho { "orthographic" } else { "perspective" },
+           "half_height": if ortho { json!(radius * (fov.to_radians() / 2.0).tan()) } else { Value::Null },
+           "eye": eye, "target": [0.0, 0.0, 0.0], "up": [0.0, -1.0, 0.0]})
+}
+
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -425,7 +454,7 @@ impl Model3dServer {
             meta["cfg"] = f(req.cfg.unwrap_or(d.cfg));
             meta["views"] = json!(views.iter().map(|v| v.0.side.clone()).collect::<Vec<_>>());
             if a.splats {
-                meta["options"] = json!(req.extra);
+                meta["options"] = options_json(&req.extra);
                 engine.splat(&req, &mut report).map(Made::Splats)
             } else {
                 engine.generate(&req, &mut report).map(|m| Made::Mesh(Box::new(m)))
@@ -457,7 +486,7 @@ impl Model3dServer {
             }
             Made::Splats(s) => {
                 meta["gaussians"] = json!(s.len());
-                meta["camera"] = json!(s.camera.map(|c| json!({"yaw": c[0], "pitch": c[1], "radius": c[2], "fov": c[3]})));
+                meta["camera"] = json!(s.camera.map(camera_json));
                 (s.len(), "gaussians")
             }
         };
@@ -578,5 +607,28 @@ mod tests {
         assert_eq!(v[1].0.side.as_deref(), Some("back"));
         assert_eq!(v[0].0.image.width, 2);
         assert!(Model3dServer::views(&json!({"image": 5})).is_err());
+    }
+
+    #[test]
+    fn options_come_back_typed() {
+        let given: nextsycl_core::options::Given = [("budget", "0.5"), ("mode", "real"), ("resident", "true")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let v = options_json(&given);
+        assert_eq!(v["budget"], json!(0.5));
+        assert_eq!(v["mode"], json!("real"));
+        assert_eq!(v["resident"], json!(true));
+    }
+
+    #[test]
+    fn the_camera_in_the_ply_frame() {
+        // yaw 0, pitch 0: on the frame's +y, which is the PLY's +z; up is the PLY's -y
+        let c = camera_json([0.0, 0.0, 2.0, 40.0]);
+        assert_eq!(c["projection"], "perspective");
+        assert!((c["eye"][2].as_f64().unwrap() - 2.0).abs() < 1e-6 && c["eye"][0].as_f64().unwrap().abs() < 1e-6);
+        // looking down from above (pitch > 0): the eye on the PLY's -y side
+        let c = camera_json([0.0, 0.5, 2.0, 40.0]);
+        assert!(c["eye"][1].as_f64().unwrap() < 0.0);
+        let o = camera_json([0.3, 0.0, 1000.0, 0.09]);
+        assert_eq!(o["projection"], "orthographic");
+        assert!((o["half_height"].as_f64().unwrap() - 1000.0 * (0.045f64).to_radians().tan()).abs() < 1e-3);
     }
 }

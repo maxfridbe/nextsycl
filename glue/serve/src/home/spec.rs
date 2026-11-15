@@ -175,6 +175,7 @@ const MODEL_STATE: &str = r#"{"type": "object", "properties": {"id": {"type": "s
   "vouch_mb": {"type": "object", "additionalProperties": {"type": "integer"}, "description": "VRAM it is counted for, by card"},
   "spans": {"type": "boolean", "description": "a chat model spread over every card (its model card: gpus all): its cards are not a choice"},
   "measured": {"type": "boolean"}, "headroom_mb": {"type": "object", "additionalProperties": {"type": "integer"}}, "headroom_given": {"type": "boolean"},
+  "license": {"type": ["string", "null"], "description": "SPDX id or the licence's name (its entry's, else its model card's); null: not stated"}, "commercial": {"type": ["boolean", "null"], "description": "whether its weights may be used commercially; null: not stated"}, "license_note": {"type": ["string", "null"]},
   "page": {"type": "integer", "description": "the port of its own page"},
   "capabilities": {"type": "array", "items": {"type": "string"}, "description": "what it does, in neutral words: chat, stream, tools, vision, describe; generate, edit, compose, img2img, loras, few_step, rgba (transparent pictures: rgba true); ocr, read_pages, pdf; song, lyrics, instrumental; speech, builtin_voices, clone, saved_voices, enrolled_voices, continue_from, voice_design, voice_direction, vocal_events; text_to_video, image_to_video, sound, chain, first_last_frame, voice_reference, controlnet, inpaint, reference_images, reference_videos"},
   "methods": {"type": "array", "items": {"type": "string"}, "description": "the /rpc methods that take it as model"}}}"#;

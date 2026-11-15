@@ -14,6 +14,9 @@ kind: llm                       # the file's folder
 arch: qwen35                    # the engine that runs it (GGUF general.architecture, or the engine's ARCH)
 title: Qwen3.8-27B UD-Q4_K_M (4-bit; the B70, 128K + 32K)
 about: Qwen's dense Qwen3.8 27B ...
+license: apache-2.0             # optional: the weights' licence (SPDX id, else its name); the front door's model rows show it
+commercial: true                # optional: whether the weights may be used commercially (false: research / non-commercial only)
+license_note: '...'             # optional: what the one word leaves out (other parts' licences, gated terms)
 gpus: '0'                       # the GPUs it loads on: '0', '1', '0,1' (one copy over both), 'all' (weakest first), or '0|1' (one of
                                 #   them, the whole model on the first with room, in that order - llm cards that fit one card)
 vram_gib: 29.0                  # its memory on each card when it runs, as measured (the front door keeps the card

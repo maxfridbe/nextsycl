@@ -121,6 +121,13 @@ fn needs_more_mb(why: &str) -> Option<u64> {
     (n > 0.0).then(|| (n * 1024.0).ceil() as u64)
 }
 
+/// A model's licence field (license, commercial, license_note): its registry entry's, else its model card's; null when
+/// neither says
+fn licence(m: &Value, cards: &[Value], k: &str) -> Value {
+    let card = cards.iter().find(|c| [s(m, "catalog"), s(m, "id")].iter().any(|i| !i.is_empty() && c["id"] == i.as_str()));
+    Some(&m[k]).filter(|v| !v.is_null()).or_else(|| card.map(|c| &c[k])).cloned().unwrap_or(Value::Null)
+}
+
 /// A card's free memory, MiB: total less used, less what each load under way (its server's port, the MiB it was
 /// placed for) has not taken yet - two loads planned at once on one card must not both count the same free memory
 fn free_on(c: &Value, pending: &[(u16, u64)]) -> u64 {
@@ -603,6 +610,9 @@ impl Home {
         // and for an image model whether its text encoder describes (a native describer card reads its file)
         let dc = if need("image") && mc.is_empty() { self.o.cfg.cards() } else { Vec::new() };
         let dc = if mc.is_empty() { &dc } else { &mc };
+        // and for every model its licence (license, commercial, license_note: its entry's, else its card's)
+        let lc_read;
+        let lc = if dc.is_empty() { lc_read = self.o.cfg.cards(); &lc_read } else { dc };
         let holds = self.holds();
         all.iter().filter(|m| registry::kind_of(m) != "lora").map(|m| {
             let (id, kind) = (s(m, "id"), registry::kind_of(m).to_string());
@@ -673,6 +683,7 @@ impl Home {
             }
             json!({"concurrency": concurrency, "coexistence": coexistence, "copies_now": copies_now,
                    "max_copies": max_copies, "recommended_copies": recommended_copies, "at_once": at_once,
+                   "license": licence(m, lc, "license"), "commercial": licence(m, lc, "commercial"), "license_note": licence(m, lc, "license_note"),
                    "id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "gpus_one_of": registry::one_of(m), "state": state,
                    "spans": spans_all(m, &mc),
                    "pinned": enabled && m["pinned"] == true, "held_s": holds.get(s(m, "id").as_str()).map_or(0.0, |h| h.reserved(now()).round()),

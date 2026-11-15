@@ -3,12 +3,15 @@
 id: budget3d-idol-turbo
 kind: model3d
 arch: budget3d-idol
+license: apache-2.0
+commercial: true
+license_note: 'Budget3D and Idol weights Apache-2.0, BiRefNet MIT, the FLUX.2 VAE from FLUX.2-klein-4B Apache-2.0; the DINOv3 image encoder is under Meta''s DINOv3 License (gated: its terms accepted on Hugging Face; commercial use allowed, with its acceptable-use and trade-control terms)'
 title: 'Budget3D-Idol-Turbo (a picture to 3D Gaussian splats in 5 steps, any token budget; Apache-2.0)'
 about: 'BudgetAny''s Budget3D fine-tune of Sperid Labs'' Idol-turbo: Budget3D-Idol''s pipeline with Idol-turbo''s two phase-LoRA experts (a slow one while t >= 0.5, a fast one below; merged into the matrices at load) in 5 Euler steps without guidance - one denoiser pass a step. Same encoders (DINOv3 gated: pulled with the Hugging Face token), decoders and token budget.'
-gpus: '0'
+gpus: '0,1'
 vram_gib: 6.5                    # B70 peak 5.7 GiB from a picture (encoders of the real shapes, random weights); two merged copies of the adapted matrices
 does: [generate, splat]
-env: {}
+env: {NS_M3D_B3D_RESIDENT: '1'}  # the image encoders stay loaded: the front door counts them in the model's memory, and no request reloads DINOv3 (3.4 GB)
 files:
   dino: dinov3-vith16plus        # defined in budget3d-idol.yml
   vae: flux2-klein-vae

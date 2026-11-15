@@ -3,12 +3,15 @@
 id: budget3d-idol
 kind: model3d
 arch: budget3d-idol
+license: apache-2.0
+commercial: true
+license_note: 'Budget3D and Idol weights Apache-2.0, BiRefNet MIT, the FLUX.2 VAE from FLUX.2-klein-4B Apache-2.0; the DINOv3 image encoder is under Meta''s DINOv3 License (gated: its terms accepted on Hugging Face; commercial use allowed, with its acceptable-use and trade-control terms)'
 title: 'Budget3D-Idol (a picture to 3D Gaussian splats at any token budget; Apache-2.0)'
 about: 'BudgetAny''s Budget3D fine-tune of Sperid Labs'' Idol: DINOv3 ViT-H+/16 and FLUX.2 VAE tokens of the picture, a 378M flow transformer over 8,192 latent tokens and the camera (50 Euler steps, guidance 3) that runs at a token budget - the latent''s flattest regions, empty space first, merged into coarser tokens and refined back to every point - then Idol''s octree and Gaussian decoders: up to 1,048,576 Gaussians as a 3DGS PLY, and the camera the picture was seen from. BiRefNet cuts opaque pictures out. DINOv3 is gated (the DINOv3 License): accept its terms on Hugging Face, and `models pull` fetches it with the account''s token; the FLUX.2 VAE comes from the Apache-2.0 FLUX.2-klein-4B.'
-gpus: '0'
+gpus: '0,1'
 vram_gib: 6.0                    # B70 peak 5.0 GiB from a picture (encoders of the real shapes, random weights: the real ones are gated)
 does: [generate, splat]
-env: {}
+env: {NS_M3D_B3D_RESIDENT: '1'}  # the image encoders stay loaded: the front door counts them in the model's memory, and no request reloads DINOv3 (3.4 GB)
 files:
   dino:                          # gated: pulled with the Hugging Face token (HF_TOKEN or `hf auth login`) once the terms are accepted
     key: dinov3-vith16plus
