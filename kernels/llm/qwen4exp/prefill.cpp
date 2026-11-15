@@ -163,6 +163,7 @@ extern "C" {
 
 int ns_qw_prefill_buffers(ns_qw* w, int64_t chunk, float** R) {
     NS_TRY
+    QW_ON(*w->q);
     if (chunk < 1) return ns_fail("qwen: a prompt chunk of no tokens");
     if (w->pf == nullptr || w->pf->T < chunk) {
         w->q->wait();
@@ -208,6 +209,7 @@ int ns_qw_prefill_buffers(ns_qw* w, int64_t chunk, float** R) {
 
 int ns_qw_prefill(ns_qw* w, ns_qw_state* st, int64_t T, const int32_t* tokens, int64_t pos0, const float* ple_rows) {
     NS_TRY
+    QW_ON(*w->q);
     Pf* p = w->pf;
     if (p == nullptr || T < 1 || T > p->T) return ns_fail("qwen: a prompt chunk past the prompt path's buffers");
     if (pos0 + T > st->max_cells) return ns_fail("qwen: the prompt runs past the session's context");

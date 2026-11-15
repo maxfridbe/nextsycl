@@ -119,6 +119,7 @@ extern "C" {
 
 int ns_qw_cvec_set(ns_qw* w, const float* dir, const float* s, int n_layer, int mode) {
     NS_TRY
+    QW_ON(*w->q);
     if (n_layer != w->n_layer) return ns_fail("qwen cvec: a vector of another layer count");
     if (w->last_st != nullptr || w->pf != nullptr) return ns_fail("qwen cvec: set before any window");
     qw::cvec_free(w);
@@ -143,6 +144,7 @@ int ns_qw_cvec_set(ns_qw* w, const float* dir, const float* s, int n_layer, int 
 
 int ns_qw_cvec_enable(ns_qw* w, int on) {
     NS_TRY
+    QW_ON(*w->q);
     if (w->cv == nullptr) return 0;
     w->q->memcpy(w->cv->on, &on, 4).wait();
     return 0;

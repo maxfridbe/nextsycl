@@ -353,6 +353,7 @@ extern "C" {
 
 int ns_qw_new(ns_gpu* g, const ns_qw_desc* d, ns_qw** out) {
     NS_TRY
+    QW_ON(g->q);
     native_preset();
     auto* w = new ns_qw();
     w->g = g;
@@ -439,6 +440,7 @@ int ns_qw_buffers(ns_qw* w, float** hand_in, float** hand_out, size_t* hand_floa
 
 int ns_qw_state_new(ns_qw* w, int64_t max_cells, ns_qw_state** out) {
     NS_TRY
+    QW_ON(*w->q);
     if (max_cells > w->max_cells || max_cells < 8) return ns_fail("qwen: a session's context past the stage's");
     auto* st = new ns_qw_state();
     st->g = w->g;
@@ -523,6 +525,7 @@ void ns_qw_state_free(ns_qw_state* st) {
 
 int ns_qw_state_reset(ns_qw* w, ns_qw_state* st) {
     NS_TRY
+    QW_ON(*w->q);
     // everything but the page tables: zero (Strata's session_init / qsa_state_zero)
     sycl::queue& q = w->g->q;
     q.memset(st->gdn, 0, (size_t) w->nG * GDN_FLOATS * 4);
@@ -570,6 +573,7 @@ int ns_qw_state_bytes(ns_qw_state* st, int64_t pos, uint64_t* bytes) {
 
 int ns_qw_state_save(ns_qw* w, ns_qw_state* st, int64_t pos, void* host) {
     NS_TRY
+    QW_ON(*w->q);
     uint8_t* h = (uint8_t*) host;
     for (const auto& p : st->parts) {
         const uint64_t b = part_bytes(st, p, pos);
@@ -583,6 +587,7 @@ int ns_qw_state_save(ns_qw* w, ns_qw_state* st, int64_t pos, void* host) {
 
 int ns_qw_state_load(ns_qw* w, ns_qw_state* st, int64_t pos, const void* host) {
     NS_TRY
+    QW_ON(*w->q);
     if (pos > st->max_cells) return ns_fail("qwen: a checkpoint past this session's context");
     const uint8_t* h = (const uint8_t*) host;
     for (const auto& p : st->parts) {
@@ -597,6 +602,7 @@ int ns_qw_state_load(ns_qw* w, ns_qw_state* st, int64_t pos, const void* host) {
 
 int ns_qw_state_copy(ns_qw* w, ns_qw_state* dst, const ns_qw_state* src, int64_t pos) {
     NS_TRY
+    QW_ON(*w->q);
     if (dst->max_cells < pos || dst->parts.size() != src->parts.size()) return ns_fail("qwen: copying a session into a smaller one");
     for (size_t i = 0; i < src->parts.size(); ++i)
         w->g->q.memcpy((uint8_t*) dst->arena + dst->parts[i].off, (const uint8_t*) src->arena + src->parts[i].off,
@@ -623,6 +629,7 @@ int ns_qw_set_silo(ns_qw* w, void* i8_available, void* i8_supported, void* i8_gr
 
 int ns_qw_dequant_f32(ns_gpu* g, int type, const void* src, int64_t n, float* dst) {
     NS_TRY
+    QW_ON(g->q);
     // iq_dequant_f32 exits the process on what it does not take: refuse those here
     if (!strata::kernels::iq_supported(type) || n <= 0 || n % 256 != 0)
         return ns_fail("ns_qw_dequant_f32: ggml type " + std::to_string(type) + ", " + std::to_string(n) + " values");
@@ -651,6 +658,7 @@ int ns_qw_set_sampling(ns_qw* w, float temperature, float top_p, int top_k, floa
 int ns_qw_window(ns_qw* w, ns_qw_state* st, int T, const int32_t* tokens, int64_t pos0, const float* ple_rows,
                  int logits_from, float* logits_host, int32_t* argmax_host) {
     NS_TRY
+    QW_ON(*w->q);
     if (T < 1 || T > MAXT) return ns_fail("qwen: a window holds 1.." + std::to_string(MAXT) + " tokens");
     if (pos0 + T > st->max_cells) return ns_fail("qwen: the window runs past the session's context");
     sycl::queue* cs = w->q;
@@ -741,6 +749,7 @@ int ns_qw_window(ns_qw* w, ns_qw_state* st, int T, const int32_t* tokens, int64_
 
 int ns_qw_state_warm(ns_qw* w, ns_qw_state* st, int max_t) {
     NS_TRY
+    QW_ON(*w->q);
     // every graph a session's decode uses, recorded now (Strata's warm: no capture inside a decode round)
     for (int T = 1; T <= std::min(max_t, MAXT); ++T) run_graph(*w->q, st->win[T], [&] { window_body(w, st, T); }, false);
     run_graph(*w->q, st->commit, [&] { commit_body(w, st); }, false);
@@ -751,6 +760,7 @@ int ns_qw_state_warm(ns_qw* w, ns_qw_state* st, int max_t) {
 
 int ns_qw_commit(ns_qw* w, ns_qw_state* st, int n_keep) {
     NS_TRY
+    QW_ON(*w->q);
     if (st != w->last_st || n_keep < 1 || n_keep > w->last_t) return ns_fail("qwen: a commit that is not the last window's");
     w->last_st = nullptr;
     if (w->last_t == 1) return 0;   // a one-token window committed itself

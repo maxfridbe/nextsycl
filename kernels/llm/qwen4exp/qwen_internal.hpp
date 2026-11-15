@@ -6,6 +6,7 @@
 #include "ns_internal.hpp"
 
 #include <sycl/sycl.hpp>
+#include <dpct/dpct.hpp>
 
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -59,6 +60,30 @@ inline bool graphs_on() {
     static const bool on = [] { const char* v = std::getenv("NS_QW_EAGER"); return !(v && v[0] == '1'); }();
     return on;
 }
+
+// The stage's GPU as dpct's current device on this thread for the call (the previous one back after). Strata's
+// kernels keep some tables in dpct device memory (native_mmvq's IQ4_NL codebook): a launch makes the table for its
+// queue's GPU, but its command group reads the pointer through dpct's default queue - the current device's, the first
+// GPU unless one is selected. With another GPU's stage first, that device's table did not exist yet: it was made (a
+// copy submitted) inside the command group - "Calls to sycl::queue::submit cannot be nested" while a session's graphs
+// were recorded with the B65 first - and a stage on the second GPU would read the first GPU's table. Every entry point
+// that launches work holds one (QW_ON); the per-device settings Strata keys by the current device id follow too.
+struct OnDevice {
+    bool pushed = false;
+    explicit OnDevice(const sycl::queue& q) {
+        auto& m = dpct::dev_mgr::instance();
+        unsigned id = 0;
+        try { id = m.get_device_id(q.get_device()); } catch (const std::runtime_error&) { return; }   // not in dpct's list
+        m.push_device(id);
+        pushed = true;
+    }
+    ~OnDevice() {
+        if (pushed) dpct::dev_mgr::instance().pop_device();
+    }
+    OnDevice(const OnDevice&) = delete;
+    OnDevice& operator=(const OnDevice&) = delete;
+};
+#define QW_ON(queue) qw::OnDevice qw_on_device_(queue)
 
 // `body`'s work on q: recorded into `slot` the first time (a graph a window size and session: the session's state
 // pointers are in it), replayed after. Everything that varies between replays is read from device or pinned memory.

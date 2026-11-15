@@ -394,6 +394,7 @@ extern "C" {
 
 int ns_qw_mtp_load(ns_qw* w, const char* rt_dir, int max_t, int64_t window, int embd_type, const void* embd, size_t embd_row) {
     NS_TRY
+    QW_ON(*w->q);
     if (w->le != w->n_layer || w->E.out == nullptr) return ns_fail("qwen mtp: the draft layer goes on the stage with the head");
     if (max_t < 2 || max_t > MAXT) return ns_fail("qwen mtp: a window of 2.." + std::to_string(MAXT) + " tokens");
     if (w->mtp != nullptr) return ns_fail("qwen mtp: loaded already");
@@ -520,6 +521,7 @@ int ns_qw_mtp_load(ns_qw* w, const char* rt_dir, int max_t, int64_t window, int 
 
 int ns_qw_mtp_prefill(ns_qw* w, ns_qw_state* st, int64_t n, int64_t cell0, const int32_t* next_tokens) {
     NS_TRY
+    QW_ON(*w->q);
     Mtp* m = w->mtp;
     if (m == nullptr || st->mtp.k_q == nullptr) return ns_fail("qwen mtp: no draft layer (or a session made before it)");
     if (n > prefill_cap(w)) return ns_fail("qwen mtp: the prompt rows are not the prompt path's");
@@ -550,6 +552,7 @@ int ns_qw_mtp_prefill(ns_qw* w, ns_qw_state* st, int64_t n, int64_t cell0, const
 int ns_qw_mtp_draft(ns_qw* w, ns_qw_state* st, const int32_t* tokens, int64_t p, int a, int max_drafts, float min_p,
                     int32_t* drafts, float* probs, int* n_out) {
     NS_TRY
+    QW_ON(*w->q);
     Mtp* m = w->mtp;
     *n_out = 0;
     if (m == nullptr || st->mtp.k_q == nullptr) return ns_fail("qwen mtp: no draft layer (or a session made before it)");
