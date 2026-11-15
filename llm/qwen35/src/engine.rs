@@ -1015,16 +1015,16 @@ impl<'g> Qwen35<'g> {
         }
         // SAFETY: arithmetic only.
         let mmvq = unsafe { (k.mmvq_supported)(w.ty.code() as i32) } != 0;
-        if t <= 8 && mmvq {
+        // the silo's product for the types it covers (kernels/llm/qwen35/silo; it reads the split layout too), the
+        // shared one otherwise - a type only the silo covers (Q3_K: the MTP file's head) is still a decode product
+        // SAFETY: arithmetic only.
+        let silo = self.silo.filter(|s| {
+            // SAFETY: arithmetic only.
+            unsafe { (s.mmvq_supported)(w.ty.code() as i32, kk) != 0 || s.xmx_covers.is_some_and(|f| f(w.ty.code() as i32, kk, n, t as i64) != 0) }
+        });
+        if t <= 8 && (mmvq || silo.is_some()) {
             // SAFETY: arithmetic only.
             let q8 = unsafe { (k.q8_1_bytes)(kk, t as i64) };
-            // the silo's product for the types it covers (kernels/llm/qwen35/silo; it reads the split layout too), the
-            // shared one otherwise
-            // SAFETY: arithmetic only.
-            let silo = self.silo.filter(|s| {
-                // SAFETY: arithmetic only.
-                unsafe { (s.mmvq_supported)(w.ty.code() as i32, kk) != 0 || s.xmx_covers.is_some_and(|f| f(w.ty.code() as i32, kk, n, t as i64) != 0) }
-            });
             let own;
             let qb = match xq {
                 Some(q) => q,
@@ -1033,15 +1033,17 @@ impl<'g> Qwen35<'g> {
                     &own
                 }
             };
-            return match (silo, &qb.split) {
-                (Some(s), Some(sp)) => self.op("mmvq silo", key, wb + q8 + 4 * t * rows, flops, || unsafe {
+            match (silo, &qb.split) {
+                (Some(s), Some(sp)) => return self.op("mmvq silo", key, wb + q8 + 4 * t * rows, flops, || unsafe {
                     // SAFETY: the matrix in its blocks, x in both forms, y [t, rows].
                     (s.mmvq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), qb.std.ptr(), sp.ptr(), y.fp(), kk, n, t as i64)
                 }),
                 // SAFETY: the matrix in its blocks, x's Q8_1 blocks, y [t, rows].
-                _ => self.op("mmvq", key, wb + q8 + 4 * t * rows, flops,
-                             || unsafe { (k.mmvq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), qb.std.ptr(), y.fp(), kk, n, t as i64) }),
-            };
+                _ if mmvq => return self.op("mmvq", key, wb + q8 + 4 * t * rows, flops,
+                                            || unsafe { (k.mmvq)(self.raw(), w.ty.code() as i32, w.buf.ptr(), qb.std.ptr(), y.fp(), kk, n, t as i64) }),
+                // x without the split form the silo reads: the half product below
+                _ => {}
+            }
         }
         // the matrix expanded to half (directly, or through float32), x to half, then the half product
         let elems = rows * cols;
