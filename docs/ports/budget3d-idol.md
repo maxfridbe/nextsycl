@@ -125,10 +125,11 @@ float32 loaded for the request and the VAE included - prepare 1.2 s, encode 2.7 
 |---|---|---|---|---|---|
 | Budget3D-Idol | B70 | 34.7 | 21.5 | 16.3 | 5.0 GiB |
 | Budget3D-Idol-Turbo | B70 | 6.0 | 5.6 | 5.3 | 5.7 GiB |
-B65ROWS
+| Budget3D-Idol | B65 | 52.0 | 31.0 | 23.4 | 5.0 GiB |
+| Budget3D-Idol-Turbo | B65 | 7.7 | 6.7 | 6.3 | 5.7 GiB |
 
 Renders (`nextsycl model3d tool render`, 4 sides) of every object are in hardac1:~/src/idol/renders: the fox and the
-robot are themselves from every side at every budget (0.25 visibly coarser), the backs plausible.
+robot are themselves from every side at every budget (0.25 visibly coarser; Turbo at 0.25 loses the fox's face), the backs plausible, and the B65's objects the B70's.
 
 ## 6. Licences
 
