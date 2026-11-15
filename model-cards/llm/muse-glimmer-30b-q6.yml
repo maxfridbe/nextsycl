@@ -6,6 +6,7 @@ arch: muse-glimmer
 title: Muse Glimmer 30B Abliterated Q6_K (6-bit; either card with its drafter, 128K + 32K)
 about: 'Meta''s dense agentic Muse Glimmer 30B, abliterated (Blackfrost), 6-bit (Q6_K) on one card: 52 layers of gated attention (39 over a 2,048 sliding window, 13 full), a dense SwiGLU, logits soft-capped; it reasons on a to=self channel before its answer; its DFlash drafter beside it drafts 15 tokens a step; 21.3 GiB + 1.5'
 gpus: '0|1'                     # one of the cards, the B70 preferred: the whole model on whichever has the room
+vram_gib: 27.2                   # measured 2026-11-14 with its sessions made, alone on each card: B70 27,788 MB, B65 27,788 MB used (the larger); llm start picks the card by it
 ctx: 131072,32768
 tools: false
 tasks: true

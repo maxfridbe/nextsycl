@@ -6,6 +6,7 @@ arch: qwen4exp
 title: Qwen3.8-Flash-Next Coder IQ1_M uncensored (refusal projection; either card, 128K + 32K)
 about: the Coder with the speed projection
 gpus: '0|1'                     # one of the cards, the B70 preferred: the whole model on whichever has the room
+vram_gib: 30.8                   # measured 2026-11-14 with its sessions made, alone on each card: B70 31,508 MB, B65 31,509 MB used (the larger); llm start picks the card by it
 streams: true                   # its PLE rows read from the file every window while it serves: keep it on the fastest drive
 ctx: 131072,32768
 tools: true

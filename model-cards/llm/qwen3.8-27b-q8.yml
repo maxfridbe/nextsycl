@@ -1,12 +1,13 @@
-# Qwen3.8-27B Q8_0 (8-bit; either card, 32K)
+# Qwen3.8-27B Q8_0 (8-bit; the B70, 32K)
 # model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
 id: qwen3.8-27b-q8
 kind: llm
 arch: qwen35
 base_model: Qwen3.8-27B             # image.describe: the language model it is (image.describers)
-title: Qwen3.8-27B Q8_0 (8-bit; either card, 32K)
+title: Qwen3.8-27B Q8_0 (8-bit; the B70, 32K)
 about: 'Qwen''s dense Qwen3.8 27B: 64 layers (48 gated DeltaNet, 16 gated full attention), a dense SwiGLU; Unsloth''s GGUF - the most faithful; 27 GiB'
-gpus: '0|1'                     # one of the cards, the B70 preferred: the whole model on whichever has the room
+gpus: '0'                       # not either card: 2026-11-14 it loaded (26.1 GiB) on the B65 and on the B70 but made no
+                                #   session on either (a 32K session needs 2.27 GiB, 3.60 free less 1.5 spare) - fix the fit first
 vram_gib: 30.5                   # its memory on the card when it runs (measured on a B70)
 ctx: '32768'
 tools: true
