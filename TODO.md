@@ -64,6 +64,22 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
       <Video 1> Ref2VA conditioning -> VAE encode -> latent upscaler -> HyperFlow + LMS Sharp + IC LoRA, up3/up4/hf8
       sigma grid -> fast VAE decode -> mux the draft's audio. Goes in video/ (crates/h3); not started.
 
+## Port: Haru-4B full-duplex speech (user asked 2026-11-15)
+
+- [ ] huggingface.co/higurashi-ai/Haru-4B (Apache-2.0; code github.com/higurashi-ai/Haru; bf16 safetensors with LM,
+      audio projections, MeanFlow head and codec in one file) and its GGUFs huggingface.co/sakasegawa/Haru-4B-GGUF
+      (F16, Q8_0, Q6_K, Q5_K, Q4_K; made for speech.cpp - check the tensor layout against the safetensors). A
+      full-duplex speech-to-speech model: every 133 ms (7.5 Hz) one 3200-sample 24 kHz frame of the user's audio in,
+      one frame of its own audio + text out; user audio, model audio and model text summed into one LM position; a
+      64-dim continuous audio latent from an MLP head with one MeanFlow step; a character card (fixed layout, see the
+      repo README) sets the character, a 3 s - 3 min reference clip the voice. Nine languages. Base model, research
+      release.
+- [ ] A new back-and-forth WebSocket endpoint on the front door for it (audio frames both ways, text alongside,
+      session start with card + voice, barge-in; a session holds the card it runs on), documented with the other
+      /rpc + /v1 APIs.
+- [ ] A live-conversation mode in the nextsycl wfe (microphone in, speaker out, the running transcript, character
+      card + voice picker from the saved voices). Not started.
+
 ## Done
 
 - [x] Server (`nextsycl serve`): OpenAI API, streaming, thinking split out, prompt-prefix reuse, graceful stop (7931d08)
