@@ -95,6 +95,20 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
       (its 133 ms frame-in/frame-out lockstep) and add it as an extension.
 - [ ] Fit on hardac1: the 32B brain at 4-bit on one card or split over the B70 + B65, the talker on the other.
 
+## Port: ZONOS3-Mini speech (platform peer asked 2026-11-15; live on nextcuda)
+
+- [ ] zonos3-mini (kind audio, arch zonos3, speech [voices, clone]) as on nextcuda: spec in nextcuda docs/ports/zonos3.md
+      (d148318 + 1d571aa). huggingface.co/Zyphra/ZONOS3-Mini gguf/ at d2d142a8: backbone-ptq.gguf (experts Q4_0),
+      zac-keep2.gguf (decoder), zac.gguf (full decoder, lazy, +4 GiB), spk-encoder.gguf, steer.gguf, voices/<lang>/<preset>
+      .codes.npy + .embedding.npy (27 presets, savannah default). Own kernels + Rust host, no Zyphra ggml C++ (MIT runtime,
+      Apache-2.0 weights; origin notes). audio.speak / /v1/audio/speech: voice preset or saved cp- voice, ref_audio clone
+      (first 60 s, no transcript), cfg, seconds, seed; options speaker-mode reference|embedding, controls "ID=DOSE,...",
+      speaking-rate, loudness, fmax, decoder keep2|full, sampling defaults (0.75, 80, 0.69, rep 2.4, silence 3). 44.1 kHz;
+      >~400 chars split by sentences 0.25 s apart. Gotchas: pad the delay pattern's cold-start triangle (codebook c while
+      c > stream row, counting the 3 silence rows); decode the silence frames ahead and cut them. nextcuda: ~15x real
+      time on an RTX 5070, 2.1 GiB, logits cos 0.9997, decoder PCM cos 1.0. The platform routes any "zonos3" id to a box
+      listing it.
+
 ## Done
 
 - [x] Server (`nextsycl serve`): OpenAI API, streaming, thinking split out, prompt-prefix reuse, graceful stop (7931d08)
