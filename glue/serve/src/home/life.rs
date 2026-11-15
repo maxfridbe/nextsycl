@@ -295,7 +295,11 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
             let does = |c: &str| m["does"].as_array().is_some_and(|a| a.iter().any(|x| x == c));
             let mut c = Vec::new();
             let mut methods = Vec::new();
-            if does("generate") {
+            if does("generate") && does("splat") {
+                // 3D Gaussian splats (a PLY) rather than a mesh
+                c.extend(["splats", "image_to_3d", "ply"]);
+                methods.push("model3d.generate");
+            } else if does("generate") {
                 c.extend(["mesh", "image_to_3d", "glb"]);
                 if does("texture") {
                     c.push("texture");

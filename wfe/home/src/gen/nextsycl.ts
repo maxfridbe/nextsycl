@@ -2857,7 +2857,7 @@ export interface Methods {
    */
   "audio.describePromptGuideMD": { req: AudioDescribePromptGuideMdReq; resp: any };
   /**
-   * A mesh from a picture of an object, or several views of it (TRELLIS.2, Hunyuan3D, Pixal3D; the model loads first if it must): its shape and, with texture, PBR textures - or, given a mesh (or file), that mesh painted like the picture; the answer links the GLB. A job like image.generate (wait, reentrant_id, status, cancel)
+   * A mesh from a picture of an object, or several views of it (TRELLIS.2, Hunyuan3D, Pixal3D; the model loads first if it must): its shape and, with texture, PBR textures - or, given a mesh (or file), that mesh painted like the picture; the answer links the GLB. A splatting model (Budget3D-Idol; capabilities: splats) makes 3D Gaussian splats instead, a PLY (options.budget: the share of its latent tokens, 0.0625 to 1). A job like image.generate (wait, reentrant_id, status, cancel)
    * @tags model3d
    * @example {"image":"data:image/png;base64,iVBORw0...","model":"trellis2","reentrant_id":"chair-1","seed":42,"texture":true,"wait":false}
    */
@@ -3507,7 +3507,7 @@ export function client(post: Post, raw?: PostRaw) {
      */
     "audio.describePromptGuideMD": (req: AudioDescribePromptGuideMdReq): Promise<any> => post("audio.describePromptGuideMD", req),
     /**
-     * A mesh from a picture of an object, or several views of it (TRELLIS.2, Hunyuan3D, Pixal3D; the model loads first if it must): its shape and, with texture, PBR textures - or, given a mesh (or file), that mesh painted like the picture; the answer links the GLB. A job like image.generate (wait, reentrant_id, status, cancel)
+     * A mesh from a picture of an object, or several views of it (TRELLIS.2, Hunyuan3D, Pixal3D; the model loads first if it must): its shape and, with texture, PBR textures - or, given a mesh (or file), that mesh painted like the picture; the answer links the GLB. A splatting model (Budget3D-Idol; capabilities: splats) makes 3D Gaussian splats instead, a PLY (options.budget: the share of its latent tokens, 0.0625 to 1). A job like image.generate (wait, reentrant_id, status, cancel)
      * @tags model3d
      * @example {"image":"data:image/png;base64,iVBORw0...","model":"trellis2","reentrant_id":"chair-1","seed":42,"texture":true,"wait":false}
      */

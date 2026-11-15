@@ -15,6 +15,20 @@ function num(label: string, key: "seed" | "steps" | "cfg" | "resolution" | "face
   );
 }
 
+/** A splatting model's token budget: the share of its latent tokens it runs (options.budget) */
+function Budget() {
+  const f = state.form;
+  const v = f.options["budget"] ?? "1";
+  return (
+    <label>token budget
+      <input attrs={{ type: "range", min: "0.0625", max: "1", step: "0.0625", title: "the share of the 8192 latent tokens run: lower is faster, coarser" }}
+             props={{ value: v }}
+             on={{ input: (e: Event) => { const t = (e.target as HTMLInputElement).value; if (t === "1") delete f.options["budget"]; else f.options["budget"] = t; saveForm(); render(); } }} />
+      <span class="hint">{Math.round(Number(v) * 100)} %</span>
+    </label>
+  );
+}
+
 function Pictures() {
   const f = state.form;
   const multi = (state.info?.abilities?.views ?? 1) > 1;
@@ -103,13 +117,14 @@ export function Create() {
           : null}
         <span class="seed">{num("seed", "seed", undefined)}
           <button class="tbtn" attrs={{ title: "a new seed" }} on={{ click: () => { f.seed = Math.floor(Math.random() * 1e6); saveForm(); render(); } }}>🎲</button></span>
-        {make ? num("triangles", "faces", d?.faces) : null}
+        {make && !ab?.splats ? num("triangles", "faces", d?.faces) : null}
+        {make && ab?.splats ? <Budget /> : null}
         {!make && ab?.animate ? num("frames", "frames", d?.frames) : null}
       </div>
       <div class="row">
         {num("steps", "steps", d?.steps)}
         {num("guidance", "cfg", d?.cfg, 0.1)}
-        {make ? num("resolution", "resolution", d?.resolution) : null}
+        {make && !ab?.splats ? num("resolution", "resolution", d?.resolution) : null}
         {make && ab?.texture ? num("texture", "textureSize", d?.texture_size) : null}
       </div>
       <div class="row">

@@ -1335,7 +1335,7 @@ impl Home {
         let ok = match kind.as_str() {
             "image" => matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp"),
             // a mesh and the picture and settings beside it; an upload (a picture or a mesh)
-            "model3d" => matches!(ext.as_str(), "glb" | "obj" | "png" | "jpg" | "jpeg" | "webp" | "json"),
+            "model3d" => matches!(ext.as_str(), "glb" | "ply" | "obj" | "png" | "jpg" | "jpeg" | "webp" | "json"),
             _ => ext == "wav",
         };
         if !ok || !path.is_file() {
@@ -1481,6 +1481,7 @@ impl Home {
                 let name = p["/v1/model3d/files/".len()..].split('?').next().unwrap_or("");
                 let kind = match name.rsplit('.').next() {
                     Some("glb") => "model/gltf-binary",
+                    Some("ply") => "application/octet-stream",
                     Some("png") => "image/png",
                     Some("json") => "application/json",
                     _ => return Err((404, format!("no file {name}"))),
@@ -1699,7 +1700,7 @@ impl Home {
                 json!({"model": ids("model3d").first(), "image": "data:image/png;base64,iVBORw0...", "texture": true, "response_format": "url"}), "model3d.generate")}));
             paths.insert("/v1/model3d/rig".into(), json!({"post": oa("A mesh rigged (skeleton and skin weights) or animated (prompt: the motion); mesh as base64 GLB / OBJ, or file: a GLB made here",
                 json!({"model": ids("model3d").first(), "file": "1792132541-trellis2-42.glb", "response_format": "url"}), "model3d.rig")}));
-            paths.insert("/v1/model3d/files/{name}".into(), file("A mesh an answer links (data[].url of model3d.generate / model3d.rig), or its picture (.png)", "<file>.glb", "model/gltf-binary", true));
+            paths.insert("/v1/model3d/files/{name}".into(), file("A mesh an answer links (data[].url of model3d.generate / model3d.rig; a splatting model's: 3D Gaussian splats, <file>.ply), or its picture (.png)", "<file>.glb", "model/gltf-binary", true));
         }
         if on.contains(&"video") {
             paths.insert("/v1/video/files/{name}".into(), file("A finished clip: <clip>.mp4 (video.jobs.list's file, video.status's and video.timeline's file URLs); also <clip>.preview.png (video.status's preview while it samples) and <clip>.last.png (a clip's last frame), image/png", "<clip>.mp4, e.g. h3_20261011_220723.mp4", "video/mp4", true));

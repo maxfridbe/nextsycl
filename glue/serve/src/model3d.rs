@@ -5,11 +5,13 @@
 //!   POST /v1/model3d/generate     a mesh from pictures: {image (PNG / JPEG / WebP as base64 or a data: URL) | images
 //!                                 [{image, side}] (several views of the object), texture (bool), seed, steps, cfg,
 //!                                 resolution, faces, texture_size, remove_background (bool), options {NAME: value},
-//!                                 response_format: glb (the file) | url (JSON with its link)}
+//!                                 response_format: glb (the file) | url (JSON with its link)}; a splatting model
+//!                                 (abilities.splats: Budget3D-Idol) answers with 3D Gaussian splats, a PLY (response_format
+//!                                 ply, or url)
 //!   POST /v1/model3d/rig          a mesh rigged (a skeleton and skin weights) or animated (prompt: the motion):
 //!                                 {mesh (GLB or OBJ, base64 / a data: URL) | file (a GLB made here), prompt, frames,
 //!                                 fps, seed, steps, cfg, options, response_format}
-//!   GET  /v1/model3d/files/<f>    a GLB made here (and its picture, <f>.png; its settings, <f>.json)
+//!   GET  /v1/model3d/files/<f>    a GLB or a PLY (splats) made here (and its picture, <f>.png; its settings, <f>.json)
 //!   POST /api/cancel              stops the request running (between steps)
 //!   GET  /v1/models, /health
 //!   GET  /api/info                the model, what it does, its defaults, its options
@@ -81,13 +83,24 @@ fn safe(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) && !name.contains("..")
 }
 
-/// A mesh's history entry: its settings (the sidecar <name>.json), its links
+/// What a result file is, by its extension: a mesh (glb) or splats (ply)
+pub fn result_kind(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()? {
+        "glb" => Some("mesh"),
+        "ply" => Some("splats"),
+        _ => None,
+    }
+}
+
+/// A result's history entry (a mesh's GLB or splats' PLY): its settings (the sidecar <name>.json), its links
 pub fn entry(glb: &Path) -> Option<Value> {
     let name = glb.file_name()?.to_string_lossy().into_owned();
     let mut e: Value = std::fs::read(glb.with_extension("json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| json!({}));
     e["url"] = json!(format!("/v1/model3d/files/{name}"));
+    e["kind"] = json!(result_kind(glb)?);
     if glb.with_extension("png").is_file() {
-        e["picture"] = json!(format!("/v1/model3d/files/{}", name.replace(".glb", ".png")));
+        let stem = glb.file_stem()?.to_string_lossy().into_owned();
+        e["picture"] = json!(format!("/v1/model3d/files/{stem}.png"));
     }
     e["bytes"] = json!(std::fs::metadata(glb).ok()?.len());
     if e.get("created").is_none() {
@@ -96,10 +109,10 @@ pub fn entry(glb: &Path) -> Option<Value> {
     Some(e)
 }
 
-/// The meshes already in `dir`, newest first
+/// The meshes and splats already in `dir`, newest first
 pub fn earlier(dir: &Path) -> VecDeque<Value> {
     let mut files: Vec<(SystemTime, PathBuf)> = std::fs::read_dir(dir).into_iter().flatten().flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "glb"))
+        .filter(|e| result_kind(&e.path()).is_some())
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
     files.sort_by_key(|f| std::cmp::Reverse(f.0));
@@ -194,8 +207,8 @@ impl Model3dServer {
                 };
                 let base = req.host.as_deref().map(|h| format!("http://{h}")).unwrap_or_default();
                 match self.run_request(p.ends_with("/rig"), &body, &base) {
-                    Ok((Some(v), _)) => http::respond_with(&mut s, 200, &v, &cors),
-                    Ok((None, glb)) => http::respond_bytes(&mut s, 200, "model/gltf-binary", &glb, &cors),
+                    Ok((Some(v), _, _)) => http::respond_with(&mut s, 200, &v, &cors),
+                    Ok((None, bytes, kind)) => http::respond_bytes(&mut s, 200, kind, &bytes, &cors),
                     Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
                 }
             }
@@ -240,7 +253,7 @@ impl Model3dServer {
         let (a, d) = (e.abilities(), e.defaults());
         json!({
             "model": self.model, "arch": e.arch(), "wfe": self.wfe.is_some(),
-            "abilities": {"generate": a.generate, "texture": a.texture, "views": a.views, "rig": a.rig, "animate": a.animate},
+            "abilities": {"generate": a.generate, "texture": a.texture, "views": a.views, "rig": a.rig, "animate": a.animate, "splats": a.splats},
             "defaults": {"steps": d.steps, "cfg": f(d.cfg), "resolution": d.resolution, "faces": d.faces, "texture_size": d.texture_size,
                          "frames": d.frames, "fps": f(d.fps)},
             "options": e.options().iter().filter(|o| o.at != nextsycl_core::At::Load)
@@ -250,10 +263,11 @@ impl Model3dServer {
         })
     }
 
-    /// A file made here: the GLB, its picture (.png) or its settings (.json)
+    /// A file made here: the GLB or PLY, its picture (.png) or its settings (.json)
     fn file(&self, s: &mut Conn, name: &str, cors: &str) {
         let kind = match name.rsplit('.').next() {
             Some("glb") => "model/gltf-binary",
+            Some("ply") => PLY,
             Some("png") => "image/png",
             Some("json") => "application/json",
             _ => "",
@@ -290,15 +304,16 @@ impl Model3dServer {
         Ok(out)
     }
 
-    /// Runs a request: (JSON for response_format url, else none) and the GLB's bytes
-    fn run_request(&self, rig: bool, b: &Value, base: &str) -> Result<(Option<Value>, Vec<u8>), (u16, String)> {
+    /// Runs a request: (JSON for response_format url, else none), the result's bytes (a GLB, or a PLY of splats) and
+    /// their content type
+    fn run_request(&self, rig: bool, b: &Value, base: &str) -> Result<(Option<Value>, Vec<u8>, &'static str), (u16, String)> {
         let bad = |m: String| (400u16, m);
         if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model) {
             return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
         }
-        let format = b["response_format"].as_str().unwrap_or("glb");
-        if !["glb", "url"].contains(&format) {
-            return Err(bad(format!("response_format {format}: glb or url")));
+        let format = b["response_format"].as_str().unwrap_or("file");
+        if !["glb", "ply", "file", "url"].contains(&format) {
+            return Err(bad(format!("response_format {format}: glb (a mesh), ply (splats) or url")));
         }
         if format == "url" && self.out_dir.is_none() {
             return Err(bad("response_format url: this server keeps no files (start it with an output directory)".into()));
@@ -359,6 +374,12 @@ impl Model3dServer {
             Ok(())
         };
         let mut meta = json!({"model": self.model, "arch": engine.arch(), "seed": seed});
+        if !rig && a.splats && format == "glb" {
+            return Err(bad(format!("{} makes 3D Gaussian splats: response_format ply or url", self.model)));
+        }
+        if (rig || !a.splats) && format == "ply" {
+            return Err(bad(format!("{} makes meshes: response_format glb or url", self.model)));
+        }
         let out = if rig {
             if !a.rig && !a.animate {
                 return Err(bad(format!("{} makes meshes; it does not rig them (model3d.generate)", self.model)));
@@ -371,7 +392,7 @@ impl Model3dServer {
                                    fps: num("fps").map(|v| v as f32), steps: num("steps").map(|v| v as u32), cfg: num("cfg").map(|v| v as f32), extra };
             meta["prompt"] = json!(prompt);
             meta["frames"] = json!(req.frames.unwrap_or(d.frames));
-            engine.rig(&req, &mut report)
+            engine.rig(&req, &mut report).map(Made::Mesh)
         } else {
             if !a.generate && !(paint_given && a.texture) {
                 return Err(bad(format!("{} rigs meshes; it does not make them (model3d.rig)", self.model)));
@@ -401,12 +422,20 @@ impl Model3dServer {
             meta["resolution"] = json!(req.resolution.unwrap_or(d.resolution));
             meta["faces"] = json!(req.faces.unwrap_or(d.faces));
             meta["views"] = json!(views.iter().map(|v| v.0.side.clone()).collect::<Vec<_>>());
-            engine.generate(&req, &mut report)
+            if a.splats {
+                meta["options"] = json!(req.extra);
+                engine.splat(&req, &mut report).map(Made::Splats)
+            } else {
+                engine.generate(&req, &mut report).map(Made::Mesh)
+            }
         };
         *p.lock().unwrap() = json!({"busy": false});
         drop(engine);
-        let mesh = out.map_err(|e| crate::engine_status(e, 400))?;
-        let glb = nextsycl_model3d::mesh::glb::write(&mesh).map_err(|e| (500u16, format!("writing the GLB: {e}")))?;
+        let made = out.map_err(|e| crate::engine_status(e, 400))?;
+        let (bytes, ext, ctype) = match &made {
+            Made::Mesh(mesh) => (nextsycl_model3d::mesh::glb::write(mesh).map_err(|e| (500u16, format!("writing the GLB: {e}")))?, "glb", "model/gltf-binary"),
+            Made::Splats(s) => (s.to_ply(), "ply", PLY),
+        };
         let took = t0.elapsed().as_secs_f64();
         let wh = match (j0, self.tele.joules()) {
             (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
@@ -416,15 +445,25 @@ impl Model3dServer {
         meta["took"] = json!(took);
         meta["wh"] = json!(wh);
         meta["created"] = json!(created);
-        meta["triangles"] = json!(mesh.triangles());
-        meta["textured"] = json!(mesh.material.as_ref().is_some_and(|m| m.base_color.is_some()));
-        meta["rigged"] = json!(mesh.skin.as_ref().map(|s| s.joints.len()));
-        meta["animated"] = json!(mesh.animation.as_ref().map(|a| a.frames.len()));
+        let (count, count_key) = match &made {
+            Made::Mesh(mesh) => {
+                meta["triangles"] = json!(mesh.triangles());
+                meta["textured"] = json!(mesh.material.as_ref().is_some_and(|m| m.base_color.is_some()));
+                meta["rigged"] = json!(mesh.skin.as_ref().map(|s| s.joints.len()));
+                meta["animated"] = json!(mesh.animation.as_ref().map(|a| a.frames.len()));
+                (mesh.triangles(), "triangles")
+            }
+            Made::Splats(s) => {
+                meta["gaussians"] = json!(s.len());
+                meta["camera"] = json!(s.camera.map(|c| json!({"yaw": c[0], "pitch": c[1], "radius": c[2], "fov": c[3]})));
+                (s.len(), "gaussians")
+            }
+        };
         let mut answer = None;
         if let Some(dir) = &self.out_dir {
-            let name = format!("{created}-{}-{seed}.glb", self.model.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"));
+            let name = format!("{created}-{}-{seed}.{ext}", self.model.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"));
             let path = dir.join(&name);
-            std::fs::write(&path, &glb).map_err(|e| (500u16, format!("{}: {e}", dir.display())))?;
+            std::fs::write(&path, &bytes).map_err(|e| (500u16, format!("{}: {e}", dir.display())))?;
             // the first picture beside it (the gallery shows it), and the settings
             if let Some((_, bytes)) = views.first() {
                 if let Ok(t) = nextsycl_model3d::read_picture(bytes).and_then(|t| t.png()) {
@@ -442,13 +481,21 @@ impl Model3dServer {
                     if let Some(pic) = v["picture"].as_str().map(str::to_string) {
                         v["picture"] = json!(format!("{base}{pic}"));
                     }
-                    answer = Some(json!({"created": created, "data": [v], "nextsycl": {"took": took, "seed": seed, "wh": wh,
-                                                                                     "triangles": mesh.triangles()}}));
+                    answer = Some(json!({"created": created, "data": [v], "nextsycl": {"took": took, "seed": seed, "wh": wh, count_key: count}}));
                 }
             }
         }
-        Ok((answer, glb))
+        Ok((answer, bytes, ctype))
     }
+}
+
+/// What a PLY is served as
+const PLY: &str = "application/octet-stream";
+
+/// What a request made: a mesh (generate, rig) or splats
+enum Made {
+    Mesh(nextsycl_model3d::Mesh),
+    Splats(nextsycl_model3d::Splats),
 }
 
 #[cfg(test)]
@@ -477,6 +524,23 @@ mod tests {
             panic!("an engine failed");
         }));
         assert_eq!(p.lock().unwrap_or_else(|e| e.into_inner())["busy"], false, "a panic does not leave the server busy for good");
+    }
+
+    #[test]
+    fn splats_and_meshes_are_both_history() {
+        let d = std::env::temp_dir().join(format!("ns-m3d-hist-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("1-a-1.glb"), b"glTF").unwrap();
+        std::fs::write(d.join("2-b-1.ply"), nextsycl_model3d::Splats::default().to_ply()).unwrap();
+        std::fs::write(d.join("2-b-1.png"), b"x").unwrap();
+        std::fs::write(d.join("3-c.txt"), b"x").unwrap();
+        let h = earlier(&d);
+        let kinds: Vec<&str> = h.iter().filter_map(|e| e["kind"].as_str()).collect();
+        assert_eq!(h.len(), 2);
+        assert!(kinds.contains(&"mesh") && kinds.contains(&"splats"));
+        let ply = h.iter().find(|e| e["kind"] == "splats").unwrap();
+        assert_eq!(ply["picture"], "/v1/model3d/files/2-b-1.png");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

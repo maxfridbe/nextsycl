@@ -1,6 +1,6 @@
 /** What the 3D server answers (glue/serve/src/model3d.rs). */
 
-export interface Abilities { generate: boolean; texture: boolean; views: number; rig: boolean; animate: boolean }
+export interface Abilities { generate: boolean; texture: boolean; views: number; rig: boolean; animate: boolean; splats?: boolean }
 
 export interface Info {
   model: string;
@@ -44,6 +44,9 @@ export interface Made {
   resolution?: number;
   faces?: number;
   triangles?: number;
+  /** splats made (a PLY) */
+  gaussians?: number;
+  kind?: "mesh" | "splats";
   texture?: boolean;
   textured?: boolean;
   rigged?: number | null;

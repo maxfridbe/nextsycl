@@ -15,7 +15,8 @@ function sync(): void {
   if (url && viewer.url !== url) {
     state.stats = "loading…";
     viewer.load(url).then((l) => {
-      state.stats = `${kilo(l.triangles)} triangles · ${kilo(l.vertices)} vertices${l.textured ? " · textured" : ""}` +
+      state.stats = l.gaussians ? `${kilo(l.gaussians)} Gaussian splats` :
+        `${kilo(l.triangles)} triangles · ${kilo(l.vertices)} vertices${l.textured ? " · textured" : ""}` +
         `${l.joints ? ` · ${l.joints} bones` : ""}${l.frames ? ` · ${l.frames} frames at ${Math.round(l.fps)} fps` : ""}`;
       render();
     }).catch((e: unknown) => {
@@ -26,6 +27,9 @@ function sync(): void {
   }
   viewer.draw();
 }
+
+/** A result that is splats (a PLY) rather than a mesh */
+const isPly = (url: string) => url.split("?")[0]!.toLowerCase().endsWith(".ply");
 
 function toggle(k: keyof typeof state.view, label: string, icon: string) {
   return (
@@ -53,11 +57,11 @@ export function Stage() {
         destroy: () => { viewer?.dispose(); viewer = null; },
       }} />
       <div class="tools">
-        {toggle("wire", "wire", "&#xf0e8;")}
-        {toggle("flat", "flat", "&#xf1b2;")}
+        {m && !isPly(m.url) ? toggle("wire", "wire", "&#xf0e8;") : null}
+        {m && !isPly(m.url) ? toggle("flat", "flat", "&#xf1b2;") : null}
         {m?.rigged ? toggle("skeleton", "bones", "&#xf0c1;") : null}
         {m?.animated ? toggle("playing", "play", "&#xf04b;") : null}
-        {m ? <a class="tbtn" attrs={{ href: m.url, download: m.url.split("/").pop() ?? "mesh.glb" }}><span class="i" props={{ innerHTML: "&#xf019;" }} />GLB</a> : null}
+        {m ? <a class="tbtn" attrs={{ href: m.url, download: m.url.split("/").pop() ?? "mesh.glb" }}><span class="i" props={{ innerHTML: "&#xf019;" }} />{isPly(m.url) ? "PLY" : "GLB"}</a> : null}
       </div>
       <div class="ov">{m ? state.stats : "nothing made yet: a picture of an object, then Make"} {m ? " · drag to turn, wheel to zoom, right-drag to pan, double-click to reset" : ""}</div>
     </div>

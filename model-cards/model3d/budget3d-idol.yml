@@ -1,0 +1,43 @@
+# Budget3D-Idol (one picture to 3D Gaussian splats, 50 guided steps, any token budget; Apache-2.0)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: budget3d-idol
+kind: model3d
+arch: budget3d-idol
+title: 'Budget3D-Idol (a picture to 3D Gaussian splats at any token budget; Apache-2.0)'
+about: 'BudgetAny''s Budget3D fine-tune of Sperid Labs'' Idol: DINOv3 ViT-H+/16 and FLUX.2 VAE tokens of the picture, a 378M flow transformer over 8,192 latent tokens and the camera (50 Euler steps, guidance 3) that runs at a token budget - the latent''s flattest regions, empty space first, merged into coarser tokens and refined back to every point - then Idol''s octree and Gaussian decoders: up to 1,048,576 Gaussians as a 3DGS PLY, and the camera the picture was seen from. BiRefNet cuts opaque pictures out. The two image encoders are gated (DINOv3 License; FLUX.2-dev''s repository terms): accept them on Hugging Face and name the files (local parts below).'
+gpus: '0'
+vram_gib: 12.0                   # not measured with the encoders (gated): the denoiser, the decoders and a 100 % budget's activations, plus DINOv3 ViT-H+ in float32
+does: [generate, splat]
+env:
+  NS_M3D_B3D_DINO: '{dino}'
+  NS_M3D_B3D_VAE: '{vae}'
+local:
+  dino: 'DINOv3 ViT-H+/16 model.safetensors (https://huggingface.co/facebook/dinov3-vith16plus-pretrain-lvd1689m, gated: accept the DINOv3 License, download it, set NS_M3D_B3D_DINO=<path> in nextsycl.conf)'
+  vae: 'the FLUX.2 VAE vae/diffusion_pytorch_model.safetensors (https://huggingface.co/black-forest-labs/FLUX.2-dev, gated: accept its terms, download it, set NS_M3D_B3D_VAE=<path> in nextsycl.conf)'
+files:
+  denoiser:
+    key: budget3d-idol
+    url: https://huggingface.co/BudgetAny/Budget3D-Idol/resolve/96f1493a908eeb25a9aa278c445cb415b857070c/budget3d_idol.safetensors
+    size: 1512422068
+    sha256: 8d87669ab02823d6fde862b4f1a0be6628f862ec16bbdb263a0838b5bbc4c1fe
+    path: budget3d-idol/budget3d_idol.safetensors
+  idol:                          # Idol's own denoiser: its 8,192 Sobol token positions (pos_pe)
+    key: idol-denoiser
+    url: https://huggingface.co/speridlabs/idol/resolve/2731c2291fc65a797c5cb627a5e5526fc1490902/denoiser.safetensors
+    size: 1482258308
+    sha256: ded2cacf671bf3978ebc62729087abdbd318ef4752e6805b4c9fc8ffa51fe716
+    path: idol/denoiser.safetensors
+  decoder:
+    key: idol-decoder
+    url: https://huggingface.co/speridlabs/idol/resolve/2731c2291fc65a797c5cb627a5e5526fc1490902/decoder.safetensors
+    size: 203171696
+    sha256: 9da4d7676bfcadb1c3fdfbff796e6257dadf82d26ec05be7717c79b2b13a1c4e
+    path: idol/decoder.safetensors
+  decoder_gs:
+    key: idol-decoder-gs
+    url: https://huggingface.co/speridlabs/idol/resolve/2731c2291fc65a797c5cb627a5e5526fc1490902/decoder_gs.safetensors
+    size: 949083036
+    sha256: 3087eb8ee5763206a53e4078acf2a1bf382dab5147d407ec13a2cf39c04cc544
+    path: idol/decoder_gs.safetensors
+  remover: birefnet              # the shared background remover (BiRefNet; defined in trellis2.yml - Idol's own birefnet.safetensors is the same network)
+guide: guides/budget3d-idol.md

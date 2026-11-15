@@ -609,6 +609,18 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   the DiT's parts, the card's peak. Checked against `reference/trellis2/ref.py` / `reference/pixal3d/ref.py`: every
   stage rel <= 6e-4 on the reference's inputs (the guided samplers' 12 steps 5.8e-3); B70: the 1024 cascade 80 s
   (9.1 GiB peak), 512 21 s, Pixal3D 45 s.
+- **budget3d** (`model3d/budget3d`, arch `budget3d-idol`) - BudgetAny's Budget3D-Idol and -Turbo (fine-tunes of Sperid
+  Labs' Idol): one picture to **3D Gaussian splats** (`Model3dEngine::splat`, `nextsycl_model3d::Splats`, a 3DGS PLY)
+  at a token budget. Idol's framing (BiRefNet, `nextsycl-remover`), DINOv3 ViT-H+/16 and the FLUX.2 VAE encoder (both
+  gated: named by `NS_M3D_B3D_DINO` / `NS_M3D_B3D_VAE`, the cards' local parts), Idol's flow transformer (24 joint
+  blocks of 1024 over [latent | picture | camera], learned RePo rotary positions, the guided branches in one batch)
+  run on Budget3D's token layout (merged octree cells and cubes, refined back to every point after the head), Idol-
+  turbo's phase LoRAs merged at load, then Idol's octree anchor decoder and Gaussian decoder. Its kernels
+  (`kernels/model3d/budget3d`): per-sequence modulated layer norm and gated adds, RePo's rotation with the per-head RMS
+  norm, the refiners' small attention, the token gathers, the ScaleMixer, the VAE's group norm; the shared diffusion
+  kernels do the linears and attention. Checked against `reference/budget3d/ref.py` (and `encoders.py` for the picture
+  side) stage by stage (docs/ports/budget3d-idol.md has the numbers). Settings: `NS_M3D_B3D_RESIDENT`,
+  `NS_M3D_B3D_PROFILE`; per request `--opt-budget`, `--opt-gaussians`, `--opt-mode`.
 
 ## The model registry
 

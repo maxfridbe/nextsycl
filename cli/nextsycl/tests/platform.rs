@@ -52,7 +52,8 @@ fn engines() -> Vec<(&'static str, Vec<&'static str>)> {
         v.push(("audio", k.archs.to_vec()));
     }
     for k in [nextsycl_model3d_trellis2::kind(), nextsycl_model3d_trellis2::kind_pixal(), nextsycl_model3d_hunyuan3d::kind(), nextsycl_model3d_unirig::kind(), nextsycl_model3d_skintokens::kind(),
-              nextsycl_model3d_rignet::kind(), nextsycl_model3d_animateanymesh::kind(), nextsycl_model3d_unimate::kind(), nextsycl_model3d_example::kind()] {
+              nextsycl_model3d_rignet::kind(), nextsycl_model3d_animateanymesh::kind(), nextsycl_model3d_unimate::kind(), nextsycl_model3d_budget3d::kind(),
+              nextsycl_model3d_example::kind()] {
         v.push(("model3d", k.archs.to_vec()));
     }
     v
@@ -124,12 +125,16 @@ fn no_architecture_is_claimed_twice() {
 #[test]
 fn cards_say_only_what_the_door_routes() {
     // model3d: what the front door routes by (api.rs: generate, rig; paint for a given mesh) and advertises (life.rs)
-    const DOES: &[&str] = &["generate", "texture", "paint", "views", "rig", "animate"];
+    const DOES: &[&str] = &["generate", "texture", "paint", "views", "rig", "animate", "splat"];
     for c in cards().iter().filter(|c| s(c, "kind") == "model3d") {
         let does: Vec<&str> = c["does"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
         assert!(!does.is_empty(), "{}: a 3D card says what it does", s(c, "id"));
         for d in &does {
             assert!(DOES.contains(d), "{}: does {d:?} - the door routes {DOES:?}", s(c, "id"));
+        }
+        // splats are what a generating model makes instead of a mesh
+        if does.contains(&"splat") {
+            assert!(does.contains(&"generate") && !does.contains(&"texture"), "{}: splats come from generate, untextured", s(c, "id"));
         }
         // painting a mesh needs the paint model: a card that paints also textures
         if does.contains(&"paint") {

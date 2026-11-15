@@ -1,0 +1,14 @@
+[package]
+name = "nextsycl-model3d-budget3d"
+description = "Budget3D-Idol and Budget3D-Idol-Turbo (BudgetAny, on Sperid Labs' Idol): one picture to 3D Gaussian splats - DINOv3 ViT-H+/16 and FLUX.2 VAE tokens, Idol's flow transformer on a token budget (merged octree tokens, refined back to every point), the octree anchor and Gaussian decoders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-model3d.workspace = true
+nextsycl-remover.workspace = true
+serde_json.workspace = true

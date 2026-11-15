@@ -10,7 +10,8 @@ use serde_json::Value;
 
 const USAGE: &str = "nextsycl model3d gen PICTURE [PICTURE[:SIDE]]... [--model ID] [--texture | --no-texture] [--seed N] [--steps N] [--cfg X]
                    [--resolution N] [--faces N] [--texture-size N] [--mesh FILE.glb|.obj (paint it like the picture; a model that paints)] [--keep-background] [--set NAME=VALUE]... [--opt-NAME VALUE]...
-                   [--out FILE.glb|DIR] [--gpu N]                 a mesh from a picture (or several views: front, back, left, right)
+                   [--out FILE.glb|DIR] [--gpu N]                 a mesh from a picture (or several views: front, back, left, right);
+                   a splatting model (Budget3D-Idol: --opt-budget 0.5) makes 3D Gaussian splats, FILE.ply
 nextsycl model3d rig MESH.glb|.obj [--model ID] [--prompt \"the motion\"] [--frames N] [--fps X] [--seed N] [--out FILE.glb|DIR] [--gpu N]
                    a skeleton and skin weights (UniRig, RigNet), or motion from words (AnimateAnyMesh)
 nextsycl model3d serve [MODEL] [--port 8088] [--host 127.0.0.1] [--gpu N] [--set NAME=VALUE]... [--wfe] [--out DIR] [--cors ORIGIN]
@@ -19,6 +20,7 @@ nextsycl model3d tool decimate IN OUT --faces N          quadric decimation (pos
 nextsycl model3d tool remesh IN OUT [--edge X] [--passes N]   isotropic remeshing (even triangles)
 nextsycl model3d tool uv IN OUT [--size N]               a fresh atlas, the old texture or colours baked across
 nextsycl model3d tool convert IN OUT                     GLB <-> OBJ (by the extensions)
+nextsycl model3d tool render IN.ply OUT.png [--views N] [--size N] [--fov DEG]   splats drawn on the CPU from N sides (default 4)
 nextsycl model3d check <dump dir> [--model ID] [--stages pre,cond,dit,steps,vae,grid] [--picture P] [--gpu N]
                    an engine's stages against a reference's dumps (reference/hunyuan3d); a paint dump's stages:
                    maps,pic,dino,enc,dual,unet,unipc,steps,decode
@@ -26,12 +28,15 @@ nextsycl model3d check <dump dir> --model ID [--stages a,b,...] [--mesh FILE.obj
                    an engine's stages against its reference's dumps (reference/<arch>/)
 nextsycl model3d check DUMP_DIR [--model ID] [--stages pre,remover,dino,ss,ssdec,shape,cascade,tex,sdec,tdec] [--full] [--picture FILE] [--gpu N]
                    an engine's stages against reference/trellis2/ref.py's dumps
+nextsycl model3d check DUMP_DIR --model ID [--stages noise,ctx,layout,tokens,call,sample,dec] [--gpu N]
+                   Budget3D-Idol's stages against reference/budget3d/ref.py's dumps
 nextsycl model3d engines | selftest [--gpu N]";
 
 /// The 3D engines this program has (model3d/<arch>)
 pub fn engines() -> Vec<nextsycl_model3d::Model3dKind> {
     vec![nextsycl_model3d_trellis2::kind(), nextsycl_model3d_trellis2::kind_pixal(), nextsycl_model3d_hunyuan3d::kind(), nextsycl_model3d_unirig::kind(), nextsycl_model3d_skintokens::kind(),
-         nextsycl_model3d_rignet::kind(), nextsycl_model3d_animateanymesh::kind(), nextsycl_model3d_unimate::kind(), nextsycl_model3d_example::kind()]
+         nextsycl_model3d_rignet::kind(), nextsycl_model3d_animateanymesh::kind(), nextsycl_model3d_unimate::kind(), nextsycl_model3d_budget3d::kind(),
+         nextsycl_model3d_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -113,12 +118,17 @@ fn seed(args: &[String]) -> Result<u64, String> {
 
 /// Where a result goes: --out FILE.glb, or a name in --out DIR (else the 3D output directory)
 fn out_file(cfg: &Config, args: &[String], stem: &str) -> Result<PathBuf, String> {
+    out_file_ext(cfg, args, stem, "glb")
+}
+
+/// `out_file` for a result of another kind (ply: splats)
+fn out_file_ext(cfg: &Config, args: &[String], stem: &str, ext: &str) -> Result<PathBuf, String> {
     match opt(args, "--out") {
-        Some(o) if o.ends_with(".glb") => Ok(PathBuf::from(o)),
+        Some(o) if o.ends_with(&format!(".{ext}")) => Ok(PathBuf::from(o)),
         o => {
             let d = o.map(PathBuf::from).unwrap_or_else(|| out_dir(cfg, &[]));
             std::fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
-            Ok(d.join(format!("{stem}.glb")))
+            Ok(d.join(format!("{stem}.{ext}")))
         }
     }
 }
@@ -168,6 +178,17 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
                             remove_background: Some(!args.iter().any(|x| x == "--keep-background")),
                             extra: nextsycl_core::options::by_name(super::engine_opts(), e.options()) };
     let t0 = std::time::Instant::now();
+    if a.splats {
+        let s = e.splat(&req, &mut progress).map_err(|e| e.0)?;
+        for l in e.report() {
+            eprintln!("{l}");
+        }
+        let out = out_file_ext(cfg, args, &format!("{}-{seed}", m["id"].as_str().unwrap_or("splats")), "ply")?;
+        std::fs::write(&out, s.to_ply()).map_err(|e| format!("{}: {e}", out.display()))?;
+        let cam = s.camera.map(|c| format!(", seen from yaw {:.0} pitch {:.0} degrees", c[0].to_degrees(), c[1].to_degrees())).unwrap_or_default();
+        println!("{} ({} Gaussians{cam}, {:.1} s, seed {seed})", out.display(), s.len(), t0.elapsed().as_secs_f64());
+        return Ok(());
+    }
     let mesh = e.generate(&req, &mut progress).map_err(|e| e.0)?;
     for l in e.report() {
         eprintln!("{l}");
@@ -235,11 +256,41 @@ fn write_any(p: &str, m: &nextsycl_model3d::Mesh) -> Result<(), String> {
     std::fs::write(p, bytes).map_err(|e| format!("{p}: {e}"))
 }
 
+/// `nextsycl model3d tool render IN.ply OUT.png`: splats drawn from `--views` sides around their up axis, side by side
+fn render(input: &str, output: &str, args: &[String]) -> Result<(), String> {
+    let s = nextsycl_model3d::Splats::from_ply(&std::fs::read(input).map_err(|e| format!("{input}: {e}"))?).map_err(|e| format!("{input}: {e}"))?;
+    let views: u32 = num(args, "--views")?.unwrap_or(4).clamp(1, 16);
+    let size: u32 = num(args, "--size")?.unwrap_or(512).clamp(64, 2048);
+    let fov: f32 = num(args, "--fov")?.unwrap_or(40.0);
+    let (lo, hi) = s.bounds();
+    let centre = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
+    let radius = (0..3).map(|c| (hi[c] - lo[c]) / 2.0).fold(0.0f32, f32::max).max(1e-3) * 1.8;
+    let dist = radius / (fov.to_radians() / 2.0).tan();
+    let t0 = std::time::Instant::now();
+    let mut sheet = nextsycl_model3d::Texture::new(size * views, size);
+    for v in 0..views {
+        let a = std::f32::consts::TAU * v as f32 / views as f32;
+        let eye = [centre[0] + dist * a.sin(), centre[1] + dist * 0.25, centre[2] + dist * a.cos()];
+        let t = nextsycl_model3d::splat::render(&s, eye, centre, [0.0, 1.0, 0.0], fov, size, size, [255, 255, 255]);
+        for y in 0..size as usize {
+            let row = &t.rgba[y * size as usize * 4..(y + 1) * size as usize * 4];
+            let at = (y * (size * views) as usize + (v * size) as usize) * 4;
+            sheet.rgba[at..at + row.len()].copy_from_slice(row);
+        }
+    }
+    std::fs::write(output, sheet.png()?).map_err(|e| format!("{output}: {e}"))?;
+    println!("{output}: {} Gaussians from {views} sides, {size} px ({:.2} s)", s.len(), t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
 /// `nextsycl model3d tool ...`: the CPU mesh tools
 fn tool(args: &[String]) -> Result<(), String> {
     use nextsycl_model3d::mesh::tools;
     let files = positional(&args[1.min(args.len())..]);
     let (Some(input), Some(output)) = (files.first(), files.get(1)) else { return Err(USAGE.into()) };
+    if args.first().map(String::as_str) == Some("render") {
+        return render(input, output, args);
+    }
     let m = read_any(input)?;
     let before = m.triangles();
     let t0 = std::time::Instant::now();
@@ -287,6 +338,12 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let worst = match m["arch"].as_str().unwrap_or("") {
         nextsycl_model3d_hunyuan3d::ARCH_21 | nextsycl_model3d_hunyuan3d::ARCH_MINI => return check_hunyuan3d(cfg, args),
         nextsycl_model3d_trellis2::ARCH | nextsycl_model3d_trellis2::ARCH_PIXAL => return check_trellis2(cfg, args),
+        nextsycl_model3d_budget3d::ARCH => {
+            let e = nextsycl_model3d_budget3d::Budget3d::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+            let st = stages("noise,ctx,layout,tokens,call,sample,dec");
+            let st: Vec<&str> = st.iter().map(String::as_str).collect();
+            nextsycl_model3d_budget3d::check::run(&e, &dir, &st, &mut log).map_err(|e| e.0)?
+        }
         nextsycl_model3d_animateanymesh::ARCH => {
             let e = nextsycl_model3d_animateanymesh::AnimateAnyMesh::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
             let st = stages("embed,fps,enc,clip,dit,dec");

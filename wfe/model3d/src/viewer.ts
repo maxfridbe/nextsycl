@@ -1,7 +1,8 @@
 /** A GLB viewer on WebGL2, no library: every triangle primitive of the scene (its node transforms applied), its
  *  base colour texture or vertex colours, lit by a key light and the sky; a skeleton drawn over it as lines; a morph
- *  animation (one target a frame, as the server writes it) played. Orbit with a drag, zoom with the wheel or a
- *  pinch, pan with the right button or two fingers. */
+ *  animation (one target a frame, as the server writes it) played. A PLY of 3D Gaussian splats is drawn by splat.ts.
+ *  Orbit with a drag, zoom with the wheel or a pinch, pan with the right button or two fingers. */
+import { parsePly, SplatLayer } from "./splat.js";
 
 type Mat4 = Float32Array;
 
@@ -66,6 +67,8 @@ interface Part {
 
 export interface Loaded {
   triangles: number; vertices: number; textured: boolean; joints: number; frames: number; fps: number;
+  /** a PLY's splats (0 for a mesh) */
+  gaussians: number;
 }
 
 /** A GLB's parts (world space), skeleton lines and animation clock */
@@ -237,6 +240,7 @@ export class Viewer {
   private lprog: WebGLProgram;
   private parts: GpuPart[] = [];
   private bones: { buf: WebGLBuffer; count: number } | null = null;
+  private splats: SplatLayer | null = null;
   private center = [0, 0, 0];
   private radius = 1;
   private yaw = 0.6;
@@ -283,11 +287,12 @@ export class Viewer {
     return p;
   }
 
-  /** Shows the GLB at `url` (its stats when it loads) */
+  /** Shows the GLB (or the PLY of splats) at `url` (its stats when it loads) */
   async load(url: string): Promise<Loaded> {
     this.url = url;
     const r = await fetch(url);
     if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+    if (url.split("?")[0]!.toLowerCase().endsWith(".ply")) return this.loadSplats(url, await r.arrayBuffer());
     const { parts, bones, fps, frames } = await parse(await r.arrayBuffer());
     if (this.url !== url) throw new Error("superseded");
     this.clear();
@@ -357,7 +362,23 @@ export class Viewer {
     this.fps = fps;
     this.t0 = performance.now();
     this.draw();
-    return { triangles: tris, vertices: verts, textured, joints: this.bones ? this.bones.count / 2 : 0, frames, fps };
+    return { triangles: tris, vertices: verts, textured, joints: this.bones ? this.bones.count / 2 : 0, frames, fps, gaussians: 0 };
+  }
+
+  /** Shows a PLY's splats: framed by their bounds, drawn back to front */
+  private loadSplats(url: string, buf: ArrayBuffer): Loaded {
+    const data = parsePly(buf);
+    if (this.url !== url) throw new Error("superseded");
+    this.clear();
+    this.splats = new SplatLayer(this.gl, (vs, fs) => this.program(vs, fs), data);
+    const { lo, hi } = data.count ? data : { lo: [-1, -1, -1], hi: [1, 1, 1] };
+    this.center = [0, 1, 2].map((k) => (lo[k]! + hi[k]!) / 2);
+    this.radius = Math.max(Math.hypot(hi[0]! - lo[0]!, hi[1]! - lo[1]!, hi[2]! - lo[2]!) / 2, 1e-3);
+    this.dist = this.radius * 2.6;
+    this.pan = [0, 0, 0];
+    this.frames = 0;
+    this.draw();
+    return { triangles: 0, vertices: 0, textured: false, joints: 0, frames: 0, fps: 0, gaussians: data.count };
   }
 
   private clear(): void {
@@ -370,6 +391,8 @@ export class Viewer {
     this.parts = [];
     if (this.bones) gl.deleteBuffer(this.bones.buf);
     this.bones = null;
+    this.splats?.dispose();
+    this.splats = null;
   }
 
   private controls(): void {
@@ -450,7 +473,13 @@ export class Viewer {
     const target = [this.center[0]! + this.pan[0]!, this.center[1]! + this.pan[1]!, this.center[2]! + this.pan[2]!];
     const eye = [target[0]! + this.dist * Math.cos(this.pitch) * Math.sin(this.yaw), target[1]! + this.dist * Math.sin(this.pitch),
                  target[2]! + this.dist * Math.cos(this.pitch) * Math.cos(this.yaw)];
-    const vp = mul(perspective(0.75, w / h, this.radius * 0.01, this.radius * 60), lookAt(eye, target, [0, 1, 0]));
+    const view = lookAt(eye, target, [0, 1, 0]);
+    const proj = perspective(0.75, w / h, this.radius * 0.01, this.radius * 60);
+    if (this.splats) {
+      this.splats.draw(view, proj, eye, target, w, h, 0.75);
+      return;
+    }
+    const vp = mul(proj, view);
     gl.useProgram(this.prog);
     gl.uniformMatrix4fv(gl.getUniformLocation(this.prog, "uVP"), false, vp);
     gl.uniform3fv(gl.getUniformLocation(this.prog, "uEye"), eye);

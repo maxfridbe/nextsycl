@@ -86,7 +86,8 @@ export async function go(): Promise<void> {
     }
     const made = a.data[0];
     if (made) state.shown = made;
-    state.status = `done in ${((performance.now() - t0) / 1000).toFixed(1)} s` + (made?.triangles ? ` · ${made.triangles} triangles` : "");
+    state.status = `done in ${((performance.now() - t0) / 1000).toFixed(1)} s` + (made?.triangles ? ` · ${made.triangles} triangles` : "") +
+      (made?.gaussians ? ` · ${made.gaussians} Gaussian splats` : "");
     await refreshHistory();
   } catch (e) {
     state.error = String(e instanceof Error ? e.message : e);

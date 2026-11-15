@@ -2,7 +2,7 @@
 //! pipeline with its own kernels (`kernels/model3d/<arch>`) and memory plan, and does one or both of:
 //!
 //! - **generate**: a mesh from one or more pictures of an object (TRELLIS.2, Hunyuan3D, Pixal3D) - its shape, and
-//!   with `texture` its PBR textures;
+//!   with `texture` its PBR textures - or 3D Gaussian splats (`splat`: Budget3D-Idol; a PLY, `Splats`);
 //! - **rig**: a mesh given a skeleton and skin weights (UniRig, RigNet), or set in motion by a description
 //!   (AnimateAnyMesh: a morph animation).
 //!
@@ -13,6 +13,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+pub mod splat;
+pub use splat::Splats;
 
 pub use nextsycl_core::options::Given;
 pub use nextsycl_core::{At, EngineOption, Error, Gpu, Result};
@@ -83,6 +86,8 @@ pub struct Abilities {
     pub rig: bool,
     /// motion from a description (`rig` with a prompt: a morph animation)
     pub animate: bool,
+    /// 3D Gaussian splats from pictures (`splat`) rather than meshes (`generate` answers with them)
+    pub splats: bool,
 }
 
 /// The engine's own defaults, shown by `engines` and used for the request's `None` fields
@@ -142,6 +147,11 @@ pub trait Model3dEngine: Send + Sync {
     /// a mesh from the request's pictures, reporting as it goes; an error from `progress` stops it (a cancel)
     fn generate(&self, _req: &MeshRequest, _progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Mesh> {
         Err(Error(format!("{} does not make meshes from pictures (it rigs them: model3d.rig)", self.arch())))
+    }
+    /// 3D Gaussian splats of the object in the request's pictures (an engine with `Abilities::splats`), reporting as it
+    /// goes; an error from `progress` stops it
+    fn splat(&self, _req: &MeshRequest, _progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Splats> {
+        Err(Error(format!("{} makes meshes, not Gaussian splats", self.arch())))
     }
     /// the request's mesh rigged (a skeleton and skin weights) or animated (a morph animation)
     fn rig(&self, _req: &RigRequest, _progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Mesh> {

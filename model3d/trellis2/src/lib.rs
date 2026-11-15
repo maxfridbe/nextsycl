@@ -682,7 +682,7 @@ impl Model3dEngine for Trellis2 {
         self.arch
     }
     fn abilities(&self) -> Abilities {
-        Abilities { generate: true, texture: true, views: 1, rig: false, animate: false }
+        Abilities { generate: true, texture: true, views: 1, rig: false, animate: false, splats: false }
     }
     fn defaults(&self) -> Defaults {
         let hr = self.files.contains_key("shape_flow_1024") && self.files.contains_key("tex_flow_1024");

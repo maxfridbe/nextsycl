@@ -49,7 +49,7 @@ impl Model3dEngine for Painter {
     }
     fn abilities(&self) -> Abilities {
         // paints a mesh it is given; makes none (generate: false)
-        Abilities { generate: false, texture: true, views: 1, rig: false, animate: false }
+        Abilities { generate: false, texture: true, views: 1, rig: false, animate: false, splats: false }
     }
     fn defaults(&self) -> Defaults {
         Defaults { steps: 15, cfg: 0.0, resolution: 0, faces: 40_000, texture_size: 2048, frames: 0, fps: 0.0 }
