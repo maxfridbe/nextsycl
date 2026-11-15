@@ -28,8 +28,8 @@ nextsycl model3d check <dump dir> --model ID [--stages a,b,...] [--mesh FILE.obj
                    an engine's stages against its reference's dumps (reference/<arch>/)
 nextsycl model3d check DUMP_DIR [--model ID] [--stages pre,remover,dino,ss,ssdec,shape,cascade,tex,sdec,tdec] [--full] [--picture FILE] [--gpu N]
                    an engine's stages against reference/trellis2/ref.py's dumps
-nextsycl model3d check DUMP_DIR --model ID [--stages noise,ctx,layout,tokens,call,sample,dec] [--gpu N]
-                   Budget3D-Idol's stages against reference/budget3d/ref.py's dumps
+nextsycl model3d check DUMP_DIR --model ID [--stages noise,ctx,layout,tokens,call,sample,dec | pre,enc | bench] [--gpu N]
+                   Budget3D-Idol's stages against reference/budget3d/ref.py's dumps (pre,enc: encoders.py's; bench: timed objects from the zero condition)
 nextsycl model3d engines | selftest [--gpu N]";
 
 /// The 3D engines this program has (model3d/<arch>)

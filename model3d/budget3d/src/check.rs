@@ -17,6 +17,9 @@
 //!   pre      picture.png                              -> pre (the framed picture; BiRefNet when the model has it)
 //!   enc      pre                                      -> enc_dino, enc_vae (the encoders' tokens)
 //! ```
+//! and `bench` (any directory): the whole denoise + decode at budgets 1, 0.5 and 0.25 (the model's steps and guidance,
+//! 262,144 Gaussians) from the zero condition - what the model makes without a picture - timed, the card's peak
+//! memory watched; each object written as bench_b<B>.ply beside the dumps.
 
 use std::path::Path;
 
@@ -102,6 +105,28 @@ fn budgets(d: &Path) -> Vec<usize> {
     b
 }
 
+/// Seconds and the card's peak for an object at three budgets, from the zero condition (no picture: the gated encoders)
+fn bench(e: &Budget3d, d: &Path, lg: &mut Log) -> Result<f64> {
+    let f1 = vec![0f32; dit::L_COND * dit::COND1];
+    let f2 = vec![0f32; dit::L_COND * dit::COND2];
+    let dd = e.defaults_of();
+    for budget in [1.0, 0.5, 0.25] {
+        let p = Params { steps: dd.0, cfg: dd.1, budget, gaussians: 262_144, margin: 1.2, seed: 42 };
+        let peak = crate::Peak::new(&e.cx.gpu);
+        let t0 = std::time::Instant::now();
+        let (z, cam, l) = e.sample(&f1, &f2, &p, &mut |_, _| Ok(()))?;
+        let ts = t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        let s = e.decode(&z, &cam, p.gaussians, p.seed)?;
+        let td = t1.elapsed().as_secs_f64();
+        let out = d.join(format!("bench_b{}.ply", (budget * 100.0).round()));
+        std::fs::write(&out, s.to_ply()).map_err(|x| Error(format!("{}: {x}", out.display())))?;
+        lg.say(format!("budget {budget:<5} {} tokens: {} steps (cfg {}) {ts:.2} s, decode {} Gaussians {td:.2} s, total {:.2} s; card peak {:.1} GiB -> {}",
+                       l.tokens(), p.steps, p.cfg, s.len(), ts + td, peak.gib(), out.display()));
+    }
+    Ok(lg.worst)
+}
+
 /// The picture side: Idol's framing and the two encoders
 fn encoders(e: &Budget3d, d: &Path, stages: &[&str], lg: &mut Log) -> Result<f64> {
     let want = read_npy(&d.join("pre.npy"))?.1;
@@ -137,6 +162,9 @@ pub fn run(e: &Budget3d, d: &Path, stages: &[&str], log: &mut dyn FnMut(String))
     let has = |n: &str| d.join(format!("{n}.npy")).is_file();
     if stages.contains(&"pre") || stages.contains(&"enc") {
         return encoders(e, d, stages, &mut lg);
+    }
+    if stages.contains(&"bench") {
+        return bench(e, d, &mut lg);
     }
     let cx = &e.cx;
     let g = &cx.gpu;

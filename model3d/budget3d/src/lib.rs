@@ -154,7 +154,7 @@ impl<T> Slot<T> {
 }
 
 /// Watches the card's free memory every 50 ms until dropped: the run's peak (every process's use)
-struct Peak {
+pub(crate) struct Peak {
     stop: Arc<std::sync::atomic::AtomicBool>,
     least: Arc<std::sync::atomic::AtomicU64>,
     total: u64,
@@ -162,7 +162,7 @@ struct Peak {
 }
 
 impl Peak {
-    fn new(gpu: &Arc<Gpu>) -> Peak {
+    pub(crate) fn new(gpu: &Arc<Gpu>) -> Peak {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         let stop = Arc::new(AtomicBool::new(false));
         let least = Arc::new(AtomicU64::new(u64::MAX));
@@ -178,7 +178,7 @@ impl Peak {
         });
         Peak { stop, least, total, t: Some(t) }
     }
-    fn gib(&self) -> f64 {
+    pub(crate) fn gib(&self) -> f64 {
         let l = self.least.load(std::sync::atomic::Ordering::Relaxed);
         if l == u64::MAX { 0.0 } else { self.total.saturating_sub(l) as f64 / GIB }
     }
@@ -304,6 +304,12 @@ impl Budget3d {
         }
         Ok(Params { steps, cfg: if self.dit.turbo { 0.0 } else { req.cfg.unwrap_or(d.cfg) }, budget, gaussians: gaussians / decoder::PER * decoder::PER, margin,
                     seed: req.seed })
+    }
+
+    /// The default steps and guidance (the check's bench)
+    pub fn defaults_of(&self) -> (usize, f32) {
+        let d = self.defaults();
+        (d.steps as usize, d.cfg)
     }
 
     /// The background remover, for the check

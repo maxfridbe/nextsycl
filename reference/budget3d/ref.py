@@ -132,8 +132,14 @@ def main():
     for n in ("refine_latent_and_camera", "joint", "head", "_expand"):
         wrap(n)
     hooks = {}
+
+    def hook(tag):
+        # a forward hook that returns a value replaces the module's output: record, return nothing
+        def f(m, i, o):
+            hooks.setdefault(tag, o)
+        return f
     for tag, mod in (("blk0", model.blocks[0]), ("blk23", model.blocks[-1])):
-        mod.register_forward_hook(lambda m, i, o, tag=tag: hooks.setdefault(tag, o))
+        mod.register_forward_hook(hook(tag))
 
     def layout_of(ref, n_tokens):
         s4, s2 = detail_scores(ref[:, model.perm_to_octree].reshape(1, 16, 16, 16, 2, -1))
