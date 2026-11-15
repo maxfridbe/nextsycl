@@ -412,6 +412,26 @@ int nsd_upload_wait(void* ctx) try {
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
+int nsd_trim(void* ctx) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    c.q.wait();
+    if (c.cq) c.cq->wait();
+    auto drop = [&c](auto*& p, size_t& cap) {
+        if (p) sycl::free(p, c.q);
+        std::lock_guard<std::mutex> l(c.mem_mu);
+        c.mem_used -= cap * sizeof(*p);
+        p = nullptr;
+        cap = 0;
+    };
+    drop(c.xq, c.xq_cap); drop(c.rs, c.rs_cap); drop(c.gmax, c.gmax_cap); drop(c.xr, c.xr_cap); drop(c.acc, c.acc_cap);
+    drop(c.inv, c.inv_cap); drop(c.wq, c.wq_cap); drop(c.yq, c.yq_cap); drop(c.hq, c.hq_cap); drop(c.hk, c.hk_cap);
+    drop(c.hv, c.hv_cap); drop(c.sc, c.sc_cap); drop(c.ao, c.ao_cap); drop(c.part, c.part_cap); drop(c.rowv, c.rowv_cap);
+    drop(c.gn, c.gn_cap); drop(c.sq, c.sq_cap); drop(c.sk, c.sk_cap); drop(c.ss, c.ss_cap);
+    c.sdpa.clear(); c.sdpa_b.clear(); c.sdpa_qk.clear(); c.attn.clear(); c.gemm.clear(); c.rot.clear(); c.lin.clear();
+    c.conv3.clear(); c.conv3_w.clear(); c.conv2.clear(); c.conv3x.clear();
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
 void nsd_destroy(void* ctx) {
     auto* c = static_cast<Ctx*>(ctx);
     if (!c) return;

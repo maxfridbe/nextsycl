@@ -28,6 +28,7 @@ struct Api {
     last_error: unsafe extern "C" fn() -> *const c_char,
     create: unsafe extern "C" fn(M) -> M,
     destroy: unsafe extern "C" fn(M),
+    trim: unsafe extern "C" fn(M) -> c_int,
     wait: unsafe extern "C" fn(M) -> c_int,
     int8_linear: unsafe extern "C" fn(M, P, c_int, i64, i64, *const i8, i64, *const f32, i64, *const f32, M, c_int, c_int) -> c_int,
     linear: unsafe extern "C" fn(M, P, c_int, i64, i64, P, i64, *const f32, M, c_int) -> c_int,
@@ -79,6 +80,7 @@ fn api() -> Result<&'static Api> {
             last_error: sym!("nsd_last_error"),
             create: sym!("nsd_create"),
             destroy: sym!("nsd_destroy"),
+            trim: sym!("nsd_trim"),
             wait: sym!("nsd_wait"),
             int8_linear: sym!("nsd_int8_linear"),
             linear: sym!("nsd_linear"),
@@ -145,6 +147,13 @@ impl Nsd {
         } else {
             Err(Error(format!("{what}: {}", last(self.k))))
         }
+    }
+
+    /// Gives back the scratch buffers and per-shape primitives kept between calls (made again on use): for a caller
+    /// short of room before a large job
+    pub fn trim(&self) -> Result<()> {
+        // SAFETY: a live context.
+        self.ok(unsafe { (self.k.trim)(self.ctx) }, "giving back the kernels' scratch")
     }
 
     pub fn wait(&self) -> Result<()> {

@@ -100,6 +100,8 @@ struct Encoder {
 
 pub struct Vae {
     gpu: Arc<Gpu>,
+    /// an encode running (the memory probes' phase: NS_QI_MEM)
+    encoding: std::sync::atomic::AtomicBool,
     post_quant: Conv,
     conv_in: Conv,
     mid: [Resnet; 2],
@@ -223,6 +225,7 @@ impl Vae {
         }
         let vae = Vae {
             gpu: gpu.clone(),
+            encoding: std::sync::atomic::AtomicBool::new(false),
             post_quant,
             conv_in: conv("decoder.conv1")?,
             mid: [resnet("decoder.middle.0")?, resnet("decoder.middle.2")?],
@@ -239,6 +242,11 @@ impl Vae {
         Ok(vae)
     }
 
+    /// The memory probes' phase: the encode's or the decode's
+    fn phase(&self) -> &'static str {
+        if self.encoding.load(std::sync::atomic::Ordering::Relaxed) { "1 vae encode" } else { "3 vae" }
+    }
+
     fn conv(&self, nsd: &Nsd, c: &Conv, x: &DevBuf, h: usize, w: usize) -> Result<DevBuf> {
         let out = DevBuf::new(&self.gpu, h * w * c.co * 2)?;
         self.conv_into(nsd, c, x, h, w, &out)?;
@@ -252,7 +260,7 @@ impl Vae {
         if std::env::var("NS_QI_MEM").is_ok_and(|v| v == "2") {
             eprintln!("vae conv {h}x{w} {} -> {} k{}", c.ci, c.co, c.k);
         }
-        prof::mem(nsd, "3 vae")
+        prof::mem(nsd, self.phase())
     }
 
     /// silu(rms norm(x) * gamma), a new buffer
@@ -272,7 +280,7 @@ impl Vae {
         if std::env::var("NS_QI_MEM").is_ok_and(|v| v == "2") {
             eprintln!("vae norm {px} x {c}");
         }
-        prof::mem(nsd, "3 vae")
+        prof::mem(nsd, self.phase())
     }
 
     /// x + conv(silu(norm(conv(silu(norm(x)))))) in a new buffer, with one more beside it: `a` holds each
@@ -501,28 +509,68 @@ impl Vae {
             r0 += rows;
         }
         prof::mark(nsd, "vae attention")?;
-        prof::mem(nsd, "3 vae")?;
+        prof::mem(nsd, self.phase())?;
         nsd.linear(o.ptr(), Dt::F16, px, c, a.proj.ptr(), c, a.proj_b.ptr(), n.ptr(), Dt::F16)?;
         nsd.gate_add(x.ptr(), Dt::F16, px, c, n.ptr(), Dt::F16, none(), none())?;
         nsd.wait()?;
         Ok(x)
     }
 
+    /// The bytes an encode of an `hh` x `ww` picture holds at most: each down block's input (kept for its shortcut,
+    /// the first resnet reads it), each resnet's input and two buffers, the stride-2 convolution's padded input and
+    /// output; the middle's buffers (its attention's at the most); the latents out
+    pub fn encode_bytes(&self, hh: usize, ww: usize) -> u64 {
+        let Some(e) = self.enc.as_ref() else { return 0 };
+        let (mut h, mut w) = (hh as u64, ww as u64);
+        let mut peak = h * w * 4 * 2 + h * w * e.conv_in.co as u64 * 2;
+        for d in &e.downs {
+            let px = h * w;
+            let kept = px * d.ci as u64 * 2;
+            for (i, r) in d.resnets.iter().enumerate() {
+                let (ci, cm, co) = (r.conv1.ci as u64, r.conv1.co as u64, r.conv2.co as u64);
+                let input = if i == 0 { 0 } else { px * ci * 2 };
+                peak = peak.max(kept + input + px * 2 * (ci.max(cm).max(co) + cm.max(co)));
+            }
+            if let Some(c) = &d.resample {
+                peak = peak.max(kept + px * c.ci as u64 * 2 + (h + 1) * (w + 1) * c.ci as u64 * 2 + (px / 4) * c.co as u64 * 2);
+                h /= 2;
+                w /= 2;
+            }
+        }
+        let (px, c) = (h * w, e.mid[0].conv2.co as u64);
+        let rows = ((256u64 << 20) / (px * 4)).clamp(1, px);
+        peak.max(6 * px * c * 2 + rows * px * 6) + px * e.quant.co as u64 * 4 + SLACK
+    }
+
     /// Normalized latents float32 [h * w, z] (h = H / 16) of a picture: RGBA float32 [H, W, 4] in [-1, 1]
     pub fn encode(&self, nsd: &Nsd, rgba: &[f32], hh: usize, ww: usize) -> Result<Vec<f32>> {
+        use std::sync::atomic::Ordering;
+        self.encoding.store(true, Ordering::Relaxed);
+        let r = self.encode_inner(nsd, rgba, hh, ww);
+        self.encoding.store(false, Ordering::Relaxed);
+        r
+    }
+
+    fn encode_inner(&self, nsd: &Nsd, rgba: &[f32], hh: usize, ww: usize) -> Result<Vec<f32>> {
         let e = self.enc.as_ref().ok_or_else(|| Error("this VAE file has no encoder (edits need it)".into()))?;
         let gpu = &self.gpu;
         let k = ffi::api()?;
-        let xf = DevBuf::from_f32(gpu, rgba)?;
-        let x = DevBuf::new(gpu, rgba.len() * 2)?;
-        // SAFETY: H x W x 4 values each way.
-        ffi::check(unsafe { (k.to_half)(gpu.raw(), xf.fp(), x.ptr(), rgba.len() as i64) }, "to half")?;
-        let mut x = self.conv(nsd, &e.conv_in, &x, hh, ww)?;
+        let mut x = {
+            let xf = DevBuf::from_f32(gpu, rgba)?;
+            let xh = DevBuf::new(gpu, rgba.len() * 2)?;
+            // SAFETY: H x W x 4 values each way.
+            ffi::check(unsafe { (k.to_half)(gpu.raw(), xf.fp(), xh.ptr(), rgba.len() as i64) }, "to half")?;
+            let x = self.conv(nsd, &e.conv_in, &xh, hh, ww)?;
+            // the picture's buffers are freed here: the work on them first
+            nsd.wait()?;
+            x
+        };
         let (mut h, mut w) = (hh, ww);
         for d in &e.downs {
-            let keep = DevBuf::new(gpu, h * w * d.ci * 2)?;
-            keep.copy_within(0, &x, 0, h * w * d.ci * 2)?;
-            for r in &d.resnets {
+            // the block's input, kept for its shortcut (the first resnet reads it and leaves it as it is: no copy)
+            let keep = x;
+            x = self.resnet(nsd, &d.resnets[0], &keep, h, w)?;
+            for r in &d.resnets[1..] {
                 x = self.resnet(nsd, r, &x, h, w)?;
             }
             match &d.resample {
@@ -534,6 +582,7 @@ impl Vae {
                     nsd.conv3d_ex(p.ptr(), Dt::F16, (1, h + 1, w + 1), c.ci, c.w.ptr(), c.co, (1, 3, 3), (1, 2, 2), c.b.ptr(), out.ptr())?;
                     // SAFETY: keep holds h x w x ci halves, out (h / 2) x (w / 2) x co.
                     ffi::check(unsafe { (k.avg_down_add)(gpu.raw(), keep.ptr(), h as i64, w as i64, d.ci as i64, d.co as i64, d.ft, out.ptr()) }, "shortcut")?;
+                    prof::mem(nsd, self.phase())?;
                     nsd.wait()?;
                     x = out;
                     h /= 2;

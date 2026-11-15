@@ -224,14 +224,22 @@ impl QwenImage21 {
     }
 
     /// What a `w` x `h` picture after a prefix of `p` rows needs on the card at most (the denoise's or the decode's
-    /// buffers, the kernels' scratch), and whether it has that now: a plain error when the card could never hold it
-    /// beside the model, no room when it could on an emptier card
-    pub fn room_for(&self, w: usize, h: usize, p: usize) -> Result<()> {
+    /// buffers, the kernels' scratch, and the VAE encodes of the pictures in `encodes`, W x H each: an edit's or an
+    /// img2img's), and whether it has that now: a plain error when the card could never hold it beside the model, no
+    /// room when it could on an emptier card
+    pub fn room_for(&self, w: usize, h: usize, p: usize, encodes: &[(usize, usize)]) -> Result<()> {
         let (lh, lw) = (h / 16, w / 16);
-        let need = (self.dit.denoise_bytes(lh * lw, p) + SCRATCH).max(self.vae.min_bytes(lh, lw)) + vae::MARGIN;
+        let enc = encodes.iter().map(|(ew, eh)| self.vae.encode_bytes(*eh, *ew)).max().unwrap_or(0);
+        let need = (self.dit.denoise_bytes(lh * lw, p) + SCRATCH).max(self.vae.min_bytes(lh, lw)).max(enc) + vae::MARGIN;
         let gpu = &self.nsd.gpu;
         let (total, free) = gpu.memory()?;
-        let free = free.unwrap_or(total);
+        let mut free = free.unwrap_or(total);
+        if need > free {
+            // the kernels' scratch and primitives from earlier requests (a 1024 edit's left 0.85 GiB): given back first
+            self.nsd.trim()?;
+            let (t, f) = gpu.memory()?;
+            free = f.unwrap_or(t);
+        }
         if need + self.resident > total {
             return Err(Error(format!("{ARCH}: {w}x{h} needs {:.1} GiB on {} beside the model's {:.1} GiB, and the card has {:.1} in all: a smaller size",
                                      need as f64 / GIB, gpu.name, self.resident as f64 / GIB, total as f64 / GIB)));
@@ -559,6 +567,13 @@ impl ImageEngine for QwenImage21 {
             (true, Some(_)) if schedule == Schedule::Shift => sched::below(&sig, strength),
             (true, _) => sched::tail(&levels(((steps as f32 / strength).round() as usize).max(steps))?, steps),
         };
+        // the size's room before any work: the pictures' encodes (an img2img's start at the output's size, an edit's
+        // pictures at the model's area) and the denoise over at least their latents (checked again with the prompt's
+        // tokens below)
+        let enc_sizes: Vec<(usize, usize)> = pics.iter().map(|p| dims(area as f64, p.width as f64 / p.height as f64))
+            .chain((strength < 1.0 && req.edit.is_some()).then_some((w, h))).collect();
+        let pics_rows: usize = pics.iter().map(|p| dims(area as f64, p.width as f64 / p.height as f64)).map(|(a, b)| (a / 16) * (b / 16)).sum();
+        self.room_for(w, h, pics_rows, &enc_sizes)?;
         let start = match &req.edit {
             Some(e) if strength < 1.0 => {
                 let r = e.image.rgba().resize_lanczos(w as u32, h as u32);
@@ -587,7 +602,7 @@ impl ImageEngine for QwenImage21 {
         // the size's room, checked before the work: a prefix at most the prompt's tokens and the pictures' latents (the
         // negative prompt's kept beside it)
         let pics_rows: usize = lats.iter().map(|(_, (a, b))| a * b).sum();
-        self.room_for(w, h, tokens + pics_rows + negative.as_ref().map_or(0, |(_, t, _)| t + pics_rows))?;
+        self.room_for(w, h, tokens + pics_rows + negative.as_ref().map_or(0, |(_, t, _)| t + pics_rows), &[])?;
         if let Ok(dir) = std::env::var("NS_QI_DUMP") {
             // what the denoiser is given (a debugging aid): raw float32 files
             let raw = |name: &str, v: &[f32]| { let _ = std::fs::write(format!("{dir}/{name}"), v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()); };

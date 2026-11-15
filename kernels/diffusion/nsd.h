@@ -37,6 +37,9 @@ void* nsd_open_gpu(int index);
 void* nsd_create(void* sycl_queue);
 /* Waits for the queue, frees the scratch buffers and everything still allocated with nsd_alloc. */
 void nsd_destroy(void* ctx);
+/* Gives back what the context keeps between calls: its scratch buffers and its per-shape primitives (with the weights
+ * reordered for them). For a caller short of room before a large job; the next calls make them again. */
+int nsd_trim(void* ctx);
 
 const char* nsd_device_name(void* ctx);
 
