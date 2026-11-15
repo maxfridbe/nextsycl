@@ -800,8 +800,17 @@ impl Server {
             .collect::<nextsycl_core::Result<Vec<_>>>() {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[the engine cannot make its sessions: {}]", e.0);
-                return;
+                // every request then fails with why (they waited for a session forever before: the server's status
+                // showed them waiting and a graceful stop never ended)
+                let why = format!("the engine cannot make its sessions: {}", e.0);
+                eprintln!("[{why}]");
+                let mut q = self.queue.lock().unwrap();
+                loop {
+                    while let Some(job) = q.pop_front() {
+                        let _ = job.tx.send(Ev::Fail(why.clone()));
+                    }
+                    q = self.wake.wait(q).unwrap();
+                }
             }
         };
         let mut rng = Rng(0x5DEECE66D);
