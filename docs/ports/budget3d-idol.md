@@ -82,3 +82,57 @@ The gated encoders are the cards' `local` parts: `NS_M3D_B3D_DINO` / `NS_M3D_B3D
   (response_format ply or url), the front door serves and lists them (`does: [generate, splat]`: capabilities splats,
   ply), and wfe/model3d draws them (`splat.ts`: EWA quads, back-to-front after a 16-bit counting sort) with a token
   budget slider (options.budget).
+
+## 4. Parity (B70, `nextsycl model3d check`, against reference/budget3d/ref.py float32 on the CPU)
+
+Without the gated encoders the condition is a seeded normal draw of their shapes (Budget3D's own parity gate does the
+same); the encoders' code is checked on seeded random weights of their exact shapes (`encoders.py`).
+
+| stage | worst relative RMS (cosine) |
+|---|---|
+| noise (`torch.manual_seed` + `randn`, latent and camera) | 3e-8 / 0 (exact) |
+| context refiner (guided, zero condition) | 2.9e-4, 7.3e-5 |
+| detail scores; layouts at budgets 1, 0.5, 0.25 | 3e-8; identical (k4 / k2 512/4096, 264/1736, 114/738) |
+| tokens (mixers, IPE, scale embeddings) | 9e-6 |
+| one guided call, budgets 1 / 0.5 / 0.25 x t 1 / 0.6 / 0.3: noise refiner, joint, head, v tokens, v points, velocity | velocity <= 3.2e-3 (>= 0.999995); v points <= 1.2e-3 |
+| Turbo one call (both phases), the same grid | velocity <= 6.2e-4 |
+| base sampler, 6 steps at budget 0.5 | steps 0-4 <= 2.6e-3; the step-5 relayout (from the clean estimate) picks a slightly different layout (near-tied scores), final latent 2.0e-2 (0.9998) |
+| Turbo sampler, 5 steps at 0.5 (a layout every step) | every layout identical; final latent 4.4e-4 |
+| octree decoder logits, all 8 levels | <= 2.6e-3 |
+| Gaussian decoder features (2048 anchors) | 3.1e-3 base latent, 6.2e-3 Turbo latent (>= 0.99998) |
+| Gaussian activation | <= 5e-8 |
+| framing (BiRefNet cut-out, crop, Lanczos) of a 768 px picture | 4.7e-3; no value more than 2 levels off |
+| DINOv3 ViT-H+/16 code (random weights) | 7.0e-5 |
+| FLUX.2 VAE encoder code (random weights) | 9.4e-4 |
+
+## 5. Speed (B70, one object, 262,144 Gaussians, seconds)
+
+From the zero condition (`check --stages bench`: denoise + decode, encoders excluded):
+
+| model | budget 1 (8192 tokens) | 0.5 (4096) | 0.25 (2048) | card peak |
+|---|---|---|---|---|
+| Budget3D-Idol, 50 steps, CFG 3 | 30.5 | 17.2 | 12.0 | 2.1-2.4 GiB |
+| Budget3D-Idol-Turbo, 5 steps | 2.2 | 1.5 | 1.1 | 2.6-2.7 GiB |
+
+(The reference's H100 fp32 numbers: 63 s at 100 %, 32 s at 50 %.) The picture side - BiRefNet, the framing, DINOv3
+ViT-H+ in float32 (3.4 GB loaded for the request) and the VAE encoder - measured with random weights of the real
+shapes: about 4-5 s a request with the loads (the 3D server's whole request at budget 0.5: 22.1 s).
+
+## 6. Licences
+
+- Budget3D weights: Apache-2.0 (fine-tuned from Idol / Idol-turbo); Budget3D's code (only read, as the reference): MIT.
+- Idol's weights and idol-sdk: Apache-2.0. BiRefNet (ZhengPeng7): MIT.
+- DINOv3 ViT-H+/16: the DINOv3 License (Meta), gated with manual approval (name, date of birth, affiliation...).
+- The FLUX.2 VAE as Idol names it (`black-forest-labs/FLUX.2-dev`, `vae/`): the repository is under the FLUX [dev]
+  Non-Commercial License Agreement and BFL's Acceptable Use Policy (gated, approved on accepting). Not used here.
+  BFL's Apache-2.0, ungated FLUX.2-klein-4B carries a FLUX.2 VAE too (168 MB, bfloat16; FLUX.2-dev's is 336 MB) - Budget3D's
+  own encoders.py loads it from there by default; whether that is acceptable is the user's call, it was not used.
+
+## 7. Open
+
+- The real encoders (gated): their weights' parity, a real picture end to end, the cards' vram_gib measured with them.
+- The page's WebGL2 splat drawing is type-checked and its PLY reader run on a real result (node), not looked at in a
+  browser (no WebGL in a headless one here); the CPU rasterizer (`nextsycl model3d tool render`) draws the results.
+- DINOv3 runs in float32 (Idol: bfloat16): exact but 3.4 GB loaded a request (`NS_M3D_B3D_RESIDENT` keeps it).
+- No silo yet: the blocks run on the shared linears and attention; a fused RePo / norm and graph capture are the
+  obvious next steps.
