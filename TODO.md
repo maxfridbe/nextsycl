@@ -116,8 +116,21 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
       64 recordings. Options normalize on/off (Zyphra textnorm, Rust port), level on/off (default on: -19 dBFS speech,
       3 s gated window, 0.5 s gain smoothing, -12..+40 dB, soft limiter; off = decoder level -3 dB). Markup [pause],
       [pause 0.25|0.5|1|2], [start], [ipa ...], [steer ID=DOSE,...]words[/steer] (ids as zonos3-cli --request);
-      (laugh) read aloud, [laugh] / <laugh/> dropped; the text pass leaves a card's `keep` regex spans alone. Still
-      coming on nextcuda: LACI/short text, speech editing, streaming.
+      (laugh) read aloud, [laugh] / <laugh/> dropped; the text pass leaves a card's `keep` regex spans alone.
+- [ ] Final delta (nextcuda faa02ae, on GitHub; spec docs/ports/zonos3.md there): card roles edit-adapter
+      (edit/accents.gguf: the edit LoRA only - no accent adapters ship, accents are steering accents_* directions),
+      aligner (Zyphra/fusealign a4d58de4) and 43 laci-* heads files; capabilities [voices, clone, edit]. Option laci
+      (default off, needs cfg 1): alignment probes on attention layers 3 and 7, their attention masked on retries,
+      Zyphra's skip/stall/truncation detector, rollback re-prefills prompt + kept rows (as Zyphra's server). Option
+      short-text (default auto): a filler sentence + codes-only silence classifier (Whisper-exact 18/18 vs 10/18 off,
+      6 texts x 3 seeds; Zyphra's server 18/18 vs 9/18). Streaming: /v1/audio/speech streams while decoding (stream:
+      true), 300-frame decode context, last frame held back, causal leveler; stream = whole take to rel 1.2e-6. Speech
+      editing: RPC audio.edit {audio, original_text, target_text, model?, seed?, options?, response_format?} ->
+      {data:[{url}], regions:[{original, edited, old_words}]}, capability speech_edit; FuseAlign word bounds within 1 ms
+      of fusealign-cli; edit LM with the LoRA applied at run time (cos 0.99987, argmax 93 % vs Zyphra's ggml runtime);
+      transcript from our own Whisper; <= 30 s clips, <= 3 regions, no CJK segmentation. Corrections: [pause 2] ~0.5 s
+      in both engines (0.53 vs 0.52 s, 8 seeds); reentrant repeats reuse a job only when its fingerprint (body, build,
+      model files) matches; leveler gated over the 10 s around each frame, gain up to +50 dB.
 - [ ] Model cards: an `annotations` list (syntax / keep / does / tested) and `annotations_note`, as nextcuda's
       model-cards/annotations.yml (the platform shows them beside the text box per engine) - for every card, not only
       ZONOS3.
