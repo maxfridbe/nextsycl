@@ -1,7 +1,8 @@
 /** 3D Gaussian splats on WebGL2, no library: a 3DGS PLY read (binary little-endian floats: x y z, f_dc_0..2, opacity as
  *  its logit, scale_0..2 as logs, rot_0..3 a (w, x, y, z) quaternion), each splat drawn as a screen-space quad its
  *  projected covariance shapes (EWA, the 0.3 px low-pass of the reference rasterizer), blended back to front after a
- *  16-bit counting sort by depth, redone when the view turns. */
+ *  16-bit counting sort by depth, redone when the view turns. The PLY is in 3DGS's frame (y down: the object's up is -y);
+ *  it is turned 180 degrees about x on reading, into the viewer's y up. */
 
 export interface SplatData {
   count: number;
@@ -56,7 +57,8 @@ export function parsePly(buf: ArrayBuffer): SplatData {
     const a = 1 / (1 + Math.exp(-g(6)));
     if (!(a > 1 / 255)) continue;
     const o = m * STRIDE;
-    const x = g(0), y = g(1), z = g(2);
+    // 3DGS's y down to the viewer's y up: (x, y, z) -> (x, -y, -z), the covariance's xy and xz with it
+    const x = g(0), y = -g(1), z = -g(2);
     rows[o] = x; rows[o + 1] = y; rows[o + 2] = z;
     for (let c = 0; c < 3; c++) rows[o + 3 + c] = Math.min(Math.max(0.5 + SH_C0 * g(3 + c), 0), 1);
     rows[o + 6] = a;
@@ -70,7 +72,7 @@ export function parsePly(buf: ArrayBuffer): SplatData {
                2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)];
     const M = R.map((v, k) => v * s[k % 3]!);
     const cov = (r: number, c: number) => M[r * 3]! * M[c * 3]! + M[r * 3 + 1]! * M[c * 3 + 1]! + M[r * 3 + 2]! * M[c * 3 + 2]!;
-    rows[o + 7] = cov(0, 0); rows[o + 8] = cov(0, 1); rows[o + 9] = cov(0, 2);
+    rows[o + 7] = cov(0, 0); rows[o + 8] = -cov(0, 1); rows[o + 9] = -cov(0, 2);
     rows[o + 10] = cov(1, 1); rows[o + 11] = cov(1, 2); rows[o + 12] = cov(2, 2);
     lo[0] = Math.min(lo[0]!, x); lo[1] = Math.min(lo[1]!, y); lo[2] = Math.min(lo[2]!, z);
     hi[0] = Math.max(hi[0]!, x); hi[1] = Math.max(hi[1]!, y); hi[2] = Math.max(hi[2]!, z);

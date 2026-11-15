@@ -256,7 +256,8 @@ fn write_any(p: &str, m: &nextsycl_model3d::Mesh) -> Result<(), String> {
     std::fs::write(p, bytes).map_err(|e| format!("{p}: {e}"))
 }
 
-/// `nextsycl model3d tool render IN.ply OUT.png`: splats drawn from `--views` sides around their up axis, side by side
+/// `nextsycl model3d tool render IN.ply OUT.png`: splats drawn from `--views` sides around their up axis (3DGS's frame:
+/// up is -y), a little from above, side by side
 fn render(input: &str, output: &str, args: &[String]) -> Result<(), String> {
     let s = nextsycl_model3d::Splats::from_ply(&std::fs::read(input).map_err(|e| format!("{input}: {e}"))?).map_err(|e| format!("{input}: {e}"))?;
     let views: u32 = num(args, "--views")?.unwrap_or(4).clamp(1, 16);
@@ -270,8 +271,8 @@ fn render(input: &str, output: &str, args: &[String]) -> Result<(), String> {
     let mut sheet = nextsycl_model3d::Texture::new(size * views, size);
     for v in 0..views {
         let a = std::f32::consts::TAU * v as f32 / views as f32;
-        let eye = [centre[0] + dist * a.sin(), centre[1] + dist * 0.25, centre[2] + dist * a.cos()];
-        let t = nextsycl_model3d::splat::render(&s, eye, centre, [0.0, 1.0, 0.0], fov, size, size, [255, 255, 255]);
+        let eye = [centre[0] + dist * a.sin(), centre[1] - dist * 0.25, centre[2] + dist * a.cos()];
+        let t = nextsycl_model3d::splat::render(&s, eye, centre, [0.0, -1.0, 0.0], fov, size, size, [255, 255, 255]);
         for y in 0..size as usize {
             let row = &t.rgba[y * size as usize * 4..(y + 1) * size as usize * 4];
             let at = (y * (size * views) as usize + (v * size) as usize) * 4;

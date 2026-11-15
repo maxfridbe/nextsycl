@@ -61,7 +61,7 @@ The gated encoders are the cards' `local` parts: `NS_M3D_B3D_DINO` / `NS_M3D_B3D
    leaves' points uniform in their 1/256 cells -> anchors (gaussians / 32). Gaussian decoder: 16 blocks (self over the
    anchors, cross to the latent, MLP) -> 480 an anchor = 32 Gaussians (offset tanh x 0.75 x softplus(offset scale),
    colour, scale softplus(+ inv_softplus(0.004)) with a 0.0009 floor, rotation x 0.1 + (1, 0, 0, 0), opacity
-   sigmoid(+ logit 0.1)); z-up in [-0.5, 0.5]^3, written y-up as Idol's save_ply.
+   sigmoid(+ logit 0.1)); z-up in [-0.5, 0.5]^3, written as Idol's save_ply does: +90 degrees about x, (x, -z, y) - 3DGS's frame, up along -y.
 
 ## 3. The port
 

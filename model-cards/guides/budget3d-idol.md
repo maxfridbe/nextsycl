@@ -1,7 +1,7 @@
 # Budget3D-Idol: a picture to 3D Gaussian splats
 
 Send one picture of one object (`model3d.generate` with `image`). The answer links a PLY of 3D Gaussian splats
-(the standard 3DGS layout: positions, colour as degree-0 spherical harmonics, opacity, scales, rotations; y up), and
+(the standard 3DGS layout: positions, colour as degree-0 spherical harmonics, opacity, scales, rotations; 3DGS's frame, the object's up along -y, as 3DGS viewers expect), and
 its settings say the camera the picture was seen from (yaw, pitch, distance, field of view).
 
 ## Pictures

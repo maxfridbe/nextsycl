@@ -9,7 +9,7 @@
 //!              (Turbo: 5 steps, unguided, its phase experts), time shifted by 3; at a budget < 1 the latent runs
 //!              as fewer, merged tokens (the layout from the noise, refreshed from the clean estimate)   dit.rs, layout.rs
 //!           -> the octree decoder's anchors, the Gaussian decoder's 32 Gaussians an anchor             decoder.rs
-//!           -> Splats (y up, the PLY's frame) and the camera the picture was seen from
+//!           -> Splats (the PLY's frame: up along -y) and the camera the picture was seen from
 //! ```
 //!
 //! The denoiser and the decoders stay loaded; the encoders and the background remover load for a request and go after
@@ -405,7 +405,7 @@ impl Budget3d {
         Ok((z, cam, lay.unwrap_or_else(Layout::dense)))
     }
 
-    /// The latent to Gaussians: the octree's anchors (a seeded draw), the Gaussian decoder, activated (y up)
+    /// The latent to Gaussians: the octree's anchors (a seeded draw), the Gaussian decoder, activated (the PLY's frame: up along -y)
     pub fn decode(&self, z: &[f32], cam: &[f32], gaussians: usize, seed: u64) -> Result<Splats> {
         let lat = decoder::latent(&self.cx.gpu, z)?;
         let mut g = nextsycl_diffusion::torch_rng::Mt19937::new(seed ^ 0x6a09_e667_f3bc_c908);

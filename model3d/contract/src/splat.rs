@@ -1,7 +1,8 @@
 //! 3D Gaussian splats: what an image-to-splat engine makes (Budget3D-Idol), the standard 3DGS PLY they travel as, and
 //! a small CPU rasterizer for checks and thumbnails (the web page draws them with its own WebGL2 renderer).
 //!
-//! Values are kept activated, in the PLY's frame (y up): positions, the degree-0 spherical-harmonic colour (`dc`:
+//! Values are kept activated, in the PLY's frame - 3DGS's, y down (OpenCV / COLMAP: the object's up is -y; Idol's
+//! save_ply writes that, and 3DGS viewers expect it): positions, the degree-0 spherical-harmonic colour (`dc`:
 //! colour = 0.5 + 0.2821 dc), opacity in [0, 1], scales (standard deviations along the rotated axes) and unit
 //! rotation quaternions (w, x, y, z). The PLY stores what 3DGS viewers read: opacity as its logit, scales as logs.
 
@@ -39,7 +40,7 @@ impl Splats {
         self.rotations.push(rot);
     }
 
-    /// From a z-up frame to the PLY's y-up one: +90 degrees about x, (x, y, z) -> (x, -z, y), each rotation turned
+    /// From a z-up frame to the PLY's (y down: up is -y): +90 degrees about x, (x, y, z) -> (x, -z, y), each rotation turned
     /// with it (Idol's save_ply)
     pub fn z_up_to_y_up(&mut self) {
         let h = std::f32::consts::FRAC_1_SQRT_2;
