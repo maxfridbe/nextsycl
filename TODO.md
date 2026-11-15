@@ -54,6 +54,16 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
 - [ ] A repetition guard in the front door (presence / frequency penalty): none exists
 - [ ] Re-fetch the VQ GGUF only if wanted (card `deepseek-v4.1-flash-vq`, 40 checked parts)
 
+## Port: Open-H3-Regenerate-2K IC (user asked 2026-11-15)
+
+- [ ] 768P H3 draft -> 2560x1440 refinement, as in github.com/slmonker/ComfyUI-OpenH3Regenerate2KIC (Apache-2.0;
+      its workflows: T2VA, Ref2VA, draft-to-2K). Upstream weights huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K-IC
+      (NVlabs/Sana sol-engine; licence "other" - read it): IC LoRA, HyperFlow 8-step + LMS LoRAs, the 3D-conv latent
+      upscaler (minimax_h3_latent_upscaler_3d_conv_v1_bf16), fast H3 VAE v2 (24 layers), its own base_model
+      (transformer_ref, text encoder, VAE - compare with our MiniMax-H3 before downloading). Pipeline: draft as
+      <Video 1> Ref2VA conditioning -> VAE encode -> latent upscaler -> HyperFlow + LMS Sharp + IC LoRA, up3/up4/hf8
+      sigma grid -> fast VAE decode -> mux the draft's audio. Goes in video/ (crates/h3); not started.
+
 ## Done
 
 - [x] Server (`nextsycl serve`): OpenAI API, streaming, thinking split out, prompt-prefix reuse, graceful stop (7931d08)
