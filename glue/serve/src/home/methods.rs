@@ -3311,7 +3311,7 @@ fn audio_describe_prompt_guide_md(h: &Arc<Home>, req: AudioDescribePromptGuideMd
     h.legacy("audio.describePromptGuideMD", req)
 }
 
-/// A mesh from a picture of an object, or several views of it (TRELLIS.2, Hunyuan3D, Pixal3D; the model loads first if it must): its shape and, with texture, PBR textures - or, given a mesh (or file), that mesh painted like the picture; the answer links the GLB. A splatting model (Budget3D-Idol; capabilities: splats) makes 3D Gaussian splats instead, a PLY (options.budget: the share of its latent tokens, 0.0625 to 1). A job like image.generate (wait, reentrant_id, status, cancel)
+/// A mesh from a picture of an object, or several views of it (TRELLIS.2, Hunyuan3D, Pixal3D; the model loads first if it must): its shape and, with texture, PBR textures - or, given a mesh (or file), that mesh painted like the picture; the answer links the GLB. A splatting model (Budget3D-Idol; capabilities: splats) makes 3D Gaussian splats instead, a PLY (options.budget: the share of its latent tokens, 0.0625 to 1; with no model named it is chosen only for response_format ply). A job like image.generate (wait, reentrant_id, status, cancel)
 #[rpc(name = "model3d.generate", tags = "model3d", example = r#"{"image": "data:image/png;base64,iVBORw0...", "model": "trellis2", "reentrant_id": "chair-1", "seed": 42, "texture": true, "wait": false}"#)]
 fn model3d_generate(h: &Arc<Home>, req: Model3dGenerateReq) -> Answer {
     h.legacy("model3d.generate", req)

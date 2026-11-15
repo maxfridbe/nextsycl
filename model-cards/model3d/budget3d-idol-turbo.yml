@@ -4,17 +4,14 @@ id: budget3d-idol-turbo
 kind: model3d
 arch: budget3d-idol
 title: 'Budget3D-Idol-Turbo (a picture to 3D Gaussian splats in 5 steps, any token budget; Apache-2.0)'
-about: 'BudgetAny''s Budget3D fine-tune of Sperid Labs'' Idol-turbo: Budget3D-Idol''s pipeline with Idol-turbo''s two phase-LoRA experts (a slow one while t >= 0.5, a fast one below; merged into the matrices at load) in 5 Euler steps without guidance - one denoiser pass a step. Same encoders (gated: name them as for budget3d-idol), decoders and token budget.'
+about: 'BudgetAny''s Budget3D fine-tune of Sperid Labs'' Idol-turbo: Budget3D-Idol''s pipeline with Idol-turbo''s two phase-LoRA experts (a slow one while t >= 0.5, a fast one below; merged into the matrices at load) in 5 Euler steps without guidance - one denoiser pass a step. Same encoders (DINOv3 gated: pulled with the Hugging Face token), decoders and token budget.'
 gpus: '0'
 vram_gib: 6.5                    # B70 peak 5.7 GiB from a picture (encoders of the real shapes, random weights); two merged copies of the adapted matrices
 does: [generate, splat]
-env:
-  NS_M3D_B3D_DINO: '{dino}'
-  NS_M3D_B3D_VAE: '{vae}'
-local:
-  dino: 'DINOv3 ViT-H+/16 model.safetensors (https://huggingface.co/facebook/dinov3-vith16plus-pretrain-lvd1689m, gated: accept the DINOv3 License, download it, set NS_M3D_B3D_DINO=<path> in nextsycl.conf)'
-  vae: 'the FLUX.2 VAE vae/diffusion_pytorch_model.safetensors (https://huggingface.co/black-forest-labs/FLUX.2-dev, gated: accept its terms, download it, set NS_M3D_B3D_VAE=<path> in nextsycl.conf)'
+env: {}
 files:
+  dino: dinov3-vith16plus        # defined in budget3d-idol.yml
+  vae: flux2-klein-vae
   denoiser:
     key: budget3d-idol-turbo
     url: https://huggingface.co/BudgetAny/Budget3D-Idol-Turbo/resolve/5d52410b1c6b3ab2feefcf819243567eafccc3d2/budget3d_idol_turbo.safetensors

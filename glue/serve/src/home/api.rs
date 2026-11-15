@@ -999,7 +999,8 @@ impl Home {
                 let id = match b["model"].as_str().filter(|x| !x.is_empty()) {
                     Some(_) => self.pick("model3d", b, &all)?,
                     None => {
-                        let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "model3d" && m["enabled"] != false && able(m)).collect();
+                        let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "model3d" && m["enabled"] != false && able(m)
+                                                                 && default_3d(m, want, b)).collect();
                         self.loaded_of("model3d").into_iter().find(|l| on.iter().any(|m| m["id"] == l.as_str())).or_else(|| on.first().map(|m| s(m, "id")))
                             .ok_or_else(|| (409, format!("no enabled 3D model does {want} (system.models: capabilities)")))?
                     }
@@ -1506,7 +1507,7 @@ impl Home {
                 let want = if p.ends_with("/rig") { "rig" } else if painting { "paint" } else { "generate" };
                 let id = match named {
                     Some(n) => self.pick("model3d", &json!({"model": n}), &all)?,
-                    None => all.iter().filter(|m| registry::kind_of(m) == "model3d" && m["enabled"] != false)
+                    None => all.iter().filter(|m| registry::kind_of(m) == "model3d" && m["enabled"] != false && default_3d(m, want, &body))
                         .find(|m| m["does"].as_array().is_none_or(|a| a.iter().any(|x| x == want || (want == "rig" && x == "animate"))))
                         .map(|m| m["id"].as_str().unwrap_or("").to_string()).ok_or_else(|| (409u16, format!("no enabled 3D model does {want}")))?,
                 };
@@ -1954,5 +1955,36 @@ mod parallel_tests {
         assert_eq!(at(2), json!({"minimax-h3": 2, "minimax-h3-q6k": 1}));
         // the studio not answering: none
         assert_eq!(at(0), json!({"minimax-h3": 0, "minimax-h3-q6k": 0}));
+    }
+}
+
+/// Whether a 3D model may answer a request that names none: a splatting model (card `does: splat`) makes Gaussian
+/// splats, not the mesh a caller of model3d.generate expects, so it is chosen only when the request asks for splats
+/// (`response_format: "ply"`), and then only a splatting model is
+fn default_3d(m: &Value, want: &str, body: &Value) -> bool {
+    if want != "generate" {
+        return true;
+    }
+    let splats = m["does"].as_array().is_some_and(|a| a.iter().any(|x| x == "splat"));
+    splats == (body["response_format"] == "ply")
+}
+
+#[cfg(test)]
+mod default_3d_tests {
+    use super::*;
+
+    #[test]
+    fn a_request_naming_no_model_lands_on_a_mesh_model_unless_it_asks_for_splats() {
+        let mesh = json!({"does": ["generate", "texture"]});
+        let splat = json!({"does": ["generate", "splat"]});
+        let plain = json!({"image": "x"});
+        assert!(default_3d(&mesh, "generate", &plain));
+        assert!(!default_3d(&splat, "generate", &plain));
+        assert!(!default_3d(&splat, "generate", &json!({"response_format": "url"})));
+        let ply = json!({"response_format": "ply"});
+        assert!(default_3d(&splat, "generate", &ply));
+        assert!(!default_3d(&mesh, "generate", &ply));
+        // painting and rigging are not about splats
+        assert!(default_3d(&splat, "rig", &plain));
     }
 }

@@ -59,7 +59,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "dino", env: "NS_M3D_B3D_DINO", value: "FILE",
                    help: "DINOv3 ViT-H+/16's model.safetensors (gated: facebook/dinov3-vith16plus-pretrain-lvd1689m), when the model's files do not name it", at: At::Load },
     EngineOption { name: "vae", env: "NS_M3D_B3D_VAE", value: "FILE",
-                   help: "the FLUX.2 VAE's diffusion_pytorch_model.safetensors (gated: black-forest-labs/FLUX.2-dev, vae/), when the model's files do not name it",
+                   help: "the FLUX.2 VAE's diffusion_pytorch_model.safetensors (FLUX.2-klein-4B's vae/, or FLUX.2-dev's), when the model's files do not name it",
                    at: At::Load },
     EngineOption { name: "resident", env: "NS_M3D_B3D_RESIDENT", value: "", help: "keep the image encoders and the background remover loaded between requests", at: At::Load },
     EngineOption { name: "profile", env: "NS_M3D_B3D_PROFILE", value: "", help: "each stage's time and the card's memory, on stderr", at: At::Load },
@@ -232,7 +232,7 @@ fn role<'f>(files: &'f ModelFiles, r: &str) -> Result<&'f Path> {
 }
 
 /// What a picture needs that this model's files lack: the gated encoders
-const GATED: &str = "the image encoders are gated on Hugging Face: DINOv3 ViT-H+/16 (facebook/dinov3-vith16plus-pretrain-lvd1689m, the DINOv3 License) and the FLUX.2 VAE (black-forest-labs/FLUX.2-dev, vae/) - accept their terms, download them and register them as this model's dino and vae files";
+const GATED: &str = "no image encoders: DINOv3 ViT-H+/16 (gated on Hugging Face: accept the DINOv3 License at facebook/dinov3-vith16plus-pretrain-lvd1689m, then `nextsycl models pull` fetches it with the account's token) and the FLUX.2 VAE (FLUX.2-klein-4B's vae/) are this model's dino and vae files (or NS_M3D_B3D_DINO / NS_M3D_B3D_VAE)";
 
 impl Budget3d {
     pub fn load(files: &ModelFiles, gpu: &Arc<Gpu>, o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Budget3d> {

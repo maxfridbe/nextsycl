@@ -211,6 +211,19 @@ pub fn silo_of(cfg: &Config, m: &Value) -> String {
 }
 
 /// A file's SHA-256, hex, reading it once
+/// The Hugging Face token: HF_TOKEN, else huggingface_hub's file ($HF_TOKEN_PATH, $HF_HOME/token,
+/// ~/.cache/huggingface/token)
+fn hf_token() -> Option<String> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    if let Some(t) = env("HF_TOKEN") {
+        return Some(t.trim().to_string());
+    }
+    let file = env("HF_TOKEN_PATH").map(PathBuf::from)
+        .or_else(|| env("HF_HOME").map(|h| Path::new(&h).join("token")))
+        .or_else(|| env("HOME").map(|h| Path::new(&h).join(".cache/huggingface/token")))?;
+    std::fs::read_to_string(file).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty() && !t.contains(char::is_whitespace))
+}
+
 fn sha256_of(p: &Path) -> Result<String, String> {
     let mut f = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
     let mut h = Sha256::new();
@@ -300,6 +313,24 @@ fn fetch(cat: &Catalog, root: &Path, key: &str, f: &Value, from: &[PathBuf], ver
         // one file of a zip archive (a release's bundle: realesrgan-ncnn-vulkan's models/): the archive downloaded once
         // under <root>/.archives (resumed like any file), the member taken out of it
         fetch_member(&url, member, root, &part)?;
+    } else if let Some(page) = f["gated"].as_str() {
+        // a gated Hugging Face file: the account's token (HF_TOKEN, else huggingface_hub's token file), sent to curl
+        // on its standard input (never on a command line), and a clear way out when there is none or it is refused
+        let token = hf_token().ok_or_else(|| format!("{key}: {url} is gated - accept its terms at {page} with a Hugging Face account, then log in \
+                                                      (`hf auth login`, or HF_TOKEN set to a token of that account) and pull again"))?;
+        println!("  {key}: downloading {:.2} GiB (gated, with the Hugging Face token)\n    {url}", gib(size));
+        let mut ch = Command::new("curl").args(["-fL", "-C", "-", "--retry", "5", "--retry-delay", "5", "-K", "-", "-o"]).arg(&part).arg(&url)
+            .stdin(std::process::Stdio::piped()).spawn().map_err(|e| format!("curl: {e}"))?;
+        {
+            use std::io::Write;
+            let mut si = ch.stdin.take().ok_or("curl: no stdin")?;
+            si.write_all(format!("header = \"Authorization: Bearer {token}\"\n").as_bytes()).map_err(|e| format!("curl: {e}"))?;
+        }
+        let st = ch.wait().map_err(|e| format!("curl: {e}"))?;
+        if !st.success() {
+            return Err(format!("{url}: the download failed - a refusal (HTTP 401 / 403) means the token's account has not been granted {page} \
+                                yet; otherwise run pull again: it resumes"));
+        }
     } else {
         println!("  {key}: downloading {:.2} GiB\n    {url}", gib(size));
         let st = Command::new("curl").args(["-fL", "-C", "-", "--retry", "5", "--retry-delay", "5", "-o"]).arg(&part).arg(&url).status()
@@ -572,6 +603,8 @@ mod tests {
                 assert_eq!(ps.iter().filter_map(|p| p["size"].as_u64()).sum::<u64>(), f["size"].as_u64().unwrap_or(0), "{k}: the parts' sizes");
             }
             assert!(s(f, "url").starts_with("https://") || f["parts"].is_array(), "{k}: a direct link");
+            // a gated file names the page whose terms its account must accept
+            assert!(f.get("gated").is_none_or(|g| g.as_str().is_some_and(|p| p.starts_with("https://huggingface.co/"))), "{k}: gated: its Hugging Face page");
             assert_eq!(s(f, "sha256").len(), 64, "{k}: a SHA-256");
             assert!(f["size"].as_u64().unwrap_or(0) > 0, "{k}: a size");
             assert!(!s(f, "path").is_empty() && !s(f, "path").starts_with('/'), "{k}: a relative path");
