@@ -136,3 +136,13 @@ shapes: about 4-5 s a request with the loads (the 3D server's whole request at b
 - DINOv3 runs in float32 (Idol: bfloat16): exact but 3.4 GB loaded a request (`NS_M3D_B3D_RESIDENT` keeps it).
 - No silo yet: the blocks run on the shared linears and attention; a fused RePo / norm and graph capture are the
   obvious next steps.
+
+The whole pipeline from a 768 px picture (`nextsycl model3d gen`, BiRefNet, the encoders with random weights of the
+real shapes, loads included; B70, seconds, the card's peak):
+
+| model | budget 1 | 0.5 | 0.25 | of which prepare / encode | peak |
+|---|---|---|---|---|---|
+| Budget3D-Idol | 35.0 | 21.4 | 16.3 | 1.2 / 2.7-3.1 | 5.0 GiB |
+| Budget3D-Idol-Turbo | 5.9 | 5.5 | 5.4 | 1.2 / 2.5-2.8 | 5.7 GiB |
+
+The B65 was not measured (the box was shared with other runs).

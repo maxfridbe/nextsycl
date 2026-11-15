@@ -6,7 +6,7 @@ arch: budget3d-idol
 title: 'Budget3D-Idol-Turbo (a picture to 3D Gaussian splats in 5 steps, any token budget; Apache-2.0)'
 about: 'BudgetAny''s Budget3D fine-tune of Sperid Labs'' Idol-turbo: Budget3D-Idol''s pipeline with Idol-turbo''s two phase-LoRA experts (a slow one while t >= 0.5, a fast one below; merged into the matrices at load) in 5 Euler steps without guidance - one denoiser pass a step. Same encoders (gated: name them as for budget3d-idol), decoders and token budget.'
 gpus: '0'
-vram_gib: 12.0                   # not measured with the encoders (gated); its denoiser keeps two merged copies of the adapted matrices
+vram_gib: 6.5                    # B70 peak 5.7 GiB from a picture (encoders of the real shapes, random weights); two merged copies of the adapted matrices
 does: [generate, splat]
 env:
   NS_M3D_B3D_DINO: '{dino}'
