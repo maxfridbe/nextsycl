@@ -306,7 +306,7 @@ impl Model3dServer {
 
     /// Runs a request: (JSON for response_format url, else none), the result's bytes (a GLB, or a PLY of splats) and
     /// their content type
-    fn run_request(&self, rig: bool, b: &Value, base: &str) -> Result<(Option<Value>, Vec<u8>, &'static str), (u16, String)> {
+    fn run_request(&self, rig: bool, b: &Value, base: &str) -> Result<Answered, (u16, String)> {
         let bad = |m: String| (400u16, m);
         if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model) {
             return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
@@ -392,7 +392,7 @@ impl Model3dServer {
                                    fps: num("fps").map(|v| v as f32), steps: num("steps").map(|v| v as u32), cfg: num("cfg").map(|v| v as f32), extra };
             meta["prompt"] = json!(prompt);
             meta["frames"] = json!(req.frames.unwrap_or(d.frames));
-            engine.rig(&req, &mut report).map(Made::Mesh)
+            engine.rig(&req, &mut report).map(|m| Made::Mesh(Box::new(m)))
         } else {
             if !a.generate && !(paint_given && a.texture) {
                 return Err(bad(format!("{} rigs meshes; it does not make them (model3d.rig)", self.model)));
@@ -416,17 +416,19 @@ impl Model3dServer {
             let req = MeshRequest { views: views.iter().map(|v| v.0.clone()).collect(), mesh: mesh_in, texture, seed, steps: num("steps").map(|v| v as u32),
                                     cfg: num("cfg").map(|v| v as f32), resolution: num("resolution").map(|v| v as u32), faces: num("faces").map(|v| v as u32),
                                     texture_size: num("texture_size").map(|v| v as u32), remove_background: b["remove_background"].as_bool(), extra };
-            meta["texture"] = json!(texture);
+            if !a.splats {
+                meta["texture"] = json!(texture);
+                meta["resolution"] = json!(req.resolution.unwrap_or(d.resolution));
+                meta["faces"] = json!(req.faces.unwrap_or(d.faces));
+            }
             meta["steps"] = json!(req.steps.unwrap_or(d.steps));
             meta["cfg"] = f(req.cfg.unwrap_or(d.cfg));
-            meta["resolution"] = json!(req.resolution.unwrap_or(d.resolution));
-            meta["faces"] = json!(req.faces.unwrap_or(d.faces));
             meta["views"] = json!(views.iter().map(|v| v.0.side.clone()).collect::<Vec<_>>());
             if a.splats {
                 meta["options"] = json!(req.extra);
                 engine.splat(&req, &mut report).map(Made::Splats)
             } else {
-                engine.generate(&req, &mut report).map(Made::Mesh)
+                engine.generate(&req, &mut report).map(|m| Made::Mesh(Box::new(m)))
             }
         };
         *p.lock().unwrap() = json!({"busy": false});
@@ -489,12 +491,15 @@ impl Model3dServer {
     }
 }
 
+/// A request's answer: JSON (response_format url) or none, the result's bytes, their content type
+type Answered = (Option<Value>, Vec<u8>, &'static str);
+
 /// What a PLY is served as
 const PLY: &str = "application/octet-stream";
 
 /// What a request made: a mesh (generate, rig) or splats
 enum Made {
-    Mesh(nextsycl_model3d::Mesh),
+    Mesh(Box<nextsycl_model3d::Mesh>),
     Splats(nextsycl_model3d::Splats),
 }
 

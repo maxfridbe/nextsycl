@@ -256,8 +256,9 @@ pub fn render(s: &Splats, eye: [f32; 3], target: [f32; 3], up: [f32; 3], fov: f3
                 if al < 1.0 / 255.0 {
                     continue;
                 }
-                for c in 0..3 {
-                    col[k][c] += al * tr[k] * g.c[c];
+                let w = al * tr[k];
+                for (o, c) in col[k].iter_mut().zip(g.c) {
+                    *o += w * c;
                 }
                 tr[k] *= 1.0 - al;
             }

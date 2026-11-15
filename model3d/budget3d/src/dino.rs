@@ -100,7 +100,7 @@ impl Dino {
         let np = size / PATCH;
         let p = np * np;
         let t = PREFIX + p;
-        if x.len() != 3 * size * size || size % PATCH != 0 {
+        if x.len() != 3 * size * size || !size.is_multiple_of(PATCH) {
             return Err(Error(format!("DINOv3: {} input values for {size} x {size}", x.len())));
         }
         // the normalized patches as rows in the convolution weight's (c, ky, kx) order

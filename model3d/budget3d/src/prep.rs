@@ -144,7 +144,7 @@ fn unpremultiply(p: &Picture) -> (Picture, Vec<u8>) {
     let mut a = Vec::with_capacity(p.data.len() / 4);
     for px in p.data.chunks_exact(4) {
         let al = px[3] as u32;
-        let u = |c: u8| if al == 0 { 0 } else { ((c as u32 * 255 + al / 2) / al).min(255) as u8 };
+        let u = |c: u8| (c as u32 * 255 + al / 2).checked_div(al).map_or(0, |v| v.min(255) as u8);
         rgb.extend([u(px[0]), u(px[1]), u(px[2])]);
         a.push(px[3]);
     }
