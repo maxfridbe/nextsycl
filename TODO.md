@@ -80,6 +80,21 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
 - [ ] A live-conversation mode in the nextsycl wfe (microphone in, speaker out, the running transcript, character
       card + voice picker from the saved voices). Not started.
 
+## Port: Sophon-Realtime (right after Haru-4B; user asked 2026-11-15)
+
+- [ ] github.com/adventists-ai/sophon-realtime (Apache-2.0 code and weights): a second full-duplex voice system, to
+      flesh out the back-and-forth API Haru-4B starts. One 32B "brain" (listens, decides when the user has finished
+      via DuplexJev, writes a tagged reply: [laughter], [sigh], <strong>) and three voices for it: Tag (expressive
+      speech model), Flash (one pass per 80 ms frame; Flash-4bit is sized for one 32 GB GPU), E2E (~350M talker ->
+      continuous voice vectors -> decoder). Zero-shot voice cloning from 3-12 s, barge-in, tool calls ("Live mode"
+      hands lookups to a bigger backend model). Weights: huggingface.co/adventists-ai/Sophon-Realtime-32B-{Tag,Flash,E2E},
+      Sophon-Realtime-32B-Flash-4bit-MLX (Mac; see flash/README.md for the 32 GB GPU build).
+- [ ] Its server speaks the OpenAI Realtime / GPT-Live interface: make our WebSocket endpoint compatible with that
+      (session.update, input_audio_buffer.append, response.* / conversation.item.* events, tool calls), so Haru and
+      Sophon share one API and the wfe conversation mode drives both; check what Haru needs that the format lacks
+      (its 133 ms frame-in/frame-out lockstep) and add it as an extension.
+- [ ] Fit on hardac1: the 32B brain at 4-bit on one card or split over the B70 + B65, the talker on the other.
+
 ## Done
 
 - [x] Server (`nextsycl serve`): OpenAI API, streaming, thinking split out, prompt-prefix reuse, graceful stop (7931d08)
