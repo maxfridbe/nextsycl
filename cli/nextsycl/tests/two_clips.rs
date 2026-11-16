@@ -150,7 +150,9 @@ fn start(tag: &str) -> Stack {
     let registry = dir.join("models.json");
     let entry = |id: &str| json!({"id": id, "kind": "video", "arch": "h3", "file": dir.join("denoiser.gguf"), "files": {"denoiser": dir.join("denoiser.gguf")}});
     std::fs::write(&registry, json!({"models": [entry("fake"), entry("fake-ref2va")]}).to_string()).unwrap();
-    let env: Vec<(String, String)> = vec![("HOME".into(), dir.join("home").display().to_string()), ("NS_REGISTRY".into(), registry.display().to_string())];
+    // its HTTPS port a free one (by default the plain port + 1, which another test may hold)
+    let env: Vec<(String, String)> = vec![("HOME".into(), dir.join("home").display().to_string()), ("NS_REGISTRY".into(), registry.display().to_string()),
+                                         ("NS_VIDEO_HTTPS_PORT".into(), free_port().to_string())];
 
     let door = Arc::new(Mutex::new(json!({"blocked": [], "held": false})));
     let told = Arc::new(Mutex::new(Vec::new()));
@@ -223,6 +225,41 @@ impl Stack {
     fn running_on(&self, label: &str, gpu: u64) {
         self.until(&format!("{label} running on GPU {gpu}"), |s| s.clip(label)["gpu"] == gpu && s.clip(label)["stage"].as_str().is_some_and(|x| x.starts_with("sampling")));
     }
+}
+
+/// The studio over HTTPS (NS_VIDEO_HTTPS_PORT here): its page and its API as on the plain port, and the certificate
+/// at /cert.pem on both, kept in its --dir's tls/
+#[test]
+fn the_studio_answers_over_https_too() {
+    let s = start("https");
+    let port = s.env.iter().find(|(k, _)| k == "NS_VIDEO_HTTPS_PORT").unwrap().1.clone();
+    let https: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let t0 = Instant::now();
+    while TcpStream::connect(https).is_err() {
+        assert!(t0.elapsed() < Duration::from_secs(20), "the studio's HTTPS did not come up");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut c = TcpStream::connect(&s.addr).unwrap();
+    c.write_all(b"GET /cert.pem HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+    let mut plain = String::new();
+    c.read_to_string(&mut plain).unwrap();
+    let cert = plain.split_once("\r\n\r\n").unwrap().1.to_string();
+    assert!(plain.starts_with("HTTP/1.1 200") && plain.contains("application/x-pem-file"), "{plain}");
+    assert_eq!(std::fs::read_to_string(s.dir.join("state/tls/cert.pem")).unwrap(), cert);
+    let get = |req: &str| -> String {
+        let mut t = nextsycl_serve::tls::test_client(&cert, https, "localhost").unwrap();
+        t.write_all(req.as_bytes()).unwrap();
+        t.flush().unwrap();
+        let mut all = Vec::new();
+        t.read_to_end(&mut all).unwrap();
+        String::from_utf8_lossy(&all).into_owned()
+    };
+    let page = get("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(page.starts_with("HTTP/1.1 200") && page.ends_with("<html></html>"), "{page}");
+    assert!(get("GET /cert.pem HTTP/1.1\r\nHost: x\r\n\r\n").ends_with(&cert));
+    let st = get("POST /rpc/status HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
+    let v: Value = serde_json::from_str(st.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!((v["ok"].clone(), v["result"]["slots_free"].clone()), (json!(true), json!(2)), "{v}");
 }
 
 #[test]

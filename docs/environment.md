@@ -59,6 +59,7 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_IMAGE_PORT2` | 8096 | the second image server's port (`image start --slot 1`), as `NS_AUDIO_PORT2` | serve |
 | `NS_PORT` | 8085 | the chat server's port (also the url the registry gives chat entries) | cli (llm start), serve, switch |
 | `NS_SERVE_PORT` | 8000 | the front door's port; `audio voices design` calls it there | serve, cli (audio) |
+| `NS_SERVE_HTTPS_PORT` | 8443 | the front door's HTTPS port beside the plain one (`--https-port` wins; 0: no HTTPS): the same routes, a self-signed certificate kept in `tls/` beside serve.json, `GET /cert.pem` on both ports (docs/host-services.md "HTTPS") | serve |
 | `OWUI_TOKEN` | a sign-in (works as is with WEBUI_AUTH=False) | Open WebUI's admin token for `glue/openwebui/install.sh` (it installs the pp / tg speed filter) | glue (openwebui install) |
 | `NS_SWITCH_PORT` | 8001 | the model switcher's port, as the front door reaches it (the switcher itself listens on --port, 8001) | serve |
 
@@ -326,6 +327,7 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 | `NS_VIDEO_GPUS` | all | the video daemon's GPUs, e.g. "0 1" (serve: the enabled video models' GPUs) | cli (video start) |
 | `NS_VIDEO_GPUSTAT` | /run/gpustat.json | the GPU telemetry file (`nextsycl gpustat`, root: every user's processes) the studio reads; the front door plans loads with its `vram_used_mb` per card where it sees more than its own sampler | cli (video serve), studio, serve |
 | `NS_VIDEO_GPU_LOCK` | none | a lock file shared with the card's other users (mounted, passed as --gpu-lock) | cli (video start) |
+| `NS_VIDEO_HTTPS_PORT` | the studio's port + 1 (8090 -> 8091) | the studio's HTTPS port beside the plain one (`video studio --https-port` wins; 0: no HTTPS): the same routes, a self-signed certificate kept in `<--dir>/tls/`, `GET /cert.pem` on both ports. `video serve` passes it on, or its port + 1 unless another service of the box has that port (8095 + 1 is `NS_IMAGE_PORT2`'s: then none) | studio, cli (video serve) |
 | `NS_VIDEO_IDLE` | 600 | seconds without a job before a video worker unloads and lets its card go (0: never) | cli (video start) |
 | `NS_VIDEO_LISTEN` | 127.0.0.1 | the studio's address | cli (video serve) |
 | `NS_VIDEO_LLM_MODES` | none | the studio's chat modes file (the language models it switches) | cli (video serve), studio |

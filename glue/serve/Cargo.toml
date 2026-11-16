@@ -22,3 +22,9 @@ sha2 = "0.10"
 # an engine's inline markup kept by the speech text pass (AudioEngine::markup: regular expressions); the same crate
 # as the tokenizers'
 fancy-regex = "0.14"
+# HTTPS beside the plain ports (tls.rs): rustls with the ring provider (the default aws-lc-rs builds a large C
+# library with cmake), its own certificate parser (webpki: does a kept certificate still name this host), and the
+# self-signed certificate made in-process by rcgen
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }

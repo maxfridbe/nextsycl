@@ -4,7 +4,7 @@
 
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -27,21 +27,52 @@ impl fmt::Display for Target {
     }
 }
 
-/// A connection of either kind.
+/// A connection of any kind.
 pub enum Conn {
     Tcp(TcpStream),
     Unix(UnixStream),
+    /// An HTTPS connection (crate::tls): the plaintext side of its TLS session, and the TCP connection's own peer and
+    /// local addresses as the kernel gave them when it was accepted
+    Tls(TlsConn),
+}
+
+/// The server's side of an HTTPS connection: the decrypted bytes over one end of a socket pair (crate::tls's pump
+/// threads hold the other end and the TLS session), and who the TCP peer is. Nothing the client sends can change `peer`
+/// or `local`: they are the accepted socket's addresses, fixed before its first byte was read. The socket pair has no
+/// name and no address: nothing else can connect to it.
+pub struct TlsConn {
+    pub(crate) s: UnixStream,
+    pub(crate) peer: SocketAddr,
+    pub(crate) local: SocketAddr,
+}
+
+impl TlsConn {
+    /// The TCP peer's address (the client's)
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer
+    }
+    /// The address the TCP connection came in on (this machine's)
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+}
+
+/// A TCP peer is on this machine: a loopback address, or this machine's own address the connection came in on
+fn same_box_addrs(peer: IpAddr, local: IpAddr) -> bool {
+    peer.is_loopback() || peer == local
 }
 
 impl Conn {
-    /// The peer is on this machine: loopback, or this machine's own address the connection came in on
+    /// The peer is on this machine: loopback, or this machine's own address the connection came in on. Over HTTPS the
+    /// TCP connection's addresses decide the same way, never anything sent inside the session (no header is read)
     pub fn same_box(&self) -> bool {
         match self {
             Conn::Unix(_) => true,
             Conn::Tcp(c) => match (c.peer_addr(), c.local_addr()) {
-                (Ok(p), Ok(l)) => p.ip().is_loopback() || p.ip() == l.ip(),
+                (Ok(p), Ok(l)) => same_box_addrs(p.ip(), l.ip()),
                 _ => false,
             },
+            Conn::Tls(t) => same_box_addrs(t.peer.ip(), t.local.ip()),
         }
     }
 
@@ -55,18 +86,24 @@ impl Conn {
         match self {
             Conn::Tcp(s) => s.set_read_timeout(d),
             Conn::Unix(s) => s.set_read_timeout(d),
+            Conn::Tls(t) => t.s.set_read_timeout(d),
         }
     }
     pub fn try_clone(&self) -> std::io::Result<Conn> {
         Ok(match self {
             Conn::Tcp(s) => Conn::Tcp(s.try_clone()?),
             Conn::Unix(s) => Conn::Unix(s.try_clone()?),
+            Conn::Tls(t) => Conn::Tls(TlsConn { s: t.s.try_clone()?, peer: t.peer, local: t.local }),
         })
     }
-    /// "socket" for the control socket, "tcp" for the API port
+    /// An HTTPS connection
+    pub fn is_tls(&self) -> bool {
+        matches!(self, Conn::Tls(_))
+    }
+    /// "socket" for the control socket, "tcp" for the API port (plain or HTTPS)
     pub fn kind(&self) -> &'static str {
         match self {
-            Conn::Tcp(_) => "tcp",
+            Conn::Tcp(_) | Conn::Tls(_) => "tcp",
             Conn::Unix(_) => "socket",
         }
     }
@@ -74,24 +111,43 @@ impl Conn {
 
 impl Read for Conn {
     fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Conn::Tcp(s) => s.read(b),
-            Conn::Unix(s) => s.read(b),
-        }
+        (&*self).read(b)
     }
 }
 
 impl Write for Conn {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Conn::Tcp(s) => s.write(b),
-            Conn::Unix(s) => s.write(b),
+        (&*self).write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self).flush()
+    }
+}
+
+/// As `&TcpStream`: a shared connection read and written (the studio's handlers take `&Conn`)
+impl Read for &Conn {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        match *self {
+            Conn::Tcp(s) => (&*s).read(b),
+            Conn::Unix(s) => (&*s).read(b),
+            Conn::Tls(t) => (&t.s).read(b),
+        }
+    }
+}
+
+impl Write for &Conn {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match *self {
+            Conn::Tcp(s) => (&*s).write(b),
+            Conn::Unix(s) => (&*s).write(b),
+            Conn::Tls(t) => (&t.s).write(b),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Conn::Tcp(s) => s.flush(),
-            Conn::Unix(s) => s.flush(),
+        match *self {
+            Conn::Tcp(s) => (&*s).flush(),
+            Conn::Unix(s) => (&*s).flush(),
+            Conn::Tls(t) => (&t.s).flush(),
         }
     }
 }
@@ -108,6 +164,8 @@ pub struct Request {
     pub origin: Option<String>,
     /// the Host header (for absolute links in an answer)
     pub host: Option<String>,
+    /// "http", or "https" when the server marks a request that came in over TLS (absolute links in an answer)
+    pub scheme: &'static str,
     pub body: Vec<u8>,
 }
 
@@ -153,7 +211,7 @@ pub fn read_request_at(stream: impl Read) -> Result<Request, (String, String)> {
     }
     let mut body = vec![0u8; length];
     r.read_exact(&mut body).map_err(|e| fail(e.to_string()))?;
-    Ok(Request { method, path, target, head, origin, host, body })
+    Ok(Request { method, path, target, head, origin, host, scheme: "http", body })
 }
 
 impl Request {
@@ -258,6 +316,8 @@ impl Conn {
         let _ = match self {
             Conn::Tcp(s) => s.shutdown(std::net::Shutdown::Both),
             Conn::Unix(s) => s.shutdown(std::net::Shutdown::Both),
+            // the pump sees the end: close_notify, then the TCP connection closed (crate::tls)
+            Conn::Tls(t) => t.s.shutdown(std::net::Shutdown::Both),
         };
     }
 }

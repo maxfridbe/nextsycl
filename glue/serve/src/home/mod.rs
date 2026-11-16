@@ -212,6 +212,8 @@ pub struct Home {
     disks: disks::Disks,
     /// models being downloaded, and the last ones (pulls.rs)
     pulls: pulls::Pulls,
+    /// HTTPS beside the plain port (crate::tls; `serve`): its certificate, for GET /cert.pem
+    tls: std::sync::OnceLock<Arc<crate::tls::Tls>>,
 }
 
 /// The cards as this page sampled them, with what the root sampler's file (`nextsycl gpustat`: one card at its top
@@ -342,7 +344,7 @@ impl Home {
             holds_file, holds_mx: Mutex::new(()), history, history_dir, video_watch: Mutex::new(Vec::new()), withdrawn: Mutex::new(BTreeMap::new()),
             chat_last: Mutex::new(now()), cards_fixed: std::sync::atomic::AtomicBool::new(false),
             pending: Mutex::new(Vec::new()), admit: Mutex::new(()), asked: Mutex::new(BTreeMap::new()), lock_paused: Mutex::new(Some(json!({"by": "gpu run", "left": true}))), progress: Mutex::new(BTreeMap::new()),
-            maint_file, maint_bypass, disks: disks::Disks::new(&st), pulls: pulls::Pulls::default(),
+            maint_file, maint_bypass, disks: disks::Disks::new(&st), pulls: pulls::Pulls::default(), tls: std::sync::OnceLock::new(),
         });
         let me = h.clone();
         std::thread::spawn(move || me.sample_cards());
@@ -439,6 +441,11 @@ impl Home {
         }
     }
 
+    /// tls/ beside serve.json: the HTTPS port's certificate and key (crate::tls)
+    pub fn tls_dir(&self) -> PathBuf {
+        self.state_file.with_file_name("tls")
+    }
+
     fn save_state(&self) {
         let st = json!({"token": self.token, "seen": *self.seen.lock().unwrap(), "maintenance_bypass": *self.maint_bypass.lock().unwrap(),
                         "drives": *self.disks.measured.lock().unwrap()});
@@ -456,9 +463,29 @@ impl Home {
         }).collect()
     }
 
+    /// Plain HTTP on `addr` only
     pub fn run(self: Arc<Self>, addr: &str) -> Result<(), String> {
+        self.serve(addr, None)
+    }
+
+    /// HTTP on `addr`, and HTTPS on `https` (host:port; None: none) answering the same: the certificate in `tls/`
+    /// beside serve.json (crate::tls). HTTPS that cannot start (its port taken, no certificate) is said and left out:
+    /// the plain port serves regardless
+    pub fn serve(self: Arc<Self>, addr: &str, https: Option<&str>) -> Result<(), String> {
         let l = TcpListener::bind(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
         eprintln!("nextsycl serve on http://{addr}/ ({} GPUs)", find_cards().len());
+        if let Some(h) = https {
+            let me = self.clone();
+            let up = crate::tls::Tls::open(&self.tls_dir()).map(Arc::new).and_then(|tls| {
+                let _ = self.tls.set(tls.clone());
+                crate::tls::listen_with(h, tls.clone(), move |c| me.handle(c)).map(|bound| (bound, tls))
+            });
+            match up {
+                Ok((bound, tls)) => eprintln!("nextsycl serve on https://{bound}/ (certificate {}/cert.pem{}; GET /cert.pem to trust it)",
+                                              tls.dir().display(), if tls.made { ", new" } else { "" }),
+                Err(e) => eprintln!("HTTPS is off: {e}"),
+            }
+        }
         for c in l.incoming().flatten() {
             let me = self.clone();
             std::thread::spawn(move || me.handle(Conn::Tcp(c)));
@@ -467,7 +494,7 @@ impl Home {
     }
 
     fn handle(self: &Arc<Self>, mut s: Conn) {
-        let req = match http::read_request_at(&mut s) {
+        let mut req = match http::read_request_at(&mut s) {
             Ok(r) => r,
             // unreadable (too large, cut short): the /rpc envelope (HTTP 200 on /rpc, as every /rpc error; 400 elsewhere),
             // which an OpenAI client reads as error.message too
@@ -478,6 +505,10 @@ impl Home {
                 return http::respond(&mut s, st, &json!({"ok": false, "error": api::rpc_error(method, 400, Some(code), &e)}));
             }
         };
+        // over HTTPS: the links an answer gives say https
+        if s.is_tls() {
+            req.scheme = "https";
+        }
         let p = req.path.as_str();
         if p.starts_with("/rpc/") || p.starts_with("/v1/") {
             return self.api(s, req);
@@ -489,6 +520,8 @@ impl Home {
             ("GET", "/") | ("GET", "/index.html") => self.page(&mut s),
             ("GET", p) if p.starts_with("/ui/") || p.starts_with("/static/") => self.asset(&mut s, p),
             ("GET", "/health") => http::respond(&mut s, 200, &json!({"status": "ok"})),
+            // the HTTPS port's self-signed certificate, to trust once (both ports)
+            ("GET", "/cert.pem") => crate::tls::respond_cert(&mut s, self.tls.get().map(|t| &**t)),
             // for the video daemon, which has no token: read-only and from this box only
             ("GET", "/chat/held") => {
                 if !s.same_box() {

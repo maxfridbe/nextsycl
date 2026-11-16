@@ -328,6 +328,7 @@ pub fn serve(cfg: &Config, raw: &[String]) -> Result<(), String> {
     if let Some(m) = cfg.get("NS_VIDEO_LLM_MODES") {
         c.args(["--llm-modes", &m]);
     }
+    c.args(["--https-port", &serve_https_port(cfg, port).to_string()]);
     for (q, id) in engine_names(cfg) {
         c.args(["--engine-name", &format!("{q}={id}")]);
     }
@@ -358,8 +359,11 @@ pub fn studio(raw: &[String]) -> Result<(), String> {
     let dir = PathBuf::from(need("--dir")?);
     let out = need("--out")?;
     let engines = repeated(raw, "--engine-name").iter().filter_map(|e| e.split_once('=').map(|(q, i)| (q.to_string(), i.to_string()))).collect();
+    let listen = need("--listen")?;
+    let https = https_beside(&listen, super::opt(raw, "--https-port").map(str::to_string).or_else(|| std::env::var("NS_VIDEO_HTTPS_PORT").ok()))?;
     studio::run(studio::Options {
-        listen: need("--listen")?,
+        https,
+        listen,
         socket: need("--socket")?.into(),
         ui: need("--ui")?.into(),
         out: out.clone().into(),
@@ -375,6 +379,36 @@ pub fn studio(raw: &[String]) -> Result<(), String> {
         door: Some(super::opt(raw, "--door").map(str::to_string).or_else(|| std::env::var("NS_VIDEO_DOOR").ok()).unwrap_or_else(|| "127.0.0.1:8000".to_string())).filter(|d| d != "off"),
     })
     .map_err(|e| e.0)
+}
+
+/// `video serve`'s HTTPS port for the studio: NS_VIDEO_HTTPS_PORT, else its port + 1 - unless another of this box's
+/// services has that port (8095 + 1 is the second image server's 8096): then none, said
+fn serve_https_port(cfg: &Config, port: u16) -> u16 {
+    if let Some(p) = cfg.get("NS_VIDEO_HTTPS_PORT").and_then(|p| p.trim().parse().ok()) {
+        return p;
+    }
+    let want = port.saturating_add(1);
+    let others = [("NS_SERVE_PORT", 8000), ("NS_SERVE_HTTPS_PORT", 8443), ("NS_SWITCH_PORT", 8001), ("NS_CHAT_UI_PORT", 8080), ("NS_PORT", 8085),
+                  ("NS_IMAGE_PORT", 8086), ("NS_AUDIO_PORT", 8087), ("NS_MODEL3D_PORT", 8088), ("NS_IMAGE_PORT2", 8096), ("NS_AUDIO_PORT2", 8097),
+                  ("NS_MODEL3D_PORT2", 8098)];
+    match others.iter().find(|(k, d)| cfg.get(k).and_then(|v| v.trim().parse::<u16>().ok()).unwrap_or(*d) == want) {
+        Some((k, _)) => {
+            println!("the studio's HTTPS is off: {want} (its port + 1) is {k}'s; NS_VIDEO_HTTPS_PORT names another");
+            0
+        }
+        None => want,
+    }
+}
+
+/// The studio's HTTPS address:`--https-port N` (or NS_VIDEO_HTTPS_PORT) on the plain port's host, by default the plain
+/// port + 1 (0.0.0.0:8090 -> 0.0.0.0:8091); 0: none
+fn https_beside(listen: &str, asked: Option<String>) -> Result<Option<String>, String> {
+    let plain: u16 = listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).ok_or_else(|| format!("--listen {listen}: host:port"))?;
+    let port: u16 = match asked {
+        Some(p) => p.trim().parse().map_err(|_| format!("--https-port {p}: a port (0: no HTTPS)"))?,
+        None => plain.checked_add(1).unwrap_or(0),
+    };
+    Ok((port != 0).then(|| nextsycl_serve::tls::beside(listen, port)))
 }
 
 /// `nextsycl video stop --web | --all`: the studio (gracefully)

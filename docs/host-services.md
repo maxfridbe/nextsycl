@@ -5,13 +5,27 @@
 Three small services sit beside the model servers, all in the program (no Python on the serving path):
 
 ```sh
-nextsycl serve [--port 8000] [--host 0.0.0.0] [--serve-host 0.0.0.0] [--idle-minutes 10]
+nextsycl serve [--port 8000] [--https-port 8443] [--host 0.0.0.0] [--serve-host 0.0.0.0] [--idle-minutes 10]
 nextsycl switch [--port 8001] [--upstream 127.0.0.1:8085] [--studio http://127.0.0.1:8090/rpc/llm.mode] [--alias OLD=NEW]...
                 [--images 127.0.0.1:8086]
 nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once]     # as root
 ```
 
-- **`serve`** (:8000, `docs/host/nextsycl-serve.service.example`): the front door.
+- **`serve`** (:8000, HTTPS :8443, `docs/host/nextsycl-serve.service.example`): the front door.
+  - **HTTPS** (`--https-port`, `NS_SERVE_HTTPS_PORT`; 8443 by default, 0: off): the same routes as :8000 on TLS - the pages,
+    /rpc and /v1, streamed answers, the /v1/realtime WebSocket, /open/... - for a browser on another machine, which
+    gives the microphone only to an https page (or localhost). Plain HTTP stays as it was, no redirect. The
+    certificate is self-signed (rcgen; TLS by rustls with the ring provider), kept in `tls/cert.pem` + `tls/key.pem`
+    (0600) beside serve.json (`/var/lib/nextsycl/tls/` with the example unit), and reused: it is made again only when
+    missing, unreadable, within 30 days of its end (it lasts 10 years) or no longer naming this host - localhost,
+    127.0.0.1, ::1, the hostname and its FQDN, the tailnet name (`tailscale status`), every interface address (IPv6
+    link-local aside). `GET /cert.pem` on either port hands it out (application/x-pem-file): trust it once in the
+    browser or the system (a new one means trusting again; the log says when one is made). Answers that link files
+    say https over HTTPS. HTTPS that cannot start (the port taken) is said in the log and left out; :8000 serves
+    regardless. This-box-only routes (`/chat/held`, `/video/blocked`) judge an HTTPS client by its TCP address as
+    on :8000 (`glue/serve/src/tls.rs`: the session is decrypted onto an anonymous socket pair, the connection keeps
+    the accepted socket's peer address; no header counts). The chat page's redirect (`/open/<chat model>`) still
+    names Open WebUI's own http port: it is a server of its own.
   - **The page**: every GPU's memory by process, and below it, hatched, what the enabled models are vouched for (as
     seen while they ran, else an estimate from their files; chat models and video engines count once a card - one
     runs at a time - and an overbooked card is flagged: whichever loads first holds it). Every registered model by

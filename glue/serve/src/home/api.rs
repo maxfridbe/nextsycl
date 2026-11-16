@@ -217,14 +217,14 @@ impl Home {
             // a method's name in any case: the one the table declares (image.generate for IMAGE.Generate)
             let asked = &req.path["/rpc/".len()..];
             let name = table::find(asked).map(|m| m.full()).unwrap_or(asked);
-            if let Some((_, v)) = self.studio_rpc(name, &body, req.host.as_deref().unwrap_or("localhost:8000")) {
+            if let Some((_, v)) = self.studio_rpc(name, &body, &format!("{}://{}", req.scheme, req.host.as_deref().unwrap_or("localhost:8000"))) {
                 return http::respond(&mut s, 200, &v);
             }
             match self.rpc(name, &body) {
                 Ok(v) => {
                     // the files an answer links, as the caller reaches them (through here: /v1/.../files/...)
                     let host = req.host.clone().unwrap_or_else(|| "localhost:8000".into());
-                    let v: Value = serde_json::from_str(&v.to_string().replace("http://nextsycl/", &format!("http://{host}/"))).unwrap_or(v);
+                    let v: Value = serde_json::from_str(&v.to_string().replace("http://nextsycl/", &format!("{}://{host}/", req.scheme))).unwrap_or(v);
                     http::respond(&mut s, 200, &json!({"ok": true, "result": v}))
                 }
                 Err((st, m)) => fail(&mut s, st, m),
@@ -464,7 +464,8 @@ impl Home {
 
     /// A studio method (video.*, but upload and the guide): the studio's answer as it gave it - its status and error
     /// code (busy, not_running ...) - with the files it names as URLs through here
-    fn studio_rpc(&self, name: &str, b: &Value, host: &str) -> Option<(u16, Value)> {
+    /// `base`: scheme://host as the caller reached this door (the files an answer links)
+    fn studio_rpc(&self, name: &str, b: &Value, base: &str) -> Option<(u16, Value)> {
         // video.upscale is the image servers' (an upscaler's job), not the studio's
         let method = name.strip_prefix("video.").filter(|m| !matches!(*m, "upload" | "describePromptGuideMD" | "upscale"))?;
         let all = self.models();
@@ -517,7 +518,7 @@ impl Home {
             self.video_taken(b, sent, &mut v["result"]);
         }
         self.video_annotate(method, &mut v);
-        let url = |kind: &str, n: &str| format!("http://{host}/v1/video/{kind}/{n}");
+        let url = |kind: &str, n: &str| format!("{base}/v1/video/{kind}/{n}");
         let r = &mut v["result"];
         for k in ["file", "preview"] {
             if let Some(f) = r[k].as_str().and_then(|f| f.strip_prefix("/out/")).map(str::to_string) {
@@ -1572,7 +1573,7 @@ impl Home {
                 let range = head.split("\r\n").find(|l| l.split(':').next().is_some_and(|k| k.trim().eq_ignore_ascii_case("range")));
                 let up = format!("GET /out/{name} HTTP/1.1\r\nHost: studio\r\n{}Connection: close\r\n\r\n", range.map(|r| format!("{r}\r\n")).unwrap_or_default());
                 let req = Request { method: "GET".into(), path: format!("/out/{name}"), target: format!("/out/{name}"), head: up.into_bytes(),
-                                    origin: None, host: None, body: Vec::new() };
+                                    origin: None, host: None, scheme: "http", body: Vec::new() };
                 http::forward(s, &self.target("video"), &req).map_err(|e| (502, e))
             }
             ("GET", p) if p.starts_with("/v1/video/thumbs/") => {
@@ -1583,7 +1584,7 @@ impl Home {
                 }
                 let req = Request { method: "GET".into(), path: format!("/thumb/{name}"), target: format!("/thumb/{name}"),
                                     head: format!("GET /thumb/{name} HTTP/1.1\r\nHost: studio\r\nConnection: close\r\n\r\n").into_bytes(),
-                                    origin: None, host: None, body: Vec::new() };
+                                    origin: None, host: None, scheme: "http", body: Vec::new() };
                 http::forward(s, &self.target("video"), &req).map_err(|e| (502, e))
             }
             ("GET", p) if p.starts_with("/v1/audio/voices/") => {
@@ -1690,8 +1691,8 @@ impl Home {
             let words: Vec<String> = errors.iter().map(|e| format!("{} {}: {}", e["code"].as_str().unwrap_or(""), e["status"], e["when"].as_str().unwrap_or(""))).collect();
             let responses = json!({"200": {"description": format!("{{\"ok\": true, \"result\": ...}}, or {{\"ok\": false, \"error\": ...}} - errors are HTTP 200 too. Its errors: {}", words.join("; ")),
                                            "content": {"application/json": {"schema": ok}}}});
-            let curl = format!("curl -s http://{host}{route} -H 'Authorization: Bearer {}' -H 'Content-Type: application/json' -d '{}'",
-                               tok, example.to_string().replace('\'', "'\\''"));
+            let curl = format!("curl -s{} {}://{host}{route} -H 'Authorization: Bearer {}' -H 'Content-Type: application/json' -d '{}'",
+                               if req.scheme == "https" { "k" } else { "" }, req.scheme, tok, example.to_string().replace('\'', "'\\''"));
             paths.insert(route, json!({"post": {
                 "tags": [m.kind], "operationId": format!("{}.{}", m.kind, m.name), "summary": m.summary,
                 "requestBody": {"required": true, "content": {"application/json": {"schema": schema, "example": example}}},
@@ -1771,7 +1772,7 @@ impl Home {
                  OpenAI-compatible /v1 routes and the files are the exception (HTTP statuses). Send Authorization: Bearer <token> with every /rpc and /v1 call (the token is on the page's API tab; \
                  this document needs none). Kinds here: {}. Generated {:.0}.\n\n{}\n\n{}",
                 on.join(", "), now(), spec::CODES, spec::LABELS)},
-            "servers": [{"url": format!("http://{host}")}],
+            "servers": [{"url": format!("{}://{host}", req.scheme)}],
             "security": [{"bearer": []}],
             // the named types the methods' requests refer to (their enums: ChainMode, FileKind ...), from methods.rs
             "components": {"securitySchemes": {"bearer": {"type": "http", "scheme": "bearer", "description": "the token on the page's API tab (NS_API_TOKEN, or serve.json)"}},

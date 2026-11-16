@@ -36,6 +36,7 @@ pub const SETTINGS: &[Setting] = &[
     st("NS_MOUNTS", "box", "", "more read-only directories for the containers, host:inside[,...]", &["llm"]),
     st("NS_CORS", "box", "", "web pages that may call the servers from a browser, beyond the loopback ones", &["llm", "image", "audio", "model3d"]),
     st("NS_SERVE_PORT", "front door", "8000", "this page's port", &["serve"]),
+    st("NS_SERVE_HTTPS_PORT", "front door", "8443", "this page's HTTPS port beside the plain one, the same routes (a self-signed certificate in tls/ beside serve.json; GET /cert.pem; 0: none)", &["serve"]),
     st("NS_API_TOKEN", "front door", "made once (serve.json)", "the API's bearer token", &["serve"]),
     st("NS_IDLE_MINUTES", "front door", "10", "an enabled model unloads after this long without a request (0: never)", &["serve", "switch"]),
     st("NS_MAX_RSVP_S", "front door", "86400", "the longest hold a request's rsvp_s or X-Keep-Up-S may ask for, in seconds; more is clamped to it", &["serve"]),
@@ -84,6 +85,7 @@ pub const SETTINGS: &[Setting] = &[
     st("NS_VIDEO_GPUSTAT", "video", "/run/gpustat.json", "the GPU telemetry file", &["studio"]),
     st("NS_VIDEO_LISTEN", "video", "127.0.0.1", "the studio's address", &["studio"]),
     st("NS_VIDEO_PORT", "video", "8090", "the studio's port", &["studio", "serve"]),
+    st("NS_VIDEO_HTTPS_PORT", "video", "the studio's port + 1", "the studio's HTTPS port beside the plain one, the same routes (a self-signed certificate in its directory's tls/; GET /cert.pem; 0: none)", &["studio"]),
     st("NS_VIDEO_STUDIO", "video", "http://127.0.0.1:8095", "the studio the tools talk to", &["cli"]),
 ];
 

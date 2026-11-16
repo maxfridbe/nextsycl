@@ -18,7 +18,9 @@ pub mod slots;
 pub mod speech;
 
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
+
+use crate::http::Conn;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -148,6 +150,8 @@ pub struct Studio {
     pub door_word: Mutex<Value>,
     /// the clips being made, by name: a request may name their files before they exist (the check runs outside `st`)
     pub running_names: Mutex<Vec<String>>,
+    /// HTTPS beside the plain port (crate::tls): its certificate, for GET /cert.pem
+    pub tls: std::sync::OnceLock<Arc<crate::tls::Tls>>,
 }
 
 pub struct Options {
@@ -165,6 +169,8 @@ pub struct Options {
     pub engines: Vec<(String, String)>,
     /// the front door, host:port (None: on its own)
     pub door: Option<String>,
+    /// HTTPS beside `listen`, host:port (None: none): the same routes, the certificate in `dir`/tls (crate::tls)
+    pub https: Option<String>,
 }
 
 impl Studio {
@@ -657,8 +663,13 @@ impl Studio {
         Ok(out)
     }
 
-    fn route(&self, stream: &TcpStream, req: http::Request) -> http::Result<()> {
+    fn route(&self, stream: &Conn, req: http::Request) -> http::Result<()> {
         let path = req.path.clone();
+        // the HTTPS port's self-signed certificate, to trust once (both ports)
+        if req.method == "GET" && path == "/cert.pem" {
+            crate::tls::respond_cert(stream, self.tls.get().map(|t| &**t));
+            return Ok(());
+        }
         let query = req.target.split_once('?').map(|q| q.1.to_string()).unwrap_or_default();
         let qv = |k: &str| -> String {
             query.split('&').filter_map(|kv| kv.split_once('=')).find(|(a, _)| *a == k).map(|(_, v)| unescape(v)).unwrap_or_default()
@@ -812,7 +823,7 @@ impl Studio {
     }
 
     /// An mp4 of out/, with byte ranges (the video player seeks).
-    fn file(&self, mut stream: &TcpStream, req: &http::Request, name: &str) -> http::Result<()> {
+    fn file(&self, mut stream: &Conn, req: &http::Request, name: &str) -> http::Result<()> {
         let p = self.out.join(name);
         // a clip's still pictures: its preview while it is made, its last frame
         if (name.ends_with(".preview.png") || name.ends_with(".last.png")) && p.is_file() {
@@ -916,6 +927,7 @@ pub fn run(o: Options) -> http::Result<()> {
         meminfo: std::env::var_os("NS_VIDEO_MEMINFO").map_or_else(|| PathBuf::from("/proc/meminfo"), PathBuf::from),
         door_word: Mutex::new(Value::Null),
         running_names: Mutex::new(st_names),
+        tls: std::sync::OnceLock::new(),
     });
     if let Some(door) = o.door {
         let me = studio.clone();
@@ -928,23 +940,44 @@ pub fn run(o: Options) -> http::Result<()> {
     let listener = TcpListener::bind(&o.listen).map_err(|e| http::Error(format!("cannot listen on {}: {e}", o.listen)))?;
     let _ = queue::ENGINES.set(o.engines.clone());
     eprintln!("nextsycl video studio {} on http://{}/ - clips in {}, engine via {}", crate::VERSION, o.listen, studio.out.display(), studio.socket.display());
+    // HTTPS beside it, the same routes (a browser elsewhere gets the microphone only over https); one that cannot
+    // start is said and left out
+    if let Some(h) = &o.https {
+        let me = studio.clone();
+        let up = crate::tls::Tls::open(&studio.dir.join("tls")).map(Arc::new).and_then(|tls| {
+            let _ = studio.tls.set(tls.clone());
+            crate::tls::listen_with(h, tls.clone(), move |c| me.serve_conn(c)).map(|bound| (bound, tls))
+        });
+        match up {
+            Ok((bound, tls)) => eprintln!("nextsycl video studio on https://{bound}/ (certificate {}/cert.pem{}; GET /cert.pem to trust it)",
+                                          tls.dir().display(), if tls.made { ", new" } else { "" }),
+            Err(e) => eprintln!("HTTPS is off: {e}"),
+        }
+    }
     let sched = studio.clone();
     std::thread::spawn(move || sched.scheduler());
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let studio = studio.clone();
-        std::thread::spawn(move || match http::read_request(&stream) {
+        std::thread::spawn(move || studio.serve_conn(Conn::Tcp(stream)));
+    }
+    Ok(())
+}
+
+impl Studio {
+    /// One connection (plain or HTTPS): its request answered
+    fn serve_conn(&self, stream: Conn) {
+        match http::read_request(&stream) {
             Ok(req) => {
-                if let Err(e) = studio.route(&stream, req) {
+                if let Err(e) = self.route(&stream, req) {
                     let _ = http::respond(&stream, 500, &json!({"error": e.0}));
                 }
             }
             Err(e) => {
                 let _ = http::respond(&stream, 400, &json!({"error": e.0}));
             }
-        });
+        }
     }
-    Ok(())
 }
 
 /// The first slot waiting for its card's memory or the lock, in words

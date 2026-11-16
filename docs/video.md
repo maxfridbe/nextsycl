@@ -7,7 +7,7 @@ MiniMax H3's engine, daemon, studio and tools (the sycl-h3 studio) as `nextsycl 
 ```sh
 nextsycl models pull minimax-h3 [--dir DIR] [--from DIR]      # --from: adopt copies already on the machine
 nextsycl video start [--model ID] [--engine ID]... [--gpu N ...] [--shared-gpu N ...]   # the daemon, in its container
-nextsycl video serve [--bind ADDR] [--port N]                   # the studio: H3's web front end and clip queue
+nextsycl video serve [--bind ADDR] [--port N]                   # the studio: H3's web front end and clip queue (HTTPS: port + 1)
 nextsycl video job generate --prompt "..." --width 768 --height 576 --seconds 5 --steps 8 --out DIR/clip.mp4 [-f]
 nextsycl video ps [-a] | inspect ID | cancel ID... | rm ID... | status | gpus | unload [--gpu N] | logs [--web]
 nextsycl video speech FILE --character NAME | scene SCENE.json | join PREFIX | speechpct CLIP... | plan measure
@@ -21,7 +21,13 @@ nextsycl video stop [--web | --all]
 - **The daemon** (`glue/serve` video::daemon): H3's queue, one worker process a GPU slot (it loads on the first
   job, unloads after `NS_VIDEO_IDLE`), the card lock and the front end's model switch for a GPU shared with chat.
 - **The studio** (`video serve`, a host process): H3's front end (`wfe/video`, TSX on snabbdom) and its legacy API,
-  the clip queue, projects, scenes, films, the language-model switch (`NS_VIDEO_LLM_MODES`).
+  the clip queue, projects, scenes, films, the language-model switch (`NS_VIDEO_LLM_MODES`). HTTPS beside its port
+  (`video studio --listen 0.0.0.0:8090` also answers https on 8091; `--https-port N` or `NS_VIDEO_HTTPS_PORT`, 0: off):
+  the same routes, for a browser elsewhere (the microphone needs https). Its self-signed certificate is kept in
+  `<--dir>/tls/` (cert.pem, key.pem 0600; `NS_VIDEO_STUDIO_DIR/tls` under `video serve`), made once and again only
+  when missing, unreadable, near its end or no longer naming this host, as the front door's (docs/host-services.md
+  "HTTPS"); `GET /cert.pem` on both ports. `video serve` gives it its port + 1 unless another service has that port
+  (its default 8095 + 1 is the second image server's 8096: then none, said).
 - **Samplers**: a job's `sampler` and `schedule` take ComfyUI's names (`--sampler euler_ancestral`, `dpmpp_2m`,
   `uni_pc` ...; the same 29 samplers and 10 schedules as the image engine); without them, Euler on H3's own shifted
   schedule. The studio's Create form has both. A 3 s 768x576 clip, 8 steps on the B70 takes 46-52 s with euler,

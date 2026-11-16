@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 const USAGE: &str = "the service (the daemon in its container; models are registry ids):
 nextsycl video start [--model ID] [--engine ID]... [--all | --gpu N ...] [--shared-gpu N ...]
-nextsycl video serve [--bind ADDR] [--port N]   the studio: the web front end and its clip queue (default :8095)
+nextsycl video serve [--bind ADDR] [--port N]   the studio: the web front end and its clip queue (default :8095; HTTPS on port + 1)
 nextsycl video stop [--web | --all] | status [--no-stream] | logs [--web] | gpus | unload [--gpu N]
 the jobs:
 nextsycl video job <kind> [--KEY VALUE]... [--engine ID] [--gpu N] [-f]   queue one (-f: follow its log)

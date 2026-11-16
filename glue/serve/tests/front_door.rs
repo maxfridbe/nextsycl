@@ -138,6 +138,80 @@ fn an_answer_is_an_envelope_and_a_call_needs_the_token() {
     assert_eq!((st, v["error"]["type"].clone()), (401, json!("invalid_api_key")), "{text}");
 }
 
+/// HTTPS beside the plain port: the same routes and token (an RPC, an OpenAI route, a this-box-only route from
+/// loopback), the certificate at /cert.pem on both ports and kept in tls/ beside serve.json across a restart
+#[test]
+fn https_serves_what_the_plain_port_does() {
+    let dir = std::env::temp_dir().join(format!("nextsycl-front-door-{}-https", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let start = |dir: &PathBuf| {
+        let free = || TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (port, https) = (free(), free());
+        let ports = Ports { llm: 0, switch: 0, image: 0, audio: 0, model3d: 0, image2: 0, audio2: 0, model3d2: 0, video: 0, chat_ui: 0 };
+        let cfg = Box::new(Mem { dir: dir.clone(), models: Mutex::new(vec![entry("chat", "llm", &[], true)]), cards: vec![] });
+        let home = Home::new(Options { wfe: dir.join("wfe"), exe: PathBuf::from("/nonexistent/nextsycl"), ports, serve_host: "127.0.0.1".into(), door: "127.0.0.1:1".into(), cfg, idle_minutes: 0 })
+            .expect("the front door starts");
+        let (addr, saddr) = (format!("127.0.0.1:{port}"), format!("127.0.0.1:{https}"));
+        let (a, s) = (addr.clone(), saddr.clone());
+        std::thread::spawn(move || {
+            let _ = Arc::clone(&home).serve(&a, Some(&s));
+        });
+        for _ in 0..200 {
+            if TcpStream::connect(&addr).is_ok() && TcpStream::connect(&saddr).is_ok() {
+                return (addr, saddr.parse::<std::net::SocketAddr>().unwrap());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the front door did not listen on {addr} and {saddr}");
+    };
+    let (plain, https) = start(&dir);
+    let (st, cert) = http(&plain, "GET", "/cert.pem", None, None);
+    assert_eq!(st, 200);
+    assert!(cert.starts_with("-----BEGIN CERTIFICATE-----"), "{cert}");
+    assert_eq!(std::fs::read_to_string(dir.join("tls/cert.pem")).unwrap(), cert);
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(dir.join("tls/key.pem")).unwrap().permissions().mode() & 0o777, 0o600);
+
+    let tls_req = |method: &str, path: &str, token: Option<&str>, body: Option<&Value>| -> (u16, String, String) {
+        let mut s = nextsycl_serve::tls::test_client(&cert, https, "localhost").expect("the certificate it hands out is the one it serves");
+        let b = body.map(Value::to_string).unwrap_or_default();
+        let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+        write!(s, "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}", b.len()).unwrap();
+        s.flush().unwrap();
+        let mut raw = Vec::new();
+        s.read_to_end(&mut raw).unwrap();
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let status = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        let (head, body) = text.split_once("\r\n\r\n").map_or((String::new(), String::new()), |(h, b)| (h.to_string(), b.to_string()));
+        (status, head, body)
+    };
+    let (st, head, body) = tls_req("GET", "/cert.pem", None, None);
+    assert_eq!((st, body.as_str()), (200, cert.as_str()));
+    assert!(head.to_ascii_lowercase().contains("content-type: application/x-pem-file"), "{head}");
+    let (st, _, body) = tls_req("GET", "/health", None, None);
+    assert_eq!(st, 200, "{body}");
+    // its links say https: the specification's server
+    let (_, _, body) = tls_req("GET", "/openapi.json", None, None);
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["servers"][0]["url"], "https://localhost", "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&http(&plain, "GET", "/openapi.json", None, None).1).unwrap()["servers"][0]["url"], format!("http://{plain}"));
+    // the API: the token checked, the envelope the same
+    let (_, _, body) = tls_req("POST", "/rpc/system.ping", Some(TOKEN), Some(&json!({})));
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["ok"], true, "{body}");
+    let (_, _, body) = tls_req("POST", "/rpc/system.ping", Some("wrong"), Some(&json!({})));
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["error"]["status"], 401, "{body}");
+    let (st, _, body) = tls_req("POST", "/v1/chat/completions", None, Some(&json!({"model": "chat", "messages": []})));
+    assert_eq!(st, 401, "{body}");
+    // a this-box-only route: from loopback over HTTPS too, as on the plain port
+    let (st, _, body) = tls_req("GET", "/chat/held", None, None);
+    assert_eq!((st, http(&plain, "GET", "/chat/held", None, None).0), (200, 200), "{body}");
+
+    // a restart: the same certificate
+    let (plain2, _) = start(&dir);
+    assert_eq!(http(&plain2, "GET", "/cert.pem", None, None).1, cert);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn ping_says_the_box_is_here_and_takes_work() {
     let a = door("ping", vec![entry("chat", "llm", &[], true)], vec![]);

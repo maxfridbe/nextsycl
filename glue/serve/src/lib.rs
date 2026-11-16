@@ -22,6 +22,7 @@ pub mod http;
 pub mod image;
 pub mod serve;
 pub mod speechfmt;
+pub mod tls;
 pub mod switch;
 pub mod telemetry;
 pub mod video;

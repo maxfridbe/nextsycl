@@ -59,10 +59,10 @@ pub fn switch(args: &[String]) -> Result<(), String> {
     std::sync::Arc::new(sw).run(&addr)
 }
 
-/// `nextsycl serve [--host 0.0.0.0] [--port 8000] [--serve-host 0.0.0.0] [--idle-minutes 10]`: the front door - the GPUs
+/// `nextsycl serve [--host 0.0.0.0] [--port 8000] [--https-port 8443] [--serve-host 0.0.0.0] [--idle-minutes 10]`: the front door - the GPUs
 /// and the models, enabling and loading them, one API for all (nextsycl_serve::home). Ports from the settings:
 /// NS_PORT, NS_SWITCH_PORT, NS_IMAGE_PORT(2), NS_AUDIO_PORT(2), NS_VIDEO_PORT, NS_CHAT_UI_PORT; the API's token NS_API_TOKEN
-/// (else one made and kept beside the registry); NS_IDLE_MINUTES.
+/// (else one made and kept beside the registry); NS_IDLE_MINUTES; HTTPS on NS_SERVE_HTTPS_PORT (8443; 0: none).
 /// The registry and the settings for the front door (nextsycl-models', which the glue may not depend on)
 pub(crate) struct Store(pub(crate) Config);
 
@@ -130,7 +130,11 @@ pub fn home(cfg: &Config, args: &[String]) -> Result<(), String> {
         cfg: Box::new(Store(Config::load())),
         idle_minutes: idle,
     };
-    Home::new(o)?.run(&format!("{host}:{port_s}"))
+    // HTTPS beside it (a browser elsewhere gets the microphone only over https): 8443 unless told (0: off)
+    let https_port = opt(args, "--https-port").map(str::to_string).or_else(|| cfg.get("NS_SERVE_HTTPS_PORT")).unwrap_or("8443".into());
+    let https_port: u16 = https_port.parse().map_err(|_| format!("--https-port {https_port}: a port (0: no HTTPS)"))?;
+    let https = (https_port != 0).then(|| format!("{host}:{https_port}"));
+    Home::new(o)?.serve(&format!("{host}:{port_s}"), https.as_deref())
 }
 
 /// `nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--power-window 15] [--pci ADDR] [--vram-mb N] [--once]`
