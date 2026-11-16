@@ -723,7 +723,9 @@ fn reply(s: &Arc<Shared>, id: &str, turns: &[Turn], cfg: &RealtimeSession, lang:
     let rendered = text::render(&msgs, tools);
     let draw = eng.brain_draw(&cfg.extra, cfg.temperature);
     let tdraw = eng.talker_draw(&cfg.extra);
-    let max_tokens = cfg.max_tokens.map(|m| m as usize).unwrap_or(if tools.is_empty() { 120 } else { 240 });
+    // a spoken answer's tokens at most: the session's max_response_output_tokens ("inf": all the context has room for),
+    // else 1,024 - about three minutes spoken (120 cut answers off mid-sentence)
+    let max_tokens = cfg.max_tokens.map_or(1024, |m| m as usize);
     let feed = Arc::new((Mutex::new(Feed { ids: Vec::new(), done: false, stopped: false }), Condvar::new()));
     // the talker, on its card
     let talker = {
@@ -788,6 +790,8 @@ fn reply(s: &Arc<Shared>, id: &str, turns: &[Turn], cfg: &RealtimeSession, lang:
         let tp = Instant::now();
         let (mut logits, _, computed) = mind.brain.prompt(&mut mind.reply, &keys, &Rows { ids: &ids, spans: &sp }, false)?;
         let pp = tp.elapsed().as_secs_f64();
+        // never past the context: the answer ends where the cache is full (a step there is an error)
+        let max_tokens = max_tokens.min(mind.reply.t.saturating_sub(mind.reply.keys.len()));
         let mut rng = Rng::new(cfg.seed ^ 0x5eed);
         let mut out: Vec<u32> = Vec::new();
         let mut shown = String::new();

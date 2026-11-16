@@ -386,7 +386,8 @@ fn apply(s: &mut Session, v: &Value, voices: VoiceLookup, built_in: &[String]) -
     if let Some(n) = mt.as_u64() {
         s.conf.max_tokens = Some(n as u32);
     } else if mt.as_str() == Some("inf") {
-        s.conf.max_tokens = None;
+        // OpenAI's "no limit": up to what the model's context has room for (None is the model's own default)
+        s.conf.max_tokens = Some(u32::MAX);
     }
     let tools = if v["tools"].is_array() { &v["tools"] } else { &eb["tools"] };
     if let Some(t) = tools.as_array() {
