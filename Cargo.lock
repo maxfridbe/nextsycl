@@ -1318,6 +1318,7 @@ name = "nextsycl-serve"
 version = "0.0.0"
 dependencies = [
  "backplane-scheduler",
+ "fancy-regex",
  "nextsycl-audio",
  "nextsycl-core",
  "nextsycl-diffusion",

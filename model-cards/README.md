@@ -140,3 +140,24 @@ The values come from the engine (image/<arch>/src: its step, guidance and size c
 shift, options) and, for what it makes well, from pictures made and looked at; a model nextcuda serves too states the
 same rules unless the engine here differs (the card's comment then says where and why).
 
+
+## Annotations
+
+What a model reads inline in its text (a speech model's tags, a song model's section markers), as nextcuda states
+them (its model-cards/annotations.yml, field for field): `annotations`, a list, and `annotations_note`, said under it.
+
+```yaml
+annotations_note: 'Only these tags are trained; other bracketed text is not a tag.'
+annotations:
+- syntax: '[laughter]'          # what to write
+  keep: '\[laughter\]'          # a regex of the spans the server's speech text pass leaves as written (absent: it may
+                                #   rewrite them - brackets become pauses, symbols words)
+  does: 'a laugh where the tag stands'
+  tested: 'verified 2026-11-16: ...'   # "verified <date>: <what was measured>", or "unverified: <why>"
+```
+
+The front door copies both into the model's row of `system.models` (its registry entry's, else its card's; null when
+neither states them): the platform's legend where the text is written. A speech engine's `keep` patterns are also its
+own (`AudioEngine::markup`): the audio server's speech text pass keeps the spans they match, so a tag reaches the model
+as written - the engine's test checks that its patterns are the card's (`audio/omnivoice`: `the_kept_spans_are_the_cards`).
+`tested` is from the real server path (`/v1/audio/speech`), each take heard by Whisper large-v3-turbo.

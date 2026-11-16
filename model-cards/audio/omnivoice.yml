@@ -11,14 +11,47 @@ about: 'OmniVoice (k2-fsa / Xiaomi, 2026): a diffusion-language-model TTS - a bi
 license: cc-by-nc-4.0
 commercial: false
 license_note: 'the weights CC BY-NC 4.0 (k2-fsa / Xiaomi; the training data''s terms); upstream''s code Apache 2.0, the Higgs Audio v2 codec (Boson AI) Apache 2.0, the GGUF conversion''s tooling (omnivoice.cpp) MIT'
-gpus: '0'
-vram_gib: 2.5                   # its memory on the card when it runs (measured on a B65: 1.6 GiB loaded, 2.2 GiB at a clone's peak)
+gpus: '0,1'                     # whole on one of them, the first with room (the B70 first)
+vram_gib: 2.6                   # its memory on the card when it runs (measured on a B65: 1.6 GiB loaded, 2.4 GiB at a 29 s recording's clone; its load asks 1.8)
 speech:
 - clone                         # a recording, or a saved voice, with its transcript
 - design                        # a voice from attributes alone (instructions)
 - direction                     # a clone steered by attributes (instructions)
 - events                        # non-verbal tags in the text
 - transcript                    # a clone needs what the recording says (saved voices without it go elsewhere)
+annotations_note: 'Only these 13 tags are trained, case and spelling as written; other bracketed text is not a tag ([laugh] is read aloud: "Well, laugh, that is really funny", verified 2026-11-16). The voice is set by instructions (attributes below) or a recording, not by text.'
+annotations:
+- syntax: '[laughter]'
+  keep: '\[laughter\]'
+  does: 'a laugh where the tag stands'
+  tested: 'verified 2026-11-16 (/v1/audio/speech, B65, seed 7, male young adult design unless said): not read aloud (Whisper heard the line alone); +0.54 s of sound above -40 dBFS against the same line without it, +0.74 s in a clone (LibriSpeech 1272)'
+- syntax: '[sigh]'
+  keep: '\[sigh\]'
+  does: 'a sigh where the tag stands'
+  tested: 'verified 2026-11-16 (/v1/audio/speech, B65, seed 7, male young adult design unless said): not read aloud; +0.28 s of sound, +0.68 s first in a clone steered by male, low pitch'
+- syntax: '[confirmation-en]'
+  keep: '\[confirmation-en\]'
+  does: 'an English affirming sound (mm-hm)'
+  tested: 'verified 2026-11-16 (/v1/audio/speech, B65, seed 7, male young adult design unless said): heard as "Hmm.", the tag''s word not read; quiet (+0.02 s above -40 dBFS)'
+- syntax: '[question-en] [question-ah] [question-oh] [question-ei] [question-yi]'
+  keep: '\[question-(?:en|ah|oh|ei|yi)\]'
+  does: 'a questioning interjection (en: English; ah, oh, ei, yi: the Chinese ones)'
+  tested: 'verified 2026-11-16 (/v1/audio/speech, B65, seed 7, male young adult design unless said): each heard as its sound, never the tag''s words: en no word (+0.58 s of sound), ah "Ah", oh "Oh", ei "A", yi "Ye"'
+- syntax: '[surprise-ah] [surprise-oh] [surprise-wa] [surprise-yo]'
+  keep: '\[surprise-(?:ah|oh|wa|yo)\]'
+  does: 'a surprised interjection'
+  tested: 'verified 2026-11-16 (/v1/audio/speech, B65, seed 7, male young adult design unless said): each heard as its sound: ah "Ah", oh "Oh", wa "why", yo "Yo, yo" (+0.6-0.9 s of sound)'
+- syntax: '[dissatisfaction-hnn]'
+  keep: '\[dissatisfaction-hnn\]'
+  does: 'a dissatisfied hmph'
+  tested: 'verified 2026-11-16 (/v1/audio/speech, B65, seed 7, male young adult design unless said): heard as "Hmm" (+0.62 s of sound), the tag''s word not read'
+- syntax: '[B EY1 S] (CMU phonemes in brackets, upper case, stress digits)'
+  keep: '\[[A-Z]{1,3}[0-2]?(?: [A-Z]{1,3}[0-2]?)*\]'
+  does: 'an English word said as the phonemes written; Chinese: pinyin with a tone digit in the text (ZHE4), no brackets'
+  tested: 'verified 2026-11-16 (/v1/audio/speech, B65): "Please put the statue on its [B EY1 S] before the guests arrive." heard as "... its base ..."; pinyin unverified'
+- syntax: 'instructions: male | female; child | teenager | young adult | middle-aged | elderly; very low | low | moderate | high | very high pitch; whisper; american | british | australian | canadian | indian | chinese | korean | japanese | portuguese | russian accent; a Chinese dialect (河南话 陕西话 四川话 贵州话 云南话 桂林话 济南话 石家庄话 甘肃话 宁夏话 青岛话 东北话); comma-separated, one a kind, or the Chinese names (男, 女, 青年, 低音调, 耳语 ...)'
+  does: 'the voice designed (alone) or steered (with a recording); accents only for English text, dialects only for Chinese; anything else is refused (400, invalid_params, field instructions)'
+  tested: 'verified 2026-11-16 (/v1/audio/speech, B65): designs in English and Chinese heard word for word (docs/ports/omnivoice.md); "speak happily and fast" answered 400 with the list'
 defaults:
   steps: 32
   cfg: 2.0

@@ -54,6 +54,11 @@ pub const FPS: f32 = 25.0;
 const MAX_SECONDS: f32 = 600.0;
 /// the longest recording to clone (upstream warns past 20 s: slower, and a worse clone)
 const MAX_REFERENCE_S: f32 = 30.0;
+/// what a load asks beyond the weights (bytes): a short request's passes. A long one takes more - 0.8 GiB over the 1.6
+/// loaded at a 29 s recording cloned into 31 s of speech (B65, 2026-11-16) - which the front door keeps for it (the
+/// card's vram_gib 2.6, then the peak it measures); the load must not ask more than that plan, or a start the front
+/// door placed would end while loading (2026-11-16: it asked weights + 2 GiB and refused on a B70 with 2.9 GiB free)
+const LOAD_MARGIN: u64 = 1 << 28;
 
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "speed", env: "NS_OV_SPEED", value: "1.0", help: "how fast it speaks: the estimated length divided by this (upstream's speed)",
@@ -219,14 +224,15 @@ impl OmniVoice {
         let (model, codecf) = (role(files, "model")?, role(files, "codec")?);
         let base = Weights::open(&model, "omnivoice-lm")?;
         let cw = Weights::open(&codecf, "omnivoice-tokenizer")?;
-        // the backbone half, the embeddings table float32, the codec float32 (its file's size twice or more), work 2 GiB
+        // the backbone half, the embeddings table float32, the codec float32 (1.6 GiB loaded, any variant), and a short
+        // request's passes (LOAD_MARGIN). Short of it: no room, not a failure
         let need: u64 = base.g.tensors.iter().filter(|t| t.name != "llm.embed_tokens.weight").map(|t| t.elements() * if t.name.starts_with("llm.layers") { 2 } else { 4 })
-            .sum::<u64>() + cw.g.tensors.iter().map(|t| t.elements() * 4).sum::<u64>() + (2u64 << 30);
+            .sum::<u64>() + cw.g.tensors.iter().map(|t| t.elements() * 4).sum::<u64>() + LOAD_MARGIN;
         let (total, free) = gpu.memory()?;
         let free = free.unwrap_or(total);
         if need > free {
-            return Err(Error(format!("{ARCH} needs about {:.1} GiB on {}; {:.1} GiB are free", need as f64 / (1u64 << 30) as f64, gpu.name,
-                                     free as f64 / (1u64 << 30) as f64)));
+            return Err(Error::no_room(format!("{ARCH} needs about {:.1} GiB on {}; {:.1} GiB are free", need as f64 / (1u64 << 30) as f64, gpu.name,
+                                              free as f64 / (1u64 << 30) as f64)));
         }
         let ops = Ops::new(gpu)?;
         let text = Text::new(&base.g)?;
@@ -578,6 +584,11 @@ impl AudioEngine for OmniVoice {
             enrolled: false,
             speakers: 1,
         })
+    }
+    fn markup(&self) -> Vec<String> {
+        // the non-verbal tags and the bracketed pronunciations are read only as written: the server's normalisation
+        // would make "[laughter]" a pause and the word "laughter", which the model then says
+        text::KEEP.iter().map(|k| k.to_string()).collect()
     }
     fn options(&self) -> &'static [EngineOption] {
         OPTIONS

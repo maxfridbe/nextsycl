@@ -20,6 +20,18 @@ pub const EVENTS: &[&str] = &[
     "[surprise-oh]", "[surprise-wa]", "[surprise-yo]", "[dissatisfaction-hnn]",
 ];
 
+/// The spans of a text the server must pass through as written (AudioEngine::markup; the card's annotations[].keep):
+/// the non-verbal tags, and a pronunciation in CMU phonemes in brackets ("[B EY1 S]")
+pub const KEEP: &[&str] = &[
+    r"\[laughter\]",
+    r"\[sigh\]",
+    r"\[confirmation-en\]",
+    r"\[question-(?:en|ah|oh|ei|yi)\]",
+    r"\[surprise-(?:ah|oh|wa|yo)\]",
+    r"\[dissatisfaction-hnn\]",
+    r"\[[A-Z]{1,3}[0-2]?(?: [A-Z]{1,3}[0-2]?)*\]",
+];
+
 /// upstream's docs/lang_id_name_map.tsv: id, name, ISO 639-3, hours of training data
 const LANGUAGES: &str = include_str!("languages.tsv");
 
@@ -485,6 +497,20 @@ mod tests {
         assert_eq!(d.target_frames(&t, None, None, 1.0), (100.0 / (14.1 / 25.0)) as usize);
         // a short one boosted toward 50
         assert!(d.target_frames("Hi.", None, None, 1.0) > 20);
+    }
+
+    /// The spans the server keeps are the card's annotations[].keep, each tag kept by one of them
+    #[test]
+    fn the_kept_spans_are_the_cards() {
+        let card = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../model-cards/audio/omnivoice.yml")).unwrap();
+        for k in KEEP {
+            assert!(card.contains(&format!("keep: '{k}'")), "the card states keep: '{k}'");
+        }
+        let res: Vec<fancy_regex::Regex> = KEEP.iter().map(|k| fancy_regex::Regex::new(k).unwrap()).collect();
+        for e in EVENTS.iter().chain(["[B EY1 S]", "[HH AH0 L OW1]"].iter()) {
+            assert!(res.iter().any(|r| r.find(e).unwrap().is_some_and(|m| m.as_str() == *e)), "{e} kept whole");
+        }
+        assert!(!res.iter().any(|r| r.is_match("[laugh] (laughs) [whisper]").unwrap()), "only the trained tags");
     }
 
     #[test]

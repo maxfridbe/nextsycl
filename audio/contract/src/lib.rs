@@ -551,6 +551,12 @@ pub trait AudioEngine: Send + Sync {
     fn speech(&self) -> Option<Speech> {
         None
     }
+    /// inline markup in a speech text that the server passes through as written: regular expressions of the spans its
+    /// speech normalisation (brackets as pauses, symbols as words) leaves alone - tags the model performs
+    /// (`\[laughter\]`), as a model card's `annotations[].keep` states them; empty: none (the whole text normalised)
+    fn markup(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// the options it takes beyond the request's fields (its kind's `options`)
     fn options(&self) -> &'static [EngineOption] {
         &[]

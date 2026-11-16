@@ -623,8 +623,9 @@ impl Home {
         // and for an image model whether its text encoder describes (a native describer card reads its file)
         let dc = if need("image") && mc.is_empty() { self.o.cfg.cards() } else { Vec::new() };
         let dc = if mc.is_empty() { &dc } else { &mc };
-        // and for every model its licence (license, commercial, license_note: its entry's, else its card's), and for a
-        // picture-making one its request rules (controls)
+        // and for every model its licence (license, commercial, license_note: its entry's, else its card's), what it
+        // reads inline in its text (annotations, annotations_note), and for a picture-making one its request rules
+        // (controls)
         let lc_read;
         let lc = if dc.is_empty() { lc_read = self.o.cfg.cards(); &lc_read } else { dc };
         let holds = self.holds();
@@ -699,6 +700,7 @@ impl Home {
                    "max_copies": max_copies, "recommended_copies": recommended_copies, "at_once": at_once,
                    "license": licence(m, lc, "license"), "commercial": licence(m, lc, "commercial"), "license_note": licence(m, lc, "license_note"),
                    "controls": controls(m, lc, &caps),
+                   "annotations": from_card(m, lc, "annotations"), "annotations_note": from_card(m, lc, "annotations_note"),
                    "id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "gpus_one_of": registry::one_of(m), "state": state,
                    "spans": spans_all(m, &mc),
                    "pinned": enabled && m["pinned"] == true, "held_s": holds.get(s(m, "id").as_str()).map_or(0.0, |h| h.reserved(now()).round()),
@@ -1548,6 +1550,17 @@ mod tests {
         assert!(super::controls(&up, &cards, &caps(&up)).is_null());
         let none = json!({"id": "nocard", "kind": "image", "arch": "z-image"});
         assert!(super::controls(&none, &cards, &caps(&none)).is_null(), "no card: null");
+    }
+
+    /// A row's inline annotations: its entry's, else its card's (OmniVoice's tags); none: null
+    #[test]
+    fn a_rows_annotations_come_from_its_card() {
+        use serde_json::json;
+        let cards = vec![json!({"id": "omnivoice", "kind": "audio", "annotations": [{"syntax": "[laughter]", "keep": "\\[laughter\\]"}], "annotations_note": "n"})];
+        let m = json!({"id": "omnivoice", "kind": "audio", "arch": "omnivoice"});
+        assert_eq!(super::from_card(&m, &cards, "annotations")[0]["syntax"], "[laughter]");
+        assert_eq!(super::from_card(&m, &cards, "annotations_note"), "n");
+        assert!(super::from_card(&json!({"id": "other", "kind": "audio"}), &cards, "annotations").is_null());
     }
 
     #[test]

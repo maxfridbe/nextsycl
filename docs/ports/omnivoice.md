@@ -196,3 +196,28 @@ steps).
   first with whisper-large-v3-turbo.
 - The shared mm3 `conv1d_lr` primitive cache should key on the bias (see the port's trap above).
 - Not deployed or registered in production.
+
+## Fixes after the platform's first use (2026-11-16)
+
+- **Tags were spoken through the server.** The audio server's speech text pass (`speakable`, glue/serve/src/audio.rs:
+  symbols as words, brackets as pauses) made `[laughter]` into ", laughter," before the engine saw it, so the model
+  said the word; `audio gen` has no such pass. An engine now names the spans the pass must keep
+  (`AudioEngine::markup`: regular expressions, empty by default - every other engine's text is normalised as
+  before), the pass keeps what they match (`speakable_keeping`), and OmniVoice names its 13 tags and the bracketed CMU
+  pronunciations - the same patterns as its card's `annotations[].keep` (a test holds them equal). Through a real
+  `audio serve` (B65, seed 7), Whisper large-v3-turbo heard no tag's word in any of the 13, in a clone or a clone
+  with instructions: `[laughter]` +0.54 s of sound (+0.74 s in a clone), `[sigh]` +0.28 s (+0.68 s), the interjections
+  as their sounds ("Hmm", "Ah", "Oh", "Ye", "Yo, yo"); `[B EY1 S]` heard as "base"; an untrained `[laugh]` is read
+  ("Well, laugh, that is really funny").
+- **"ended while loading" on a full B70.** The card said `gpus: '0'`, and the engine's own load check asked the
+  weights plus a flat 2 GiB (about 3.6 GiB) against a measured peak of 2.4 GiB - with H3 holding 29 GiB the front
+  door (vouching the measured peak) started it, the engine refused with a plain error, and the server ended. Now the
+  card says `gpus: '0,1'` (whole on the first card with room), `vram_gib: 2.6` (the peak measured at a 29 s
+  recording's clone), and the load asks the weights plus 0.25 GiB (1.8 GiB) as no room - never more than the front
+  door plans for. General (not changed): a load refused for any reason reaches the front door as the server's end
+  (`audio start`: "ended while loading", 502 unavailable), not 503 no_room.
+- **A refused `instructions` looked retryable.** The audio server answers it 400 (`engine_status`), the front door
+  relays it as such: invalid_params, field instructions, not retryable (a test holds it). The unavailable the platform
+  saw came with the load failure above (no server: every request 502).
+- **Annotations**: the card states the 13 tags, the pronunciations and the instructions' attributes in nextcuda's
+  schema (`annotations`, `annotations_note`; model-cards/README.md), and system.models rows carry them.

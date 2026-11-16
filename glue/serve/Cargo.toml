@@ -19,3 +19,6 @@ serde = { version = "1", features = ["derive"] }
 # the RPC methods are their handlers: vendor/rpcgen, from vibe-creative-platform (tooling/sync_rpcgen.sh)
 rpcgen = { path = "../../vendor/rpcgen", default-features = false }
 sha2 = "0.10"
+# an engine's inline markup kept by the speech text pass (AudioEngine::markup: regular expressions); the same crate
+# as the tokenizers'
+fancy-regex = "0.14"

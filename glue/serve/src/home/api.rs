@@ -1968,6 +1968,9 @@ mod tests {
         assert_eq!(rpc_error("video.cancel", 409, Some("not_running"), "no job is running")["retryable"], false);
         assert_eq!(rpc_error("image.enable", 409, None, "disabled")["retryable"], false);
         assert_eq!(rpc_error("audio.speak", 499, None, "cancelled")["code"], "cancelled");
+        // an engine's refusal of a request (the audio server's 400, relayed as it is): a bad value, its field named
+        let e = rpc_error("audio.speak", 400, None, "instructions: \"speak happily\" not a voice attribute OmniVoice knows ...");
+        assert_eq!((e["code"].as_str(), e["retryable"].as_bool(), e["field"].as_str()), (Some("invalid_params"), Some(false), Some("instructions")));
         let e = rpc_error("image.generate", 503, None, "cards taken: a GPU run holds /tmp/ds2run.lock (pid 7)");
         assert_eq!((e["code"].as_str(), e["retryable"].as_bool(), e["retry_after_s"].as_u64()), (Some("cards_taken"), Some(true), Some(120)));
         for (st, c) in [(400, "invalid_params"), (401, "unauthorized"), (404, "not_found"), (502, "unavailable"), (504, "timeout"), (500, "internal")] {

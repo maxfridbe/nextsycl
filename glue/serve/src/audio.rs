@@ -616,7 +616,12 @@ impl AudioServer {
             (p, text(&["input", "lyrics"]), None)
         };
         // speech: the text as it is said (symbols as words, no markdown) unless normalize: false / NS_SPEECH_NORMALIZE=0
-        let prompt = if speech && b["normalize"] != false && !std::env::var("NS_SPEECH_NORMALIZE").is_ok_and(|v| v == "0") { speakable(&prompt) } else { prompt };
+        // (the engine's own inline markup - OmniVoice's [laughter] - kept as written: AudioEngine::markup)
+        let prompt = if speech && b["normalize"] != false && !std::env::var("NS_SPEECH_NORMALIZE").is_ok_and(|v| v == "0") {
+            speakable_keeping(&prompt, &engine.markup())
+        } else {
+            prompt
+        };
         let frames_per_s = if speech { 12.5 } else { 25.0 };
         let seconds = num(&["seconds", "duration", "audio_duration"]).or_else(|| num(&["max_new_tokens"]).map(|f| f / frames_per_s)).map(|v| v as f32);
         let mut saved: Option<String> = None;
@@ -1094,6 +1099,35 @@ pub fn speakable(text: &str) -> String {
     speakable_line(text)
 }
 
+/// `speakable` around the spans that match `keep` (an engine's inline markup, AudioEngine::markup: regular
+/// expressions, a model card's annotations[].keep): those stay as written, the text between them is normalised; no
+/// `keep` (or none that compiles): `speakable` itself
+pub fn speakable_keeping(text: &str, keep: &[String]) -> String {
+    let res: Vec<fancy_regex::Regex> = keep.iter().filter(|k| !k.is_empty()).filter_map(|k| fancy_regex::Regex::new(k).ok()).collect();
+    if res.is_empty() {
+        return speakable(text);
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut at = 0;
+    while at <= text.len() {
+        // the earliest span any pattern matches from here (the longest at a position)
+        let next = res.iter().filter_map(|r| r.find_from_pos(text, at).ok().flatten()).filter(|m| m.end() > m.start())
+            .min_by_key(|m| (m.start(), std::cmp::Reverse(m.end())));
+        match next {
+            Some(m) => {
+                parts.push(speakable(&text[at..m.start()]));
+                parts.push(m.as_str().to_string());
+                at = m.end();
+            }
+            None => {
+                parts.push(speakable(&text[at..]));
+                break;
+            }
+        }
+    }
+    parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
 fn speakable_line(text: &str) -> String {
     let c: Vec<char> = text.chars().collect();
     let word = |ch: char| ch.is_alphanumeric();
@@ -1178,6 +1212,13 @@ mod tests {
         // a speakers' script keeps its lines
         assert_eq!(s("Speaker 1: a = b\n\nSpeaker 2: *yes*"), "Speaker 1: a equals b\nSpeaker 2: yes");
         assert_eq!(s("one\ntwo"), "one two", "plain text is one line, as before");
+        // an engine's markup kept as written (OmniVoice's tags), the rest as before; no markup: brackets are pauses
+        let k = |t: &str| super::speakable_keeping(t, &[r"\[(?:laughter|sigh)\]".to_string(), r"\[[A-Z]{1,3}[0-2]?(?: [A-Z]{1,3}[0-2]?)*\]".to_string()]);
+        assert_eq!(k("The [B EY1 S] of it (low)"), "The [B EY1 S] of it, low");
+        assert_eq!(k("That is funny [laughter] tell me again."), "That is funny [laughter] tell me again.");
+        assert_eq!(k("[sigh] Fine, a = b."), "[sigh] Fine, a equals b.");
+        assert_eq!(k("Wait (really) [laughter]"), "Wait, really [laughter]");
+        assert_eq!(super::speakable_keeping("Funny [laughter] yes", &[]), "Funny, laughter, yes");
     }
 
     use super::{gpu_failed, own_vram_mb, range};
