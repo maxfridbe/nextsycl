@@ -170,6 +170,8 @@ pub struct Home {
     loading: Mutex<BTreeMap<String, f64>>,
     /// one load or swap at a time per kind
     kind_lock: BTreeMap<&'static str, Mutex<()>>,
+    /// per kind: a request matched to a server of its model loaded and idle, and counted there (never across a load)
+    hot_lock: BTreeMap<&'static str, Mutex<()>>,
     /// model id -> card -> MiB, the most seen while it ran
     seen: Mutex<BTreeMap<String, BTreeMap<usize, u64>>>,
     /// the requests sent on to each image and audio server and not answered yet, by its port
@@ -340,6 +342,7 @@ impl Home {
             o, token, state_file, jobs,
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
+            hot_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
             seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), answers: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()),
             holds_file, holds_mx: Mutex::new(()), history, history_dir, video_watch: Mutex::new(Vec::new()), withdrawn: Mutex::new(BTreeMap::new()),
             chat_last: Mutex::new(now()), cards_fixed: std::sync::atomic::AtomicBool::new(false),
@@ -730,7 +733,7 @@ impl Home {
         });
         json!({"ts": now(), "host": meminfo(), "cards": cards, "models": models, "services": self.services(), "runs": runs,
                "idle_minutes": self.o.idle_minutes, "ports": {"video": self.o.ports.video, "chat_ui": self.o.ports.chat_ui},
-               "maintenance": maintenance, "cards_taken": self.cards_taken(), "drives": self.drives_view(&all, &models),
+               "maintenance": maintenance, "cards_taken": self.box_taken(), "cards_taken_gpus": self.taken_gpus(), "drives": self.drives_view(&all, &models),
                // the models a card offers that are not here yet, their downloads, and whether a request fetches one itself
                "available": self.not_downloaded_all(), "pulls": self.pulls_view(), "auto_pull": self.auto_pull()})
     }

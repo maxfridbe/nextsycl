@@ -749,12 +749,14 @@ impl Home {
         backplane_scheduler::eta::ahead_s(&self.history, now(), &views, kind, exclude, self.slots(kind).len())
     }
 
-    /// The jobs not ended (system.busy)
+    /// The jobs not ended (system.busy); `stage` what one started here waits for (cards_taken: a GPU run holds its cards)
     pub(crate) fn jobs_open(&self) -> Vec<Value> {
         let paused = self.jobs.paused.lock().unwrap().clone();
+        let stages = self.stages.lock().unwrap().clone();
         self.jobs.list.lock().unwrap().iter().filter(|j| !ended(j))
             .map(|j| json!({"id": j["id"], "kind": j["kind"], "label": j["label"], "title": j["title"], "state": j["state"], "model": j["body"]["model"],
-                            "held": j["state"] == "queued" && held(j, &paused[j["kind"].as_str().unwrap_or("")])})).collect()
+                            "held": j["state"] == "queued" && held(j, &paused[j["kind"].as_str().unwrap_or("")]),
+                            "stage": j["id"].as_str().and_then(|id| stages.get(id)).map(|(st, _)| st.clone())})).collect()
     }
 }
 

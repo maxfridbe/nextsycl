@@ -692,7 +692,33 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
 settings, so an engine's settings are given once, at `models add --set`, and `nextsycl llm start <id>` applies them.
 [registry.md](registry.md) has the commands. Where an entry's files live is the registry's business too:
 `nextsycl_serve::drives` (the front door's Drives panel, `system.move`, `nextsycl models move`) copies a model's files
-to another drive (with the sidecars its model card lists - files its engine finds beside the model by convention), checks them, repoints the entry and removes the old files that no other entry names. The front door loads nothing while a GPU run holds `NS_GPU_LOCK` (`cards_taken`) and plans placement with the memory every process holds (the root sampler's gpustat file).
+to another drive (with the sidecars its model card lists - files its engine finds beside the model by convention), checks them, repoints the entry and removes the old files that no other entry names. The front door loads nothing on the cards a GPU run holds (`NS_GPU_LOCK`, `cards_taken`; below) and plans placement with the memory every process holds (the root sampler's gpustat file).
+
+### The GPU run lock
+
+GPU work the front door does not manage (a test, a benchmark, a build) holds the lock file `NS_GPU_LOCK`
+(/tmp/ds2run.lock, `flock`) while it runs. The front door only reads it (/proc/locks: the holder's pid), never takes it.
+
+- **Naming the cards.** Once it holds the lock, a run writes the side file beside it, `<lock>.cards`
+  (/tmp/ds2run.cards), as `{"pid": P, "gpus": [1]}` - P the lock holder's pid as /proc/locks shows it (for `flock -w N 9`
+  that is the `flock` process's, so the writer reads it from /proc/locks), written to a temporary name and renamed.
+  hardac1's `~/src/gpu-lock.sh` (`gpu_lock GPUS`) does this.
+- **What it takes.** The named cards only: no model loads there; a model with another card of its loads on that one;
+  a model whose one copy spans a named card (Sophon: `gpus: 0,1`, `spans: true`) and a chat model spread over one do
+  not load. A request that cannot load is refused 503 `cards_taken` (retryable, retry_after_s; /v1 Retry-After), a job
+  waits (`stage: cards_taken`). What is loaded keeps answering on every card. The video queue still pauses while any card
+  is taken.
+- **The safe default.** A holder with no side file, a side file naming another pid (a stale one: a run that ended or
+  crashed), no card, or one that does not parse: every card is taken. The old runners that only flock keep the whole box.
+- **No card left blocked by a crash.** The side file counts only while a holder with its pid holds the lock; the lock
+  goes when the holder's process ends, so a file left behind means nothing.
+- **What system.busy says.** `cards_taken` is the sentence only when EVERY card is taken (the box loads nothing: a
+  platform routes around it); `cards_taken_gpus` lists the taken cards (empty: none); each `cards[]` row has `taken`
+  (the sentence, or null). `system.state` carries `cards_taken` and `cards_taken_gpus` too. The feature flag is
+  `cards_taken.gpus`.
+- **A run never waits for the front door while it holds the lock** (it loads nothing on the run's cards meanwhile, so
+  work for them waits forever). Under the lock, a helper yields (exit 75) when a job waits with `stage: cards_taken`
+  or, for a run that named no cards, whenever the box is busy.
 
 ## What stays shared on purpose
 

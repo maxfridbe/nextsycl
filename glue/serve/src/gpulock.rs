@@ -6,6 +6,14 @@
 //!
 //! The lock is read, never taken: /proc/locks lists every flock with its holder's pid and the file's device and inode
 //! (a waiter's line starts with `->` and holds nothing), so a run waiting for the lock never waits on this.
+//!
+//! A run may say which cards it uses: once it holds the lock it writes `{"pid": P, "gpus": [1]}` to the side file
+//! beside the lock (`<lock>.cards`: /tmp/ds2run.cards), P the holder's pid as /proc/locks shows it. Only those cards are
+//! taken then: nothing loads there (nor a model that spans them, nor a chat model spread over them) and the other cards
+//! serve as always. The side file counts only while a holder with that pid holds the lock, so a run that ends - or
+//! crashes - leaves no card blocked: the lock goes with its process, and the file left behind names a pid that holds
+//! nothing. A holder with no side file, or one naming another pid or no card, takes every card (the old runners only
+//! flock). The video queue still pauses while any card is taken.
 
 use std::path::{Path, PathBuf};
 
@@ -68,10 +76,72 @@ fn cmdline(pid: i64) -> String {
     cmd.chars().take(120).collect()
 }
 
+/// The side file in which a run holding `lock` names its cards: `ds2run.lock` -> `ds2run.cards`
+pub fn cards_file(lock: &Path) -> PathBuf {
+    lock.with_extension("cards")
+}
+
+/// The cards a side file names for the holder `pid` (`{"pid": P, "gpus": [..]}`); None - every card - when it is not
+/// that holder's, names no card, or is not one
+pub fn declared(text: &str, pid: i64) -> Option<Vec<usize>> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v["pid"].as_i64()? != pid {
+        return None;
+    }
+    let mut g: Vec<usize> = v["gpus"].as_array()?.iter().map(|g| g.as_u64().map(|g| g as usize)).collect::<Option<_>>()?;
+    g.sort_unstable();
+    g.dedup();
+    (!g.is_empty()).then_some(g)
+}
+
+/// The lock held: by whom, and the cards it takes (None: every card)
+#[derive(Clone, Debug, PartialEq)]
+pub struct Taken {
+    pub holder: Holder,
+    pub gpus: Option<Vec<usize>>,
+}
+
+impl Taken {
+    /// Whether card `g` is taken
+    pub fn takes(&self, g: usize) -> bool {
+        self.gpus.as_ref().is_none_or(|v| v.contains(&g))
+    }
+
+    /// Whether a load on `gpus` may not start: one of them taken (`all_needed`: a model whose one copy spans them, a
+    /// chat model spread over them), else every one of them (a model that may go on any of them goes on a free one).
+    /// No cards given: barred
+    pub fn bars(&self, gpus: &[usize], all_needed: bool) -> bool {
+        if gpus.is_empty() || self.gpus.is_none() {
+            return true;
+        }
+        if all_needed { gpus.iter().any(|g| self.takes(*g)) } else { gpus.iter().all(|g| self.takes(*g)) }
+    }
+
+    /// The taken cards among `cards` (all of them when the run named none)
+    pub fn among(&self, cards: &[usize]) -> Vec<usize> {
+        cards.iter().copied().filter(|g| self.takes(*g)).collect()
+    }
+}
+
+/// Who holds the lock file now and which cards it takes (none: free, no file, or no lock file set)
+pub fn taken(file: &Path) -> Option<Taken> {
+    let holder = held(file)?;
+    let gpus = std::fs::read_to_string(cards_file(file)).ok().and_then(|t| declared(&t, holder.pid));
+    Some(Taken { holder, gpus })
+}
+
 /// The sentence a refused request or a waiting job reads
-pub fn message(file: &Path, h: &Holder) -> String {
+pub fn message(file: &Path, t: &Taken) -> String {
+    let h = &t.holder;
     let what = if h.cmd.is_empty() { String::new() } else { format!(": {}", h.cmd) };
-    format!("cards taken: a GPU run holds {} (pid {}{what}); no model loads beside it - try again when it ends", file.display(), h.pid)
+    match &t.gpus {
+        None => format!("cards taken: a GPU run holds {} (pid {}{what}); no model loads beside it - try again when it ends", file.display(), h.pid),
+        Some(g) => {
+            let on = g.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(", ");
+            format!("cards taken: a GPU run holds {} (pid {}{what}) on GPU {on}; no model loads there beside it - try again when it ends",
+                    file.display(), h.pid)
+        }
+    }
 }
 
 /// Seconds a refused caller is told to wait before trying again
@@ -119,7 +189,58 @@ mod tests {
         let _ = c.wait();
         let h = h.expect("the lock is seen while flock holds it");
         assert_eq!(h.pid, c.id() as i64);
-        assert!(message(&f, &h).starts_with("cards taken:"));
+        assert!(message(&f, &Taken { holder: h, gpus: None }).starts_with("cards taken:"));
+        let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
+    fn a_side_file_counts_for_its_holder_only() {
+        assert_eq!(cards_file(Path::new("/tmp/ds2run.lock")), PathBuf::from("/tmp/ds2run.cards"));
+        assert_eq!(declared(r#"{"pid": 7, "gpus": [1]}"#, 7), Some(vec![1]));
+        assert_eq!(declared(r#"{"pid": 7, "gpus": [1, 0, 1]}"#, 7), Some(vec![0, 1]));
+        // a stale file (another run's, ended or crashed), no card, or nonsense: every card
+        assert_eq!(declared(r#"{"pid": 6, "gpus": [1]}"#, 7), None);
+        assert_eq!(declared(r#"{"pid": 7, "gpus": []}"#, 7), None);
+        assert_eq!(declared(r#"{"pid": 7, "gpus": ["1"]}"#, 7), None);
+        assert_eq!(declared(r#"{"pid": 7}"#, 7), None);
+        assert_eq!(declared("1", 7), None);
+    }
+
+    #[test]
+    fn only_the_named_cards_are_taken() {
+        let h = Holder { pid: 7, cmd: "regen2k test".into() };
+        let one = Taken { holder: h.clone(), gpus: Some(vec![1]) };
+        assert!(one.takes(1) && !one.takes(0));
+        assert!(!one.bars(&[0], false), "a model on the free card loads");
+        assert!(!one.bars(&[0, 1], false), "a model that may go on either goes on the free one");
+        assert!(one.bars(&[1], false));
+        assert!(one.bars(&[0, 1], true), "a model that spans both needs both");
+        assert!(one.bars(&[], false), "no cards given: barred");
+        assert_eq!(one.among(&[0, 1]), vec![1]);
+        let m = message(Path::new("/tmp/ds2run.lock"), &one);
+        assert!(m.starts_with("cards taken:") && m.contains("on GPU 1;"), "{m}");
+        let all = Taken { holder: h, gpus: None };
+        assert!(all.bars(&[0], false) && all.bars(&[0, 1], false));
+        assert_eq!(all.among(&[0, 1]), vec![0, 1]);
+    }
+
+    #[test]
+    fn a_real_holder_with_a_side_file() {
+        // the side file is read for the pid /proc/locks shows; skipped where there is no `flock`
+        let f = std::env::temp_dir().join(format!("ns-gpulock-side-{}.lock", std::process::id()));
+        std::fs::write(&f, "").unwrap();
+        let Ok(mut c) = std::process::Command::new("flock").arg(&f).args(["sleep", "2"]).spawn() else { return };
+        std::fs::write(cards_file(&f), format!(r#"{{"pid": {}, "gpus": [1]}}"#, c.id())).unwrap();
+        let t0 = std::time::Instant::now();
+        let mut t = None;
+        while t.is_none() && t0.elapsed().as_secs() < 3 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            t = taken(&f);
+        }
+        let _ = c.wait();
+        assert_eq!(t.expect("held").gpus, Some(vec![1]));
+        assert!(taken(&f).is_none(), "the run ended: the file left behind takes nothing");
+        let _ = std::fs::remove_file(cards_file(&f));
         let _ = std::fs::remove_file(f);
     }
 }

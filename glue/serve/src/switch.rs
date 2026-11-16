@@ -45,6 +45,8 @@ pub struct Model {
     pub tasks: bool,
     /// never unloaded or swapped out (system.pin)
     pub pinned: bool,
+    /// the cards it loads on (empty: every card); a GPU run holding any of them keeps it from loading (crate::gpulock)
+    pub gpus: Vec<usize>,
 }
 
 /// The registry's enabled chat models, read on every request (an added or disabled model shows at once)
@@ -209,9 +211,9 @@ impl Switch {
                                              want.title)));
             }
         }
-        // a GPU run holds the cards: nothing loads beside it
-        if let Some((f, h)) = self.gpu_lock.as_deref().and_then(|f| crate::gpulock::held(f).map(|h| (f, h))) {
-            return Some((503, json!({"error": {"message": crate::gpulock::message(f, &h), "type": "cards_taken", "code": "cards_taken"}})));
+        // a GPU run holds the cards (or one of the model's): nothing loads beside it
+        if let Some((f, t)) = self.gpu_lock.as_deref().and_then(|f| crate::gpulock::taken(f).map(|t| (f, t))).filter(|(_, t)| t.bars(&want.gpus, true)) {
+            return Some((503, json!({"error": {"message": crate::gpulock::message(f, &t), "type": "cards_taken", "code": "cards_taken"}})));
         }
         if let Err(e) = self.studio(Some(&want.id)) {
             return Some(err(503, format!("the model switch (the studio's llm.mode) did not answer: {e}")));
@@ -349,7 +351,7 @@ mod tests {
     }
 
     fn model(id: &str, pinned: bool) -> Model {
-        Model { id: id.into(), title: id.into(), tools: true, tasks: true, pinned }
+        Model { id: id.into(), title: id.into(), tools: true, tasks: true, pinned, gpus: vec![0] }
     }
 
     #[test]

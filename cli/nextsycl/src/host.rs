@@ -31,7 +31,13 @@ pub fn switch(args: &[String]) -> Result<(), String> {
         // the chat models (entries of other kinds - image, video, audio, lora - are not chat models)
         all.iter().filter(|m| m["enabled"] != false && models::kind_of(m) == "llm").filter_map(|m| {
             let id = m["id"].as_str()?.to_string();
-            Some(Model { title: m["title"].as_str().unwrap_or(&id).to_string(), tools: m["tools"] != false, tasks: m["tasks"] != false, pinned: m["pinned"] == true, id })
+            // its cards as the front door counts them (life.rs gpus_of): none named, the first; "all": every card
+            let gpus = match m["gpus"].as_str().map(str::trim) {
+                None | Some("") => vec![0],
+                Some("all") => Vec::new(),
+                Some(g) => nextsycl_serve::home::registry::gpu_list(g),
+            };
+            Some(Model { title: m["title"].as_str().unwrap_or(&id).to_string(), tools: m["tools"] != false, tasks: m["tasks"] != false, pinned: m["pinned"] == true, gpus, id })
         }).collect()
     });
     let mut aliases = HashMap::new();

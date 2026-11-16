@@ -2,6 +2,14 @@
 
 Bump `VERSION` in `src/lib.rs` and `version` in `Cargo.toml` with each entry.
 
+## 0.1.0+nextsycl.3 - 2026-11-16
+
+- `place::hot` + `Host::lock_hot`: `ensure` places a request on a server of its model that is up and idle (on a card no other work
+  saturates) under the kind's short lock, without waiting for the kind's lock, which a load of another model holds for minutes (two
+  zonos3 jobs waited a minute beside their idle server for a Sophon load). Every `placed` is now counted under the short lock.
+- `Host::barred_on`: a card a GPU run holds (one that named its cards). `place` loads a model on its other cards, a model whose one copy
+  spans a taken card is `Barred`, and `start_copy` starts no copy there; `Host::barred` stays "nothing may load at all".
+
 ## 0.1.0+nextsycl.2 - 2026-11-16
 
 - `ModelInfo::spans`: a model whose ONE copy spans its cards (an audio server with a 32B brain on one card and its voice on the other).

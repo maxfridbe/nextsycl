@@ -138,8 +138,9 @@ fn start_copy(host: &dyn Host, req: &PlaceReq, snap: &Snapshot, mine: &[&Server]
     // copies per card: extra ones up to the profile's recommended count (the default 1: one a card), never past its max
     let per_card = m.profile.concurrency.recommended_copies.min(m.profile.concurrency.max_copies_per_card) as usize;
     let spare = sv.iter().find(|x| x.model.is_none()).or_else(|| sv.iter().find(idle_other))?;
-    // (no second copy while nothing may load, or when its host memory is not there: the requests share the first)
+    // (no second copy while nothing may load, on a card taken, or when its host memory is not there: the requests share the first)
     let copy_plans = m.gpus.iter().copied().filter(|g| cards(*g) && extra_copy_allowed(&on, *g, per_card)).filter(|_| host.barred().is_none())
+        .filter(|g| host.barred_on(*g).is_none())
         .map(|g| (g, card_free(&snap.cards, g), room_plan(snap, host, g, want(g), kind, true, Some(m))));
     let (gpu, plan) = if host.first_listed_card() { pick_first(copy_plans) } else { pick_card(copy_plans) }?;
     let ram = host.ram_plan(snap, m).ok()?;
@@ -224,9 +225,16 @@ pub fn place(host: &dyn Host, req: &PlaceReq) -> Result<Outcome, Fail> {
     if let Some(why) = host.barred() {
         return Ok(Outcome::Barred(why));
     }
+    // cards a GPU run holds: a model whose one copy spans one of them waits, any other goes on a free card of its
+    let taken: Vec<(usize, String)> = gpus.iter().filter_map(|g| host.barred_on(*g).map(|w| (*g, w))).collect();
+    let free_cards: Vec<usize> = gpus.iter().copied().filter(|g| !taken.iter().any(|(t, _)| t == g)).collect();
+    if let Some((_, why)) = taken.first().filter(|_| m.spans || free_cards.is_empty()) {
+        return Ok(Outcome::Barred(why.clone()));
+    }
     if m.spans {
         return place_span(host, req, &snap);
     }
+    let gpus = &free_cards;
     let plans = gpus.iter().map(|&g| (g, card_free(cards, g), room_plan(&snap, host, g, want(g), kind, false, Some(m))));
     let plan = if host.first_listed_card() { pick_first(plans) } else { pick_card(plans) };
     let empty = sv.iter().find(|x| x.model.is_none());
@@ -377,6 +385,24 @@ fn place_span(host: &dyn Host, req: &PlaceReq, snap: &Snapshot) -> Result<Outcom
     Ok(Outcome::Placed { slot: x.slot, port: x.port })
 }
 
+/// A server of the model up (not loading) with nothing to do, on a card no other work saturates: the request counted on
+/// it under the kind's short lock ([`Host::lock_hot`]) and its (slot, port), without waiting for the kind's lock - which a
+/// load of another model holds while it lasts. None: [`place`] decides, under the kind's lock (a copy to start, a load,
+/// a server busy or contended)
+pub fn hot(host: &dyn Host, req: &PlaceReq) -> Option<(usize, u16)> {
+    let m = req.model;
+    if !m.enabled {
+        return None;
+    }
+    let _h = host.lock_hot(&m.kind);
+    let snap = host.snapshot();
+    let x = snap.servers_of(&m.kind).iter().find(|x| {
+        x.model.as_deref() == Some(m.id.as_str()) && x.idle() && !card_of_port(&snap.cards, x.port).is_some_and(|g| card_contended(&snap, host, g, x.port))
+    })?;
+    host.placed(x.port);
+    Some((x.slot, x.port))
+}
+
 /// The loop around [`place`]: tries again every 3 s until a server is found, a cancel (499), the wait runs out (503 no_room:
 /// `default_wait`, or - when the caller gave `max_wait` - that, answered `wait_too_long` with the `eta` it was given) or
 /// a failure. Returns the (slot, port) to send the request to.
@@ -399,11 +425,17 @@ pub fn ensure(host: &dyn Host, req: &PlaceReq, default_wait: std::time::Duration
             host.sleep(3.0);
             continue;
         }
-        // one try with the kind's lock held; the request counted on its server before the lock goes
+        // a server of it up and idle: taken at once, whatever another model of the kind is doing (a load holds the
+        // kind's lock for minutes: two zonos3 jobs waited a minute for a Sophon load beside their idle server, 2026-11-16)
+        if let Some(placed) = hot(host, req) {
+            return Ok(placed);
+        }
+        // else one try with the kind's lock held; the request counted on its server before the lock goes
         let tried = {
             let _g = host.wait_lock_kind(&req.model.kind);
             let o = place(host, req)?;
             if let Outcome::Placed { port, .. } = o {
+                let _h = host.lock_hot(&req.model.kind);
                 host.placed(port);
             }
             o

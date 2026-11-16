@@ -23,7 +23,10 @@
 //!   declare (`ram_cache_gib`) must leave its `ram_gib` and RAM_MARGIN_MB; idle holders on any card go for it, else it waits or answers no_room. A model without it: VRAM only.
 //! - GPU work this page does not manage (a test, a benchmark) holds the run lock (crate::gpulock, NS_GPU_LOCK): while
 //!   it is held no model loads - requests are refused with `cards_taken` (503, retryable), jobs wait, the video queue
-//!   pauses (mod.rs video_hold); what is loaded keeps answering.
+//!   pauses (mod.rs video_hold); what is loaded keeps answering. A run that named its cards (the side file
+//!   `<lock>.cards`) takes only those: nothing loads there, the other cards serve (taken_for, Host::barred_on).
+//! - A server that refuses to load for want of room (its `no room: ...` / "needs about X GiB ...; Y GiB are free") is
+//!   503 no_room with what it said (load_failed); a server that ends for another reason stays 502.
 //! - video: the daemon (`nextsycl video start`) with the enabled video models as its engines, on their GPUs; its
 //!   workers load per clip and let the card go when idle. No video model enabled: the daemon is stopped. A worker waiting for its card's memory (any card, shared or
 //!   not) has the same room rule applied for it (video_room_loop): idle holders there go, a chat model kept or answering stays, and the worker gives up after VIDEO_ROOM_WAIT_S.
@@ -122,6 +125,33 @@ fn listening(port: u16) -> bool {
 fn needs_more_mb(why: &str) -> Option<u64> {
     let n = why.split("needs ").nth(1)?.split(" GiB more").next()?.trim().parse::<f64>().ok()?;
     (n > 0.0).then(|| (n * 1024.0).ceil() as u64)
+}
+
+/// What a server that would not load said of the room, when it refused for want of it: the line of its log that says so
+/// (an engine's `no room: ...`, "needs about X GiB on CARD; Y GiB are free", or the device out of memory). None: it
+/// ended for another reason (a crash)
+fn room_refusal(e: &str) -> Option<String> {
+    let says = |l: &str| {
+        nextsycl_core::Error(l.trim().to_string()).is_no_room() || l.contains(nextsycl_core::NO_ROOM) || place::asked_mb(l).is_some()
+    };
+    // (`nextsycl <kind> start` says the server's last lines joined by " | ")
+    let line = e.split(" | ").find(|l| says(l))?;
+    // (the last of them ends with where its logs are: " (/path/to/nextsycl audio logs)")
+    let line = match line.rfind(" (") {
+        Some(at) if line.trim_end().ends_with(" logs)") => &line[..at],
+        _ => line,
+    };
+    let line = line.split(" - its last lines: ").last().unwrap_or(line).trim();
+    Some(line.to_string())
+}
+
+/// A server start that failed: 503 no_room (retryable) when the server refused for want of room - with what it said,
+/// and the whole error after it (a learned ask reads its figures from it) - else 502, the server ended (a crash)
+fn load_failed(id: &str, on: &str, e: String) -> (u16, String) {
+    match room_refusal(&e) {
+        Some(why) => (503, format!("no room for {id} on {on}: its server refused to load ({why}); it loads once the room is there - {e}")),
+        None => (502, e),
+    }
 }
 
 /// A model's licence field (license, commercial, license_note): its registry entry's, else its model card's; null when
@@ -925,8 +955,8 @@ impl Home {
         if let Some(why) = self.moving_why(id) {
             return Err((409, why));
         }
-        // a GPU run holds the cards: refused now (the load would only wait in the background)
-        if let Some(why) = self.cards_taken() {
+        // a GPU run holds its cards: refused now (the load would only wait in the background)
+        if let Some(why) = self.taken_for(&m) {
             let loaded = match registry::kind_of(&m) {
                 "llm" => self.chat_loaded(&self.models()).as_deref() == Some(id),
                 "video" => true,
@@ -1227,11 +1257,12 @@ impl Home {
     pub(super) fn video_room_loop(&self) {
         loop {
             std::thread::sleep(Duration::from_secs(5));
-            if self.cards_taken().is_some() || !listening(self.o.ports.video) {
+            if self.box_taken().is_some() || !listening(self.o.ports.video) {
                 continue;
             }
             let Ok(st) = call_for(&self.target("video"), "GET", "/engine/status", None, 4) else { continue };
-            for (g, need) in waiting_workers(&st) {
+            // (nothing stopped for a worker on a card a GPU run holds)
+            for (g, need) in waiting_workers(&st).into_iter().filter(|(g, _)| self.card_taken(*g).is_none()) {
                 let snap = self.snapshot();
                 if let Some(plan) = self.room_plan(&snap, g, need, "video", false, None) {
                     if let Err((_, e)) = self.free(&plan, "video", "a video job") {
@@ -1319,8 +1350,8 @@ impl Home {
         if let Some(why) = self.chat_loaded(&all).and_then(|c| self.swap_blocked(&c)) {
             return Err((503, format!("the chat server holds one model at a time and {why}; {id} loads once it is released")));
         }
-        // a GPU run holds the cards (crate::gpulock): no chat model loads beside it
-        if let Some(why) = self.cards_taken() {
+        // a GPU run holds one of its cards (crate::gpulock): it does not load beside it
+        if let Some(why) = self.taken_for(m) {
             return Err((503, why));
         }
         let info = self.model_info(m);
@@ -1391,10 +1422,39 @@ impl Home {
         }
     }
 
-    /// A GPU run holding the cards (crate::gpulock, NS_GPU_LOCK): the sentence a refused load or a waiting job reads
-    pub(crate) fn cards_taken(&self) -> Option<String> {
+    /// A GPU run holding the lock (crate::gpulock, NS_GPU_LOCK): its sentence and the cards it takes
+    fn gpu_run(&self) -> Option<(String, crate::gpulock::Taken)> {
         let f = crate::gpulock::path(self.o.cfg.get("NS_GPU_LOCK"))?;
-        crate::gpulock::held(&f).map(|h| crate::gpulock::message(&f, &h))
+        crate::gpulock::taken(&f).map(|t| (crate::gpulock::message(&f, &t), t))
+    }
+
+    /// A GPU run holding any card (crate::gpulock): the sentence (the video queue pauses for it)
+    pub(crate) fn cards_taken(&self) -> Option<String> {
+        self.gpu_run().map(|(m, _)| m)
+    }
+
+    /// A GPU run holding every card: the sentence - nothing loads on this box (system.busy's `cards_taken`)
+    pub(crate) fn box_taken(&self) -> Option<String> {
+        let all: Vec<usize> = (0..self.ncards().max(1)).collect();
+        self.gpu_run().filter(|(_, t)| t.among(&all).len() == all.len()).map(|(m, _)| m)
+    }
+
+    /// The cards a GPU run holds (system.busy's `cards_taken_gpus`; every card when it named none)
+    pub(crate) fn taken_gpus(&self) -> Vec<usize> {
+        self.gpu_run().map(|(_, t)| t.among(&(0..self.ncards().max(1)).collect::<Vec<_>>())).unwrap_or_default()
+    }
+
+    /// A GPU run holding card `g`: the sentence
+    pub(crate) fn card_taken(&self, g: usize) -> Option<String> {
+        self.gpu_run().filter(|(_, t)| t.takes(g)).map(|(m, _)| m)
+    }
+
+    /// A GPU run keeping a load of `m` off its cards (one of them for a model that needs them all - spanning, or a chat
+    /// model spread over them - else every one): the sentence
+    pub(crate) fn taken_for(&self, m: &Value) -> Option<String> {
+        let all_needed = registry::kind_of(m) == "llm" || registry::spans(m);
+        let gpus = self.gpus_of(m);
+        self.gpu_run().filter(|(_, t)| t.bars(&gpus, all_needed)).map(|(m, _)| m)
     }
 
     /// `id` started in server `slot` on card `gpu`, answering; until a moment after it answers, the memory it has yet to
@@ -1419,7 +1479,7 @@ impl Home {
         self.loading.lock().unwrap().insert(id.to_string(), now());
         let r = self.exec(format!("{kind} start {id} on {on}{}", if slot > 0 { format!(" (server {})", slot + 1) } else { String::new() }), &args);
         self.loading.lock().unwrap().remove(id);
-        r.map_err(|e| (502, e))?;
+        r.map_err(|e| load_failed(id, &on, e))?;
         self.wait_up(port, id)
     }
 
@@ -1557,7 +1617,16 @@ impl Host for Sched<'_> {
         more
     }
     fn barred(&self) -> Option<String> {
-        self.0.cards_taken()
+        self.0.box_taken()
+    }
+    fn barred_on(&self, g: usize) -> Option<String> {
+        self.0.card_taken(g)
+    }
+    fn lock_hot<'a>(&'a self, kind: &str) -> Box<dyn Guard + 'a> {
+        match self.0.hot_lock.get(kind) {
+            Some(l) => Box::new(l.lock().unwrap_or_else(|p| p.into_inner())),
+            None => Box::new(()),
+        }
     }
     fn not_ready(&self, id: &str) -> Option<String> {
         self.0.moving_why(id)
@@ -1851,6 +1920,42 @@ mod tests {
         assert!(!spans_all(&json!({"id": "qwen3.8-27b-q8", "kind": "llm"}), &cards), "a one-card chat model");
         assert!(!spans_all(&json!({"id": "breeze-tts-2", "kind": "audio"}), &cards), "an audio model's all is where its copies may go");
         assert!(!spans_all(&json!({"id": "my-own", "kind": "llm", "gpus": "all"}), &cards), "no model card: a choice");
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::load_failed;
+
+    #[test]
+    fn a_server_that_refused_for_room_is_no_room_and_a_crash_stays_502() {
+        // a spanning engine's refusal (core's Error::no_room), as `audio start` says it: the container's last lines
+        let e = "audio start sophon-realtime-32b-flash on GPUs 0 + 1: nextsycl: nextsycl-audio ended while loading - its last lines: loading sophon \
+                 | Error: no room: sophon needs about 23.4 GiB on Intel(R) Arc(TM) Pro B70 (and 1.5 GiB kept free); 12.1 GiB are free \
+                 (/var/home/u/src/nextsycl/dist/nextsycl audio logs)".to_string();
+        let (st, m) = load_failed("sophon-realtime-32b-flash", "GPUs 0 + 1", e);
+        assert_eq!(st, 503);
+        assert!(m.starts_with("no room for sophon-realtime-32b-flash on GPUs 0 + 1: its server refused to load (Error: no room: sophon needs about 23.4 GiB"), "{m}");
+        assert!(m.contains("12.1 GiB are free); it loads once the room is there - audio start sophon"), "the reason without where the logs are: {m}");
+        assert_eq!(super::super::api::code_of(st), "no_room");
+        assert!(super::super::api::retryable(st, "no_room"));
+        // the learned ask still reads its figures
+        assert_eq!(backplane_scheduler::place::asked_mb(&m).map(|x| x.0), Some(23961));
+        // an engine's plain "needs about ... GiB are free" (zonos3's), the first of its last lines
+        let e = "audio start zonos3-mini on GPU 0: nextsycl-audio ended while loading - its last lines: zonos3 needs about 5.6 GiB on B70; \
+                 3.1 GiB are free | nextsycl: ended (nextsycl audio logs)".to_string();
+        let (st, m) = load_failed("zonos3-mini", "GPU 0", e);
+        assert_eq!(st, 503);
+        assert!(m.contains("(zonos3 needs about 5.6 GiB on B70; 3.1 GiB are free)"), "{m}");
+        // the device out of memory while loading
+        let (st, _) = load_failed("x", "GPU 1", "image start x on GPU 1: nextsycl-image ended while loading - its last lines: \
+                                   UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY (nextsycl image logs)".into());
+        assert_eq!(st, 503);
+        // a crash is not room: 502, the error as it was
+        let crash = "audio start zonos3-mini on GPU 0: nextsycl-audio ended while loading - its last lines: GPU 0: no such device \
+                     | nextsycl: ended (nextsycl audio logs)".to_string();
+        assert_eq!(load_failed("zonos3-mini", "GPU 0", crash.clone()), (502, crash));
+        assert_eq!(load_failed("y", "GPU 0", "image run failed (exit 125)".into()).0, 502);
     }
 }
 

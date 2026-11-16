@@ -44,7 +44,7 @@ const FEATURES: &[&str] = &[
     "video.slots.cards", "video.running_clips", "video.status.clip", "video.cancel.name", "video.reentry.before_limit", "video.reentry.label", "jobs.title", "video.speed",
     "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars", "image.loras.request", "video.soundtrack", "video.exposure_fix",
     "backplane", "system.busy.engines", "models.profile", "system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long", "jobs.eta", "video.on_demand", "video.multi_guide",
-    "image.describe", "image.describe.describer", "image.describers", "video.regen2k",
+    "image.describe", "image.describe.describer", "image.describers", "video.regen2k", "cards_taken.gpus",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -613,8 +613,11 @@ impl Home {
         let clips_now: Vec<Value> = video["clips"].as_array().cloned().unwrap_or_default();
         let mut cards = cards;
         super::backplane::name_procs(&mut cards, &clips_now, &jobs);
+        let taken = self.taken_gpus();
+        let run = (!taken.is_empty()).then(|| self.cards_taken()).flatten();
         let per_card: Vec<Value> = cards.as_array().into_iter().flatten().map(|c| {
             let g = c["index"].clone();
+            let taken_here = g.as_u64().is_some_and(|g| taken.contains(&(g as usize)));
             let here: Vec<&Value> = slots.iter().filter(|x| x["gpu"] == g || x["gpus"].as_array().is_some_and(|a| a.contains(&g))).collect();
             let models: Vec<Value> = c["procs"].as_array().into_iter().flatten().filter_map(|p| p["model_id"].as_str().map(|m| json!(m))).collect();
             json!({"gpu": g, "name": c["name"], "vram_total_mb": c["vram_total_mb"], "vram_used_mb": c["vram_used_mb"], "busy_pct": c["busy_pct"],
@@ -623,11 +626,13 @@ impl Home {
                    // what is being made there, by the names people gave it
                    "jobs": clips_now.iter().filter(|x| x["gpu"] == g).map(|x| json!({"kind": "video", "label": x["label"], "title": x["title"]}))
                        .chain(c["procs"].as_array().into_iter().flatten().filter(|p| p["kind"] != "video" && !p["job_label"].is_null())
-                              .map(|p| json!({"kind": p["kind"], "label": p["job_label"], "title": p["job_title"]}))).collect::<Vec<_>>()})
+                              .map(|p| json!({"kind": p["kind"], "label": p["job_label"], "title": p["job_title"]}))).collect::<Vec<_>>(),
+                   // a GPU run holding this card (crate::gpulock): nothing loads here until it ends
+                   "taken": if taken_here { json!(run) } else { Value::Null }})
         }).collect();
         let maintenance = self.maintenance().map(|n| super::maint::public(&n));
         json!({"busy": !reasons.is_empty(), "reasons": reasons, "loading": loading, "working": working, "llm": {"active": active, "parallel": chat_parallel},
-               "maintenance": maintenance, "cards_taken": self.cards_taken(),
+               "maintenance": maintenance, "cards_taken": self.box_taken(), "cards_taken_gpus": taken,
                "jobs": jobs, "video": video, "cards": per_card, "slots": slots, "parallel": self.parallel(&states, video["cards"].as_u64().map(|n| n as usize)), "engines": Self::engines(&states)})
     }
 

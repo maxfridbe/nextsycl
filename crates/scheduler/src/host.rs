@@ -65,6 +65,17 @@ pub trait Host: Idleness {
     fn barred(&self) -> Option<String> {
         None
     }
+    /// Why nothing may load on card `g` now (a GPU run that named its cards holds it): a model goes on another card of
+    /// its, one whose one copy spans `g` is barred as by [`Host::barred`]
+    fn barred_on(&self, _g: usize) -> Option<String> {
+        None
+    }
+    /// The kind's short lock: held only while a request is matched to a server of its model loaded and idle, and that
+    /// request counted ([`Host::placed`]); never across a load, so a request for a model up and idle is not kept waiting
+    /// by another model's load (which holds the kind's lock, [`Host::wait_lock_kind`])
+    fn lock_hot<'a>(&'a self, _kind: &str) -> Box<dyn Guard + 'a> {
+        Box::new(())
+    }
     /// Why this model cannot load yet, whatever the room (its files moving): waited for like room
     fn not_ready(&self, _id: &str) -> Option<String> {
         None

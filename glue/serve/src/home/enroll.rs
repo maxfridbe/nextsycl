@@ -114,7 +114,9 @@ impl Home {
             if job.is_some_and(|j| self.job_cancelled(j)) {
                 return Err((499, format!("cancelled while {what} waited for a card")));
             }
-            if let Some(why) = self.cards_taken() {
+            // (a card a GPU run holds is no choice; every one of them held: it waits)
+            let taken = self.taken_gpus();
+            if let Some(why) = gpus.iter().all(|g| taken.contains(g)).then(|| self.cards_taken()).flatten() {
                 self.note(job, "cards_taken", &why);
                 std::thread::sleep(Duration::from_secs(3));
                 t0 = Instant::now();
@@ -122,7 +124,7 @@ impl Home {
             }
             let snap = self.snapshot();
             let loading = |g: usize| self.pending.lock().unwrap().iter().any(|p| p.gpu == g && p.answered.is_none());
-            let plan = gpus.iter().copied().filter(|g| !loading(*g)).find_map(|g| self.room_plan(&snap, g, want, "enroll", false, None).map(|p| (g, p)));
+            let plan = gpus.iter().copied().filter(|g| !loading(*g) && !taken.contains(g)).find_map(|g| self.room_plan(&snap, g, want, "enroll", false, None).map(|p| (g, p)));
             if let Some((g, plan)) = plan {
                 if self.free(&plan, "enroll", &what).is_ok() && self.wait_room(g, want) {
                     let mut p = self.pending.lock().unwrap();

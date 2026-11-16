@@ -682,10 +682,11 @@ impl Home {
     /// The pinned, enabled models not up, loaded in the background (their daemon is video_apply's: not a video model).
     /// Each tried every 5 minutes at most; a failed load is a run. Not while the box is set aside.
     fn reload_pinned(self: &Arc<Self>, tried: &mut BTreeMap<String, Instant>) {
-        if self.maintenance().is_some() || self.cards_taken().is_some() {
+        if self.maintenance().is_some() || self.box_taken().is_some() {
             return;
         }
-        for m in self.models().iter().filter(|m| m["pinned"] == true && m["enabled"] != false && registry::kind_of(m) != "video") {
+        // (one whose cards a GPU run holds: when the run ends)
+        for m in self.models().iter().filter(|m| m["pinned"] == true && m["enabled"] != false && registry::kind_of(m) != "video" && self.taken_for(m).is_none()) {
             let id = s(m, "id");
             let state = self.model_states(std::slice::from_ref(m), &json!([])).first().map(|x| s(x, "state")).unwrap_or_default();
             if state == "unloaded" && tried.get(&id).is_none_or(|t| t.elapsed() > Duration::from_secs(300)) {

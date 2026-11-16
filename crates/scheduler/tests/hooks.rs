@@ -24,6 +24,10 @@ struct Hooks {
     placed: RefCell<Vec<u16>>,
     locks: Cell<u32>,
     first_listed: Cell<bool>,
+    barred_on: RefCell<BTreeMap<usize, String>>,
+    /// another model of the kind loading: it holds the kind's lock, so waiting for it waits for that load
+    kind_lock_held: Cell<bool>,
+    hot_locks: Cell<u32>,
 }
 
 struct H {
@@ -81,6 +85,7 @@ impl Host for H {
         self.f.learn_ask(i, e, g, w)
     }
     fn wait_lock_kind<'a>(&'a self, _k: &str) -> Box<dyn Guard + 'a> {
+        assert!(!self.k.kind_lock_held.get(), "waited for the kind's lock while another model loads");
         self.k.locks.set(self.k.locks.get() + 1);
         Box::new(())
     }
@@ -89,6 +94,13 @@ impl Host for H {
     }
     fn barred(&self) -> Option<String> {
         self.k.barred.borrow().clone()
+    }
+    fn barred_on(&self, g: usize) -> Option<String> {
+        self.k.barred_on.borrow().get(&g).cloned()
+    }
+    fn lock_hot<'a>(&'a self, _k: &str) -> Box<dyn Guard + 'a> {
+        self.k.hot_locks.set(self.k.hot_locks.get() + 1);
+        Box::new(())
     }
     fn not_ready(&self, _i: &str) -> Option<String> {
         self.k.not_ready.borrow().clone()
@@ -317,4 +329,56 @@ fn a_spanning_model_never_runs_a_second_copy() {
     let again = ask_span(&h, &s, &SOPHON, 90).unwrap();
     assert_eq!(first, again);
     assert_eq!(h.f.count("start audio sophon"), 1, "{:?}", h.f.log());
+}
+
+#[test]
+fn a_model_up_and_idle_answers_at_once_while_another_model_of_its_kind_loads() {
+    // zonos3 idle on its audio server while Sophon loads on the other (that load holds the kind's lock for minutes): a
+    // zonos3 request takes its idle server without waiting for the lock (2026-11-16: two jobs waited a minute)
+    let h = span_host();
+    let z = h.f.add("zonos3", "audio", 6000, &[0, 1], Profile::default());
+    let first = ask_span(&h, &z, &[(0, 6000), (1, 6000)], 90).unwrap();
+    assert_eq!(h.k.locks.get(), 1, "its first load took the kind's lock");
+    h.k.kind_lock_held.set(true);
+    let again = ask_span(&h, &z, &[(0, 6000), (1, 6000)], 90).unwrap();
+    assert_eq!(first, again);
+    assert_eq!(*h.k.placed.borrow(), vec![first.1, first.1], "counted on its server each time");
+    assert!(h.k.hot_locks.get() >= 2, "counted under the short lock");
+    assert_eq!(h.f.count("start audio zonos3"), 1);
+}
+
+#[test]
+fn a_busy_model_still_goes_through_the_kinds_lock() {
+    let h = span_host();
+    let z = h.f.add("zonos3", "audio", 6000, &[0], Profile::default());
+    ask_span(&h, &z, &[(0, 6000)], 90).unwrap();
+    h.f.busy("zonos3", 600.0, 1);
+    ask_span(&h, &z, &[(0, 6000)], 90).unwrap();
+    assert_eq!(h.k.locks.get(), 2, "not idle: placed under the kind's lock, as before");
+}
+
+#[test]
+fn a_gpu_run_on_one_card_leaves_the_other_serving() {
+    let h = span_host();
+    h.k.barred_on.borrow_mut().insert(1, "cards taken: a run on GPU 1".into());
+    // a model that may go on either card loads on the free one
+    let a = h.f.add("a", "audio", 6000, &[1, 0], Profile::default());
+    ask_span(&h, &a, &[(0, 6000), (1, 6000)], 90).unwrap();
+    assert!(h.f.log().iter().any(|l| l.starts_with("start audio a") && l.ends_with("gpu 0")), "{:?}", h.f.log());
+    // one only on the taken card: refused (a job would wait)
+    let b = h.f.add("b", "audio", 6000, &[1], Profile::default());
+    assert_eq!(ask_span(&h, &b, &[(1, 6000)], 90).unwrap_err(), (503, "cards taken: a run on GPU 1".to_string()));
+    // one whose one copy spans both cards: refused, nothing stopped or started for it
+    let s = h.f.add_span("sophon", "audio", &SOPHON, Profile::default());
+    assert_eq!(ask_span(&h, &s, &SOPHON, 90).unwrap_err().0, 503);
+    assert!(!h.f.log().iter().any(|l| l.contains("sophon") || l.starts_with("stop")), "{:?}", h.f.log());
+    // no second copy of `a` on the taken card while its first is busy: the requests share the first
+    h.f.busy("a", 600.0, 1);
+    ask_span(&h, &a, &[(0, 6000), (1, 6000)], 90).unwrap();
+    assert_eq!(h.f.count("start audio a"), 1, "{:?}", h.f.log());
+    // the run ends: the spanning model loads (a, idle again, goes for it)
+    h.k.barred_on.borrow_mut().clear();
+    h.f.busy("a", 0.0, 0);
+    ask_span(&h, &s, &SOPHON, 90).unwrap();
+    assert_eq!(h.f.count("start audio sophon"), 1);
 }
