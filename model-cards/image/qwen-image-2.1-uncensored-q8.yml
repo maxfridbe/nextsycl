@@ -30,7 +30,7 @@ encoder:                         # its text encoder (image.describe describer na
 controls:                        # its request rules (model-cards/README.md, Image controls; schema 1)
   version: 1
   steps: {min: 20, max: 100, default: 40}   # 12 looked at: whole but softer; 20 and 40 sharp (nextcuda's floor of 20 kept)
-  cfg: {min: 1, max: 30, default: 1}        # above 1 needs a negative prompt (true_cfg_scale); 1: one pass a step, as the card's default
+  cfg: {min: 1, max: 30, default: 1}        # above 1: true guidance against the negative prompt, or an empty one (two passes a step); 1: one pass, the card's default
   negative: true
   size:
     min_side: 256

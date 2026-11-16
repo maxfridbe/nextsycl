@@ -478,7 +478,7 @@ impl ImageEngine for QwenImage21 {
     fn schedules(&self) -> Vec<Schedule> {
         Schedule::ALL.to_vec()
     }
-    /// true guidance: a scale above 1 with a negative prompt (off by default: one pass a step)
+    /// true guidance: a scale above 1, against the negative prompt or an empty one (off by default: one pass a step)
     fn transparent(&self) -> bool {
         true
     }
@@ -512,11 +512,9 @@ impl ImageEngine for QwenImage21 {
             }
             None => Vec::new(),
         };
-        // true guidance: a scale above 1 with a negative prompt (as the pipeline: either alone does nothing)
+        // true guidance: a scale above 1, against the negative prompt - an empty one when none is given (the unconditional
+        // pass on "", as nextcuda: a published cfg range holds without a negative)
         let cfg = req.cfg.unwrap_or(1.0);
-        if cfg > 1.0 && req.negative.is_none() {
-            return Err(Error(format!("{ARCH}: guidance {cfg} needs a negative prompt (the model's true_cfg_scale)")));
-        }
         let sampler = req.sampler.unwrap_or(Sampler::Euler);
         let schedule = req.schedule.unwrap_or(Schedule::Shift);
         // the request's LoRAs on the side path (the weights stay as loaded), dropped when it ends
@@ -594,10 +592,7 @@ impl ImageEngine for QwenImage21 {
         let prompt = if req.rgba { rgba_prompt(&req.prompt) } else { req.prompt.clone() };
         let (embeds, tokens, pads) = encode(&prompt)?;
         prof::mem(&self.nsd, "1 text encoder")?;
-        let negative = match (&req.negative, cfg > 1.0) {
-            (Some(np), true) => Some(encode(np)?),
-            _ => None,
-        };
+        let negative = if cfg > 1.0 { Some(encode(req.negative.as_deref().unwrap_or(""))?) } else { None };
         let conds: Vec<(&DevBuf, (usize, usize))> = lats.iter().map(|(b, s)| (b, *s)).collect();
         // the size's room, checked before the work: a prefix at most the prompt's tokens and the pictures' latents (the
         // negative prompt's kept beside it)

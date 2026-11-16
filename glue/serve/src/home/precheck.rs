@@ -47,12 +47,6 @@ pub fn size_multiple(m: &Value) -> u32 {
     if m["arch"] == "hunyuanimage-2.1" { 32 } else { 16 }
 }
 
-/// Whether a guidance scale above 1 needs a negative prompt: Qwen-Image's true_cfg_scale does (its engine refuses
-/// without one); MOSS-Image's and HunyuanImage's guidance runs against an empty one
-pub fn cfg_needs_negative(m: &Value) -> bool {
-    m["arch"] == "qwen-image-2.1"
-}
-
 /// The largest Z-Image-Turbo picture: 2048 x 2048 (nextcuda's cap is 2.36 MP for 12 GB cards; ours fit 4.19 MP: 23.7 GiB)
 pub const Z_IMAGE_MAX_PIXELS: u64 = 4_194_304;
 
@@ -248,10 +242,8 @@ impl Home {
                 return Err(bad(format!("steps {st}: {id} runs its own {n} sigmas (a few-step distill) - send {n} or leave steps out")));
             }
         }
-        let cfg = number(b, "cfg", 0.0, 30.0)?.unwrap_or(1.0);
-        if cfg > 1.0 && cfg_needs_negative(&m) && s(b, "negative_prompt").trim().is_empty() {
-            return Err(bad(format!("cfg {cfg}: guidance above 1 needs a negative_prompt (the model's true_cfg_scale)")));
-        }
+        // guidance above 1 without a negative prompt runs against an empty one (every engine here)
+        number(b, "cfg", 0.0, 30.0)?;
         let strength = number(b, "strength", 0.05, 1.0)?.unwrap_or(1.0);
         let pics: Vec<(String, &str)> = if edit {
             let list: Vec<&Value> = match (&b["images"], &b["image"]) {
@@ -400,15 +392,12 @@ pub fn speech_lists(m: &Value) -> (Vec<String>, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{cfg_needs_negative, number, size_multiple, speech_lists, steps_of, whole};
+    use super::{number, size_multiple, speech_lists, steps_of, whole};
 
     #[test]
-    fn each_engine_has_its_own_grid_and_guidance_rule() {
+    fn each_engine_has_its_own_grid() {
         assert_eq!(size_multiple(&json!({"arch": "hunyuanimage-2.1"})), 32);
         assert_eq!(size_multiple(&json!({"arch": "moss-image"})), 16);
-        assert!(cfg_needs_negative(&json!({"arch": "qwen-image-2.1"})));
-        // MOSS-Image's guidance (cfg 3 by default) runs against an empty negative prompt
-        assert!(!cfg_needs_negative(&json!({"arch": "moss-image"})));
     }
     use serde_json::json;
 
