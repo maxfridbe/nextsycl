@@ -13,7 +13,7 @@ use super::http::Target;
 use serde_json::{json, Value};
 
 use super::queue::{label_number, label_prefix, project_of, s};
-use super::{now, write_atomic, Job, State, Studio, MAX_ENDED};
+use super::{library, now, write_atomic, Job, State, Studio, MAX_ENDED};
 
 /// A finished clip of the series: (number, file stem, camera).
 type SeriesClip = (u64, String, String);
@@ -493,8 +493,20 @@ impl Studio {
             job.saved = true;
             self.invalidate();
         }
+        let kind = if failed { failure(state, j["error"].as_str().unwrap_or(""), &log) } else { Value::Null };
         if failed {
             job.finished = true;
+            // a failed or cancelled clip's record, once, kept out of the clips directory (its listing is the clips made):
+            // video.jobs.get answers with it after the studio's ended list forgot it, or after a restart
+            if !job.saved && library::is_clip_name(&name) {
+                job.saved = true;
+                let side = json!({"state": if state == "cancelled" { "cancelled" } else { "failed" }, "name": name, "job": job.rec, "error": error, "failure": kind,
+                                  "frames": frames, "wall": (elapsed * 10.0).round() / 10.0, "energy_wh": energy,
+                                  "engine_log": log.iter().rev().take(12).rev().collect::<Vec<_>>()});
+                let dir = self.dir.join(super::FAILED_DIR);
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = write_atomic(&dir.join(format!("{name}.json")), &serde_json::to_vec_pretty(&side).unwrap_or_default());
+            }
         }
         let rec = job.rec.clone();
         let idle = done || failed;
@@ -505,7 +517,7 @@ impl Studio {
         out.insert("done".into(), json!(done));
         out.insert("error".into(), json!(error));
         // the same as data: what kind of failure, and whether running it again as is can help
-        out.insert("failure".into(), if failed { failure(state, j["error"].as_str().unwrap_or(""), &log) } else { Value::Null });
+        out.insert("failure".into(), kind);
         // the card the engine runs it on (while it waits for one: the one it asked for, if any)
         out.insert("gpu".into(), if idle { Value::Null } else { j["gpu"].clone() });
         out.insert("waiting_for".into(), if idle { Value::Null } else { es.map_or(Value::Null, |e| super::waiting_on(e, &j["gpu"])) });

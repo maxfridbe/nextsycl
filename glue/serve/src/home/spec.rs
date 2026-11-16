@@ -481,9 +481,13 @@ pub fn result(method: &str) -> Option<String> {
   "label": {"type": "string"}, "project": {"type": "string"}, "seconds": {"type": "number"}, "steps": {"type": "integer"}, "engine": {"type": "string"},
   "total": {"type": "number", "description": "seconds it took"}, "energy_wh": {"type": "number", "nullable": true}, "camera": {"type": "string", "nullable": true},
   "speech_pct": {"type": "number", "nullable": true}, "te": {"type": "string"}}}}}}"#.into(),
-        "video.jobs.get" => format!(r#"{{"type": "object", "description": "a finished clip's record (<name>.json beside the mp4)", "properties": {{
+        "video.jobs.get" => format!(r#"{{"type": "object", "description": "a clip's record: made (<name>.json beside the mp4), or running, queued, held, failed or cancelled with its progress or failure as video.status shows them (a queued clip has no name yet: send name \"\" with its label or reentrant_id)", "properties": {{
+  "state": {{"type": "string", "enum": ["done", "running", "queued", "held", "failed", "cancelled"]}}, "name": {{"type": "string", "nullable": true}},
   "job": {JOB}, "times": {{"type": "object", "additionalProperties": {{"type": "number"}}, "description": "seconds by stage; TOTAL the whole"}},
-  "frames": {{"type": "integer"}}, "wall": {{"type": "number", "description": "seconds from start to done"}}, "energy_wh": {{"type": "number", "nullable": true}}}}}}"#),
+  "frames": {{"type": "integer"}}, "wall": {{"type": "number", "nullable": true, "description": "seconds from start to its end; null while it runs"}}, "energy_wh": {{"type": "number", "nullable": true}},
+  "stage": {{"type": "string", "description": "not made: as video.status"}}, "pct": {{"type": "integer"}}, "eta": {{"type": "integer", "nullable": true}}, "elapsed": {{"type": "number"}},
+  "position": {{"type": "integer", "nullable": true, "description": "queued: its place"}}, "error": {{"type": "string", "nullable": true}},
+  "failure": {{"type": "object", "nullable": true, "description": "failed or cancelled: {{code, retryable, message, hint}}"}}}}}}"#),
         "video.upload" => r#"{"type": "object", "properties": {"name": {"type": "string", "description": "the file's name in the clips directory (ref_<unix>_<name>): what first_frame, ref_images ... take"}}}"#.into(),
         "video.engines.list" => r#"{"type": "object", "properties": {"engines": {"type": "array", "items": {"type": "object", "properties": {
   "quant": {"type": "string", "description": "the name video.generate's engine takes"}, "file": {"type": "string"}, "path": {"type": "string"},
@@ -513,7 +517,7 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
                               (409, "busy", "a clip is being made or a runnable one waits, and queue is not true")],
         "video.cancel" => &[(404, "not_found", "label: no running or queued clip with it"), (409, "ambiguous", "no clip named and two running: name one"), (409, "not_running", "no label and no clip is being made")],
         "video.queue.move" | "video.queue.remove" => &[(404, "not_found", "no queued clip with that label")],
-        "video.jobs.get" => &[(404, "not_found", "no record of that clip")],
+        "video.jobs.get" => &[(404, "not_found", "no clip by that name: not running, queued, made, failed or cancelled")],
         "video.upload" => &[(400, "invalid_params", "not a picture, clip or sound (png jpg jpeg webp mp4 mov webm mkv wav mp3 flac m4a ogg), or empty")],
         "system.pin" => &[(404, "not_found", "no such model"), (409, "conflict", "disabled, or its files are moving"), (503, "cards_taken", "a GPU run holds the cards; the pin stays set")],
         "system.eta" => &[(400, "invalid_params", "not a method that runs a model")],

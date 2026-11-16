@@ -110,6 +110,9 @@ pub struct Job {
 /// How many ended clips are kept to answer for (`video.status {label}`, `ended_clips`)
 pub const MAX_ENDED: usize = 16;
 
+/// Where (under --dir) a failed or cancelled clip's record goes: `<name>.json`, what video.jobs.get answers for it
+pub const FAILED_DIR: &str = "failed";
+
 #[derive(Default)]
 pub struct State {
     pub q: Queue,
@@ -584,11 +587,7 @@ impl Studio {
                 crate::files::stat(&self.out.join(&n)).map_err(|_| RpcError::not_found(&format!("no file {n}")))?
             }
             "files.delete" => self.delete(&ps("name"))?,
-            "jobs.get" => {
-                let n = queue::basename(&ps("name"));
-                let n = n.trim_end_matches(".mp4");
-                self.record(n).ok_or_else(|| RpcError::not_found(&format!("no record for {n}")))?
-            }
+            "jobs.get" => self.job_record(p)?,
             other => return Err(RpcError::new("unknown_method", &format!("unknown method {other}"), 404)),
         })
     }
@@ -618,6 +617,10 @@ impl Studio {
                 }
             }
             let _ = std::fs::remove_file(self.out.join(".thumbs").join(format!("{stem}.webp")));
+            // a failed or cancelled clip's record (kept under --dir)
+            if std::fs::remove_file(self.dir.join(FAILED_DIR).join(format!("{stem}.json"))).is_ok() {
+                gone.push(format!("{stem} (failure record)"));
+            }
             if st.last_file.as_deref() == Some(stem) {
                 st.last_file = None; // prev no longer means it
             }
@@ -644,6 +647,55 @@ impl Studio {
             return None;
         }
         std::fs::read(self.out.join(format!("{name}.json"))).ok().and_then(|b| serde_json::from_slice(&b).ok())
+    }
+
+    /// A failed or cancelled clip's record (runner.rs writes it when it ends)
+    fn failed_record(&self, name: &str) -> Option<Value> {
+        if !library::is_clip_name(name) {
+            return None;
+        }
+        std::fs::read(self.dir.join(FAILED_DIR).join(format!("{name}.json"))).ok().and_then(|b| serde_json::from_slice(&b).ok())
+    }
+
+    /// `jobs.get`: a clip's record by `name` (or, for a queued clip that has no name yet, `label` or `reentrant_id`).
+    /// Made: its record (`<name>.json`) with `state` "done". Running, queued or held: the record's shape with its state and
+    /// progress as `status` shows them. Failed or cancelled: its failure, also after a restart.
+    fn job_record(&self, p: &Value) -> Result<Value, RpcError> {
+        let name = queue::basename(p.get("name").and_then(Value::as_str).unwrap_or("").trim());
+        let name = name.trim_end_matches(".mp4").to_string();
+        let mut q = p.clone();
+        if let Some(o) = q.as_object_mut() {
+            if name.is_empty() {
+                o.remove("name");
+            } else {
+                o.insert("name".into(), json!(name));
+            }
+        }
+        // a clip just finished is registered (its record written) first
+        let running = {
+            let mut st = self.st.lock().unwrap();
+            let _ = self.status(&mut st);
+            st.running.iter().any(|j| !name.is_empty() && s(&j.rec, "name") == name)
+        };
+        if !running {
+            if let Some(r) = self.record(&name) {
+                return Ok(done_record(r, &name));
+            }
+        }
+        let mut v = json!({});
+        match self.clip_status(&q, &mut v) {
+            Ok(true) if v["done"] == true => {
+                let n = s(&v["job"], "name");
+                Ok(self.record(&n).map_or_else(|| record_of(&v), |r| done_record(r, &n)))
+            }
+            Ok(true) => Ok(record_of(&v)),
+            Ok(false) => Err(RpcError::param("name: a clip (h3_YYYYMMDD_HHMMSS[.mp4]); or, for one still queued, label or reentrant_id")),
+            Err(e) if e.http == 404 => self.failed_record(&name).ok_or_else(|| {
+                let what = if name.is_empty() { "that clip" } else { name.as_str() };
+                RpcError::not_found(&format!("no record for {what}: not running, queued, made, failed or cancelled"))
+            }),
+            Err(e) => Err(e),
+        }
     }
 
     /// A reference file into the output directory as `ref_<seconds>_<name>`: pictures, clips and sounds only
@@ -995,6 +1047,70 @@ pub(crate) fn waiting_on(status: &Value, gpu: &Value) -> Value {
     }
     let st = status["gpus"].as_array().into_iter().flatten().find(|g| g["gpu"] == *gpu).and_then(|g| g["engine"].as_str()).filter(|e| e.starts_with("waiting for"));
     st.map_or(Value::Null, |st| json!(format!("GPU {gpu}: {st}")))
+}
+
+/// A made clip's record as video.jobs.get answers it: the file as written, with its state and name
+fn done_record(mut r: Value, name: &str) -> Value {
+    if let Some(o) = r.as_object_mut() {
+        o.insert("state".into(), json!("done"));
+        o.insert("name".into(), json!(name));
+    }
+    r
+}
+
+/// What a clip's status view says it is: queued, held, running, done, failed or cancelled
+fn clip_state(v: &Value) -> &'static str {
+    if v["done"] == true {
+        "done"
+    } else if v["failure"]["code"] == "cancelled" {
+        "cancelled"
+    } else if v["error"].is_string() || v["failure"].is_object() {
+        "failed"
+    } else {
+        match v["stage"].as_str() {
+            Some("queued") => "queued",
+            Some("held") => "held",
+            _ => "running",
+        }
+    }
+}
+
+/// A clip not made (yet) as video.jobs.get answers it: the record's shape ({job, times, frames, wall, energy_wh}) with its
+/// state, and its progress or failure as `status` shows them
+fn record_of(v: &Value) -> Value {
+    let state = clip_state(v);
+    let ended = matches!(state, "done" | "failed" | "cancelled");
+    json!({"state": state, "name": v["job"]["name"], "job": v["job"], "times": v.get("times").cloned().unwrap_or(json!({})), "frames": v["frames"],
+           "wall": if ended { v["elapsed"].clone() } else { Value::Null }, "energy_wh": v["job"]["energy_wh"],
+           "stage": v["stage"], "pct": v["pct"], "eta": v["eta"], "elapsed": v["elapsed"], "steps_done": v["steps_done"], "steps_total": v["steps_total"],
+           "position": v["position"], "gpu": v["gpu"], "waiting_for": v["waiting_for"], "preview": v["preview"], "file": v["file"],
+           "error": v["error"], "failure": v["failure"]})
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    #[test]
+    fn a_clip_not_made_answers_with_its_state() {
+        let running = json!({"idle": false, "job": {"name": "h3_20261116_104140", "label": "A", "energy_wh": 0.5}, "stage": "sampling 3/8", "pct": 40, "eta": 120,
+                             "elapsed": 60, "steps_done": 2, "steps_total": 8, "done": false, "error": null, "failure": null, "gpu": 0});
+        let r = record_of(&running);
+        assert_eq!((r["state"].clone(), r["name"].clone(), r["stage"].clone(), r["pct"].clone(), r["eta"].clone(), r["wall"].clone()),
+                   (json!("running"), json!("h3_20261116_104140"), json!("sampling 3/8"), json!(40), json!(120), Value::Null), "{r}");
+        assert_eq!(r["job"]["label"], "A");
+        let queued = json!({"idle": false, "job": {"label": "C"}, "stage": "queued", "pct": 0, "done": false, "error": null, "failure": null, "position": 2});
+        assert_eq!((record_of(&queued)["state"].clone(), record_of(&queued)["position"].clone()), (json!("queued"), json!(2)));
+        assert_eq!(clip_state(&json!({"stage": "held", "done": false, "error": null, "failure": null})), "held");
+        let failed = json!({"idle": true, "job": {"name": "h3_20261116_090000"}, "stage": "failed", "done": false, "elapsed": 33, "error": "failed: it broke",
+                            "failure": {"code": "engine_error", "retryable": true}});
+        let r = record_of(&failed);
+        assert_eq!((r["state"].clone(), r["failure"]["code"].clone(), r["wall"].clone()), (json!("failed"), json!("engine_error"), json!(33)), "{r}");
+        let cancelled = json!({"done": false, "error": "cancelled", "failure": {"code": "cancelled"}});
+        assert_eq!(clip_state(&cancelled), "cancelled");
+        let made = done_record(json!({"job": {"label": "A"}, "wall": 99.0}), "h3_20261116_104140");
+        assert_eq!((made["state"].clone(), made["name"].clone(), made["wall"].clone()), (json!("done"), json!("h3_20261116_104140"), json!(99.0)));
+    }
 }
 
 #[cfg(test)]

@@ -441,6 +441,60 @@ fn host_memory_keeps_a_second_worker_out() {
     s.until("B starts", |s| s.clip("B")["gpu"] == 1);
 }
 
+/// jobs.get answers for a clip in every state, not only once it is made (2026-11-16: a running clip was "no record for
+/// h3_..."; a failed one had no record at all)
+#[test]
+fn jobs_get_answers_for_a_running_queued_failed_or_cancelled_clip_also_after_a_restart() {
+    let mut s = start("jobsget");
+    let get = |s: &Stack, b: Value| s.rpc("jobs.get", b);
+    s.gen("A", json!({}));
+    s.running_on("A", 0);
+    let aname = s.clip("A")["name"].as_str().unwrap().to_string();
+    for n in [aname.clone(), format!("{aname}.mp4")] {
+        let r = get(&s, json!({"name": n}))["result"].clone();
+        assert_eq!((r["state"].clone(), r["name"].clone(), r["job"]["label"].clone()), (json!("running"), json!(aname), json!("A")), "{r}");
+        assert!(r["stage"].as_str().unwrap().starts_with("sampling") && r["pct"].as_i64().unwrap() > 0 && r["eta"].is_number(), "{r}");
+    }
+    s.gen("B", json!({}));
+    s.running_on("B", 1);
+    let bname = s.clip("B")["name"].as_str().unwrap().to_string();
+    // a queued clip has no name yet: by label
+    s.gen("C", json!({"queue": true}));
+    let r = get(&s, json!({"name": "", "label": "C"}))["result"].clone();
+    assert_eq!((r["state"].clone(), r["position"].clone()), (json!("queued"), json!(1)), "{r}");
+
+    // cancelled
+    assert_eq!(s.rpc("cancel", json!({"label": "B"}))["result"]["stopped"], true);
+    s.until("C on B's card", |s| s.clip("C")["gpu"] == 1);
+    let r = get(&s, json!({"name": bname}))["result"].clone();
+    assert_eq!((r["state"].clone(), r["failure"]["code"].clone()), (json!("cancelled"), json!("cancelled")), "{r}");
+    // failed (if it goes round again it is under a new name; this try's failure stays)
+    let cname = s.clip("C")["name"].as_str().unwrap().to_string();
+    s.fail("C");
+    s.until("C failed", |s| s.clip("C")["name"] != cname.as_str());
+    let r = get(&s, json!({"name": cname}))["result"].clone();
+    assert_eq!((r["state"].clone(), r["job"]["label"].clone()), (json!("failed"), json!("C")), "{r}");
+    assert!(r["failure"]["code"].is_string() && r["error"].as_str().unwrap().contains("it broke"), "{r}");
+
+    // after a restart the studio's ended list is gone: the failures are still answered
+    let child = s.studio.take().unwrap();
+    { let mut c = child; let _ = c.kill(); let _ = c.wait(); }
+    s.addr = format!("127.0.0.1:{}", free_port());
+    s.studio = Some(start_studio(&s.dir, &s.addr, &s.door_addr, &s.env));
+    s.until("the studio back", |s| TcpStream::connect(&s.addr).is_ok() && s.status()["running_clips"].as_array().is_some_and(|a| a.iter().any(|c| c["label"] == "A")));
+    assert_eq!(get(&s, json!({"name": cname}))["result"]["state"], "failed");
+    assert_eq!(get(&s, json!({"name": bname}))["result"]["state"], "cancelled");
+
+    // made: its record, state done
+    s.release("A");
+    s.until("A's record", |s| s.dir.join("out").join(format!("{aname}.json")).exists());
+    let r = get(&s, json!({"name": aname}))["result"].clone();
+    assert_eq!((r["state"].clone(), r["job"]["label"].clone(), r["frames"].is_number()), (json!("done"), json!("A"), true), "{r}");
+    // never there: a 404
+    let e = get(&s, json!({"name": "h3_20990101_000000"}));
+    assert_eq!(e["error"]["code"], "not_found", "{e}");
+}
+
 #[test]
 fn holds_priority_and_a_failure_are_per_clip() {
     let s = start("hold");
