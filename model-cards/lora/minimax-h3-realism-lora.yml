@@ -3,6 +3,9 @@
 id: minimax-h3-realism-lora
 kind: lora
 arch: minimax-h3
+license: minimax-h3-community
+commercial: true
+license_note: 'fal''s realism LoRA, a MiniMax H3 Model Derivative: the MiniMax H3 Community License (not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; products show "Powered by MiniMax H3"; its Acceptable Use Policy; outputs may not improve another model).'
 title: MiniMax H3 realism, people (fal; trigger r34l1sm, strength ~0.5)
 about: photographic people for text, image and reference to video
 base: minimax-h3

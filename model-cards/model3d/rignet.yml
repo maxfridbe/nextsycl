@@ -3,6 +3,9 @@
 id: rignet
 kind: model3d
 arch: rignet
+license: gpl-3.0
+commercial: true
+license_note: 'The trained models linked from the RigNet repository (zhan-xu/RigNet), which is GPLv3 and states no other licence for them; the engine that runs them (model3d/rignet) is GPLv3 too.'
 title: 'RigNet (a skeleton and skin weights for a character mesh; SIGGRAPH 2020; GPLv3)'
 about: Xu et al.'s RigNet - GMEdgeNet joints with mean-shift, RootNet and BoneNet for the tree, SkinNet for the weights over volumetric geodesics. Its code is GPLv3 (a commercial licence is offered by UMass), and so is the nextsycl engine that ports it (model3d/rignet, kept apart). Best on humanoids and animals standing upright, facing +Z, symmetric about x = 0.
 does: [rig]

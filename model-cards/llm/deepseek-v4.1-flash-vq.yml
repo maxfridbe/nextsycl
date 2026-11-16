@@ -3,6 +3,9 @@
 id: deepseek-v4.1-flash-vq
 kind: llm
 arch: deepseek41
+license: mit
+commercial: true
+license_note: 'DeepSeek-V4.1-Flash-1017 (DeepSeek, MIT); Baekpica''s VQ GGUF inherits it, its quantization tools (YoungAi) MIT.'
 title: DeepSeek-V4.1-Flash-1017 VQ · 128K context (both GPUs, pinned memory and the NVMe)
 about: Baekpica's VQ GGUF of DeepSeek-V4.1-Flash-1017 (YoungAi's recipe; 105.8 GiB - routed experts as 8-dim vector codes of 12-13 bits, ~1.6 bits a weight, the rest q4_K; 13B active, 384 experts) with its three DSpark draft towers inside, and DeepSeek's own Engram tables (two 101.5 GB shards read a row at a time while it runs - keep them on the fastest drive); the experts beyond VRAM in pinned host memory, the rest read from the file
 gpus: all

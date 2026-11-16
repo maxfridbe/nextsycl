@@ -3,6 +3,9 @@
 id: deepseek-v4-flash-iq2m-256k
 kind: llm
 arch: deepseek4
+license: mit
+commercial: true
+license_note: 'DeepSeek-V4-Flash (DeepSeek, MIT); unsloth''s GGUF inherits it.'
 title: DeepSeek-V4-Flash 284B UD-IQ2_M · 256K context + a 32K chat (both GPUs and pinned memory)
 about: the same files as deepseek-v4-flash-iq2m with a 256K session (its compressed caches ~1.9 GiB over both cards) beside a 32K one
 gpus: all

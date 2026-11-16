@@ -3,6 +3,9 @@
 id: breeze-tts-2-q4
 kind: audio
 arch: breeze-tts-2
+license: breezeblue-research-non-commercial-1.1
+commercial: false
+license_note: 'BreezeBlue Research and Non-Commercial License 1.1 (RESONIA, Inc.): research and personal use only - no product, hosted service, organisation''s internal use or monetized content, the audio it makes included, without a separate commercial licence; clone a real voice only with that person''s explicit consent; the GGUF is cstr''s conversion under the same licence; the 12 Hz codec is Qwen3-TTS''s (Apache-2.0).'
 title: 'Breeze TTS 2 Q4_K (speech in English and Chinese, 24 kHz: a smaller download of breeze-tts-2; non-commercial)'
 about: 'Breeze TTS 2 from CrispASR''s Q4_K GGUF (Q4_K; the text encoder''s 1,152-wide matrices Q4_0): the same engine and modes as breeze-tts-2, a 2.2 GB file instead of 3.4 GB, further from the checkpoint (the 4-bit text encoder: its output 1e-1 from upstream''s against Q8_0''s 6e-3 - a word can come out wrong; prefer breeze-tts-2); the same memory on the card (the matrices are expanded to half). Weights and outputs: BreezeBlue Research and Non-Commercial License 1.1 (research and non-commercial use only)'
 gpus: '0'
@@ -13,6 +16,8 @@ speech:
 - direction
 - events
 - transcript                    # a clone needs what the recording says (saved voices without it go elsewhere)
+annotations_note: 'None kept as written: this engine declares no markup (AudioEngine::markup is empty), so the server''s speech text pass makes brackets and parentheses pauses and says the word inside. Breeze TTS 2''s own vocal events - (laugh) (sigh) (cough) (clears throat) in English, [笑] [叹气] [咳嗽] [清嗓子] in Chinese - reach the model only in a request with normalize: false. Direction goes in instructions.'
+annotations: []
 defaults:
   seconds: 60.0
   cfg: 4.0

@@ -3,6 +3,9 @@
 id: qwen-image-2.1-turbo-lora
 kind: lora
 arch: qwen-image-2.1
+license: qwen-research
+commercial: false
+license_note: 'Viggle''s turbo LoRA (v0.3, rank 128), a Qwen-Image 2.1 derivative: Qwen Research License Agreement (Tongyi Lab, 2026-09-20): research and evaluation only - any commercial use needs a separate licence from Qwen (model-business@notice.qwencloud.com); redistributed copies carry the agreement and mark their changes.'
 title: Qwen-Image 2.1 Turbo (Viggle v0.3, a 6-step LoRA, rank 128; qwen-research license)
 about: the few-step distill as a LoRA for the base model at scale 1.0; brings its 6-sigma preset
 base: qwen-image-2.1

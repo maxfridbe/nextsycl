@@ -3,6 +3,9 @@
 id: deepseek-v4.1-flash-iq1m
 kind: llm
 arch: deepseek41
+license: mit
+commercial: true
+license_note: 'DeepSeek-V4.1-Flash-1017 (DeepSeek, MIT); unsloth''s GGUF inherits it.'
 title: DeepSeek-V4.1-Flash-1017 UD-IQ1_M (experimental) · 128K context (both GPUs, pinned memory and the NVMe)
 about: "Unsloth's smallest-but-one dynamic GGUF of DeepSeek-V4.1-Flash-1017 (llama.cpp PR 30817's form): routed experts in IQ1_S / IQ2_XXS / IQ2_XS / IQ2_S by layer, Q8_0 / Q6_K attention, the 103 GiB IQ4_NL Engram table in the last shard. Experimental: teacher-forced perplexity 9% above UD-IQ2_XXS (3.74 against 3.44 and 4.37 against 4.02), and a long story starts repeating itself from ~5,000 words where UD-IQ2_XXS holds to ~8,000. tg ~16 tok/s exact over 512 tokens (UD-IQ2_XXS ~12.7)."
 gpus: all

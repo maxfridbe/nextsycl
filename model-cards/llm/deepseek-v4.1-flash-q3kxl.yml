@@ -3,6 +3,9 @@
 id: deepseek-v4.1-flash-q3kxl
 kind: llm
 arch: deepseek41
+license: mit
+commercial: true
+license_note: 'DeepSeek-V4.1-Flash-1017 (DeepSeek, MIT); unsloth''s GGUF inherits it.'
 title: DeepSeek-V4.1-Flash-1017 UD-Q3_K_XL · 128K context (both GPUs, pinned memory and the NVMe)
 about: "Unsloth's dynamic GGUF of DeepSeek-V4.1-Flash-1017 (llama.cpp PR 30817's form): DeepSeek's own MXFP4 routed experts in most layers, Q3_K / IQ3_S / IQ3_XXS / IQ2_S in the rest (253 GiB of experts), Q8_0 attention and shared experts, the 189 GB MXFP8 Engram table in the last shard (read a row at a time while it runs); 13B active, 384 experts. Near the original's quality; most of its experts stream from the drive, so it is slow"
 gpus: all

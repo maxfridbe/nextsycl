@@ -3,6 +3,9 @@
 id: swift-1.5-iq3_xxs
 kind: llm
 arch: qwen4exp
+license: swift-open-license-1.0
+commercial: true
+license_note: 'Swift Open License 1.0 for UkisAI''s fine-tune: free, commercial use included, up to US$1 million gross yearly revenue (affiliates counted) - above it a Swift Enterprise License from UkisAI; the base, Qwen3.8-Flash-Next, stays under the Qwen Community License 1.0 (a Model-as-a-Service or AI Work Assistant business needs Qwen''s licence; the model name shown above 100 million monthly active users or US$20 million monthly revenue). Strata''s expert profile is MIT.'
 title: Swift 1.5 IQ3_XXS (short thinking; both GPUs, 128K + 32K)
 about: 'UkisAI''s fine-tune: much shorter thinking; their standard 3-bit GGUF (~96% of experts in VRAM over both cards, tg ~53-58 with MTP)'
 gpus: '0,1'                     # the B70 first (its order as measured; 'all' puts the B65 first, where the served sessions failed to record their graphs)

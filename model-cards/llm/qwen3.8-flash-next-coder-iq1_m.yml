@@ -3,6 +3,9 @@
 id: qwen3.8-flash-next-coder-iq1_m
 kind: llm
 arch: qwen4exp
+license: qwen-community-1.0
+commercial: true
+license_note: 'Qwen Community License 1.0 (Qwen3.8-Flash-Next; ISTA-DASLab''s GSQ-RCO GGUF says its quantized weights inherit it, though its metadata says Apache-2.0): a Model-as-a-Service or AI coding / office-assistant business needs a separate licence from Qwen before commercial use; products above 100 million monthly active users or US$20 million monthly revenue show the model name. Strata''s expert profile (Niko1221/Strata) is MIT.'
 title: Qwen3.8-Flash-Next Coder IQ1_M (coding; either card, 128K + 32K)
 about: 'ISTA-DASLab''s coding version: half the experts, kept for code and tools'
 gpus: '0|1'                     # one of the cards, the B70 preferred: the whole model on whichever has the room

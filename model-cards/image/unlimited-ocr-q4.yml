@@ -3,6 +3,9 @@
 id: unlimited-ocr-q4
 kind: image
 arch: unlimited-ocr
+license: mit
+commercial: true
+license_note: 'Unlimited-OCR (Baidu, MIT); sahilchachra''s GGUF inherits it.'
 title: Unlimited-OCR Q4_K_M (pages to Markdown)
 about: 'Baidu''s Unlimited-OCR as unlimited-ocr-q8, its decoder in 4 bits (Q4_K_M, imatrix; the vision encoder F16 as always): the same speed here - the weights are expanded to half on the card - for a smaller download; 1.8 GiB + 0.8'
 gpus: '0'

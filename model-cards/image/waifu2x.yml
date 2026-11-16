@@ -3,6 +3,9 @@
 id: waifu2x
 kind: image
 arch: waifu2x
+license: mit
+commercial: true
+license_note: 'The cunet and upconv_7 models of nihui''s waifu2x-ncnn-vulkan (MIT).'
 title: 'waifu2x upscaler (cunet for illustration, upconv_7 anime / photo; denoise -1 to 3, 1x to 32x)'
 about: 'nagadomi''s waifu2x models as waifu2x-ncnn-vulkan ships them: cunet (with squeeze-and-excitation blocks) and the upconv_7 anime-art and photo models, a denoise level from -1 (none) to 3, the 2x model run again for 4x and up - tiles of 400 with the program''s prepadding (7, 18 or 28 pixels, edges repeated), alpha upscaled bicubically. Checked against the program: 63-66 dB on a photograph'
 gpus: '0'

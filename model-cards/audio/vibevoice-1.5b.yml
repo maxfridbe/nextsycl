@@ -6,6 +6,9 @@
 id: vibevoice-1.5b
 kind: audio
 arch: vibevoice
+license: mit
+commercial: true
+license_note: 'MIT (Microsoft''s VibeVoice-1.5B; gguf-org''s GGUF and the -hf repository''s tokenizer and config inherit it), but Microsoft releases it for research only and advises against commercial or real-world use without further testing; out of scope: cloning a voice without explicit, recorded consent, disinformation, live voice conversion.'
 title: 'VibeVoice-1.5B Q8_0 (long-form speech of up to four speakers in English and Chinese, 24 kHz: voices cloned from recordings, no transcript needed)'
 about: 'VibeVoice-1.5B (Microsoft): a Qwen2.5-1.5B language model reads a script of up to four speakers ("Speaker 1: ...") and their voices'' recordings; a diffusion head draws each 7.5 Hz frame''s acoustic latent and the σ-VAE decoder makes the sound - gguf-org''s Q8_0 GGUF (the language model 8-bit, the tokenizers and head BF16), half on the GPU. Voice cloning from a recording alone (no transcript), multi-speaker dialogue (podcasts), long-form (tens of minutes). MIT; Microsoft asks that it not impersonate anyone without consent'
 gpus: '0'
@@ -13,6 +16,11 @@ vram_gib: 4.5                   # its memory on the card when it runs (measured:
 speech:
 - clone                         # a recording, or a saved voice, with or without its transcript
 - speakers                      # a script of several speakers, each with a voice (voices / ref_audios: one a speaker)
+annotations_note: 'Only the script''s "Speaker N:" lines; no tags and no instructions (the voices come from recordings). Write "Speaker" and the number apart ("Speaker 1:"): the server''s speech text pass keeps such lines as lines (the text in them is normalised: brackets become pauses). No keep pattern: the engine declares no markup, the speaker lines are the text pass''s own rule.'
+annotations:
+- syntax: 'Speaker 1: ...  Speaker 2: ... (one turn a line, numbered from 1, up to 4)'
+  does: 'a script''s turn: the line is said in speaker N''s voice (the Nth of voices / ref_audios); a line without one continues the turn before it, a text without any is speaker 1''s'
+  tested: 'unverified: not heard on /v1/audio/speech in this change; the server''s text pass keeps "Speaker N:" lines (glue/serve/src/audio.rs speakable, unit-tested) and the engine reads them (audio/vibevoice/src/prompt.rs)'
 defaults:
   seconds: 600.0                # the most; the model ends the speech itself
   steps: 10

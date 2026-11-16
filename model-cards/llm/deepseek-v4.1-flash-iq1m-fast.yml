@@ -3,6 +3,9 @@
 id: deepseek-v4.1-flash-iq1m-fast
 kind: llm
 arch: deepseek41
+license: mit
+commercial: true
+license_note: 'DeepSeek-V4.1-Flash-1017 (DeepSeek, MIT); unsloth''s GGUF inherits it.'
 title: DeepSeek-V4.1-Flash-1017 UD-IQ1_M fast (experimental) · 128K context (both GPUs, pinned memory and the NVMe)
 about: "The UD-IQ1_M of deepseek-v4.1-flash-iq1m with deepseek-v4.1-flash-iq2xxs-fast's two approximations on (cold experts under 0.2 of the routing weight left out, attention and the shared expert in q4_K). tg ~25.8 tok/s over 512 tokens and ~26.4 sustained over 12,000 (UD-IQ2_XXS fast: ~21.4 and ~25.3); pp 143 / 242 / 450 tok/s at 580 / 2.5K / 10K tokens. Experimental: perplexity 4.07 / 4.37, and long answers degrade from ~5,000 words."
 gpus: all

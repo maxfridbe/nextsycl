@@ -3,6 +3,9 @@
 id: nemotron-3.5-super-q2kxl
 kind: llm
 arch: nemotron_h_moe
+license: openmdw-1.1
+commercial: true
+license_note: 'OpenMDW License 1.1 (NVIDIA Nemotron 3.5 Super VL; unsloth''s GGUF inherits it): use, change and share freely, keeping the agreement and notices with copies; the rights end for whoever sues claiming the model infringes.'
 title: Nemotron 3.5 Super 120B-A12B UD-Q2_K_XL (both GPUs)
 about: 'NVIDIA''s hybrid Mamba-2 / latent-MoE / attention model (88 layers: 40 Mamba-2, 40 MoE of 22 / 512 experts in a 1024 latent, 8 attention without positions); unsloth''s dynamic 2-bit quant (53.8 GiB; 12B active), all in VRAM over both cards. Text only for now: the vision tower (mmproj) and the MTP block are not read yet'
 gpus: all

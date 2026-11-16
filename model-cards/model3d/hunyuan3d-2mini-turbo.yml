@@ -3,6 +3,9 @@
 id: hunyuan3d-2mini-turbo
 kind: model3d
 arch: hunyuan3d-2mini
+license: tencent-hunyuan-community
+commercial: true
+license_note: 'Tencent Hunyuan 3D 2.0 Community License (Hunyuan3D-2mini): not licensed in the European Union, the United Kingdom or South Korea; a licence from Tencent above 1 million monthly active users; its Acceptable Use Policy; outputs may not improve another AI model. BiRefNet MIT.'
 title: Hunyuan3D-2mini-turbo (a mesh from a picture in seconds; shape only)
 about: 'Tencent''s Hunyuan3D-2mini, turbo: DINOv2-giant at 1,022 px, the 0.6B Flux-style DiT (8 double + 16 single blocks, guidance-distilled) in 5 consistency steps over 3,072 latent tokens, the FlashVDM turbo shape decoder; marching cubes. No texture.'
 gpus: '0'

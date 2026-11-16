@@ -3,6 +3,9 @@
 id: minimax-h3-ref2v-turbo-lora
 kind: lora
 arch: minimax-h3
+license: minimax-h3-community
+commercial: true
+license_note: 'The Ref2V turbo LoRA from Comfy-Org''s MiniMax H3 repack: the MiniMax H3 Community License (not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; products show "Powered by MiniMax H3"; its Acceptable Use Policy; outputs may not improve another model).'
 title: MiniMax H3 ref2v turbo, 4 steps (Comfy-Org)
 about: reference-to-video in 4 steps
 base: minimax-h3

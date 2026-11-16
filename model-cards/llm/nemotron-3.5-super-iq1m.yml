@@ -3,6 +3,9 @@
 id: nemotron-3.5-super-iq1m
 kind: llm
 arch: nemotron_h_moe
+license: openmdw-1.1
+commercial: true
+license_note: 'OpenMDW License 1.1 (NVIDIA Nemotron 3.5 Super VL; unsloth''s GGUF inherits it): use, change and share freely, keeping the agreement and notices with copies; the rights end for whoever sues claiming the model infringes.'
 title: Nemotron 3.5 Super 120B-A12B UD-IQ1_M (both GPUs)
 about: 'unsloth''s dynamic 1-bit quant of NVIDIA''s hybrid Mamba-2 / latent-MoE / attention model (43 GiB; IQ1_S / IQ2 / IQ3_XXS ups, Q2_0 downs). On two cards all in VRAM; on one card (gpus: "0") the engine keeps as many MoE layers'' experts as do not fit in pinned host memory, read in place over PCIe. Text only for now'
 gpus: all

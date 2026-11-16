@@ -3,6 +3,9 @@
 id: deepseek-v4.1-flash-q2kxl
 kind: llm
 arch: deepseek41
+license: mit
+commercial: true
+license_note: 'DeepSeek-V4.1-Flash-1017 (DeepSeek, MIT); unsloth''s GGUF inherits it.'
 title: DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL · 128K context (both GPUs, pinned memory and the NVMe)
 about: "Unsloth's dynamic GGUF of DeepSeek-V4.1-Flash-1017 (llama.cpp PR 30817's form): routed experts in IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / MXFP4 by layer (178 GiB of experts; no Q2_K tensors despite the name), Q8_0 / Q6_K attention and shared experts, the 126 GiB Q5_K Engram table in the last shard. A 12,000-token novel stays clean to the end (UD-IQ2_XXS drifts from ~8,000 words); 27% more expert bytes than UD-IQ2_XXS, so slower: tg 8.8 tok/s exact over 512 tokens (UD-IQ2_XXS 12.7)."
 gpus: all

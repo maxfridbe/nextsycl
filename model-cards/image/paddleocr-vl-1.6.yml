@@ -3,6 +3,9 @@
 id: paddleocr-vl-1.6
 kind: image
 arch: paddleocr-vl
+license: apache-2.0
+commercial: true
+license_note: 'PaddleOCR-VL 1.6 (PaddlePaddle, Apache-2.0): the GGUF and the tokenizer from PaddlePaddle''s own repositories.'
 title: PaddleOCR-VL 1.6 (pages, tables, formulas, charts, seals)
 about: 'PaddlePaddle''s PaddleOCR-VL 1.6 (Apache-2.0): a SigLIP NaViT vision tower that sees the page at its own size and an ERNIE-4.5 0.3B decoder; reads text, tables (to HTML), formulas (LaTeX), charts (to a table), seals, and spots text with its place; 109 languages; GGUF (BF16) by PaddlePaddle; 0.9 GiB + 0.8'
 gpus: '0'

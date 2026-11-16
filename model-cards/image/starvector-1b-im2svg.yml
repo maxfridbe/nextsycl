@@ -3,6 +3,8 @@
 id: starvector-1b-im2svg
 kind: image
 arch: starvector
+license: apache-2.0
+commercial: true
 title: 'StarVector-1B im2svg (a picture as SVG code: logos, icons, simple illustrations)'
 about: 'ServiceNow''s StarVector-1B: a CLIP ViT-L/14 sees the picture (flattened on white, 224 x 224), an adapter makes its 257 rows StarCoder-1B''s first embeddings, and StarCoder writes the SVG after "<svg" - as the starvector package''s generate_im2svg (2 beams sampled, top_p 0.9), until </svg> or max_length. The checkpoint''s own safetensors, half on the GPU; Rust and SYCL (image/starvector). image.vectorize. Checked against the package in float32: the pixels exact, the logits 4e-4, 2500 greedy tokens forced with one near-tie (0.001)'
 gpus: '0'

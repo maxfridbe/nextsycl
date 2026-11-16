@@ -4,6 +4,8 @@
 id: whisper-large-v3-turbo
 kind: audio
 arch: whisper
+license: mit
+commercial: true
 title: 'Whisper large-v3-turbo (speech to text in 99 languages: segments and words timed, language detected; MIT)'
 about: 'OpenAI''s Whisper large-v3-turbo (809M): large-v3''s 32-layer encoder over 128 mel bands with the decoder pruned to 4 layers - the checkpoint''s own safetensors, half on the GPU. audio.transcribe: the text, segments timed by its timestamp tokens, each word timed by six alignment heads'' cross-attention (DTW), the language detected when not given; long recordings in 30 s windows (openai-whisper''s transcribe, greedy with its fallback). Translates into English too'
 gpus: '0'

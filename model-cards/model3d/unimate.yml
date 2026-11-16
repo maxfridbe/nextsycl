@@ -3,6 +3,9 @@
 id: unimate
 kind: model3d
 arch: unimate
+license: cc-by-nc-4.0
+commercial: false
+license_note: 'UniMate weights CC BY-NC 4.0 (non-commercial research; no rights in the Truebones ZOO, Mixamo and Objaverse-XL training data, which keep their own terms); its code MIT; the Flan-T5-base text encoder Apache-2.0.'
 title: 'UniMate (text-driven skeletal animation of a rigged GLB: 60 frames, joint rotations and a root path; weights CC BY-NC 4.0, non-commercial)'
 about: Friedrich-M et al., SIGGRAPH Asia 2026 - flan-T5-base text, a graph spatio-temporal flow transformer (10 blocks of attention among a frame's joints with spectral rotary positions and a graph-distance bias, attention among a joint's frames, a SwiGLU MLP, adaLN from the time, the text and the rest pose) sampled by an adaptive Dormand-Prince ODE with guidance 3; float32; run directory unimate_uniml3d_f60_v3 (graph_adaln, step 150000, the EMA weights, trained on UniML3D). The checkpoint's licence is CC BY-NC 4.0 - research and other non-commercial use only; the code is MIT. Takes a rigged mesh (UniRig or RigNet output, or any GLB with a skin of at most 71 joints and a single root), reads the joints by rules (no LLM), and returns the same mesh with an animation on its skeleton
 does: [animate]

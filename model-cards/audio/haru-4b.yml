@@ -18,6 +18,8 @@ speech:
 - realtime                       # a live conversation: /v1/realtime (lockstep below; a saved voice's recording is its voice). It
                                  #   does not read text aloud: no clone / voices here, so speech requests never come to it
 - lockstep                       # a frame of audio in, a frame out, every 133 ms (the row says lockstep: true)
+annotations_note: 'None: Haru-4B does not read text aloud - it holds a spoken conversation over /v1/realtime; its character card (persona, names, situation) is plain prose.'
+annotations: []
 defaults:
   seconds: 20.0
 env: {}

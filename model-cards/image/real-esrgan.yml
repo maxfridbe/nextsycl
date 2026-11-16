@@ -3,6 +3,9 @@
 id: real-esrgan
 kind: image
 arch: realesrgan
+license: bsd-3-clause
+commercial: true
+license_note: 'The models of Real-ESRGAN''s ncnn-vulkan release, from xinntao/Real-ESRGAN (BSD-3-Clause).'
 title: 'Real-ESRGAN upscaler (x4plus for photographs, x4plus-anime, animevideov3 2x / 3x / 4x for video frames)'
 about: 'xinntao''s Real-ESRGAN as realesrgan-ncnn-vulkan ships it: RealESRGAN_x4plus (RRDB, 23 blocks), its 6-block anime model and the compact SRVGG realesr-animevideov3 at 2x, 3x and 4x - the ncnn graphs and half weights run on the upscale silo''s convolutions (oneDNN, the activations, residuals and dense blocks'' concatenations fused; docs/ports/real-esrgan.md), in tiles of 200 with 10 pixels of mirrored context (the program''s own), alpha upscaled bicubically. Checked against the program: 58-63 dB on a photograph, every variant'
 gpus: '0'

@@ -3,6 +3,9 @@
 id: glm-5.3-flash-reap50-q3km
 kind: llm
 arch: glm5-next
+license: mit
+commercial: true
+license_note: 'GLM-5.3-Flash (Z.AI, MIT); patrickbdevaney''s REAP-pruned GGUF inherits it.'
 title: GLM-5.3-Flash REAP-50 Q3_K_M · 64K context (both GPUs)
 about: GLM-5.3-Flash with half its routed experts pruned (REAP, 144 of 288), Q3_K_M imatrix with its MTP block (patrickbdevaney's llama.cpp fork layout), MIT
 gpus: all

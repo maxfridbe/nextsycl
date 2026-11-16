@@ -3,6 +3,9 @@
 id: qwen-image-2.1-turbo-q8
 kind: image
 arch: qwen-image-2.1
+license: qwen-research
+commercial: false
+license_note: 'Qwen Research License Agreement (Tongyi Lab, 2026-09-20): research and evaluation only - any commercial use needs a separate licence from Qwen (model-business@notice.qwencloud.com); redistributed copies carry the agreement and mark their changes. The denoiser is Viggle''s turbo distillation merged in (a Qwen-Image 2.1 derivative, the same licence). The VAE and tokenizer are Qwen-Image 2.1''s own (the same licence); the Qwen3-VL-8B text encoder is Apache-2.0.'
 title: 'Qwen-Image 2.1 Turbo Q8_0 (Viggle v0.3: 6 steps, no CFG; qwen-research license)'
 about: Viggle's few-step distill merged into the base transformer in fp32, then Q8_0; the base model's text encoder and VAE; its 6 sigmas with the size's shift, no terminal stretch
 gpus: '0'

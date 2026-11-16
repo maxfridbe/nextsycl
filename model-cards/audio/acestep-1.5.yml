@@ -4,6 +4,9 @@
 id: acestep-1.5
 kind: audio
 arch: acestep
+license: mit
+commercial: true
+license_note: 'ACE-Step 1.5 MIT: the DiT, the 5 Hz LM, the VAE and the Qwen3-Embedding-0.6B text encoder as the ACE-Step repositories ship them.'
 title: 'ACE-Step 1.5 turbo (songs in 50 languages from a description and lyrics; 48 kHz stereo, a 3-minute song in seconds; Apache-2.0)'
 about: 'ACE-Step''s 1.5 turbo: a 2B flow DiT (24 layers; 8 steps, guidance distilled) over the Oobleck VAE''s latents (25 a second, 48 kHz stereo), conditioned on Qwen3-Embedding-0.6B''s states of the caption and metas (BPM, key, time signature, length), the lyrics through their own encoder and a timbre reference - the checkpoint''s own safetensors, bfloat16 on the GPU (the VAE float32). audio.generate: instructions the caption, input the lyrics (structure tags on lines of their own), seconds the length (1 to 600), options bpm, key, time-signature, language'
 gpus: '1'

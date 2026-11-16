@@ -3,6 +3,9 @@
 id: minimax-h3-q4km
 kind: video
 arch: minimax-h3
+license: minimax-h3-community
+commercial: true
+license_note: 'MiniMax H3''s denoiser, VAEs, embeddings, ControlNet and the Qwen3-VL-32B text encoder as MiniMax ships it (Comfy-Org''s repack; the GGUFs woodfireind''s and unsloth''s): the MiniMax H3 Community License (not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; products show "Powered by MiniMax H3"; its Acceptable Use Policy; outputs may not improve another model). The encoder underneath is Qwen3-VL-32B (Apache-2.0); the latent upscaler (LBH-123-AI) Apache-2.0; the Qwen2.5 tokenizer files come from ComfyUI''s GPL-3.0 repository. Not an official MiniMax product.'
 title: 'MiniMax H3 Q4_K_M (the denoiser in 10.6 GiB: the longest clips)'
 about: the denoiser as a Q4_K_M GGUF
 gpus: '0'

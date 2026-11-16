@@ -4,6 +4,9 @@
 id: moss-image-turbo-base-8step-lora
 kind: lora
 arch: moss-image
+license: apache-2.0
+commercial: true
+license_note: 'Apache-2.0: lodestones'' MOSS-Image-Base-8-steps-dmd on Hugging Face; this file is the Civitai re-upload ("Moss Image Turbo LoRas", marked for commercial use), and MOSS-Image itself is Apache-2.0.'
 title: 'MOSS-Image-Base 8-step DMD v0.1 (lodestones, a turbo LoRA, rank 128; Apache-2.0)'
 about: 'lodestones'' data-space DMD distillation of MOSS-Image-Base to 8 steps without guidance, as a LoRA at strength 1.0 (the Base 8-step also works at 4). Brings 8 steps, cfg 1'
 base: moss-image

@@ -3,12 +3,17 @@
 id: qwen3-tts-design
 kind: audio
 arch: qwen3-tts
+license: apache-2.0
+commercial: true
+license_note: 'Qwen3-TTS 12 Hz 1.7B (Qwen, Apache-2.0), the VoiceDesign checkpoint with the CustomVoice files'' codec.'
 title: Qwen3-TTS VoiceDesign (speech in a voice made up from a description; 10 languages, 24 kHz)
 about: 'Qwen3-TTS 12 Hz 1.7B: the talker (a 28-layer Qwen3 of 2,048) and its 5-layer code predictor, the 12 Hz codec''s decoder (Qwen''s checkpoint)'
 gpus: '0'
 vram_gib: 4.5                   # its memory on the card when it runs (measured on a B70)
 speech:
 - design
+annotations_note: 'Plain text: Qwen3-TTS reads no inline tags; the voice is described in instructions. Brackets and parentheses in the text become pauses, symbols are said as words (the server''s speech text pass).'
+annotations: []
 defaults:
   seconds: 60.0
 env: {}

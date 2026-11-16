@@ -3,6 +3,9 @@
 id: deepseek-v4.1-flash-q2kxl-fast
 kind: llm
 arch: deepseek41
+license: mit
+commercial: true
+license_note: 'DeepSeek-V4.1-Flash-1017 (DeepSeek, MIT); unsloth''s GGUF inherits it.'
 title: DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL fast · 128K context (both GPUs, pinned memory and the NVMe)
 about: "The UD-Q2_K_XL of deepseek-v4.1-flash-q2kxl with deepseek-v4.1-flash-iq2xxs-fast's two approximations on (cold experts under 0.2 of the routing weight left out, attention and the shared expert in q4_K). tg 19.2 tok/s over 512 tokens and 22.3 sustained over a 12,000-token novel that stays clean to the end (UD-IQ2_XXS fast: 21.4 and 25.3); pp 121 / 138 / 300 tok/s at 580 / 2.5K / 10K tokens."
 gpus: all

@@ -3,6 +3,9 @@
 id: trellis2-512
 kind: model3d
 arch: trellis2
+license: mit
+commercial: true
+license_note: 'TRELLIS.2 (Microsoft) MIT, from Aero-Ex''s GGUF repack (which states no licence of its own); the DINOv3 ViT-L/16 image encoder is under Meta''s DINOv3 License (commercial use allowed, with its acceptable-use and trade-control terms); BiRefNet MIT.'
 title: 'TRELLIS.2 4B Q8_0, 512 (picture to textured mesh, the light path; MIT)'
 about: TRELLIS.2's 512 pipeline - the same DINOv3, structure flow and decoders as trellis2 with the 512 shape and texture flows only (two fewer 1.3B models to download, a coarser mesh in a fraction of the time); BiRefNet cuts opaque pictures out
 gpus: '0'

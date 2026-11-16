@@ -3,6 +3,9 @@
 id: pixal3d
 kind: model3d
 arch: pixal3d
+license: mit
+commercial: true
+license_note: 'Pixal3D (Tencent ARC) MIT, from Aero-Ex''s GGUF repack (which states no licence of its own; the original repository is closed to users in the European Union on Hugging Face); TRELLIS.2 (Microsoft) MIT, from Aero-Ex''s GGUF repack (which states no licence of its own); the DINOv3 ViT-L/16 image encoder is under Meta''s DINOv3 License (commercial use allowed, with its acceptable-use and trade-control terms); BiRefNet MIT.'
 title: 'Pixal3D Q8_0 (picture to textured mesh, pixel-aligned TRELLIS.2; the 1024 cascade; MIT)'
 about: Tencent ARC's Pixal3D from Aero-Ex's GGUFs - TRELLIS.2's pipeline whose flows also read DINOv3 features sampled where each voxel projects into the picture (a pinhole camera of the picture's field of view, --opt-fov, default 49 degrees; MoGe-2's estimate is not ported), so the mesh follows the picture closely; NAF's upsampled half of the features is the low-res ones again (not ported); TRELLIS.2's DINOv3, decoders and BiRefNet
 gpus: '0'

@@ -4,6 +4,9 @@
 id: moss-image-turbo-dmd2-8step-lora
 kind: lora
 arch: moss-image
+license: apache-2.0
+commercial: true
+license_note: 'Apache-2.0: the 8-step DMD2 LoRA of lodestones'' Kromoss on Hugging Face; this file is the Civitai re-upload ("Moss Image Turbo LoRas", marked for commercial use), and MOSS-Image itself is Apache-2.0.'
 title: 'MOSS-Image 8-step DMD2 (lodestones / Kromoss, a turbo LoRA, rank 128; Apache-2.0)'
 about: 'lodestones'' Base 8-step distillation refined by a DMD2 GAN stage against real images, as a LoRA at strength 1.0: a little more contrast and detail than the plain DMD, the creator''s pick; runs on Base, SFT and Kromoss (also at 4 steps). Brings 8 steps, cfg 1'
 base: moss-image

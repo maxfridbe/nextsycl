@@ -3,6 +3,9 @@
 id: unlimited-ocr-q8
 kind: image
 arch: unlimited-ocr
+license: mit
+commercial: true
+license_note: 'Unlimited-OCR (Baidu, MIT); sahilchachra''s GGUF inherits it.'
 title: Unlimited-OCR Q8_0 (pages to Markdown)
 about: 'Baidu''s Unlimited-OCR (the DeepSeek-OCR architecture, MIT): a SAM-B + CLIP-L vision encoder (F16) and a 3B DeepSeek-V2 MoE decoder (64 experts, 6 a token) that reads whole pages into Markdown, tables as HTML, boxes on request; long pages in fixed memory (the last 128 tokens written attend); GGUF by sahilchachra; 2.9 GiB + 0.8'
 gpus: '0'

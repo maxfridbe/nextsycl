@@ -3,6 +3,9 @@
 id: muse-glimmer-30b-q4
 kind: llm
 arch: muse-glimmer
+license: apache-2.0
+commercial: true
+license_note: 'Muse Glimmer 30B (Meta, Apache-2.0 at meta-models/Muse-Glimmer-30B); The-freezer''s GGUF of Blackfrost''s abliterated build states Apache-2.0 (the Blackfrost BF16 repository it names is not public); refusals are removed - lawful use is on the user.'
 title: Muse Glimmer 30B Abliterated Q4_K_M (4-bit; either card with its drafter, 128K + 32K)
 about: 'Meta''s dense agentic Muse Glimmer 30B, abliterated (Blackfrost), 4-bit (Q4_K_M) on one card: 52 layers of gated attention (39 over a 2,048 sliding window, 13 full), a dense SwiGLU, logits soft-capped; it reasons on a to=self channel before its answer; its DFlash drafter beside it drafts 15 tokens a step; 15.8 GiB + 1.5'
 gpus: '0|1'                     # one of the cards, the B70 preferred: the whole model on whichever has the room

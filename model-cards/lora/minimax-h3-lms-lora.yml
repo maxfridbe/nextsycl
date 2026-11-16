@@ -3,6 +3,9 @@
 id: minimax-h3-lms-lora
 kind: lora
 arch: minimax-h3
+license: minimax-h3-community
+commercial: true
+license_note: 'Alissonerdx''s LMS LoRA, a MiniMax H3 Model Derivative: its repository grants no licence of its own for it (mixed per-asset licences; the custom Character Swap / Motion Transfer terms do not cover it), so the MiniMax H3 Community License (not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; products show "Powered by MiniMax H3"; its Acceptable Use Policy; outputs may not improve another model) applies.'
 title: MiniMax H3 LMS v1.0, rank 64 (Alissonerdx)
 about: a LoRA published as minimax_h3_lms_v1.0_r64
 base: minimax-h3

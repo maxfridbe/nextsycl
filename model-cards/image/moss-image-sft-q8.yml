@@ -4,6 +4,9 @@
 id: moss-image-sft-q8
 kind: image
 arch: moss-image
+license: apache-2.0
+commercial: true
+license_note: 'MOSS-Image-SFT (OpenMOSS) Apache-2.0, as are unsloth''s GGUF of it and the VAE from unsloth''s FP8 repack; the Qwen3.5-9B text encoder (unsloth''s GGUF of Qwen/Qwen3.5-9B) Apache-2.0.'
 title: 'MOSS-Image-SFT Q8_0 (text to image: photos, illustrations, posters; Rust + SYCL)'
 about: 'OpenMOSS''s MOSS-Image-SFT (Apache-2.0): a 5.1B single-stream DiT conditioned by Qwen3.5-9B''s hidden states, the FLUX.2 VAE; prompts in sentences, tags or a JSON layout. 5.1 GiB DiT, 8.9 GiB text encoder'
 gpus: '0'

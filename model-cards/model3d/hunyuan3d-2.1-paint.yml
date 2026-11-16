@@ -4,6 +4,9 @@
 id: hunyuan3d-2.1-paint
 kind: model3d
 arch: hunyuan3d-2.1-paint
+license: tencent-hunyuan-community
+commercial: true
+license_note: 'Tencent Hunyuan 3D 2.1 Community License: not licensed in the European Union, the United Kingdom or South Korea; a licence from Tencent above 1 million monthly active users; its Acceptable Use Policy; outputs may not improve another AI model. DINOv2-giant Apache-2.0.'
 title: Hunyuan3D 2.1 paint (PBR textures for a mesh, from a picture)
 about: 'Hunyuan3D 2.1''s paint model without its shape model: the 2.5D multiview UNet (Stable Diffusion 2.1 with material-aware, reference, multiview and DINOv2-giant attentions) draws six views of albedo and metallic-roughness in 15 UniPC steps, baked into a UV atlas. It makes no shape: model3d.generate with a mesh (or file) and a picture paints that mesh. The same files as hunyuan3d-2.1''s paint; a pull of both fetches them once.'
 gpus: '0'

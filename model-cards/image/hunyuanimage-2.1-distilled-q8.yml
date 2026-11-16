@@ -3,6 +3,9 @@
 id: hunyuanimage-2.1-distilled-q8
 kind: image
 arch: hunyuanimage-2.1
+license: tencent-hunyuan-community
+commercial: true
+license_note: 'Tencent Hunyuan Community License (HunyuanImage 2.1): not licensed in the European Union, the United Kingdom or South Korea; a licence from Tencent above 100 million monthly active users; its Acceptable Use Policy; outputs may not improve another AI model. The GGUFs are calcuis'' repacks; the Qwen2.5-VL-7B text encoder is Apache-2.0 (Qwen); the glyph ByT5 encoder comes from calcuis/pig-encoder (MIT, as that repository states).'
 title: 'HunyuanImage 2.1 Distilled Q8_0 (text to image, 2K; 8 steps, guidance embedded; Tencent Hunyuan Community License)'
 about: Tencent's MeanFlow-distilled 17B DiT (calcuis' v2 GGUF, Q8_0) - one pass a step, its guidance scale embedded; the base model's text encoders and VAE
 gpus: '0'

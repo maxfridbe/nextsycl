@@ -5,6 +5,9 @@
 id: breeze-tts-2
 kind: audio
 arch: breeze-tts-2
+license: breezeblue-research-non-commercial-1.1
+commercial: false
+license_note: 'BreezeBlue Research and Non-Commercial License 1.1 (RESONIA, Inc.): research and personal use only - no product, hosted service, organisation''s internal use or monetized content, the audio it makes included, without a separate commercial licence; clone a real voice only with that person''s explicit consent; the GGUF is cstr''s conversion under the same licence; the 12 Hz codec is Qwen3-TTS''s (Apache-2.0).'
 title: 'Breeze TTS 2 Q8_0 (speech in English and Chinese, 24 kHz: voices designed, cloned or directed; vocal events; non-commercial)'
 about: 'Breeze TTS 2 (BreezeBlue, a CSM fork, ~3B): a T5Gemma2 text encoder (26 layers), a Qwen3 backbone (28 layers) and a 12-layer depth decoder over the Qwen3-TTS 12 Hz codec''s 16 codebooks - CrispASR''s Q8_0 GGUF, half on the GPU. Voice design from a description, voice cloning from a recording and its exact transcript, voice direction (a cloned voice steered by an instruction), vocal events inline ("(laugh)", "[笑]"). Weights and outputs: BreezeBlue Research and Non-Commercial License 1.1 (research and non-commercial use only)'
 gpus: '0'
@@ -15,6 +18,8 @@ speech:
 - direction
 - events
 - transcript                    # a clone needs what the recording says (saved voices without it go elsewhere)
+annotations_note: 'None kept as written: this engine declares no markup (AudioEngine::markup is empty), so the server''s speech text pass makes brackets and parentheses pauses and says the word inside. Breeze TTS 2''s own vocal events - (laugh) (sigh) (cough) (clears throat) in English, [笑] [叹气] [咳嗽] [清嗓子] in Chinese - reach the model only in a request with normalize: false. Direction goes in instructions.'
+annotations: []
 defaults:
   seconds: 60.0
   cfg: 4.0                      # used with an instruction (design, direction); a clone or plain read is unguided

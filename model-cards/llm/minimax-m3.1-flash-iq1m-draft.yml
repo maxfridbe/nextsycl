@@ -3,6 +3,9 @@
 id: minimax-m3.1-flash-iq1m-draft
 kind: llm
 arch: minimax-m3
+license: minimax-community
+commercial: true
+license_note: 'MiniMax Community License (M3.1-Flash; unsloth''s GGUF inherits it): commercial use shows "Built with MiniMax M3.1-Flash" and sends MiniMax a one-time notice (api@minimax.io), or needs its written authorization above US$20 million yearly revenue; its prohibited uses include any military purpose.'
 title: MiniMax-M3.1-Flash UD-IQ1_M with the DSpark drafter (both GPUs)
 about: 'minimax-m3.1-flash-iq1m with its 2 GB DSpark drafter on the last card: up to 6 drafts a step at confidence 0.8, the same text. Measured through a server against the plain card: tg up about 4-7% on code and long prompts, about level on prose, down to 13% on free prose it drafts little of; pp 6-11% lower; drafts only with one request decoding. Text only; license minimax-community, read it before serving'
 gpus: all

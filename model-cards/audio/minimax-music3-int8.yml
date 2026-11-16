@@ -3,6 +3,9 @@
 id: minimax-music3-int8
 kind: audio
 arch: minimax-music3
+license: minimax-music3-community
+commercial: true
+license_note: 'MiniMax-Music3 Community License: commercial products show "MiniMax-Music3" and need MiniMax''s written authorization above US$20 million yearly revenue; a service that generates for others keeps safeguards against infringing uses and outputs; its Acceptable Use Policy (no military use, machine-made content disclosed in public). Built on Qwen3-8B (Apache-2.0) and Stable Audio / DAC code (MIT).'
 title: MiniMax Music 3, its language model in int8 (half the VRAM, faster frames)
 about: the 8B semantic language model (Qwen3-8B's shape) and RVQ depth decoder, the 2.4B flow-matching transformer, the Flow-VAE decoder (MiniMax's diffusers checkpoint)
 gpus: '0'

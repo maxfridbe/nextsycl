@@ -4,6 +4,9 @@
 id: moss-image-turbo-sft-4step-lora
 kind: lora
 arch: moss-image
+license: apache-2.0
+commercial: true
+license_note: 'Apache-2.0: akhaliq''s MOSS-Image-SFT-4-steps (v2) on Hugging Face; this file is the Civitai re-upload ("Moss Image Turbo LoRas", marked for commercial use), and MOSS-Image itself is Apache-2.0.'
 title: 'MOSS-Image 4-step v2.0 (akhaliq, a turbo LoRA for SFT, rank 128; Apache-2.0)'
 about: 'akhaliq''s 4-step distillation of MOSS-Image-SFT as a LoRA at strength 1.0: Euler on the stock schedule, no guidance (4 steps to 1024x1024, 6 around 1536 wide, 8 at 2048x2048; fewer look hazy above 1024); also runs on Base. Brings 4 steps, cfg 1'
 base: moss-image

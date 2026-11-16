@@ -4,6 +4,9 @@
 id: deepseek-v4.1-flash-q8kxl
 kind: llm
 arch: deepseek41
+license: mit
+commercial: true
+license_note: 'DeepSeek-V4.1-Flash-1017 (DeepSeek, MIT); unsloth''s GGUF inherits it.'
 title: DeepSeek-V4.1-Flash-1017 UD-Q8_K_XL · 473 GiB · reference for audits (routed experts original, dense BF16) · 128K context (both GPUs, pinned memory and the NVMe)
 about: "Unsloth's dynamic GGUF of DeepSeek-V4.1-Flash-1017 (llama.cpp PR 30817's form): every routed expert in MXFP4, DeepSeek's own format, the shared experts and other dense weights in BF16, the Engram table in MXFP8. The closest set to DeepSeek's weights that is on the box, used as the reference for `llm audit` and NS_DS41_GATE_EXPERTS; whether its BF16 holds the original FP8 exactly is not checked, so it is not called exact"
 gpus: all

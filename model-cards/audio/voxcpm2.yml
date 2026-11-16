@@ -3,6 +3,9 @@
 id: voxcpm2
 kind: audio
 arch: voxcpm2
+license: apache-2.0
+commercial: true
+license_note: 'VoxCPM2 (OpenBMB) Apache-2.0, weights and code.'
 title: 'VoxCPM2 (speech in 30 languages at 48 kHz: voices designed from a description or cloned from a recording)'
 about: 'VoxCPM2: MiniCPM4 base (28 layers) and residual (8) language models, a local encoder and a local flow-matching DiT (12 layers each), AudioVAE V2 (16 kHz in, 48 kHz out) - OpenBMB''s checkpoint'
 gpus: '0'
@@ -10,6 +13,8 @@ vram_gib: 5.5                   # its memory on the card when it runs (measured 
 speech:
 - design
 - clone
+annotations_note: 'Plain text: VoxCPM2 reads no inline tags. A designed voice''s description or a clone''s style goes in instructions, which the engine puts in parentheses before the text as VoxCPM2 reads it ("(a young woman, gentle voice)Hello"); parentheses written in the text itself become pauses.'
+annotations: []
 defaults:
   seconds: 60.0
   steps: 10

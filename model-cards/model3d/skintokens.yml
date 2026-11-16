@@ -3,6 +3,8 @@
 id: skintokens
 kind: model3d
 arch: skintokens
+license: mit
+commercial: true
 title: 'SkinTokens / TokenRig (a skeleton and skin weights for any mesh, written as one token sequence; MIT)'
 about: VAST-AI, 2026 - one Qwen3-shaped decoder (28 layers, width 896) over a Michelangelo shape encoding writes the skeleton's tokens and then four skin tokens a joint (codes of an FSQ-CVAE's 32,768-entry codebook); the skin VAE's decoder turns a joint's codes into its weights over 54,000 surface samples, carried to the mesh's vertices by the 8 nearest. Beam search with sampling as the demo; float32. The TokenRig checkpoint carries the skin VAE (bfloat16-rounded), so the standalone skin VAE file is optional and unused at inference; both are read as published, without Python
 does: [rig]

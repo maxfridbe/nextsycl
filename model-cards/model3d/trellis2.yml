@@ -3,6 +3,9 @@
 id: trellis2
 kind: model3d
 arch: trellis2
+license: mit
+commercial: true
+license_note: 'TRELLIS.2 (Microsoft) MIT, from Aero-Ex''s GGUF repack (which states no licence of its own); the DINOv3 ViT-L/16 image encoder is under Meta''s DINOv3 License (commercial use allowed, with its acceptable-use and trade-control terms); BiRefNet MIT.'
 title: 'TRELLIS.2 4B Q8_0 (picture to textured mesh, the 1024 cascade; MIT)'
 about: Microsoft's TRELLIS.2 from Aero-Ex's GGUFs - DINOv3 ViT-L/16, four 1.3B flow transformers (Q8_0) - the sparse structure, the shape at 512 then 1024, the PBR texture at 1024, the fp16 sparse decoders (a dual-grid mesh, PBR voxels baked into base colour and metallic-roughness textures); BiRefNet cuts opaque pictures out
 gpus: '0'

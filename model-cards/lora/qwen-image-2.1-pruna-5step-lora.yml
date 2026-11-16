@@ -3,6 +3,9 @@
 id: qwen-image-2.1-pruna-5step-lora
 kind: lora
 arch: qwen-image-2.1
+license: qwen-research
+commercial: false
+license_note: 'Pruna AI''s 5-step LoRA, a Qwen-Image 2.1 derivative: Qwen Research License Agreement (Tongyi Lab, 2026-09-20): research and evaluation only - any commercial use needs a separate licence from Qwen (model-business@notice.qwencloud.com); redistributed copies carry the agreement and mark their changes.'
 title: Qwen-Image 2.1 Pruna 5-step (a LoRA, v0.1, faster, rougher; qwen-research license)
 about: Pruna's DMD few-step LoRA at scale 1.0, trained at 1K; brings its 5 sigmas, used as given (no shift)
 base: qwen-image-2.1
