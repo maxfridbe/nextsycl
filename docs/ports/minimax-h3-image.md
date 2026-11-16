@@ -281,6 +281,23 @@ So: 4 - 4.5 % on the kernel, 5.5 % on the attention op at 16.8 MP (2,766 -> 2,61
 exact, but far from the doubling a better tile shape was hoped to give: in every form tried the kernel is held by its
 vector work and loads, not by the matrix engine.
 
+**The B65** (card 1; the same build, benches and order, the same day):
+
+| | ARK | silo kernel |
+|---|---|---|
+| kernel, 1,074 tokens | 0.451 / 0.451 ms (73.4 TFLOPS) | 0.426 / 0.427 ms (77.6) |
+| kernel, 16,434 tokens | 81.06 / 81.13 ms (95.5 TFLOPS) | 78.43 / 78.64 ms (98.7) |
+| kernel vs int8 math, 1,074 / 16,434 tokens (max / mean) | 1.228e-2 / 2.892e-4; 8.788e-3 / 1.264e-4 | 1.228e-2 / 2.848e-4; 7.821e-3 / 1.245e-4 |
+| kernel vs float32, relative (both sizes) | 2.434e-2; 2.781e-2 | 2.434e-2; 2.781e-2 |
+| 6 steps, 1024 x 1024 | 5.25 / 5.25 s | 5.22 / 5.22 s |
+| 6 steps, 4096 x 4096 | 78.04 / 78.07 s | 76.88 / 76.97 s |
+
+Parity with Sage forced (576 x 384, seed 3): int8 gives the B70's digits exactly on both kernels (velocities silo
+3.15e-2 - 8.27e-2, ARK 3.54e-2 - 7.32e-2; worst cosine 0.99658 / 0.99727). Q4_K_M, whose numbers move in the third digit
+from run to run: silo 9.96e-2 - 1.40e-1 (mean 1.25e-1, worst cosine 0.99023), ARK 1.01e-1 - 1.36e-1 (mean 1.22e-1, worst
+0.99070) - the reverse of the B70's Q4_K_M ordering, inside that spread. So on the B65: 3 - 6 % on the kernel, 1.4 % on a
+16.8 MP picture, 0.6 % at 1 MP, as exact as ARK's.
+
 - **P-H3-Image** has the same layout (56 heads of 128, the same packed qkv) but does not use this yet: its silo
   (`kernels/image/ph3image/silo`) would need its own copy of `tla/` (silos are per model) and its own parity run.
 - **Build** (`kernels/build.sh`): a silo with both plain sources (`silo/*.cpp` -> `libnextsycl-<arch>.so`) and sycl-tla
