@@ -327,8 +327,12 @@ nextsycl audio check <reference dump dir> --model omnivoice [--stages prompt,enc
   and a clone): prompts identical; logits 2.3-2.5e-4 (F32 files, teacher forced); a recording's 1,912 codes all
   identical; the decoder 1-2e-6; the post-processing exact. Real clips transcribe word for word. Details and the
   served Q8_0 file's numbers: [docs/ports/omnivoice.md](ports/omnivoice.md).
-- **Served** like the other speech models: `nextsycl audio serve omnivoice` (`/v1/audio/speech`) and `:8000`'s
-  `audio.speak`.
+- **Speed** (Q8_0, warm, 2026-11-16): B70 a 9 s design clip in 0.45 s (real-time factor 0.05, 20x real time), a
+  clone 0.08 (12x), a 36 s paragraph in 2.2 s (0.06); B65 0.075 / 0.12 / 0.09. A one-shot `audio gen` pays first-use
+  costs (about 1 s more). 1.6 GiB on the card loaded, 2.2 GiB at a run's peak.
+- **Served** through the same AudioEngine path as the other speech models (`nextsycl audio serve omnivoice`,
+  `/v1/audio/speech`; `:8000`'s `audio.speak` once registered); checked so far with `audio gen` and `audio check`
+  only, not yet through a server.
 
 ## Voxtral TTS
 

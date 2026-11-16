@@ -139,3 +139,60 @@ Our runs' sound (`ours.wav`, F32, deterministic) transcribed by Whisper large-v3
 
 All at 24 kHz mono, peak 0.5 (design / auto) or the recording's level (clone: peak 0.46, RMS 0.067 against the
 recording's 0.071).
+
+### The served Q8_0 files
+
+The same checks with `omnivoice-base-Q8_0.gguf` + `omnivoice-tokenizer-Q8_0.gguf` (the card's), B65 and B70 alike:
+
+| stage | result |
+|---|---|
+| prompt tokens, T, L | identical (five cases) |
+| HuBERT mean / semantic encoder / fc | rel 6.2e-3 / 7.1e-3 / 7.0e-4 (HuBERT's linears Q8_0) |
+| the recording's codes | 1,908 / 1,912 |
+| step input rows | rel 5-6e-3 (the embeddings Q8_0) |
+| logits, step 0 / step 16 | rel 8.3-8.5e-4 / 8.5-9.9e-4, cosine 1.000000 |
+| codec decoder | rel 4-8e-4 (the file's convolutions half) |
+| post-processing | exact |
+
+## Listening (the served card)
+
+`nextsycl audio gen` with the Q8_0 card on the B65 (`~/src/omnivoice-runs/omnivoice-g1-*.wav` on hardac1), Whisper
+large-v3-turbo on the CPU (25 s windows):
+
+| clip | heard (text given in brackets where it differs) | length, level, f0 |
+|---|---|---|
+| design `female, middle-aged, british accent` | "Welcome to the evening news. Tonight, scientists announced a new way to turn sunlight into clean fuel and the City Council approved a plan for three new parks." | 9.4 s, peak 0.50, 188 Hz |
+| auto, `[laughter]` | "I can't believe it's already November. Where did the year go? Anyway, let's make the most of it." (the tag is a laugh, not words) | 6.4 s, 164 Hz |
+| Chinese, `female, young adult` | "春天来了,公园里的花都开了,我们周末一起去看看吧,顺便带上相机拍几张照片。" | 6.7 s, 205 Hz |
+| clone (LibriSpeech 1272, 9 s) | "Every morning I walk to the bakery on the corner and buy a loaf of fresh bread for the family." | 7.2 s, RMS 0.064 (recording 0.065), 114 Hz (recording 112 Hz) |
+| a 6-sentence paragraph, `male, elderly, low pitch` (chunked: 3 chunks) | the whole paragraph word for word ("harbor" for "harbour") | 36.0 s, 156 Hz |
+
+## Speed and memory
+
+`nextsycl audio check DIR --model omnivoice --stages bench`: the whole request (the recording encoded, 32 steps, the
+decode, the post-processing) three times in one process; the first run pays the kernels' and oneDNN's first-use
+costs (a one-shot `audio gen` sees those: 1.2 s of steps instead of 0.4). Q8_0, 2026-11-16:
+
+| case | B70: cold / warm | B70 real-time factor warm | B65: cold / warm | B65 real-time factor warm |
+|---|---|---|---|---|
+| design, 9 s of speech | 1.40 s / 0.45 s | 0.048-0.051 (19.5-21.0x real time) | 2.60 s / 0.69 s | 0.074-0.079 (12.7-13.6x) |
+| clone, 6.8 s (prompt 2.6x longer: the 9 s recording's frames) | 2.75 s / 0.55 s (encoding 0.07 s) | 0.080-0.082 (12.2-12.5x) | 3.97 s / 0.83-0.85 s (encoding 0.09-0.11 s) | 0.12-0.13 (7.8-8.2x) |
+| paragraph, 36 s in 3 chunks | 4.35 s / 2.16 s | 0.059-0.060 (16.6-16.9x) | 5.47 s / 3.33 s | 0.092 (10.8x) |
+
+Upstream quotes a real-time factor down to 0.025 (its own GPU runs); this port is untuned (no silo yet).
+
+The card: 1.6 GiB loaded (any variant: the backbone half, the codec float32), 1.9-2.2 GiB at a run's peak (both
+cards: 31.89 GiB, 29.73 GiB free after a clone, 30.0 after the paragraph). A step is one pass over L + T rows (prompt
+and target, then the target again): 7-15 ms at 300-650 rows (B70 0.28 s / B65 0.42 s for the design case's 32
+steps).
+
+## Open
+
+- Speed: nothing is tuned. A step is ~150 kernel launches and one host round trip (the scores); candidates are a
+  silo with a fused norm + product, the attention of the two sequences in one call, and graphs over the step.
+- The class temperature (upstream's top-k 10% + Gumbel on the codes; default 0 = greedy) and text normalization
+  (WeTextProcessing; off by default upstream) are not offered.
+- Cloning without a transcript (upstream transcribes with Whisper) is refused: the front door could transcribe
+  first with whisper-large-v3-turbo.
+- The shared mm3 `conv1d_lr` primitive cache should key on the bias (see the port's trap above).
+- Not deployed or registered in production.

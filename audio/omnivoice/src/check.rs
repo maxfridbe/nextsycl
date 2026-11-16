@@ -12,6 +12,8 @@
 //!                                       tokens.npy's codes agree; its sound (ours.wav) for listening
 //!   codec   tokens.npy               -> raw.npy (the decoder)
 //!   post    raw.npy                  -> out.npy (silences, level, fades)
+//!   bench   request.json alone       -> the whole request three times in this process (cold, then warm): seconds,
+//!                                       real-time factor, the card's memory
 //! ```
 
 use std::path::Path;
@@ -197,14 +199,17 @@ pub fn run(e: &OmniVoice, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
         None => None,
     };
     let g = Gen { steps: rq.steps, position_temperature: 0.0, duration: rq.duration, ..Gen::default() };
-    let (ids_shape, ids) = read_npy(&dir.join("ids.npy"))?;
+    // a bench needs only request.json (text, language, instruct, a recording): the stages against a dump need its ids
+    let dumped = dir.join("ids.npy").exists();
+    let stages: Vec<&str> = stages.iter().copied().filter(|s| dumped || *s == "bench").collect();
+    let (ids_shape, ids) = if dumped { read_npy(&dir.join("ids.npy"))? } else { (vec![c, rq.l], Vec::new()) };
     if ids_shape != vec![c, rq.l] {
         return Err(Error(format!("ids.npy: shape {ids_shape:?}, [{c}, {}] expected", rq.l)));
     }
-    let ref_frames = rq.l - rq.audio_start - rq.t;
+    let ref_frames = rq.l.saturating_sub(rq.audio_start + rq.t);
     // the recording as the reference encoded it, its codes ours or the reference's
     let mut voice: Option<Voice> = None;
-    if let Some(rt) = rq.ref_text.as_deref() {
+    if let (Some(rt), true) = (rq.ref_text.as_deref(), dumped) {
         let codes: Vec<i32> = (0..c).flat_map(|k| (rq.audio_start..rq.audio_start + ref_frames).map(move |r| (k, r))).map(|(k, r)| ids[k * rq.l + r] as i32).collect();
         voice = Some(Voice { codes, frames: ref_frames, text: crate::text::add_punctuation(rt), rms: rq.ref_rms });
     }
@@ -301,6 +306,34 @@ pub fn run(e: &OmniVoice, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
         let (total, free) = e.ops.gpu.memory()?;
         log(format!("  ours.wav: {:.2} s; the card: {:.2} GiB free of {:.2} after it", a.seconds(), free.unwrap_or(0) as f64 / (1u64 << 30) as f64,
                     total as f64 / (1u64 << 30) as f64));
+    }
+    if stages.contains(&"bench") {
+        // the whole request as a server makes it (the recording encoded, every step, the decode, the post-processing),
+        // three times in this process: the first pays the kernels' and oneDNN's first-use costs
+        let rec = match (rq.ref_audio.as_deref(), rq.ref_text.as_deref()) {
+            (Some(src), Some(rt)) => {
+                let b = std::fs::read(src).map_err(|e| Error(format!("{src}: {e}")))?;
+                let (s, rate) = nextsycl_audio::decode_audio(&b).map_err(Error)?;
+                Some((s, rate, rt.to_string()))
+            }
+            _ => None,
+        };
+        let g = Gen { steps: rq.steps, duration: rq.duration, ..Gen::default() };
+        for i in 0..3 {
+            let t0 = Instant::now();
+            let v = match &rec {
+                Some((s, rate, rt)) => Some(e.voice(s, *rate, rt, None)?.0),
+                None => None,
+            };
+            let te = t0.elapsed().as_secs_f64();
+            let out = e.say(&rq.text, v.as_ref(), lang.as_deref(), instruct.as_deref(), &g, Some(600.0), i as u64, t0, &mut |_| Ok(()))?;
+            let took = t0.elapsed().as_secs_f64();
+            let secs = out.len() as f64 / crate::codec::RATE as f64;
+            log(format!("bench {i}: {secs:.2} s of speech in {took:.3} s (the recording {te:.3} s): real-time factor {:.3} ({:.1}x real time)", took / secs,
+                        secs / took));
+        }
+        let (total, free) = e.ops.gpu.memory()?;
+        log(format!("  the card: {:.2} GiB free of {:.2}", free.unwrap_or(0) as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64));
     }
     if stages.contains(&"codec") {
         let (shape, tk) = read_npy(&dir.join("tokens.npy"))?;

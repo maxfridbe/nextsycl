@@ -12,7 +12,7 @@ license: cc-by-nc-4.0
 commercial: false
 license_note: 'the weights CC BY-NC 4.0 (k2-fsa / Xiaomi; the training data''s terms); upstream''s code Apache 2.0, the Higgs Audio v2 codec (Boson AI) Apache 2.0, the GGUF conversion''s tooling (omnivoice.cpp) MIT'
 gpus: '0'
-vram_gib: 3.5                   # its memory on the card when it runs (measured: see docs/ports/omnivoice.md)
+vram_gib: 2.5                   # its memory on the card when it runs (measured on a B65: 1.6 GiB loaded, 2.2 GiB at a clone's peak)
 speech:
 - clone                         # a recording, or a saved voice, with its transcript
 - design                        # a voice from attributes alone (instructions)
