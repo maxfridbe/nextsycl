@@ -1748,6 +1748,80 @@ pub struct AudioTranscribeReq {
     pub rest: serde_json::Map<String, serde_json::Value>,
 }
 
+/// What audio.edit takes.
+#[derive(Deserialize, Serialize, Rpc)]
+#[allow(non_snake_case)]
+pub struct AudioEditReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
+    /// a group inside the project
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 60)]
+    pub batch: Option<String>,
+    /// queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = false)]
+    pub held: Option<bool>,
+    /// names the job for <kind>.status and <kind>.cancel (default: its id)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
+    /// a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = -9, max = 9, default = 0)]
+    pub priority: Option<i64>,
+    /// a group of jobs held or released together (<kind>.queue.pause / resume), listed with <kind>.jobs {project}
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 60)]
+    pub project: Option<String>,
+    /// false: refused at once (409 busy, retryable) when the job would not start now - a server free and no runnable job waiting before it; true (default): it waits its turn
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = true)]
+    pub queue: Option<bool>,
+    /// idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)
+    #[serde(rename = "reentrant_id", default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 200)]
+    pub reentrant_id: Option<String>,
+    /// true: answer when it ends (the job goes on if the call drops); false: answer at once with the job
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = true)]
+    pub wait: Option<bool>,
+    /// the recording: WAV, MP3, FLAC, Ogg or M4A as base64, a data: URL, or upload:<name> (audio.upload); at most 30 s of one speaker
+    pub audio: String,
+    /// what the recording says (its transcript: audio.transcribe makes one)
+    pub original_text: String,
+    /// what it should say: the words that differ are said anew, the rest kept
+    pub target_text: String,
+    /// the model's id (one whose speech has edit: zonos3-mini); none: the first enabled
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// the draws (the same seed, the same edit)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    pub seed: Option<i64>,
+    /// a code or a name; none: the text decides
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// the engine's own (temperature ...)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<serde_json::Map<String, serde_json::Value>>,
+    /// wav (the file) or url (JSON with its link, the default)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+    /// what else the caller sent: passed on as it came
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
+}
+
 /// What audio.voices.list takes.
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
@@ -3242,6 +3316,12 @@ fn audio_transcribe(h: &Arc<Home>, req: AudioTranscribeReq) -> Answer {
     h.legacy("audio.transcribe", req)
 }
 
+/// Speech editing (a speech model whose card says edit: ZONOS3-Mini): a recording, what it says and what it should say; the words that change are said anew in the recording's voice and the rest kept frame for frame. Clips of at most 30 s; the transcript is the caller's (audio.transcribe makes one). A job like audio.speak
+#[rpc(name = "audio.edit", tags = "audio", example = r#"{"audio": "upload:up_1792400000_take2.wav", "original_text": "It runs on weaker hardware.", "target_text": "It runs on older laptops."}"#)]
+fn audio_edit(h: &Arc<Home>, req: AudioEditReq) -> Answer {
+    h.legacy("audio.edit", req)
+}
+
 /// The saved voices (cloned or designed): name, owner, what the sample says, its description, length, whether it can be spoken now (ready) and by which enabled models; sample: its WAV
 #[rpc(name = "audio.voices.list", tags = "audio", example = r#"{"owner": "film-app"}"#)]
 fn audio_voices_list(h: &Arc<Home>, req: AudioVoicesListReq) -> Answer {
@@ -3569,7 +3649,7 @@ rpcgen::rpc_methods![sync Arc<Home>, RpcFail;
     image_upscale, image_vectorize, image_remove_background, video_upscale, image_ocr, image_describe, image_describers, image_info, image_status,
     image_jobs, image_queue_list, image_queue_move, image_queue_pause, image_queue_resume, image_upload,
     image_cancel, image_canvases_list, image_progress, image_history, image_describe_prompt_guide_md, audio_generate,
-    audio_speak, audio_transcribe, audio_voices_list, audio_voices_add, audio_voices_design, audio_voices_enroll, audio_voices_remove,
+    audio_speak, audio_transcribe, audio_edit, audio_voices_list, audio_voices_add, audio_voices_design, audio_voices_enroll, audio_voices_remove,
     audio_info, audio_progress, audio_history, audio_status, audio_jobs, audio_queue_list,
     audio_queue_move, audio_queue_pause, audio_queue_resume, audio_upload, audio_cancel, audio_describe_prompt_guide_md,
     model3d_generate, model3d_rig, model3d_tool, model3d_info, model3d_progress, model3d_history,

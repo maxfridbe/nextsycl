@@ -87,6 +87,10 @@ audio/                     AUDIO
                                  Gated DeltaNet + attention layers over the three summed streams, the MeanFlow head, the
                                  streaming VibeVoice codec (the vibevoice engine's code on its kernels), the character
                                  card, stage checks
+  zonos3     nextsycl-audio-zonos3  ZONOS3-Mini (Zyphra): the gated-DeltaNet / attention backbone with Full AttnRes and a
+                                 Q4_0 latent MoE, the ZAC MR-iSTFT decoders, the MECT-B2 speaker encoder, raw-reference
+                                 cloning (the reference encoder + W2V-BERT teacher), steering, markup, LACI, short texts,
+                                 streaming, speech editing (FuseAlign, the edit LoRA), stage checks
   example    nextsycl-audio-example  a template
 
 model3d/                   3D
@@ -554,6 +558,15 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   (float32). The unmasking (layer penalty, Gumbel noise on the positions, the schedule), the quantizer's nearest codes
   and upstream's pydub silence trimming run on the host. Per-request options: `NS_OV_SPEED`, `NS_OV_DURATION`,
   `NS_OV_T_SHIFT`, `NS_OV_LAYER_PENALTY`, `NS_OV_POSITION_TEMPERATURE`, `NS_OV_DENOISE`, `NS_OV_POSTPROCESS`.
+- **zonos3** - ZONOS3-Mini from Zyphra's own GGUFs (card zonos3-mini: the backbone with its Q4_0 experts kept in their
+  blocks and read by the engine's expert products, the rest float32 on oneMKL; the keep2 decoder resident, the full one
+  loaded on first use; the reference encoder, its SSL teacher and FuseAlign loaded for an encode / an edit and freed).
+  Its kernels (`kernels/audio/zonos3/z3.cpp`) are nextcuda's port's 53 CUDA kernels rewritten in SYCL: embeddings,
+  Full AttnRes scores and mixes, the gated DeltaNet's convolution, prep, scan (a sub-group a value row) and readout,
+  small-head attention (causal / windowed / full / relative with BF16 rounding), the MoE router and Q4_0 experts (with
+  the edit LoRA's terms), the decoder's lookups, convolutions, iSTFT and resampler, the speaker encoder's grouped
+  convolutions and pooling, LACI's windowed attention, FuseAlign's table RoPE and col2im. Host code from nextcuda's
+  crate (docs/ports/zonos3.md). Debug variables: `NS_Z3_ENC_F32`, `NS_Z3_ENC_DUMP`, `NS_Z3_EDIT_DUMP`.
 - **voxtraltts** - Voxtral 4B TTS 2603 from CrispASR's GGUF (q8_0 served, f16 for parity; F16 / Q8_0 / Q4_0 / Q4_K
   expanded to half at load; the Tekken vocabulary, the 20 preset voices and the codec in the file; the text embedding
   and the voices read from the file a row at a time). The backbone (Ministral 3B, adjacent-pair RoPE made rotate-half

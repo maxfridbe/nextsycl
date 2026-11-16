@@ -119,7 +119,7 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
 
 ## Port: ZONOS3-Mini speech (platform peer asked 2026-11-15; live on nextcuda)
 
-- [ ] zonos3-mini (kind audio, arch zonos3, speech [voices, clone]) as on nextcuda: spec in nextcuda docs/ports/zonos3.md
+- [x] (2026-11-16: ported, checked and heard; docs/ports/zonos3.md.) zonos3-mini (kind audio, arch zonos3, speech [voices, clone]) as on nextcuda: spec in nextcuda docs/ports/zonos3.md
       (d148318 + 1d571aa). huggingface.co/Zyphra/ZONOS3-Mini gguf/ at d2d142a8: backbone-ptq.gguf (experts Q4_0),
       zac-keep2.gguf (decoder), zac.gguf (full decoder, lazy, +4 GiB), spk-encoder.gguf, steer.gguf, voices/<lang>/<preset>
       .codes.npy + .embedding.npy (27 presets, savannah default). Own kernels + Rust host, no Zyphra ggml C++ (MIT runtime,
@@ -130,7 +130,7 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
       c > stream row, counting the 3 silence rows); decode the silence frames ahead and cut them. nextcuda: ~15x real
       time on an RTX 5070, 2.1 GiB, logits cos 0.9997, decoder PCM cos 1.0. The platform routes any "zonos3" id to a box
       listing it.
-- [ ] Delta (nextcuda b0f25cf): main file backbone-ptq-edit.gguf (same as the release on plain text); new roles
+- [x] Delta (nextcuda b0f25cf): main file backbone-ptq-edit.gguf (same as the release on plain text); new roles
       zac-encoder (zac-encoder.gguf) and ssl-teacher (ssl-teacher.gguf), rev d2d142a8, SHA-256s pinned. speaker-mode
       reference with a recording = raw-reference cloning (first 60 s -> zac-encoder + 16-layer W2V-BERT teacher -> codec
       codes as prefix); needs Zyphra's BF16 rounding (fp32 teacher drifts 24 %, cb0 agreement 80 %); nextcuda parity vs
@@ -139,7 +139,7 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
       3 s gated window, 0.5 s gain smoothing, -12..+40 dB, soft limiter; off = decoder level -3 dB). Markup [pause],
       [pause 0.25|0.5|1|2], [start], [ipa ...], [steer ID=DOSE,...]words[/steer] (ids as zonos3-cli --request);
       (laugh) read aloud, [laugh] / <laugh/> dropped; the text pass leaves a card's `keep` regex spans alone.
-- [ ] Final delta (nextcuda faa02ae, on GitHub; spec docs/ports/zonos3.md there): card roles edit-adapter
+- [x] Final delta (nextcuda faa02ae, on GitHub; spec docs/ports/zonos3.md there): card roles edit-adapter
       (edit/accents.gguf: the edit LoRA only - no accent adapters ship, accents are steering accents_* directions),
       aligner (Zyphra/fusealign a4d58de4) and 43 laci-* heads files; capabilities [voices, clone, edit]. Option laci
       (default off, needs cfg 1): alignment probes on attention layers 3 and 7, their attention masked on retries,
@@ -153,7 +153,7 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
       transcript from our own Whisper; <= 30 s clips, <= 3 regions, no CJK segmentation. Corrections: [pause 2] ~0.5 s
       in both engines (0.53 vs 0.52 s, 8 seeds); reentrant repeats reuse a job only when its fingerprint (body, build,
       model files) matches; leveler gated over the 10 s around each frame, gain up to +50 dB.
-- [ ] Model cards: an `annotations` list (syntax / keep / does / tested) and `annotations_note`, as nextcuda's
+- [ ] (2026-11-16: model-cards/annotations.yml for the speech and song archs, kept through the speech text pass; image / llm cards not yet.) Model cards: an `annotations` list (syntax / keep / does / tested) and `annotations_note`, as nextcuda's
       model-cards/annotations.yml (the platform shows them beside the text box per engine) - for every card, not only
       ZONOS3.
 

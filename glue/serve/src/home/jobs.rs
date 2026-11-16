@@ -27,8 +27,8 @@ use super::{now, Home};
 use crate::http::{call_for, Target};
 
 /// The methods that run as jobs
-pub const METHODS: [&str; 13] = ["image.generate", "image.edit", "image.upscale", "image.vectorize", "image.remove_background", "image.describe", "video.upscale", "audio.generate", "audio.speak", "audio.transcribe",
-    "audio.voices.enroll", "model3d.generate", "model3d.rig"];
+pub const METHODS: [&str; 14] = ["image.generate", "image.edit", "image.upscale", "image.vectorize", "image.remove_background", "image.describe", "video.upscale", "audio.generate", "audio.speak", "audio.transcribe",
+    "audio.edit", "audio.voices.enroll", "model3d.generate", "model3d.rig"];
 
 /// The queue a method's jobs wait in: its prefix, but video.upscale runs on the image servers (an upscaler there) and
 /// so waits with the image jobs (image.status / image.cancel read it)

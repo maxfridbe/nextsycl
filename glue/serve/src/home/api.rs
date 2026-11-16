@@ -968,6 +968,21 @@ impl Home {
                 body["model"] = json!(id);
                 relay(&t, "POST", "/v1/audio/transcriptions", Some(&body), 7200)
             }
+            ("audio", "edit") => {
+                // a speech model that edits (its card's speech: edit): the one named, else the first enabled
+                let id = match b["model"].as_str().filter(|x| !x.is_empty()) {
+                    Some(x) => x.to_string(),
+                    None => all.iter().find(|m| registry::kind_of(m) == "audio" && m["enabled"] != false
+                                 && m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == "edit"))).map(|m| s(m, "id"))
+                        .ok_or_else(|| (400u16, "audio.edit: no enabled speech model edits speech (zonos3-mini does)".to_string()))?,
+                };
+                let job = b["request_id"].as_str();
+                let t = self.ensure_for(&id, job)?;
+                self.sent(job);
+                let mut body = b.clone();
+                body["model"] = json!(id);
+                relay(&t, "POST", "/v1/audio/edit", Some(&body), 3600)
+            }
             ("audio", "generate" | "speak") => {
                 let mut b = b.clone();
                 if m.name == "speak" {
@@ -1241,6 +1256,7 @@ impl Home {
             "image.ocr" => ("image", &[("images", true)]),
             "audio.speak" => ("audio", &[("ref_audio", false), ("ref_audios", true)]),
             "audio.transcribe" => ("audio", &[("audio", false)]),
+            "audio.edit" => ("audio", &[("audio", false)]),
             "audio.generate" => ("audio", &[("audio", false)]),
             "audio.voices.add" => ("audio", &[("sample", false)]),
             "model3d.generate" => ("model3d", &[("image", false), ("images", true)]),

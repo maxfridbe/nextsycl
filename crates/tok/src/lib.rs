@@ -95,6 +95,16 @@ impl Tokenizer {
         Self::from_hf_json_text(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
+    /// A tokenizer.json whose Split pre-tokenizer ("Isolated") does not cover the text: the stretches between its
+    /// matches are pieces too, as tokenizers' Split keeps them (SuperBPE's: digits, punctuation runs and lone spaces
+    /// split off, the words with their spaces left whole for the superword merges - ZONOS3's text tokenizer)
+    pub fn from_hf_json_text_keep_gaps(text: &str) -> Result<Tokenizer, String> {
+        let mut t = Self::from_hf_json_text(text)?;
+        let all = Regex::new("(?s).+").map_err(|e| e.to_string())?;
+        t.pre = vec![std::mem::replace(&mut t.split, all)];
+        Ok(t)
+    }
+
     /// The same from the file's text (a model that carries its tokenizer.json inside another file: Ming-Image's GGUF)
     pub fn from_hf_json_text(text: &str) -> Result<Tokenizer, String> {
         let path = std::path::Path::new("tokenizer.json");
@@ -1547,4 +1557,24 @@ mod hf_json_tests {
         assert_eq!(t.eos, Some(2));
     }
 
+}
+
+
+#[cfg(test)]
+mod keep_gaps_tests {
+    use super::*;
+
+    /// SuperBPE's Split (ZONOS3's tokenizer): the text between the pattern's matches is a piece too
+    #[test]
+    fn superbpe_keeps_the_text_between_its_split_matches() {
+        let j = r#"{"model": {"type": "BPE", "vocab": {"1": 0, "2": 1, "a": 2, "b": 3, "Ġ": 4, "Ġa": 5, "Ġab": 6, "12": 7},
+                    "merges": [["Ġ", "a"], ["Ġa", "b"], ["1", "2"]]}, "added_tokens": [],
+                    "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+                        {"type": "Split", "pattern": {"Regex": "\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]{2,}[\\r\\n/]*| +(?!\\S)"}, "behavior": "Isolated"},
+                        {"type": "ByteLevel", "add_prefix_space": false, "use_regex": false}]}}"#;
+        let t = Tokenizer::from_hf_json_text_keep_gaps(j).unwrap();
+        assert_eq!(t.encode_ordinary("12 ab"), vec![7, 6]);
+        // the matches alone: what the plain constructor reads
+        assert_eq!(Tokenizer::from_hf_json_text(j).unwrap().encode_ordinary("12 ab"), vec![7]);
+    }
 }

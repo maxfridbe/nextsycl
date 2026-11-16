@@ -304,6 +304,11 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
                 c.push("multi_speaker");
             }
             let mut methods = vec!["audio.speak"];
+            // its words changed in a recording, the rest kept (speech editing: ZONOS3-Mini)
+            if speech("edit") {
+                c.push("speech_edit");
+                methods.push("audio.edit");
+            }
             if speech("design") {
                 methods.push("audio.voices.design");
             }
@@ -1671,6 +1676,14 @@ mod tests {
         let want = (42.5 * 1024.0) as u64 + RAM_MARGIN_MB;
         assert!(host_free_mb(16400, 12700) < want);
         assert_eq!(room::plan_room(3700, want, vec![chat_holder(43520 + 12700)]).map(|p| p.len()), Some(1));
+    }
+
+    #[test]
+    fn a_speech_model_whose_card_says_edit_edits() {
+        let (caps, methods) = capabilities(&json!({"id": "zonos3-mini", "kind": "audio", "arch": "zonos3", "speech": ["voices", "clone", "edit"]}));
+        assert!(caps.contains(&"speech_edit") && methods.contains(&"audio.edit") && methods.contains(&"audio.speak"));
+        let (caps, methods) = capabilities(&json!({"id": "voxcpm2", "kind": "audio", "arch": "voxcpm2", "speech": ["clone"]}));
+        assert!(!caps.contains(&"speech_edit") && !methods.contains(&"audio.edit"));
     }
 
     #[test]

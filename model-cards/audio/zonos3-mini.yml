@@ -1,0 +1,691 @@
+# ZONOS3-Mini (Zyphra: multilingual speech at 44.1 kHz in preset voices or a voice cloned from a recording; steering)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets.
+# The files are Zyphra's own GGUF conversions (Zyphra/ZONOS3-Mini, gguf/, pinned at d2d142a8): the backbone (Q4_0
+# experts, Q8_0 mixers, the tokenizer, condition tables and the codec's silence frame inside; the edit build: the release
+# LM with the phoneme, start and pause rows and speech editing's vocabulary - on plain text the release LM bit for bit), the ZAC codec's MR-iSTFT
+# decoders (keep2_plain, the default; full_mr, loaded on the first request that names it), the MECT-B2 speaker
+# encoder, the reference encoder and its Wav2Vec2-BERT teacher (raw-reference cloning: a recording's own codes, loaded
+# for the encode and freed after it), speech editing's adapter (edit/accents.gguf: the edit LoRA) and Zyphra's FuseAlign
+# aligner (Zyphra/fusealign, Apache-2.0: word timings; loaded for an edit), LACI's alignment heads (laci/, a language a file: LACI and short texts), the steering
+# bundle, and the 27 preset voices' codes (.codes.npy: the reference prefix, the model's default)
+# and speaker embeddings (.embedding.npy). Apache-2.0 (the weights; the runtime this port follows is MIT).
+id: zonos3-mini
+kind: audio
+arch: zonos3
+title: 'ZONOS3-Mini (speech in 43 languages at 44.1 kHz: 27 preset voices, a voice cloned from a recording, steering of pace and emotion)'
+about: 'Zyphra''s ZONOS3-Mini in Rust and SYCL: an 11-layer backbone of 1024 (gated DeltaNet mixers with a global-attention layer in four, Full AttnRes instead of the residual stream, a top-2-of-64 latent MoE) reads SuperBPE text after a voice and writes ten 4096-code books at 15 Hz; the ZAC codec''s MR-iSTFT decoder makes 44.1 kHz. Voices: a preset (voice: savannah, rupert, ...; its shipped codes as a reference prefix, or option speaker-mode embedding), or a recording (ref_audio, a saved voice) cloned by the MECT-B2 speaker encoder''s embedding, or with option speaker-mode reference by its own codes (raw-reference cloning: the reference encoder, 6.3 GiB more for about 6 s on a B70, then freed). options: controls (steering: delivery.tempo, emotions.*, mood.*, delivery.whisper ...), speaking-rate, decoder full, temperature; cfg is speaker guidance (1: off)'
+license: apache-2.0
+commercial: true
+gpus: '0'
+vram_gib: 2.5                    # measured 2026-11-16 on the B70 and B65: 1.81 GiB loaded (backbone 0.8, keep2 decoder 0.7, edit adapter 0.25,
+                                 # speaker encoder), 2.2 GiB at the peak of a 54 s take
+headroom_gib: 1.0                # a long take's decoder activations; raw-reference cloning and edits load the reference encoder (+6.3 GiB at the
+                                 # peak, 8.1 GiB in all, freed after), decoder full 4 GiB more on first use
+speech:
+- voices
+- clone
+- edit
+voices: [savannah, wyatt, rupert, imogen, cillian, jett, morgana, sakura, thaddeus, willow, gaspard, liesel, wolfgang, ananya, arjun, ginevra, lorenzo, minjun, seoyeon, haoran, meilin, leonor, thiago, rodrigo, ximena, chaitanya, sravya, none]   # the presets (voice-<name> files below); none: no voice (unconditioned)
+annotations_note: 'Any other bracketed text (`(laugh)`, `[laugh]`, `<laugh/>`) is not a tag: ZONOS3-Mini has no trained non-verbal tags (Zyphra: angle-bracket strings are ordinary text). Numbers, money, dates, times and units are said as words by Zyphra''s normalizer in the request''s language (option normalize off: as written).'
+annotations:
+- syntax: '[pause] [pause 0.25|0.5|1|2]'
+  keep: '\[pause(?: [0-9.]+s?)?\]'
+  does: 'a pause after a word (the nearest of the model''s four trained buckets, nominally 0.25 / 0.5 / 1 / 2 s); the model shortens long ones'
+  tested: 'verified 2026-11-15: "One.[pause 2] Two.[pause 2] Three, and four." in Rupert''s embedding, 8 seeds: the two longest pauses 0.53 s on average (0.30 s unmarked); Zyphra''s runtime, same text, voice and seeds: 0.52 s (0.28 s unmarked) - the model says a 2 s pause marker as about half a second, in both; never read aloud. nextsycl 2026-11-16 (B70, through the audio server): 0.55 s marked, 0.30 s unmarked over the same 8 seeds; Whisper heard "One, two, three and four."'
+- syntax: '[start]'
+  keep: '\[start\]'
+  does: 'first in the text, once: speech from the first frame (no lead-in silence)'
+  tested: 'verified 2026-11-15: becomes the start token, ids identical to Zyphra''s runtime (nextsycl 2026-11-16 too, with no silence prefill after it, as Zyphra''s server); audible onset not measured'
+- syntax: '[ipa təmɑːtoʊ]'
+  keep: '\[ipa [^\]]*\]'
+  does: 'a word said as the IPA written (the model''s 136 phone symbols; stress marks and syllable dots dropped)'
+  tested: 'verified 2026-11-15: token ids identical to Zyphra''s runtime; Whisper heard "tomato" where written - the vowel itself not measured. nextsycl 2026-11-16: ids identical to Zyphra''s runtime; "I would like a [ipa təmɑːtoʊ], please." in Rupert''s embedding, seeds 1-4: Whisper heard "tomato" once ("liken Matto", "a no, toe", "to motto" the others)'
+- syntax: '[steer ID=DOSE, ...]words[/steer]'
+  keep: '\[steer [^\]]*\]|\[/steer\]'
+  does: 'hidden-space steering over these words alone, ramped in and out over 0.2 s: emotions.* (happy, sad, angry ...), mood.valence / arousal / ..., delivery.whisper / loud / tempo / conversational, expressive.expressive, disfluency.disfluent, emphasis_nv_nodur.emphasis (doses about -4..4)'
+  tested: 'verified 2026-11-15: [steer delivery.whisper=4] over a clause dropped its voicing (autocorrelation 0.22-0.35 against 0.72-0.77 unsteered) and it came back after the span; nextsycl 2026-11-16: kept through the audio server and never read aloud (Whisper heard the words alone), the voicing not measured'
+- syntax: '(laugh) [laugh] <laugh/>'
+  does: 'nothing trained: (laugh) is read aloud; [laugh] and <laugh/> were dropped on the take tested at the engine - through the audio server''s speech text pass the brackets become pauses and the word is read, and <laugh/> is said as "less than laugh slash greater than"'
+  tested: 'verified 2026-11-15: Whisper heard "Loth" for (laugh) and no word for [laugh] or <laugh/>; nextsycl 2026-11-16 through the audio server: "Well, laugh, that is funny. Laugh, indeed, less than laugh slash greater than, isn''t it?"'
+defaults:
+  seconds: 60.0
+  cfg: 1.0
+env: {}
+files:
+  model:
+    key: zonos3-backbone-ptq-edit
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/backbone-ptq-edit.gguf
+    size: 663491840
+    sha256: 7e23d261e2cef3cbbbaa33f43fbe683acb393a157ac672f2de04858aef21011f
+    path: zonos3-mini/backbone-ptq-edit.gguf
+  decoder:
+    key: zonos3-zac-keep2
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/zac-keep2.gguf
+    size: 452325440
+    sha256: 834e5b70b88294afc3c702a478487e0664dcc6b574c16fc6167d72444aabeafd
+    path: zonos3-mini/zac-keep2.gguf
+  decoder-full:
+    key: zonos3-zac-full
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/zac.gguf
+    size: 2199903264
+    sha256: 9dc8e29cb681dae320bd77329c0f7a39806ad5de6c231ad111adab1a1f6774d8
+    path: zonos3-mini/zac.gguf
+  speaker-encoder:
+    key: zonos3-spk-encoder
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/spk-encoder.gguf
+    size: 45385728
+    sha256: 9539f340b70be246005403b9c254732e180e85e0b3c57fb1973f0d6bc6c59bdc
+    path: zonos3-mini/spk-encoder.gguf
+  edit-adapter:
+    key: zonos3-edit-adapter
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/edit/accents.gguf
+    size: 256592064
+    sha256: ac77fc95e91a6b0c28135f27ee3e4fef1411b8ac3dba969e06f99ce9f84e7376
+    path: zonos3-mini/edit/accents.gguf
+  aligner:
+    key: zonos3-fusealign
+    url: https://huggingface.co/Zyphra/fusealign/resolve/a4d58de4f0c6aff1e00f36e27bc58c901a39c359/fusealign-multilingual-ns4-step60000-f32.gguf
+    size: 1345210432
+    sha256: 4c68ca23fed8dac1ca2eed49ddd3d68e796123aac9fe19da3feb39c5988587b9
+    path: zonos3-mini/fusealign-multilingual-ns4-step60000-f32.gguf
+  zac-encoder:
+    key: zonos3-zac-encoder
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/zac-encoder.gguf
+    size: 4034646368
+    sha256: 4c4335196486fd24cc56b24a40ac4548f8cc58a6400bce8e4af4e72160b18053
+    path: zonos3-mini/zac-encoder.gguf
+  ssl-teacher:
+    key: zonos3-ssl-teacher
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/ssl-teacher.gguf
+    size: 1548700000
+    sha256: 59e4f150e1ccdf54e6349b06605c2274f2262139678688025b6614f1393e415a
+    path: zonos3-mini/ssl-teacher.gguf
+  laci-zonos3_mini_heads:
+    key: zonos3-laci-heads
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads.json
+    size: 7495
+    sha256: 407e47472224c603b9c3a969e7175f35b637e0c1995eb606d5128ec1b2e88528
+    path: zonos3-mini/laci/zonos3_mini_heads.json
+  laci-zonos3_mini_heads_ar:
+    key: zonos3-laci-heads-ar
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_ar.json
+    size: 7661
+    sha256: e8d283a8eb0647015e26e2c6d49d2ec6fa2bd9941e5390e7b30396ca5e035ed6
+    path: zonos3-mini/laci/zonos3_mini_heads_ar.json
+  laci-zonos3_mini_heads_bg:
+    key: zonos3-laci-heads-bg
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_bg.json
+    size: 7608
+    sha256: 1c4820a421ab318cd62ecc49e52ea4ec9aff520fe510ab54e31a654e394f6828
+    path: zonos3-mini/laci/zonos3_mini_heads_bg.json
+  laci-zonos3_mini_heads_bn:
+    key: zonos3-laci-heads-bn
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_bn.json
+    size: 7654
+    sha256: 9b49a48f9b7bfaf8857ee759736b786f3940c1890c394a4cdbe679e1f522e45e
+    path: zonos3-mini/laci/zonos3_mini_heads_bn.json
+  laci-zonos3_mini_heads_cs:
+    key: zonos3-laci-heads-cs
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_cs.json
+    size: 7571
+    sha256: 97ce6b22613053a17463deccbcd4943c1450c4f73210b09e93eec7679683eff1
+    path: zonos3-mini/laci/zonos3_mini_heads_cs.json
+  laci-zonos3_mini_heads_da:
+    key: zonos3-laci-heads-da
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_da.json
+    size: 7616
+    sha256: bc1971f6054b465b939141bb06d0d07682501e74652fa0023d3f0a2db0c70146
+    path: zonos3-mini/laci/zonos3_mini_heads_da.json
+  laci-zonos3_mini_heads_de:
+    key: zonos3-laci-heads-de
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_de.json
+    size: 7539
+    sha256: 5029f11f7a75c02f68229f87f774e0440dc7bc98c091e8086828a1645d200645
+    path: zonos3-mini/laci/zonos3_mini_heads_de.json
+  laci-zonos3_mini_heads_el:
+    key: zonos3-laci-heads-el
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_el.json
+    size: 7603
+    sha256: 511ccc46c94476a01a0fe3fd96ee2b7e8926b1e5852772000faa9df54e92cee7
+    path: zonos3-mini/laci/zonos3_mini_heads_el.json
+  laci-zonos3_mini_heads_es:
+    key: zonos3-laci-heads-es
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_es.json
+    size: 7571
+    sha256: 20f0e8fae411ca651ddf6ae7fcab63e6b2d94340aa5497ca541b349feeb2d754
+    path: zonos3-mini/laci/zonos3_mini_heads_es.json
+  laci-zonos3_mini_heads_fi:
+    key: zonos3-laci-heads-fi
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_fi.json
+    size: 7580
+    sha256: 7b7ece889fef904c39ca569d882746d61b105c37a348838041a72aa2164c43ef
+    path: zonos3-mini/laci/zonos3_mini_heads_fi.json
+  laci-zonos3_mini_heads_fr:
+    key: zonos3-laci-heads-fr
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_fr.json
+    size: 7571
+    sha256: 6ceacd45c4618504350532eb5c2628aec69ac8f18911256fa4378653216733d3
+    path: zonos3-mini/laci/zonos3_mini_heads_fr.json
+  laci-zonos3_mini_heads_gu:
+    key: zonos3-laci-heads-gu
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_gu.json
+    size: 7362
+    sha256: 2282bc9873b50cd86e0fe84e0d4478df0558cbfbea9f5e0683f80de6fbe1383f
+    path: zonos3-mini/laci/zonos3_mini_heads_gu.json
+  laci-zonos3_mini_heads_he:
+    key: zonos3-laci-heads-he
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_he.json
+    size: 7639
+    sha256: 4cb8baae3d74b3099a68c07e9c69dc388b5c05755ee3544bd2da0860e1ba3956
+    path: zonos3-mini/laci/zonos3_mini_heads_he.json
+  laci-zonos3_mini_heads_hi:
+    key: zonos3-laci-heads-hi
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_hi.json
+    size: 7579
+    sha256: 0ef8179db4db8e29014faaebdbab9494d33a2974cf21405a884d6269eca1630a
+    path: zonos3-mini/laci/zonos3_mini_heads_hi.json
+  laci-zonos3_mini_heads_hu:
+    key: zonos3-laci-heads-hu
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_hu.json
+    size: 7614
+    sha256: 8d42f5c087bb205a2e67509324ce999c5cdb56b26fd29685664bc8fe10dce143
+    path: zonos3-mini/laci/zonos3_mini_heads_hu.json
+  laci-zonos3_mini_heads_id:
+    key: zonos3-laci-heads-id
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_id.json
+    size: 7597
+    sha256: 0b2fe2fbc497b4f821d83488061ca32e6283ce2080975d4986e7c209a619dbad
+    path: zonos3-mini/laci/zonos3_mini_heads_id.json
+  laci-zonos3_mini_heads_it:
+    key: zonos3-laci-heads-it
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_it.json
+    size: 7557
+    sha256: bd1ab97819057fd0b7c1cb6577a646118b42e1ba7568dff4ee379e925a74e2e7
+    path: zonos3-mini/laci/zonos3_mini_heads_it.json
+  laci-zonos3_mini_heads_ja:
+    key: zonos3-laci-heads-ja
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_ja.json
+    size: 7584
+    sha256: 1da810b373a7ddc591ffc654de363d8024821a407665083748c3eef5bf3e233a
+    path: zonos3-mini/laci/zonos3_mini_heads_ja.json
+  laci-zonos3_mini_heads_ka:
+    key: zonos3-laci-heads-ka
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_ka.json
+    size: 7568
+    sha256: 854646c45094c81f5ff1cd7719a6eba1e13d45ed05676b3b4d2fe68ce14649cf
+    path: zonos3-mini/laci/zonos3_mini_heads_ka.json
+  laci-zonos3_mini_heads_kn:
+    key: zonos3-laci-heads-kn
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_kn.json
+    size: 7698
+    sha256: 0a0cf44eab3ebd28266e91750b32383d1e0ac5aa7a87a1e3d812145530b74307
+    path: zonos3-mini/laci/zonos3_mini_heads_kn.json
+  laci-zonos3_mini_heads_ko:
+    key: zonos3-laci-heads-ko
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_ko.json
+    size: 7566
+    sha256: b5ef1551a418333ddc37a74078a825da718ac6434400a46efa98f5e5472c9fb9
+    path: zonos3-mini/laci/zonos3_mini_heads_ko.json
+  laci-zonos3_mini_heads_ml:
+    key: zonos3-laci-heads-ml
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_ml.json
+    size: 7639
+    sha256: 99d02ad7afeebe8f08b51ad2b6cde84c2a689c49c5644aab1693ff4937a1b66f
+    path: zonos3-mini/laci/zonos3_mini_heads_ml.json
+  laci-zonos3_mini_heads_mr:
+    key: zonos3-laci-heads-mr
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_mr.json
+    size: 7591
+    sha256: 94d5414ef4c5a76a37b9bce02045e08b5f9a75bffca8379e9411301fcece8a27
+    path: zonos3-mini/laci/zonos3_mini_heads_mr.json
+  laci-zonos3_mini_heads_ms:
+    key: zonos3-laci-heads-ms
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_ms.json
+    size: 7564
+    sha256: 723dd6e8c6a63f7eb157c12e9676d7b8ee44de2253a32887bb64483df874a70e
+    path: zonos3-mini/laci/zonos3_mini_heads_ms.json
+  laci-zonos3_mini_heads_nl:
+    key: zonos3-laci-heads-nl
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_nl.json
+    size: 7626
+    sha256: 5a28c72337284768512d274052e76e06a2b804447fcb0b7840740bbf77b631fe
+    path: zonos3-mini/laci/zonos3_mini_heads_nl.json
+  laci-zonos3_mini_heads_no:
+    key: zonos3-laci-heads-no
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_no.json
+    size: 7566
+    sha256: 2ce69edde434697ce97e10e4b7c65fbc90bd1d075533dbd1abd27e99d1774a6f
+    path: zonos3-mini/laci/zonos3_mini_heads_no.json
+  laci-zonos3_mini_heads_or:
+    key: zonos3-laci-heads-or
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_or.json
+    size: 7434
+    sha256: ce438e2cdcfa6e21ee9cddddeb03ea3fae519e8c81ed5a6b485ac03c356490b5
+    path: zonos3-mini/laci/zonos3_mini_heads_or.json
+  laci-zonos3_mini_heads_pa:
+    key: zonos3-laci-heads-pa
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_pa.json
+    size: 7582
+    sha256: 06ab88201f37b55b5f8ec87fcf9f28e002fc2ca3d983e5257bc2359d3aba531a
+    path: zonos3-mini/laci/zonos3_mini_heads_pa.json
+  laci-zonos3_mini_heads_pl:
+    key: zonos3-laci-heads-pl
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_pl.json
+    size: 7569
+    sha256: 627b2d45c108d7be9afe0d603c24bdff69504145b750b1e3ef06065bad940e45
+    path: zonos3-mini/laci/zonos3_mini_heads_pl.json
+  laci-zonos3_mini_heads_pt:
+    key: zonos3-laci-heads-pt
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_pt.json
+    size: 7557
+    sha256: cd675f1943ef3b06ee4d33a9c8fc55c0b3d0b41aedcf538889c89965b75036fb
+    path: zonos3-mini/laci/zonos3_mini_heads_pt.json
+  laci-zonos3_mini_heads_ro:
+    key: zonos3-laci-heads-ro
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_ro.json
+    size: 7574
+    sha256: f42815de5929d821cbba40497e97d9cae284791b0651445d825f67e15f1205c9
+    path: zonos3-mini/laci/zonos3_mini_heads_ro.json
+  laci-zonos3_mini_heads_ru:
+    key: zonos3-laci-heads-ru
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_ru.json
+    size: 7573
+    sha256: 63be82dca8a36445affdfd6483f31b5f4d3c0770a37b98cb791857a91d7fea3c
+    path: zonos3-mini/laci/zonos3_mini_heads_ru.json
+  laci-zonos3_mini_heads_sk:
+    key: zonos3-laci-heads-sk
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_sk.json
+    size: 7578
+    sha256: a9323f447a98d91af68d1f5d69f703f833f14f23467ddfe122ff052761127422
+    path: zonos3-mini/laci/zonos3_mini_heads_sk.json
+  laci-zonos3_mini_heads_sv:
+    key: zonos3-laci-heads-sv
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_sv.json
+    size: 7584
+    sha256: b710183a79178c6aa2ebe2699ec5947f6e1308d21107c166caf161f98c59af3b
+    path: zonos3-mini/laci/zonos3_mini_heads_sv.json
+  laci-zonos3_mini_heads_ta:
+    key: zonos3-laci-heads-ta
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_ta.json
+    size: 7452
+    sha256: 4b441fdbfa47587b560c1e3cef388aa0842191fc15c651b81cd65e3c88a6b8e0
+    path: zonos3-mini/laci/zonos3_mini_heads_ta.json
+  laci-zonos3_mini_heads_te:
+    key: zonos3-laci-heads-te
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_te.json
+    size: 7459
+    sha256: c93da663899e460d08de7b158f765e963e231137369c2f7458240aaf3b4a2acf
+    path: zonos3-mini/laci/zonos3_mini_heads_te.json
+  laci-zonos3_mini_heads_th:
+    key: zonos3-laci-heads-th
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_th.json
+    size: 7630
+    sha256: b882630f4dfd28a1f610b99a9cdc3f8b22ce3abaa1b6b84d273149e32bbc0c92
+    path: zonos3-mini/laci/zonos3_mini_heads_th.json
+  laci-zonos3_mini_heads_tl:
+    key: zonos3-laci-heads-tl
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_tl.json
+    size: 7602
+    sha256: 6e76d81cff51edff3acf96b3bc52891e7c9aa02b1b217d5c8561287bafffb381
+    path: zonos3-mini/laci/zonos3_mini_heads_tl.json
+  laci-zonos3_mini_heads_tr:
+    key: zonos3-laci-heads-tr
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_tr.json
+    size: 7679
+    sha256: f48baeea20cdb4bb84b84175a00a8a2307fcb4c5e0978bbb77aa7c856ed7a22e
+    path: zonos3-mini/laci/zonos3_mini_heads_tr.json
+  laci-zonos3_mini_heads_uk:
+    key: zonos3-laci-heads-uk
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_uk.json
+    size: 7631
+    sha256: f5f6c66f31281e287b21b45cf6b4ab722349e8299c48ed1c0396135edb44c6cc
+    path: zonos3-mini/laci/zonos3_mini_heads_uk.json
+  laci-zonos3_mini_heads_ur:
+    key: zonos3-laci-heads-ur
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_ur.json
+    size: 7628
+    sha256: bc2c557897ceafcfa8494f8321fa87c22b4b1ce5ae14b2407a91d843a3ffae32
+    path: zonos3-mini/laci/zonos3_mini_heads_ur.json
+  laci-zonos3_mini_heads_vi:
+    key: zonos3-laci-heads-vi
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_vi.json
+    size: 7644
+    sha256: 0ed6768e0fa3aa1a5c444319dbbe813137d0a4083bc0c1dc53bedb06b9635030
+    path: zonos3-mini/laci/zonos3_mini_heads_vi.json
+  laci-zonos3_mini_heads_zh:
+    key: zonos3-laci-heads-zh
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/web/laci/zonos3_mini_heads_zh.json
+    size: 7558
+    sha256: e8ef4f98d7738ca3a5768a125cad4a7362297580f9fcc46581c3eb025fd9273f
+    path: zonos3-mini/laci/zonos3_mini_heads_zh.json
+  steer:
+    key: zonos3-steer
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/steer.gguf
+    size: 204960
+    sha256: 6e8e3f86e89a09801ce083b9286f43263ec696acfaff72e25aca537aa9efa90c
+    path: zonos3-mini/steer.gguf
+  voice-cillian:
+    key: zonos3-voice-cillian-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Cillian_en-Irish_M_1.codes.npy
+    size: 5928
+    sha256: dadae1124c63cda7a0627fd282d54aa255a8800155eae1b9da54b08b345c2f10
+    path: zonos3-mini/voices/English/Cillian_en-Irish_M_1.codes.npy
+  voice-cillian-emb:
+    key: zonos3-voice-cillian-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Cillian_en-Irish_M_1.embedding.npy
+    size: 896
+    sha256: f3125fae2f679fb5c8128d308ddd02986fd7d914975d17cc6dadf9eb130b1061
+    path: zonos3-mini/voices/English/Cillian_en-Irish_M_1.embedding.npy
+  voice-imogen:
+    key: zonos3-voice-imogen-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Imogen_en-British_F_1.codes.npy
+    size: 7728
+    sha256: c906f6c405c9078607fe9c54cf1b71ef0e112839490499e34bf8791ed1ad7e86
+    path: zonos3-mini/voices/English/Imogen_en-British_F_1.codes.npy
+  voice-imogen-emb:
+    key: zonos3-voice-imogen-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Imogen_en-British_F_1.embedding.npy
+    size: 896
+    sha256: 683424b91faeade48c8a92e05e1c3679366abbba443ef62eccba8dc40de48e9e
+    path: zonos3-mini/voices/English/Imogen_en-British_F_1.embedding.npy
+  voice-jett:
+    key: zonos3-voice-jett-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Jett_en-energetic_M_1.codes.npy
+    size: 6608
+    sha256: 8f32e946509673ae422c37cc9b79957cb569f212360745f9110d343f6f1f9f2c
+    path: zonos3-mini/voices/English/Jett_en-energetic_M_1.codes.npy
+  voice-jett-emb:
+    key: zonos3-voice-jett-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Jett_en-energetic_M_1.embedding.npy
+    size: 896
+    sha256: 624b749d220dac7fdcda479b1964cb8f7de58c838c1357f2f0161dac06e34f48
+    path: zonos3-mini/voices/English/Jett_en-energetic_M_1.embedding.npy
+  voice-morgana:
+    key: zonos3-voice-morgana-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Morgana_en-witch_F_1.codes.npy
+    size: 12448
+    sha256: 2f60227a9f7cdc6ce696548f4c28c199d3f5afeadf7317a1bde132575a1ed731
+    path: zonos3-mini/voices/English/Morgana_en-witch_F_1.codes.npy
+  voice-morgana-emb:
+    key: zonos3-voice-morgana-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Morgana_en-witch_F_1.embedding.npy
+    size: 896
+    sha256: a817387697c43138639aa1e52a9e42d9f3a629655e0faea5ac8565eb8e57c091
+    path: zonos3-mini/voices/English/Morgana_en-witch_F_1.embedding.npy
+  voice-rupert:
+    key: zonos3-voice-rupert-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Rupert_en-British_M_1.codes.npy
+    size: 8048
+    sha256: abf42171c7402fea5888ec350a50b64fd78777e44d7caf665c04e4e2b629fc79
+    path: zonos3-mini/voices/English/Rupert_en-British_M_1.codes.npy
+  voice-rupert-emb:
+    key: zonos3-voice-rupert-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Rupert_en-British_M_1.embedding.npy
+    size: 896
+    sha256: 0c68e699376dbafdc1ab0fadc133f48e7df9cb33b3a7b80b05f42c5c0aad8fa7
+    path: zonos3-mini/voices/English/Rupert_en-British_M_1.embedding.npy
+  voice-sakura:
+    key: zonos3-voice-sakura-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Sakura_en-anime_F_1.codes.npy
+    size: 9168
+    sha256: 4b8c8288b45e1a3ff5aa3adc05a4af386f5889e9ab47902ff36f9daa8900ded2
+    path: zonos3-mini/voices/English/Sakura_en-anime_F_1.codes.npy
+  voice-sakura-emb:
+    key: zonos3-voice-sakura-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Sakura_en-anime_F_1.embedding.npy
+    size: 896
+    sha256: daf3e82d2e6f2ce2fe90c73473a312a721295ae7f85763f99c87ee2f861063a9
+    path: zonos3-mini/voices/English/Sakura_en-anime_F_1.embedding.npy
+  voice-savannah:
+    key: zonos3-voice-savannah-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Savannah_en-American_F_1.codes.npy
+    size: 6968
+    sha256: f6e450fea8fa521c6be32b64fc61f48d6f9fd8301fe5759abd2315ce6ac946fb
+    path: zonos3-mini/voices/English/Savannah_en-American_F_1.codes.npy
+  voice-savannah-emb:
+    key: zonos3-voice-savannah-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Savannah_en-American_F_1.embedding.npy
+    size: 896
+    sha256: dd81587e66f96fb62da47ef13d5d867de464ca386a83f01b4403cdd19629ca6c
+    path: zonos3-mini/voices/English/Savannah_en-American_F_1.embedding.npy
+  voice-thaddeus:
+    key: zonos3-voice-thaddeus-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Thaddeus_en-announcervoice_M_1.codes.npy
+    size: 9368
+    sha256: 5c76de5bf16fd10282fced313c6c00a03fa2150b1df4c2382e19c6cbad65f179
+    path: zonos3-mini/voices/English/Thaddeus_en-announcervoice_M_1.codes.npy
+  voice-thaddeus-emb:
+    key: zonos3-voice-thaddeus-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Thaddeus_en-announcervoice_M_1.embedding.npy
+    size: 896
+    sha256: fc8e21356730988aa20da70123991404345e0bdbfe3afe31e6371d8d93095461
+    path: zonos3-mini/voices/English/Thaddeus_en-announcervoice_M_1.embedding.npy
+  voice-willow:
+    key: zonos3-voice-willow-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Willow_en-asrm_F_1.codes.npy
+    size: 15048
+    sha256: 29ca4c14c16bb09b2bc48bb93f2d5a56327558d64271e54ebd1f713a4204905b
+    path: zonos3-mini/voices/English/Willow_en-asrm_F_1.codes.npy
+  voice-willow-emb:
+    key: zonos3-voice-willow-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Willow_en-asrm_F_1.embedding.npy
+    size: 896
+    sha256: 6ebb84309f21f1dcbe6371e2355dc98f8ee3d0aee5850c305d06a73fe0a7c222
+    path: zonos3-mini/voices/English/Willow_en-asrm_F_1.embedding.npy
+  voice-wyatt:
+    key: zonos3-voice-wyatt-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Wyatt_en-American_M_1.codes.npy
+    size: 10248
+    sha256: 7a854f9b66eefa9203a9f752c2a1ec808345b4d72ac34f8547ee776c58e4b72f
+    path: zonos3-mini/voices/English/Wyatt_en-American_M_1.codes.npy
+  voice-wyatt-emb:
+    key: zonos3-voice-wyatt-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/English/Wyatt_en-American_M_1.embedding.npy
+    size: 896
+    sha256: b39d377b653ebaca6bbd4ecd13c382fe16d81f0cfae27217d9b626e5589a0511
+    path: zonos3-mini/voices/English/Wyatt_en-American_M_1.embedding.npy
+  voice-gaspard:
+    key: zonos3-voice-gaspard-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/French/Gaspard_fr_M_1.codes.npy
+    size: 11488
+    sha256: 34293ea302d3a47c17ab2f8514fb3a3354dc4ad695581d9b2f93fb37476ee1f7
+    path: zonos3-mini/voices/French/Gaspard_fr_M_1.codes.npy
+  voice-gaspard-emb:
+    key: zonos3-voice-gaspard-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/French/Gaspard_fr_M_1.embedding.npy
+    size: 896
+    sha256: 6e19a9a545af6a263c00b997368d8396ff8abc761b53dce2a6d4df735f0766e9
+    path: zonos3-mini/voices/French/Gaspard_fr_M_1.embedding.npy
+  voice-liesel:
+    key: zonos3-voice-liesel-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/German/Liesel_de_F_1.codes.npy
+    size: 6928
+    sha256: 6952aa3383e1181610b3b88115ff2fa20a2a2da0686c9b19f2cf0f57f96ab92e
+    path: zonos3-mini/voices/German/Liesel_de_F_1.codes.npy
+  voice-liesel-emb:
+    key: zonos3-voice-liesel-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/German/Liesel_de_F_1.embedding.npy
+    size: 896
+    sha256: 2d44e40f8c1f43fcabaabf301e14bfc48325bf4596cb04e076d662d8b2724c5d
+    path: zonos3-mini/voices/German/Liesel_de_F_1.embedding.npy
+  voice-wolfgang:
+    key: zonos3-voice-wolfgang-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/German/Wolfgang_de_M_1.codes.npy
+    size: 7488
+    sha256: 553a4dd74cc650ea333c49033f5b459e1faa7244cfa4185862cce1a223fe41e1
+    path: zonos3-mini/voices/German/Wolfgang_de_M_1.codes.npy
+  voice-wolfgang-emb:
+    key: zonos3-voice-wolfgang-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/German/Wolfgang_de_M_1.embedding.npy
+    size: 896
+    sha256: 3a0e305b2789f79b843d96628b275b5d8f3f877f89c80e87fe57bf6078901467
+    path: zonos3-mini/voices/German/Wolfgang_de_M_1.embedding.npy
+  voice-ananya:
+    key: zonos3-voice-ananya-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Hindi/Ananya_hi_F_1.codes.npy
+    size: 7768
+    sha256: 85288fd646bb836b2424faad617d13f311c4ce129a48d7f9577bbfe29df9aa5b
+    path: zonos3-mini/voices/Hindi/Ananya_hi_F_1.codes.npy
+  voice-ananya-emb:
+    key: zonos3-voice-ananya-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Hindi/Ananya_hi_F_1.embedding.npy
+    size: 896
+    sha256: f7acf756273d86131de701d51b25a7e0b3323d724b7e98a0c890fcf176f85a14
+    path: zonos3-mini/voices/Hindi/Ananya_hi_F_1.embedding.npy
+  voice-arjun:
+    key: zonos3-voice-arjun-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Hindi/Arjun_hi_M_1.codes.npy
+    size: 7128
+    sha256: dec52799002595008cf710381b5eb5f2acf0edd82fb28636c1bbef4aba9df618
+    path: zonos3-mini/voices/Hindi/Arjun_hi_M_1.codes.npy
+  voice-arjun-emb:
+    key: zonos3-voice-arjun-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Hindi/Arjun_hi_M_1.embedding.npy
+    size: 896
+    sha256: 9cb0eb4cc81b79acadedb173e1fbbc0203bf71ea9ae66e56bd76393386f25815
+    path: zonos3-mini/voices/Hindi/Arjun_hi_M_1.embedding.npy
+  voice-ginevra:
+    key: zonos3-voice-ginevra-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Italian/Ginevra_it_F_1.codes.npy
+    size: 6808
+    sha256: 91e5f1a6ccc71d55840e4277a4f00c900e01e446e956949a5651c2e5657f2d4f
+    path: zonos3-mini/voices/Italian/Ginevra_it_F_1.codes.npy
+  voice-ginevra-emb:
+    key: zonos3-voice-ginevra-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Italian/Ginevra_it_F_1.embedding.npy
+    size: 896
+    sha256: 950ecf44f57fd053effd83c65f7f35059df0dcd1bb99dbc197b6649507171621
+    path: zonos3-mini/voices/Italian/Ginevra_it_F_1.embedding.npy
+  voice-lorenzo:
+    key: zonos3-voice-lorenzo-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Italian/Lorenzo_it_M_1.codes.npy
+    size: 7488
+    sha256: e25cc35719d796ba7ace4a0ec563d159cfe31e978f78098b126b2a8c7f3fbc02
+    path: zonos3-mini/voices/Italian/Lorenzo_it_M_1.codes.npy
+  voice-lorenzo-emb:
+    key: zonos3-voice-lorenzo-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Italian/Lorenzo_it_M_1.embedding.npy
+    size: 896
+    sha256: a355bb33b907130985b74eae3fa05e4aa19d7fe7233f26c0416afad0726c2367
+    path: zonos3-mini/voices/Italian/Lorenzo_it_M_1.embedding.npy
+  voice-minjun:
+    key: zonos3-voice-minjun-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Korean/Minjun_ko_M_1.codes.npy
+    size: 7288
+    sha256: 2b40a0d108b5188be2fb8695eb0f28b5a6f16c4dd485fba4ab82876b46e79522
+    path: zonos3-mini/voices/Korean/Minjun_ko_M_1.codes.npy
+  voice-minjun-emb:
+    key: zonos3-voice-minjun-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Korean/Minjun_ko_M_1.embedding.npy
+    size: 896
+    sha256: ab3d9c60c3f36080fd7e9eebd20c8ece42059236dd83f19980e5e4dbca94fc4e
+    path: zonos3-mini/voices/Korean/Minjun_ko_M_1.embedding.npy
+  voice-seoyeon:
+    key: zonos3-voice-seoyeon-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Korean/Seoyeon_ko_F_1.codes.npy
+    size: 7048
+    sha256: d6ca0cb788e610d56b02824108aa7c54e115bdab1eaeca81330b1475f6de9d15
+    path: zonos3-mini/voices/Korean/Seoyeon_ko_F_1.codes.npy
+  voice-seoyeon-emb:
+    key: zonos3-voice-seoyeon-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Korean/Seoyeon_ko_F_1.embedding.npy
+    size: 896
+    sha256: dddb6aa68c3febe83ca656c959f4d78246c72e011cde72c3745d1a46a37d8345
+    path: zonos3-mini/voices/Korean/Seoyeon_ko_F_1.embedding.npy
+  voice-haoran:
+    key: zonos3-voice-haoran-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Mandarin%20Chinese/Haoran_zh-energetic_M_1.codes.npy
+    size: 6608
+    sha256: 033e6e1acb03cacf2dc9278f752c43774224747e3aa91882113422ab35dbfbb6
+    path: zonos3-mini/voices/Mandarin-Chinese/Haoran_zh-energetic_M_1.codes.npy
+  voice-haoran-emb:
+    key: zonos3-voice-haoran-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Mandarin%20Chinese/Haoran_zh-energetic_M_1.embedding.npy
+    size: 896
+    sha256: b056f91bcbf4ffda432459f8c6a80b37cdc98cd82fd296e29cf2584325809c6c
+    path: zonos3-mini/voices/Mandarin-Chinese/Haoran_zh-energetic_M_1.embedding.npy
+  voice-meilin:
+    key: zonos3-voice-meilin-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Mandarin%20Chinese/Meilin_zh-energetic_F_1.codes.npy
+    size: 6888
+    sha256: 8a3b3aef695ca75788eea98d94d8580d2147c783f427e08cf4ed2d66ecf5c4c6
+    path: zonos3-mini/voices/Mandarin-Chinese/Meilin_zh-energetic_F_1.codes.npy
+  voice-meilin-emb:
+    key: zonos3-voice-meilin-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Mandarin%20Chinese/Meilin_zh-energetic_F_1.embedding.npy
+    size: 896
+    sha256: 8430a2852291d874f327666d05bd15ee854a009cc54b9d3cdba9005d6bc7f59b
+    path: zonos3-mini/voices/Mandarin-Chinese/Meilin_zh-energetic_F_1.embedding.npy
+  voice-leonor:
+    key: zonos3-voice-leonor-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Portuguese/Leonor_pt_F_1.codes.npy
+    size: 7448
+    sha256: 56f4c8d2d6f856305e250966710fa7669244ef1d86ffd82659ade969755c7f88
+    path: zonos3-mini/voices/Portuguese/Leonor_pt_F_1.codes.npy
+  voice-leonor-emb:
+    key: zonos3-voice-leonor-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Portuguese/Leonor_pt_F_1.embedding.npy
+    size: 896
+    sha256: c4074805d713ac20444253f1b98f814b7f27c43b6ab29bb2f0feeaaae8f7e4b2
+    path: zonos3-mini/voices/Portuguese/Leonor_pt_F_1.embedding.npy
+  voice-thiago:
+    key: zonos3-voice-thiago-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Portuguese/Thiago_pt_M_1.codes.npy
+    size: 8848
+    sha256: b63efbc88127b88ad89740eed377a0f1600c4e2ae0deb030e574f8b7b9c6c667
+    path: zonos3-mini/voices/Portuguese/Thiago_pt_M_1.codes.npy
+  voice-thiago-emb:
+    key: zonos3-voice-thiago-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Portuguese/Thiago_pt_M_1.embedding.npy
+    size: 896
+    sha256: fd1eee487091ef60636fe08cbafc15133c34a3f697629e1057e749c5b9893dc0
+    path: zonos3-mini/voices/Portuguese/Thiago_pt_M_1.embedding.npy
+  voice-rodrigo:
+    key: zonos3-voice-rodrigo-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Spanish/Rodrigo_es_M_1.codes.npy
+    size: 6408
+    sha256: 1d6ff61ab49a2f3cfeb116afa80adcc33290cd5c7d7cb4c50181f4359c52b1c0
+    path: zonos3-mini/voices/Spanish/Rodrigo_es_M_1.codes.npy
+  voice-rodrigo-emb:
+    key: zonos3-voice-rodrigo-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Spanish/Rodrigo_es_M_1.embedding.npy
+    size: 896
+    sha256: 0305b7ab40d5d4a1df07ed7aa1c164f64ede1ac4b6250fa56383b4c3ae03e1e1
+    path: zonos3-mini/voices/Spanish/Rodrigo_es_M_1.embedding.npy
+  voice-ximena:
+    key: zonos3-voice-ximena-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Spanish/Ximena_es_F_1.codes.npy
+    size: 7968
+    sha256: b571c52d7543867bb2299e0626cea9d6f6c6c9a3bffabc85570baf08897dafb9
+    path: zonos3-mini/voices/Spanish/Ximena_es_F_1.codes.npy
+  voice-ximena-emb:
+    key: zonos3-voice-ximena-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Spanish/Ximena_es_F_1.embedding.npy
+    size: 896
+    sha256: b9cc1284c52003705619b37f2c25c59e170d2c70650af39e5692b2fe91782bd6
+    path: zonos3-mini/voices/Spanish/Ximena_es_F_1.embedding.npy
+  voice-chaitanya:
+    key: zonos3-voice-chaitanya-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Telugu/Chaitanya_te_M_1.codes.npy
+    size: 6368
+    sha256: 7003a4812a759171470f3187955e1b5c27f37bd449eb4bc012d7ac8620d0e9f7
+    path: zonos3-mini/voices/Telugu/Chaitanya_te_M_1.codes.npy
+  voice-chaitanya-emb:
+    key: zonos3-voice-chaitanya-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Telugu/Chaitanya_te_M_1.embedding.npy
+    size: 896
+    sha256: ca818012cf5656d12eb3bccdfad4086831a6a892f8e7bf2277ca11bf921e5eb7
+    path: zonos3-mini/voices/Telugu/Chaitanya_te_M_1.embedding.npy
+  voice-sravya:
+    key: zonos3-voice-sravya-codes
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Telugu/Sravya_te_F_1.codes.npy
+    size: 6928
+    sha256: e938016bb413c48bb5deb0bf80515f646bd5b7374f5bfb4d616a8ba3e254f373
+    path: zonos3-mini/voices/Telugu/Sravya_te_F_1.codes.npy
+  voice-sravya-emb:
+    key: zonos3-voice-sravya-emb
+    url: https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/d2d142a86b1e6aeb4252679673c86ecd86177bf8/gguf/voices/Telugu/Sravya_te_F_1.embedding.npy
+    size: 896
+    sha256: a62e330ccfe900dbc4caac3e57d661adf284da8c967072dbe91bab154df79c0f
+    path: zonos3-mini/voices/Telugu/Sravya_te_F_1.embedding.npy
+guide: guides/zonos3.md

@@ -119,7 +119,7 @@ dist/nextsycl llm stop
 | More language-model engines: Qwen3.8-27B, Nemotron 3.5 Super | [docs/llm-engines.md](docs/llm-engines.md) |
 | Images: Qwen-Image 2.1, HunyuanImage 2.1, the image server and its page | [docs/images.md](docs/images.md) |
 | Video: MiniMax H3 as `nextsycl video`; making films | [docs/video.md](docs/video.md), [docs/video/h3.md](docs/video/h3.md) |
-| Audio: songs (Music 3) and speech (Qwen3-TTS, Breeze, VibeVoice, S2 Pro, OmniVoice, Voxtral, VoxCPM2) | [docs/audio.md](docs/audio.md) |
+| Audio: songs (Music 3) and speech (Qwen3-TTS, Breeze, VibeVoice, S2 Pro, OmniVoice, Voxtral, VoxCPM2, ZONOS3-Mini) | [docs/audio.md](docs/audio.md) |
 | 3D: meshes from pictures, rigging and animation | [docs/3d.md](docs/3d.md) |
 | Speed: every model at each context length, benchy | [docs/speed.md](docs/speed.md), [docs/benchy/](docs/benchy/) |
 | Context ladders: pp and tg by prompt length, with the machine and silo each ran on | [docs/ladders/](docs/ladders/) |

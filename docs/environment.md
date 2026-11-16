@@ -482,6 +482,9 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 | `NS_WH_CONDITION` | 0 | 1: Whisper prompts each 30 s window with the text before it (openai's condition_on_previous_text: a steadier style, but a mistake carries on); also a request's option condition (--opt-condition) | audio whisper |
 | `NS_WH_FALLBACK` | 1 | 0: a window that runs on without ending, or decodes unsure (average log-probability under -1), is kept as greedy decoding left it instead of decoded again at rising temperatures (openai's fallback); also a request's option fallback (--opt-fallback) | audio whisper |
 | `NS_WH_NO_SPEECH` | 0.6 | a window is skipped as silence when <\|nospeech\|> is likelier than this and its text unsure; also a request's option no-speech (--opt-no-speech) | audio whisper |
+| `NS_Z3_ENC_F32` | 0 | Debug: 1 runs ZONOS3's reference encoder (raw-reference cloning) in float32 instead of Zyphra's BF16 recipe - a diagnostic: the codes drift from the reference's | audio zonos3 |
+| `NS_Z3_ENC_DUMP` | - | Debug: a directory where the reference encoder writes its first lane's stages as .npy (named as zac-encoder-cli --dump names them), for reference/zonos3 | audio zonos3 |
+| `NS_Z3_EDIT_DUMP` | - | Debug: a directory where a speech edit writes its first region's prompt (ids.npy, ids.cond.json) for Zyphra's zonos3-cli | audio zonos3 |
 
 ## 3D
 

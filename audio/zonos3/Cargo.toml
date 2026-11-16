@@ -1,0 +1,18 @@
+[package]
+name = "nextsycl-audio-zonos3"
+description = "ZONOS3-Mini (Zyphra) on Intel Arc (SYCL): multilingual speech at 44.1 kHz in preset voices or a voice cloned from a recording - an 11-layer gated-DeltaNet / attention backbone with Full AttnRes and a latent MoE writing ten 4096-code books at 15 Hz, the MR-iSTFT codec decoder, the MECT-B2 speaker encoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true
+nextsycl-audio.workspace = true
+serde_json.workspace = true
+zyphra-textnorm = "0.2.0"
+
+[dev-dependencies]
+fancy-regex = "0.14"

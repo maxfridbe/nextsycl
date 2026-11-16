@@ -333,6 +333,37 @@ nextsycl audio check <reference dump dir> --model omnivoice [--stages prompt,enc
 - **Served** through the same AudioEngine path as the other speech models (`nextsycl audio serve omnivoice`,
   `/v1/audio/speech`; `:8000`'s `audio.speak` once registered); checked so far with `audio gen` and `audio check`
   only, not yet through a server.
+## ZONOS3-Mini
+
+Zyphra's ZONOS3-Mini (`audio/zonos3`, card `zonos3-mini`; Zyphra's own GGUFs, Apache-2.0): speech in 43 languages at
+44.1 kHz from an 11-layer gated-DeltaNet / attention backbone with a Q4_0 latent MoE, ten 4096-code books at 15 Hz and
+the ZAC MR-iSTFT decoder. What it does:
+
+- **voices**: 27 presets (savannah - the default -, wyatt, rupert, imogen, cillian ... `none`); a preset comes in as
+  its shipped codes (the reference prefix) or with `options.speaker-mode: embedding` as its speaker embedding.
+- **clone** (`ref_audio`, or a saved voice): by the recording's MECT-B2 speaker embedding, or with `speaker-mode:
+  reference` by its own codes (raw-reference cloning: the reference encoder and its SSL teacher, about 6.3 GiB more
+  for the encode, then freed; the codes of the last 64 recordings kept). No transcript needed.
+- **steering** (`options.controls`: `delivery.tempo=2`, `emotions.happy=4`, `delivery.whisper=3`, `identity.*` ...),
+  the condition rows (`speaking-rate`, `loudness`, `fmax`), `decoder` keep2|full, `normalize` (Zyphra's normalizer),
+  `level` (-19 dBFS of speech held through the take), `laci` (reading checked, a skip or stall said again),
+  `short-text` (a word or two said with a filler and cut).
+- **markup** in the text: `[pause]`, `[pause 0.25|0.5|1|2]`, `[start]`, `[ipa ...]`, `[steer ID=DOSE,...]words[/steer]`
+  (the card's annotations keep them through the server's speech text pass).
+- **streaming**: `/v1/audio/speech` with `stream: true` sends the sound as it is decoded, the same samples as the whole
+  take.
+- **speech editing**: `audio.edit` (`/v1/audio/edit` on the audio server): a recording of up to 30 s, its transcript
+  and the target text; the words that differ (up to three places) are said anew in its voice, the rest kept
+  (FuseAlign's word timings, the edit LoRA on the backbone).
+
+```sh
+nextsycl audio gen "Hello there. [pause 1] How are you?" --model zonos3-mini [--voice rupert] [--opt-speaker-mode embedding]
+nextsycl audio gen "Cloned." --model zonos3-mini --ref-audio r.wav [--opt-speaker-mode reference] [--opt-controls delivery.tempo=2]
+nextsycl audio check <reference dump dir> --model zonos3-mini --stages prompt,lm,forced,decoder,speaker,encoder,stream,align,edit
+```
+
+Checked against Zyphra's ggml runtime and FuseAlign's CLI on the CPU; numbers, speed and VRAM in
+[docs/ports/zonos3.md](ports/zonos3.md).
 
 ## Voxtral TTS
 

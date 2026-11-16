@@ -24,6 +24,10 @@
 //!                                 each word timed), translate (into English), prompt (text leading the first window),
 //!                                 options} -> {text, language, duration, segments [{start, end, text}], words [{start,
 //!                                 end, text, probability}], nextsycl: {took, wh}} (JSON only, no multipart form)
+//!   POST /v1/audio/edit           speech editing (an engine that edits: zonos3-mini): {audio (the recording, <= 30 s),
+//!                                 original_text, target_text, model?, seed?, language?, options?, response_format
+//!                                 (url, the default: JSON {created, data [{url ...}], regions [{original, edited,
+//!                                 old_words}], nextsycl {took, seconds, seed}} | wav)}
 //!   GET  /v1/audio/files/<f>      a song made here (saved in the output directory; byte ranges for seeking)
 //!   GET  /v1/realtime             a live conversation with a full-duplex speech model (Sophon-Realtime): the request
 //!                                 upgraded to a WebSocket of OpenAI Realtime's events (crate::realtime)
@@ -251,6 +255,19 @@ impl AudioServer {
                     Err(m) => http::respond_with(&mut s, 400, &err(m), &cors),
                 }
             }
+            ("POST", "/v1/audio/edit") | ("POST", "/audio/edit") => {
+                let body: Value = match serde_json::from_slice(&req.body) {
+                    Ok(v) => v,
+                    Err(e) => return http::respond_with(&mut s, 400, &err(format!("the body is not JSON: {e}")), &cors),
+                };
+                let base = req.host.as_deref().map(|h| format!("http://{h}")).unwrap_or_default();
+                match self.edit_speech(&body, &base) {
+                    Ok((Some(v), _)) => http::respond_with(&mut s, 200, &v, &cors),
+                    Ok((None, wav)) => http::respond_bytes(&mut s, 200, "audio/wav", &wav, &cors),
+                    Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
+                }
+                self.maybe_retire();
+            }
             ("POST", "/v1/audio/transcriptions") | ("POST", "/audio/transcriptions") => {
                 let body: Value = match serde_json::from_slice(&req.body) {
                     Ok(v) => v,
@@ -457,6 +474,84 @@ impl AudioServer {
             None => from.to_string(),
         };
         lib.add(name, &bytes, text.as_deref(), description.as_deref(), language.as_deref(), kind, &from, b["replace"] == true)
+    }
+
+    /// Speech editing (an engine that edits: zonos3-mini): the recording with the words the target changes said anew in
+    /// its voice, the rest kept - JSON with its link and the regions (response_format wav: the file's bytes)
+    fn edit_speech(&self, b: &Value, base: &str) -> Result<(Option<Value>, Vec<u8>), (u16, String)> {
+        let bad = |m: String| (400u16, m);
+        if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model) {
+            return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
+        }
+        let text = |k: &str| b[k].as_str().map(str::trim).filter(|x| !x.is_empty()).map(str::to_string);
+        let a = text("audio").ok_or_else(|| bad("audio (the recording: base64 or a data URL): required".into()))?;
+        let bytes = http::unbase64(&a).map_err(|e| bad(format!("audio: {e}")))?;
+        let (samples, rate) = nextsycl_audio::decode_audio(&bytes).map_err(|e| bad(format!("audio: {e}")))?;
+        let original = text("original_text").ok_or_else(|| bad("original_text (what the recording says): required - audio.transcribe makes one".into()))?;
+        let target = text("target_text").ok_or_else(|| bad("target_text (what it should say): required".into()))?;
+        let seed = b["seed"].as_u64().unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos() as u64 % 1_000_000).unwrap_or(7));
+        let given: nextsycl_core::options::Given = b["options"].as_object().into_iter().flatten()
+            .map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect();
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let engine = self.engine.read().unwrap_or_else(|p| p.into_inner());
+        // one edit at a time, as the engine's batch says
+        let _slot = Slot::take(&self.slots, engine.batch());
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        let Some(_running) = self.cancel.begin(b["request_id"].as_str()) else {
+            return Err((499, "cancelled".into()));
+        };
+        if !engine.edits() {
+            return Err(bad(format!("{} does not edit speech (audio.edit needs a speech model whose card says edit: zonos3-mini, with its edit adapter and aligner)",
+                                   self.model)));
+        }
+        let mut req = nextsycl_audio::EditRequest { samples, rate, original: original.clone(), target: target.clone(), language: text("language"), seed,
+                                                    extra: Default::default() };
+        if !given.is_empty() {
+            nextsycl_core::options::resolve(&given, engine.options(), nextsycl_core::At::Request, &self.model).map_err(bad)?;
+            req.extra = nextsycl_core::options::by_name(&given, engine.options());
+        }
+        let t0 = Instant::now();
+        let p = &self.progress;
+        *p.lock().unwrap() = json!({"busy": true, "prompt": target, "phase": "align", "at": 0, "of": 1, "seconds": 0});
+        let out = engine.edit(&req, &mut |st| {
+            *p.lock().unwrap() = json!({"busy": true, "prompt": target, "phase": st.phase, "at": st.at, "of": st.of, "seconds": st.seconds});
+            if self.cancel.stopping() {
+                return Err(nextsycl_core::Error("cancelled".into()));
+            }
+            Ok(())
+        });
+        *p.lock().unwrap() = json!({"busy": false});
+        drop(engine);
+        if let Err(e) = &out {
+            if gpu_failed(&e.0) {
+                eprintln!("nextsycl audio: a GPU error ({}) - ending after this answer", e.0);
+                self.retire.store(true, Ordering::Relaxed);
+            }
+        }
+        let e = out.map_err(|e| crate::engine_status(e, 400))?;
+        let took = t0.elapsed().as_secs_f64();
+        let created = now();
+        let regions: Vec<Value> = e.regions.iter()
+            .map(|r| json!({"original": [r.original.0, r.original.1], "edited": [r.edited.0, r.edited.1], "old_words": r.old_words}))
+            .collect();
+        let meta = json!({"model": self.model, "seed": seed, "took": took, "created": created, "edit": {"original": original, "regions": regions}}).to_string();
+        let wav = e.audio.wav(&[("INAM", &target), ("ICMT", &meta)]);
+        let mut answer = None;
+        if b["response_format"].as_str() != Some("wav") {
+            let dir = self.out_dir.as_ref().ok_or_else(|| bad("response_format url: this server keeps no files (response_format wav)".into()))?;
+            let name = format!("{created}-{}-edit-{seed}.wav", self.model.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"));
+            let path = dir.join(&name);
+            std::fs::write(&path, &wav).map_err(|x| (500u16, format!("{}: {x}", dir.display())))?;
+            let mut v = entry(&path, created).unwrap_or_default();
+            if let Some(e) = entry(&path, created) {
+                let mut h = self.history.lock().unwrap();
+                h.push_front(e);
+                h.truncate(200);
+            }
+            v["url"] = json!(format!("{base}/v1/audio/files/{name}"));
+            answer = Some(json!({"created": created, "data": [v], "regions": regions, "nextsycl": {"took": took, "seconds": e.audio.seconds(), "seed": seed}}));
+        }
+        Ok((answer, wav))
     }
 
     /// A recording written down: the engine's transcript as JSON

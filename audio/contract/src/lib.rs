@@ -429,6 +429,38 @@ impl LoadOptions {
     }
 }
 
+/// A speech edit (`AudioEngine::edit`): a recording, the words it says, the words it should say
+#[derive(Clone, Debug, Default)]
+pub struct EditRequest {
+    /// the recording (mono, any rate)
+    pub samples: Vec<f32>,
+    pub rate: u32,
+    /// what the recording says (its transcript)
+    pub original: String,
+    /// what it should say
+    pub target: String,
+    pub language: Option<String>,
+    pub seed: u64,
+    /// the engine's own options for this request, by name (as `AudioRequest::extra`)
+    pub extra: Given,
+}
+
+/// An edit's answer: the whole recording with the edit, and the changed regions
+#[derive(Clone, Debug)]
+pub struct Edited {
+    pub audio: Audio,
+    pub regions: Vec<EditedRegion>,
+}
+
+/// A region said anew: seconds in the recording sent, seconds in the answer, the words it held and holds now
+#[derive(Clone, Debug)]
+pub struct EditedRegion {
+    pub original: (f64, f64),
+    pub edited: (f64, f64),
+    pub old_words: String,
+    pub new_words: String,
+}
+
 /// What a full-duplex speech model offers a live conversation (`AudioEngine::realtime`): the front door's
 /// /v1/realtime WebSocket (OpenAI Realtime's events, docs/api/realtime.md) drives it through `Conversation`
 #[derive(Clone, Debug, Default)]
@@ -565,6 +597,15 @@ pub trait AudioEngine: Send + Sync {
     fn load_seconds(&self) -> f64;
     /// make the request's sound, reporting as it goes; an error from `progress` stops it (a cancel)
     fn generate(&self, req: &AudioRequest, progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Audio>;
+    /// whether it edits a recording's speech (`edit`: audio.edit, capability speech_edit)
+    fn edits(&self) -> bool {
+        false
+    }
+    /// change the words of a recording: the recording, what it says (the caller's transcript) and what it should say;
+    /// the answer is the whole recording with the changed words said anew in its voice, the rest kept
+    fn edit(&self, _req: &EditRequest, _progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<Edited> {
+        Err(Error(format!("{} does not edit speech (audio.edit needs a speech model whose card says edit: zonos3-mini)", self.arch())))
+    }
     /// a recogniser's languages and abilities (None: it makes sound, it does not listen)
     fn recogniser(&self) -> Option<Recogniser> {
         None

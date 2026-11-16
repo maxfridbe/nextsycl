@@ -20,6 +20,85 @@ export interface AudioDescribePromptGuideMdReq {
   [key: string]: unknown;
 }
 
+/** What audio.edit takes. */
+export interface AudioEditReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
+  /**
+   * a group inside the project
+   * @maxLength 60
+   */
+  batch?: string | null;
+  /**
+   * queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch
+   * @default false
+   */
+  held?: boolean | null;
+  /**
+   * names the job for <kind>.status and <kind>.cancel (default: its id)
+   * @maxLength 120
+   */
+  label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
+  /**
+   * a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)
+   * @minimum -9
+   * @maximum 9
+   * @default 0
+   */
+  priority?: number | null;
+  /**
+   * a group of jobs held or released together (<kind>.queue.pause / resume), listed with <kind>.jobs {project}
+   * @maxLength 60
+   */
+  project?: string | null;
+  /**
+   * false: refused at once (409 busy, retryable) when the job would not start now - a server free and no runnable job waiting before it; true (default): it waits its turn
+   * @default true
+   */
+  queue?: boolean | null;
+  /**
+   * idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)
+   * @maxLength 200
+   */
+  reentrant_id?: string | null;
+  /**
+   * true: answer when it ends (the job goes on if the call drops); false: answer at once with the job
+   * @default true
+   */
+  wait?: boolean | null;
+  /** the recording: WAV, MP3, FLAC, Ogg or M4A as base64, a data: URL, or upload:<name> (audio.upload); at most 30 s of one speaker */
+  audio: string;
+  /** what the recording says (its transcript: audio.transcribe makes one) */
+  original_text: string;
+  /** what it should say: the words that differ are said anew, the rest kept */
+  target_text: string;
+  /** the model's id (one whose speech has edit: zonos3-mini); none: the first enabled */
+  model?: string | null;
+  /** the draws (the same seed, the same edit) */
+  seed?: number | null;
+  /** a code or a name; none: the text decides */
+  language?: string | null;
+  /** the engine's own (temperature ...) */
+  options?: Record<string, unknown> | null;
+  /** wav (the file) or url (JSON with its link, the default) */
+  response_format?: string | null;
+  /** other keys */
+  [key: string]: unknown;
+}
+
 /** What audio.generate takes. */
 export interface AudioGenerateReq {
   /**
@@ -2777,6 +2856,12 @@ export interface Methods {
    */
   "audio.transcribe": { req: AudioTranscribeReq; resp: any };
   /**
+   * Speech editing (a speech model whose card says edit: ZONOS3-Mini): a recording, what it says and what it should say; the words that change are said anew in the recording's voice and the rest kept frame for frame. Clips of at most 30 s; the transcript is the caller's (audio.transcribe makes one). A job like audio.speak
+   * @tags audio
+   * @example {"audio":"upload:up_1792400000_take2.wav","original_text":"It runs on weaker hardware.","target_text":"It runs on older laptops."}
+   */
+  "audio.edit": { req: AudioEditReq; resp: any };
+  /**
    * The saved voices (cloned or designed): name, owner, what the sample says, its description, length, whether it can be spoken now (ready) and by which enabled models; sample: its WAV
    * @tags audio
    * @example {"owner":"film-app"}
@@ -3426,6 +3511,12 @@ export function client(post: Post, raw?: PostRaw) {
      * @example {"audio":"upload:up_1792400000_take2.wav","language":"english","words":true}
      */
     "audio.transcribe": (req: AudioTranscribeReq): Promise<any> => post("audio.transcribe", req),
+    /**
+     * Speech editing (a speech model whose card says edit: ZONOS3-Mini): a recording, what it says and what it should say; the words that change are said anew in the recording's voice and the rest kept frame for frame. Clips of at most 30 s; the transcript is the caller's (audio.transcribe makes one). A job like audio.speak
+     * @tags audio
+     * @example {"audio":"upload:up_1792400000_take2.wav","original_text":"It runs on weaker hardware.","target_text":"It runs on older laptops."}
+     */
+    "audio.edit": (req: AudioEditReq): Promise<any> => post("audio.edit", req),
     /**
      * The saved voices (cloned or designed): name, owner, what the sample says, its description, length, whether it can be spoken now (ready) and by which enabled models; sample: its WAV
      * @tags audio
