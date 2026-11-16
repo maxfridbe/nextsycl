@@ -1,0 +1,166 @@
+# Sophon-Realtime 32B Flash (full-duplex voice conversation: a 32B brain that listens, a voice that laughs; /v1/realtime)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets.
+# adventists-ai/Sophon-Realtime-32B-Flash @ 13b33529 (Apache-2.0): the thinker (DuplexJev-32B-Para: Qwen3-ASR's audio
+# encoder, an Ultravox projector and Qwen3-VL-32B's language model with a merged tag-writing adapter, FP8 a channel),
+# the talker (Qwen3-TTS-12Hz-1.7B-Base fine-tuned to perform sound tags; its config.json and the 12 Hz codec are the
+# Base checkpoint's, byte for byte: the q3t-base keys) and the release's voices. The vision tower's file is not taken
+# (the audio path does not read it). The brain's matrices are made 4-bit on the card as it loads (NS_SOPHON_BITS=4,
+# audio/sophon brain.rs) - one card; the talker on the other. docs/ports/sophon-realtime.md has the checks.
+id: sophon-realtime-32b-flash
+kind: audio
+arch: sophon-realtime
+license: apache-2.0
+commercial: true
+license_note: 'Apache-2.0 code and weights (Adventists AI); derived from Qwen3-VL-32B-Instruct, Qwen3-ASR and Qwen3-TTS-12Hz-1.7B-Base (Qwen, Apache-2.0); the release asks that only your own voice, or one you have permission to use, be cloned'
+title: 'Sophon-Realtime 32B Flash (full-duplex voice conversation; Rust + SYCL)'
+about: 'A live voice conversation over /v1/realtime (OpenAI Realtime events): the 32B brain hears your speech itself, decides when you have finished (DuplexJev''s turn question) and writes a reply with sound tags ([laughter], [sigh], <strong>); a Qwen3-TTS voice speaks it as it is written; barge-in, voice cloning from a saved voice, tool calls. The brain q4 on the first card, the voice on the second'
+gpus: '0,1'
+vram_gib: 23.0                   # the brain's card (q4, 6K context); the talker's ~5.5
+speech:
+- clone                          # a saved voice (its recording's x-vector), or a recording
+- realtime                       # a live conversation: /v1/realtime
+defaults:
+  seconds: 60.0
+env: {}
+files:
+  thinker-1:
+    key: sophon-flash-thinker-01
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00001-of-00016.safetensors
+    size: 3879586648
+    sha256: ebf4fda9e1d3b41ac06feff67ce0ad270eedfa337f744297e0651407411ae139
+    path: sophon-realtime-32b-flash/thinker/model-v15-00001-of-00016.safetensors
+  thinker-2:
+    key: sophon-flash-thinker-02
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00002-of-00016.safetensors
+    size: 2040187152
+    sha256: d60b1182e25987560c64766e284c1304bad06ab06eccda0f0b8300a06c3ed884
+    path: sophon-realtime-32b-flash/thinker/model-v15-00002-of-00016.safetensors
+  thinker-3:
+    key: sophon-flash-thinker-03
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00003-of-00016.safetensors
+    size: 2082100536
+    sha256: 8ef1acd2d0901584445f94846fce9bef465bbf5f90c0e1babc33fb9bce9f55ff
+    path: sophon-realtime-32b-flash/thinker/model-v15-00003-of-00016.safetensors
+  thinker-4:
+    key: sophon-flash-thinker-04
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00004-of-00016.safetensors
+    size: 2082141480
+    sha256: c20eec70c382ef32850fb1e237e90a908fdf0e040e8c3c38a9f933ebfbeb04cc
+    path: sophon-realtime-32b-flash/thinker/model-v15-00004-of-00016.safetensors
+  thinker-5:
+    key: sophon-flash-thinker-05
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00005-of-00016.safetensors
+    size: 2129351336
+    sha256: cc6bc68c733f64e22159679591f4374f58ddf1a613bd15ab7721149a70c6bcd9
+    path: sophon-realtime-32b-flash/thinker/model-v15-00005-of-00016.safetensors
+  thinker-6:
+    key: sophon-flash-thinker-06
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00006-of-00016.safetensors
+    size: 2129315760
+    sha256: 3d728f9386b00e208345755c359f9bc01c1dbcadeefb9240ef54f72ba204a294
+    path: sophon-realtime-32b-flash/thinker/model-v15-00006-of-00016.safetensors
+  thinker-7:
+    key: sophon-flash-thinker-07
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00007-of-00016.safetensors
+    size: 2082141480
+    sha256: 0db2a44889cde26c7b4f83169cf744711ba5a412440ef5a633088dfbaf14d247
+    path: sophon-realtime-32b-flash/thinker/model-v15-00007-of-00016.safetensors
+  thinker-8:
+    key: sophon-flash-thinker-08
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00008-of-00016.safetensors
+    size: 2129351336
+    sha256: 5d4537e569d7483fe65c5e064ecac6d1bd1b340d569745ec231cb30aa949e629
+    path: sophon-realtime-32b-flash/thinker/model-v15-00008-of-00016.safetensors
+  thinker-9:
+    key: sophon-flash-thinker-09
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00009-of-00016.safetensors
+    size: 2129315744
+    sha256: 497f398eab42f0a206716301a59efe487e868540f3ebd22183a1b7625e0a456d
+    path: sophon-realtime-32b-flash/thinker/model-v15-00009-of-00016.safetensors
+  thinker-10:
+    key: sophon-flash-thinker-10
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00010-of-00016.safetensors
+    size: 2082141496
+    sha256: d45d8db3da82aeb1248c23e30d6967552e3a6d4c7e47b21c7d0fdbf48ac62264
+    path: sophon-realtime-32b-flash/thinker/model-v15-00010-of-00016.safetensors
+  thinker-11:
+    key: sophon-flash-thinker-11
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00011-of-00016.safetensors
+    size: 2129351336
+    sha256: 9dfb941922913ca1fae55939171a64786b47d019a210daec4bffef369d48b0e6
+    path: sophon-realtime-32b-flash/thinker/model-v15-00011-of-00016.safetensors
+  thinker-12:
+    key: sophon-flash-thinker-12
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00012-of-00016.safetensors
+    size: 2129315744
+    sha256: d7e8a931ff02185bd14256e268c22bfc490ebcf91c239425c5d1544705e8ebf2
+    path: sophon-realtime-32b-flash/thinker/model-v15-00012-of-00016.safetensors
+  thinker-13:
+    key: sophon-flash-thinker-13
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00013-of-00016.safetensors
+    size: 2082141496
+    sha256: b02b38d0a21b214997f840c9e96a019f3c4d146432346807bdf39c475d008a6d
+    path: sophon-realtime-32b-flash/thinker/model-v15-00013-of-00016.safetensors
+  thinker-14:
+    key: sophon-flash-thinker-14
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00014-of-00016.safetensors
+    size: 2129351320
+    sha256: 440c54a2e1f83e0de234ae9eedd29c8d6c2f98be94cb6e2b739d42c1e4cbf83e
+    path: sophon-realtime-32b-flash/thinker/model-v15-00014-of-00016.safetensors
+  thinker-15:
+    key: sophon-flash-thinker-15
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00015-of-00016.safetensors
+    size: 2129315752
+    sha256: 1ca1e3aaab45104b63db450822e8efa4be6627db340570b0a70b7f3eaae86b7a
+    path: sophon-realtime-32b-flash/thinker/model-v15-00015-of-00016.safetensors
+  thinker-16:
+    key: sophon-flash-thinker-16
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/model-v15-00016-of-00016.safetensors
+    size: 1367840656
+    sha256: 3f9119c01a8132caccafc04b3df4f110878db0a7a3af2d5df4a21447d563a7ec
+    path: sophon-realtime-32b-flash/thinker/model-v15-00016-of-00016.safetensors
+  thinker-config:
+    key: sophon-flash-thinker-config
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/config.json
+    size: 2392
+    sha256: b48dc9247bf75aa54ba2af1109ae9e2e5414db54ce0331dba8169ccd6f4405ba
+    path: sophon-realtime-32b-flash/thinker/config.json
+  tokenizer:
+    key: sophon-flash-tokenizer
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/thinker/tokenizer.json
+    size: 11422840
+    sha256: 0422f49acb9b2b8861f8a8c9fc5883758d7be3e805fdc014ade10478ea8fb1c9
+    path: sophon-realtime-32b-flash/thinker/tokenizer.json
+  talker:
+    key: sophon-flash-talker
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/talker/model.safetensors
+    size: 3857413744
+    sha256: b1d57164d4370ec8692e06ce7212fd2e73c613cd51e2ba3706805de8ed4752ad
+    path: sophon-realtime-32b-flash/talker/model.safetensors
+  talker-config: q3t-base-config
+  codec: q3t-codec
+  voice-1:
+    key: sophon-flash-voice-brand-en
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/voices/brand_en.pt
+    size: 9776
+    sha256: fbee12412548b4aaa0e35a86cc16c7a4ca494212639ffc76a72404e9cbd634c7
+    path: sophon-realtime-32b-flash/voices/brand_en.pt
+  voice-2:
+    key: sophon-flash-voice-brand-zh
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/voices/brand_zh.pt
+    size: 9776
+    sha256: 12d9ac7626a01cc8afda2e440b92ff83f46d21733689daf249ec75c56cd19bf0
+    path: sophon-realtime-32b-flash/voices/brand_zh.pt
+  voice-3:
+    key: sophon-flash-voice-chelsie-en
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/voices/chelsie_en.pt
+    size: 9790
+    sha256: 3d42ee1759b604ea22e3a9e548233d347b0c035bb2a9f06bd3369f4acfed3acb
+    path: sophon-realtime-32b-flash/voices/chelsie_en.pt
+  voice-4:
+    key: sophon-flash-voice-chelsie-zh
+    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/voices/chelsie_zh.pt
+    size: 9790
+    sha256: b09d658e32dfb0009da00007907d69b76c0977b649b652e3468fa5d2c13041f0
+    path: sophon-realtime-32b-flash/voices/chelsie_zh.pt
+guide: guides/sophon-realtime.md

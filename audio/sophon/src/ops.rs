@@ -1,0 +1,350 @@
+//! The engine's kernels (ffi.rs) as checked calls on device pointers; the talker's matrices (half, or int8 with a scale
+//! a row: the Qwen3-TTS engine's layout, on the shared mm3 product) and a checkpoint's safetensors shards. The brain's
+//! own matrices (q8 / q4 made on the card from FP8) are brain.rs's `QMat`.
+//!
+//! The pointers are device memory the host never dereferences: the kernels read them on the GPU, so the calls are not
+//! `unsafe` fns; what they rest on is the sizes the caller names.
+#![allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
+
+use std::ffi::c_void;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use nextsycl_audio::{Error, Result};
+use nextsycl_core::{DevBuf, Gpu};
+use nextsycl_diffusion::kernels::{none, Dt, Nsd};
+use nextsycl_gguf::safetensors::{SafeTensors, StTensor};
+
+use crate::ffi;
+
+type P = *const c_void;
+type M = *mut c_void;
+
+/// A float pointer `at` floats into a buffer
+pub fn fp(b: &DevBuf, at: usize) -> *mut f32 {
+    b.fp().wrapping_add(at)
+}
+
+/// The engine's kernels on one GPU
+pub struct Ops {
+    pub gpu: Arc<Gpu>,
+    pub(crate) k: &'static ffi::Api,
+}
+
+impl Ops {
+    pub fn new(gpu: &Arc<Gpu>) -> Result<Ops> {
+        Ok(Ops { gpu: gpu.clone(), k: ffi::api()? })
+    }
+
+    pub(crate) fn g(&self) -> M {
+        self.gpu.raw()
+    }
+
+    /// out[m] (+)= x[m] . W^T (* scale + bias), m < M <= 8, out rows `ldo` apart (the talker's matrices)
+    pub fn gemv(&self, x: *const f32, m: usize, k: usize, w: &Mat, bias: P, out: *mut f32, ldo: usize, acc: bool) -> Result<()> {
+        let (wt, sc) = match &w.scale {
+            None => (0, std::ptr::null()),
+            Some(s) => (1, s.fp() as *const f32),
+        };
+        // SAFETY: the caller's buffers hold the sizes named.
+        ffi::check(unsafe { (self.k.gemv)(self.g(), x, m as i64, k as i64, w.w.ptr(), wt, sc, w.n as i64, bias.cast(), out, ldo as i64, acc as i32) }, "gemv")
+    }
+
+    /// Floats of scratch `attn` needs
+    pub fn attn_scratch(&self, b: usize, s: usize, hq: usize, d: usize, p0: usize) -> usize {
+        // SAFETY: arithmetic only.
+        unsafe { (self.k.attn_scratch)(b as i64, s as i64, hq as i64, d as i64, p0 as i64) as usize }
+    }
+
+    pub fn attn(&self, q: *const f32, qs: usize, kc: &DevBuf, vc: &DevBuf, b: usize, s: usize, hq: usize, hkv: usize, d: usize, t: usize, p0: usize,
+                out: *mut f32, part: *mut f32) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named; the cache [b, hkv, t, d] half.
+        ffi::check(unsafe { (self.k.attn)(self.g(), q, qs as i64, kc.ptr(), vc.ptr(), b as i64, s as i64, hq as i64, hkv as i64, d as i64, t as i64, p0 as i64,
+                                          out, part) }, "attention")
+    }
+
+    pub fn kv_store(&self, k: *const f32, v: *const f32, ks: usize, b: usize, s: usize, hkv: usize, d: usize, t: usize, p0: usize, kc: &DevBuf,
+                    vc: &DevBuf) -> Result<()> {
+        // SAFETY: as attn.
+        ffi::check(unsafe { (self.k.kv_store)(self.g(), k, v, ks as i64, b as i64, s as i64, hkv as i64, d as i64, t as i64, p0 as i64, kc.ptr(), vc.ptr()) },
+                   "kv store")
+    }
+
+    pub fn qk_norm_rope(&self, x: *mut f32, xs: usize, rows: usize, s: usize, h: usize, w: &DevBuf, eps: f32, inv: &DevBuf, p0: usize) -> Result<()> {
+        // SAFETY: rows of h heads x 128 floats, xs apart; w 128 floats, inv 64.
+        ffi::check(unsafe { (self.k.qk_norm_rope)(self.g(), x, xs as i64, rows as i64, s as i64, h as i64, w.fp(), eps, inv.fp(), p0 as i64) }, "q/k norm + rope")
+    }
+
+    pub fn embed(&self, table: &DevBuf, d: usize, idx: &[i32], scale: f32, out: *mut f32, ldo: usize, copies: usize) -> Result<()> {
+        // SAFETY: table rows of d halfs (the indices in range: the caller's), out copies rows.
+        ffi::check(unsafe { (self.k.embed)(self.g(), table.ptr(), d as i64, idx.as_ptr(), idx.len() as i32, scale, out, ldo as i64, copies as i32) }, "embed")
+    }
+
+    pub fn to_half(&self, x: *const f32, out: M, n: usize) -> Result<()> {
+        // SAFETY: n values each.
+        ffi::check(unsafe { (self.k.to_half)(self.g(), x, out, n as i64) }, "to half")
+    }
+
+    pub fn bf16_to_float(&self, x: P, out: *mut f32, n: usize) -> Result<()> {
+        // SAFETY: n values each.
+        ffi::check(unsafe { (self.k.bf16_to_float)(self.g(), x.cast(), out, n as i64) }, "bf16 to float")
+    }
+
+    pub fn quant_rows(&self, w: *const f32, n: usize, k: usize, q: M, scale: *mut f32) -> Result<()> {
+        // SAFETY: w [n, k] floats, q [n, k] bytes, scale n floats.
+        ffi::check(unsafe { (self.k.quant_rows)(self.g(), w, n as i64, k as i64, q.cast(), scale) }, "int8 rows")
+    }
+
+    pub fn dequant_rows(&self, q: P, scale: *const f32, n: usize, k: usize, out: M) -> Result<()> {
+        // SAFETY: q [n, k] bytes, scale n floats, out [n, k] halfs.
+        ffi::check(unsafe { (self.k.dequant_rows)(self.g(), q.cast(), scale, n as i64, k as i64, out) }, "int8 rows to half")
+    }
+
+    pub fn add(&self, x: *mut f32, y: *const f32, n: usize) -> Result<()> {
+        // SAFETY: n floats each.
+        ffi::check(unsafe { (self.k.add)(self.g(), x, y, n as i64) }, "add")
+    }
+
+    pub fn silu(&self, x: *mut f32, n: usize) -> Result<()> {
+        // SAFETY: n floats.
+        ffi::check(unsafe { (self.k.silu)(self.g(), x, n as i64) }, "silu")
+    }
+
+    // ---- the brain's (sp.h)
+
+    /// Rows of FP8 (`fp8`: their scales, float32 [n] on the device) or bf16 into layout `wt` (0 q8, 1 q4)
+    pub fn quant(&self, wt: i32, src: P, fp8: Option<*const f32>, n: usize, k: usize, q: M, s: M) -> Result<()> {
+        let (st, sc) = match fp8 {
+            Some(p) => (0, p),
+            None => (1, std::ptr::null()),
+        };
+        // SAFETY: src [n, k] of its type, q / s sized for the layout.
+        ffi::check(unsafe { (self.k.quant)(self.g(), wt, src, st, sc, n as i64, k as i64, q, s) }, "quantize")
+    }
+
+    /// out[m] (+)= x[m] . W^T for m < M <= 4, W in layout `wt`
+    pub fn qgemv(&self, wt: i32, q: P, s: P, x: *const f32, m: usize, k: usize, n: usize, out: *mut f32, ldo: usize, acc: bool) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        ffi::check(unsafe { (self.k.qgemv)(self.g(), wt, q, s, x, m as i64, k as i64, n as i64, out, ldo as i64, acc as i32) }, "quantized gemv")
+    }
+
+    /// Rows [r0, r0 + rows) of a layout-`wt` matrix as half into `out`
+    pub fn dequant(&self, wt: i32, q: P, s: P, k: usize, r0: usize, rows: usize, out: M) -> Result<()> {
+        // SAFETY: the rows exist; out holds rows * k halfs.
+        ffi::check(unsafe { (self.k.dequant)(self.g(), wt, q, s, k as i64, r0 as i64, rows as i64, out) }, "dequantize")
+    }
+
+    pub fn sp_attn_scratch(&self, s: usize, hq: usize, hkv: usize, d: usize, p0: usize) -> usize {
+        // SAFETY: arithmetic only.
+        unsafe { (self.k.sp_attn_scratch)(s as i64, hq as i64, hkv as i64, d as i64, p0 as i64) as usize }
+    }
+
+    /// S query rows (positions p0 + s) against the cache [T, Hkv * D] half
+    pub fn sp_attn(&self, q: *const f32, qs: usize, kc: P, vc: P, s: usize, hq: usize, hkv: usize, d: usize, p0: usize, out: *mut f32,
+                   part: *mut f32) -> Result<()> {
+        // SAFETY: the caller's buffers hold the sizes named.
+        ffi::check(unsafe { (self.k.sp_attn)(self.g(), q, qs as i64, kc, vc, s as i64, hq as i64, hkv as i64, d as i64, p0 as i64, out, part) }, "attention")
+    }
+
+    pub fn sp_kv_store(&self, k: *const f32, v: *const f32, ks: usize, s: usize, hd: usize, p0: usize, kc: M, vc: M) -> Result<()> {
+        // SAFETY: the cache holds positions p0 + s.
+        ffi::check(unsafe { (self.k.sp_kv_store)(self.g(), k, v, ks as i64, s as i64, hd as i64, p0 as i64, kc, vc) }, "kv store")
+    }
+
+    pub fn im2col_s2(&self, x: *const f32, b: usize, h: usize, w: usize, c: usize, out: *mut f32) -> Result<()> {
+        // SAFETY: x [b, h, w, c], out [b * ho * wo, c * 9].
+        ffi::check(unsafe { (self.k.im2col_s2)(self.g(), x, b as i64, h as i64, w as i64, c as i64, out) }, "im2col")
+    }
+
+    pub fn swap12(&self, x: *const f32, a: usize, b: usize, c: usize, d: usize, out: *mut f32) -> Result<()> {
+        // SAFETY: a * b * c * d floats each.
+        ffi::check(unsafe { (self.k.swap12)(self.g(), x, a as i64, b as i64, c as i64, d as i64, out) }, "swap")
+    }
+
+    pub fn add_rows(&self, x: *mut f32, y: *const f32, b: usize, r: usize, c: usize) -> Result<()> {
+        // SAFETY: x [b, r, c], y [r, c].
+        ffi::check(unsafe { (self.k.add_rows)(self.g(), x, y, b as i64, r as i64, c as i64) }, "add rows")
+    }
+
+    /// Attention within windows of `w` rows (the ear's): q / k / v rows of h heads x d, `stride` apart; out [n, h * d]
+    pub fn attn_win(&self, q: *const f32, k: *const f32, v: *const f32, n: usize, h: usize, d: usize, stride: usize, w: usize, out: *mut f32) -> Result<()> {
+        // SAFETY: n rows each, out [n, h * d].
+        ffi::check(unsafe { (self.k.attn_win)(self.g(), q, k, v, n as i64, h as i64, d as i64, stride as i64, w as i64, out) }, "window attention")
+    }
+
+    pub fn gather(&self, x: *const f32, idx: *const i32, n: usize, c: usize, out: *mut f32) -> Result<()> {
+        // SAFETY: idx n in-range rows of x, out [n, c].
+        ffi::check(unsafe { (self.k.gather)(self.g(), x, idx, n as i64, c as i64, out) }, "gather")
+    }
+}
+
+/// A matrix [n, k] on the GPU: half, or int8 with a scale per row (the talker's)
+pub struct Mat {
+    pub w: DevBuf,
+    pub scale: Option<DevBuf>,
+    pub n: usize,
+    pub k: usize,
+}
+
+impl Mat {
+    /// out [m, n] f32 = x [m, k] f32 . W^T + bias: a few rows by the shared product, more by oneDNN's half GEMM (x
+    /// converted into `xh`, a half buffer of m * k; an int8 matrix first expanded to half in `wh`)
+    pub fn apply(&self, ops: &Ops, nsd: &Nsd, x: *const f32, m: usize, xh: Option<&DevBuf>, wh: Option<&DevBuf>, bias: P, out: *mut f32) -> Result<()> {
+        if m <= 8 {
+            return ops.gemv(x, m, self.k, self, bias, out, self.n, false);
+        }
+        let xh = xh.ok_or_else(|| Error("a half staging buffer for a wide product".into()))?;
+        ops.to_half(x, xh.ptr(), m * self.k)?;
+        let w = match &self.scale {
+            None => self.w.ptr(),
+            Some(s) => {
+                let wh = wh.ok_or_else(|| Error("a half matrix buffer for a wide int8 product".into()))?;
+                ops.dequant_rows(self.w.ptr(), s.fp(), self.n, self.k, wh.ptr())?;
+                wh.ptr()
+            }
+        };
+        nsd.linear(xh.ptr(), Dt::F16, m, self.k, w, self.n, bias, out.cast(), Dt::F32)
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.w.len + self.scale.as_ref().map_or(0, |s| s.len)
+    }
+}
+
+/// A model's safetensors shards, its tensors found by name across them
+pub struct Shards {
+    pub files: Vec<SafeTensors>,
+}
+
+impl Shards {
+    pub fn open(paths: &[PathBuf]) -> Result<Shards> {
+        if paths.is_empty() {
+            return Err(Error("no files".into()));
+        }
+        let files = paths.iter().map(|p| SafeTensors::open(p).map_err(|e| Error(e.0))).collect::<Result<Vec<_>>>()?;
+        Ok(Shards { files })
+    }
+
+    pub fn find(&self, name: &str) -> Result<(&SafeTensors, &StTensor)> {
+        self.files.iter().find_map(|f| f.tensor(name).map(|t| (f, t))).ok_or_else(|| {
+            Error(format!("{}: no tensor {name}", self.files[0].path.parent().map(|p| p.display().to_string()).unwrap_or_default()))
+        })
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.files.iter().any(|f| f.tensor(name).is_some())
+    }
+
+    pub fn shape(&self, name: &str) -> Result<Vec<usize>> {
+        Ok(self.find(name)?.1.shape.iter().map(|d| *d as usize).collect())
+    }
+
+    /// A tensor's raw bytes
+    pub fn raw(&self, name: &str) -> Result<Vec<u8>> {
+        let (f, t) = self.find(name)?;
+        f.read(t).map_err(|e| Error(e.0))
+    }
+
+    /// A tensor as float32 on the host
+    pub fn f32(&self, name: &str) -> Result<Vec<f32>> {
+        let (f, _) = self.find(name)?;
+        f.f32(name).map_err(|e| Error(e.0))
+    }
+
+    /// Rows [r0, r1) of a 2-D (or more: rows of the rest) bf16 / f32 tensor as float32 on the host
+    pub fn rows_f32(&self, name: &str, r0: usize, r1: usize) -> Result<Vec<f32>> {
+        let (f, t) = self.find(name)?;
+        let row: usize = t.shape.iter().skip(1).product::<u64>() as usize;
+        let es = elem(t)?;
+        let mut b = vec![0u8; (r1 - r0) * row * es];
+        f.read_into(t, (r0 * row * es) as u64, &mut b).map_err(|e| Error(e.0))?;
+        Ok(match t.dtype.as_str() {
+            "BF16" => b.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect(),
+            _ => b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        })
+    }
+
+    /// Rows [r0, r1) of a tensor onto the GPU as float32 at `dst` (f32 offset `at`), through `stage` (bytes, at least
+    /// the rows' size)
+    fn rows_to(&self, ops: &Ops, name: &str, r0: usize, r1: usize, stage: &DevBuf, dst: &DevBuf, at: usize) -> Result<usize> {
+        let (f, t) = self.find(name)?;
+        let row: usize = t.shape.iter().skip(1).product::<u64>() as usize;
+        let es = elem(t)?;
+        let n = (r1 - r0) * row;
+        let mut b = vec![0u8; n * es];
+        f.read_into(t, (r0 * row * es) as u64, &mut b).map_err(|e| Error(e.0))?;
+        if es == 4 {
+            dst.write(at * 4, &b)?;
+        } else {
+            stage.write(0, &b)?;
+            ops.bf16_to_float(stage.ptr(), fp(dst, at), n)?;
+            ops.gpu.sync()?;
+        }
+        Ok(n)
+    }
+
+    /// A tensor as float32 on the GPU
+    pub fn dev_f32(&self, ops: &Ops, name: &str) -> Result<DevBuf> {
+        let (_, t) = self.find(name)?;
+        let n = t.elements() as usize;
+        let out = DevBuf::f32(&ops.gpu, n)?;
+        let stage = DevBuf::new(&ops.gpu, n * 2)?;
+        self.rows_to(ops, name, 0, t.shape.first().copied().unwrap_or(1) as usize, &stage, &out, 0)?;
+        Ok(out)
+    }
+
+    /// A matrix from row ranges of tensors, stacked: [(name, r0, r1)], every part `k` wide; half, or int8 rows
+    pub fn mat(&self, ops: &Ops, parts: &[(&str, usize, usize)], int8: bool) -> Result<Mat> {
+        let mut k = 0;
+        let mut n = 0;
+        let mut biggest = 0;
+        for (name, r0, r1) in parts {
+            let s = self.shape(name)?;
+            let kk: usize = s.iter().skip(1).product();
+            if k != 0 && kk != k {
+                return Err(Error(format!("{name}: {kk} wide, the matrix {k}")));
+            }
+            if *r1 > s[0] || r0 >= r1 {
+                return Err(Error(format!("{name}: rows {r0}..{r1} of {}", s[0])));
+            }
+            k = kk;
+            n += r1 - r0;
+            biggest = biggest.max((r1 - r0) * kk);
+        }
+        let gpu = &ops.gpu;
+        let w = DevBuf::new(gpu, n * k * if int8 { 1 } else { 2 })?;
+        let scale = if int8 { Some(DevBuf::f32(gpu, n)?) } else { None };
+        let stage = DevBuf::new(gpu, biggest * 2)?;
+        let f = DevBuf::f32(gpu, biggest)?;
+        let mut row = 0;
+        for (name, r0, r1) in parts {
+            let cnt = self.rows_to(ops, name, *r0, *r1, &stage, &f, 0)?;
+            match &scale {
+                None => ops.to_half(f.fp(), w.ptr().wrapping_byte_add(row * k * 2), cnt)?,
+                Some(s) => ops.quant_rows(f.fp(), r1 - r0, k, w.ptr().wrapping_byte_add(row * k), fp(s, row))?,
+            }
+            ops.gpu.sync()?;
+            row += r1 - r0;
+        }
+        Ok(Mat { w, scale, n, k })
+    }
+
+    /// A whole tensor as a matrix
+    pub fn mat1(&self, ops: &Ops, name: &str, int8: bool) -> Result<Mat> {
+        let r = self.shape(name)?[0];
+        self.mat(ops, &[(name, 0, r)], int8)
+    }
+}
+
+fn elem(t: &StTensor) -> Result<usize> {
+    match t.dtype.as_str() {
+        "BF16" => Ok(2),
+        "F32" => Ok(4),
+        d => Err(Error(format!("{}: {d}, not bf16 or f32", t.name))),
+    }
+}
+
+/// A null pointer (an absent bias)
+pub fn nul() -> P {
+    none()
+}

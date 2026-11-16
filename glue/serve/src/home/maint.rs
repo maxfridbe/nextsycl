@@ -24,7 +24,7 @@ pub(super) fn starts_work(method: &str) -> bool {
 
 /// The OpenAI routes that start work
 fn openai_starts_work(method: &str, path: &str) -> bool {
-    method == "POST" && matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/images/generations" | "/v1/images/edits" | "/v1/audio/speech" | "/v1/audio/transcriptions" | "/v1/model3d/generate" | "/v1/model3d/rig"
+    (method == "GET" && path == "/v1/realtime") || method == "POST" && matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/images/generations" | "/v1/images/edits" | "/v1/audio/speech" | "/v1/audio/transcriptions" | "/v1/model3d/generate" | "/v1/model3d/rig"
                                        | "/v1/images/upscale" | "/v1/videos/upscale" | "/v1/images/vectorize" | "/v1/images/remove-background")
 }
 

@@ -174,6 +174,9 @@ fn relay(t: &crate::http::Target, method: &str, path: &str, body: Option<&Value>
 impl Home {
     fn authorized(&self, req: &Request) -> bool {
         http::header(&req.head, "authorization").is_some_and(|h| h.trim().strip_prefix("Bearer ").is_some_and(|t| t.trim() == self.token))
+            // a browser's WebSocket cannot set headers: the token as a sub-protocol (OpenAI Realtime's convention)
+            || (http::is_upgrade(&req.head) && http::header(&req.head, "sec-websocket-protocol")
+                .is_some_and(|p| p.split(',').any(|x| x.trim().strip_prefix("openai-insecure-api-key.").is_some_and(|t| t == self.token))))
     }
 
     pub(crate) fn api(self: &Arc<Self>, mut s: Conn, req: Request) {
@@ -1462,6 +1465,27 @@ impl Home {
                 let t = self.ensure(&id)?;
                 pass(s, &t)
             }
+            ("GET", "/v1/realtime") => {
+                // a live conversation: the WebSocket passed on to the server of the model asked for (?model=), else the
+                // loaded or first enabled full-duplex speech model (a card's speech list says "realtime")
+                if !http::is_upgrade(&req.head) {
+                    return Err((400, "/v1/realtime is a WebSocket: connect with Upgrade: websocket".into()));
+                }
+                need("audio")?;
+                let query = req.target.split_once('?').map_or("", |(_, q)| q);
+                let named = query.split('&').find_map(|kv| kv.strip_prefix("model=")).map(str::to_string).filter(|n| all.iter().any(|m| m["id"] == n.as_str()));
+                let live: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "audio" && m["enabled"] != false
+                    && m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == "realtime"))).collect();
+                let id = match named {
+                    Some(n) => self.pick("audio", &json!({"model": n}), &all)?,
+                    None => self.loaded_of("audio").into_iter().find(|l| live.iter().any(|m| m["id"] == l.as_str()))
+                        .or_else(|| live.first().and_then(|m| m["id"].as_str().map(str::to_string)))
+                        .ok_or((409, "no full-duplex speech model is enabled (a card whose speech list says realtime: sophon-realtime)".to_string()))?,
+                };
+                let t = self.ensure(&id)?;
+                let target = if query.is_empty() { "/v1/realtime".to_string() } else { format!("/v1/realtime?{query}") };
+                http::splice(s, &t, req, &target).map_err(|e| (502, e))
+            }
             ("POST", "/v1/audio/transcriptions") => {
                 need("audio")?;
                 let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
@@ -1701,6 +1725,16 @@ impl Home {
                 json!({"model": ids("audio").first(), "instructions": "warm folk", "input": "[verse]\nRiver runs slow", "response_format": "url"}), "audio.generate")}));
             paths.insert("/v1/audio/files/{name}".into(), file("A song or speech an answer links (data[].url of audio.generate / audio.speak)", "<file>.wav", "audio/wav", true));
             paths.insert("/v1/audio/voices/{name}".into(), file("A saved voice's sample (audio.voices.list's sample)", "<voice>.wav", "audio/wav", false));
+            // a live conversation with a full-duplex speech model (docs/api/realtime.md): a WebSocket, not a JSON call
+            if all.iter().any(|m| m["enabled"] != false && m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == "realtime"))) {
+                paths.insert("/v1/realtime".into(), json!({"get": {"tags": ["openai"],
+                    "summary": "A live voice conversation: a WebSocket (Upgrade: websocket) of OpenAI Realtime's events - session.update, \
+                        input_audio_buffer.append (pcm16 24 kHz, g711, or pcm_f32le), response.* with the model's speech and text as made; \
+                        barge-in, tool calls; the token as Authorization or the sub-protocol openai-insecure-api-key.<token> (docs/api/realtime.md)",
+                    "parameters": [{"name": "model", "in": "query", "required": false, "schema": {"type": "string"},
+                                    "description": "a full-duplex speech model (none: the loaded or first enabled one)"}],
+                    "responses": {"101": {"description": "Switching Protocols: the conversation's WebSocket"}}}}));
+            }
         }
         if on.contains(&"model3d") {
             paths.insert("/v1/model3d/generate".into(), json!({"post": oa("A mesh from a picture (image) or several views (images: [{image, side}]); texture, seed, steps, faces; response_format glb or url",

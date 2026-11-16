@@ -219,6 +219,49 @@ pub fn forward_body(mut client: impl Write, upstream: &Target, req: &Request, bo
     Ok(())
 }
 
+/// Whether the request asks to become a WebSocket (`Upgrade: websocket`)
+pub fn is_upgrade(head: &[u8]) -> bool {
+    header(head, "upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket"))
+}
+
+/// An upgrade (a WebSocket) passed on to `upstream` as `target` (a path and its query; the head's other lines unchanged,
+/// `Connection: Upgrade` kept), then both directions copied until either side closes - the front door between a
+/// client and a model server's /v1/realtime
+pub fn splice(client: &Conn, upstream: &Target, req: &Request, target: &str) -> Result<(), String> {
+    let head = String::from_utf8_lossy(&req.head);
+    let mut lines = head.split("\r\n").filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or("");
+    let version = first.rsplit(' ').next().filter(|v| v.starts_with("HTTP/")).unwrap_or("HTTP/1.1");
+    let mut out = format!("{} {target} {version}\r\n", req.method);
+    for l in lines {
+        out.push_str(l);
+        out.push_str("\r\n");
+    }
+    out.push_str("\r\n");
+    let mut up = Conn::connect(upstream).map_err(|e| format!("{upstream} does not answer ({e})"))?;
+    up.write_all(out.as_bytes()).and_then(|_| up.flush()).map_err(|e| e.to_string())?;
+    let (mut c_in, mut c_out) = (client.try_clone().map_err(|e| e.to_string())?, client.try_clone().map_err(|e| e.to_string())?);
+    let (mut u_in, mut u_out) = (up.try_clone().map_err(|e| e.to_string())?, up);
+    let to_up = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut c_in, &mut u_out);
+        u_out.shutdown();
+    });
+    let _ = std::io::copy(&mut u_in, &mut c_out);
+    c_out.shutdown();
+    let _ = to_up.join();
+    Ok(())
+}
+
+impl Conn {
+    /// Both directions closed (a splice's end: the other copy's read returns)
+    pub fn shutdown(&self) {
+        let _ = match self {
+            Conn::Tcp(s) => s.shutdown(std::net::Shutdown::Both),
+            Conn::Unix(s) => s.shutdown(std::net::Shutdown::Both),
+        };
+    }
+}
+
 /// `call_for` that keeps the answer whatever its status: (status, body)
 pub fn call_status(t: &Target, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<(u16, Value), String> {
     let (status, mut r) = send(t, method, path, body)?;
@@ -472,5 +515,51 @@ mod tests {
         let head = String::from_utf8_lossy(&got.head).to_ascii_lowercase();
         assert!(head.contains("connection: close") && !head.contains("keep-alive"), "{head}");
         assert!(answer.ends_with(b"\r\n\r\nok"), "{}", String::from_utf8_lossy(&answer));
+    }
+
+    /// An upgrade passes on with its Upgrade / Connection headers, then bytes flow both ways until upstream closes
+    #[test]
+    fn a_splice_copies_both_ways() {
+        let up_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let up_addr = up_l.local_addr().unwrap().to_string();
+        let upstream = std::thread::spawn(move || {
+            let (mut c, _) = up_l.accept().unwrap();
+            let got = read_request(&mut c).unwrap();
+            c.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n").unwrap();
+            // echo what the client sends, upper-cased, then close
+            let mut b = [0u8; 5];
+            c.read_exact(&mut b).unwrap();
+            c.write_all(&b.to_ascii_uppercase()).unwrap();
+            got
+        });
+        // the door: a listener whose one connection is spliced to upstream
+        let door_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let door_addr = door_l.local_addr().unwrap();
+        let door = std::thread::spawn(move || {
+            let (c, _) = door_l.accept().unwrap();
+            let mut conn = Conn::Tcp(c);
+            let req = read_request(&mut conn).unwrap();
+            assert!(is_upgrade(&req.head));
+            splice(&conn, &Target::Tcp(up_addr), &req, "/v1/realtime?model=m").unwrap();
+        });
+        let mut c = std::net::TcpStream::connect(door_addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(b"GET /open/m/v1/realtime?model=m HTTP/1.1\r\nHost: box\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n").unwrap();
+        // a WebSocket client sends nothing before the 101 (RFC 6455): the head the door read had no bytes after it
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            c.read_exact(&mut b).unwrap();
+            head.push(b[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
+        c.write_all(b"hello").unwrap();
+        let mut all = Vec::new();
+        c.read_to_end(&mut all).unwrap();
+        assert_eq!(all, b"HELLO");
+        let got = upstream.join().unwrap();
+        assert_eq!(got.target, "/v1/realtime?model=m");
+        assert!(is_upgrade(&got.head) && header(&got.head, "connection").as_deref() == Some("Upgrade"));
+        door.join().unwrap();
     }
 }

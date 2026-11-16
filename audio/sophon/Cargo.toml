@@ -1,0 +1,16 @@
+[package]
+name = "nextsycl-audio-sophon"
+description = "Sophon-Realtime (Flash) on Intel Arc (SYCL): a full-duplex voice conversation - the 32B brain (DuplexJev: Qwen3-ASR ear, Qwen3-32B) listens, decides when the user has finished and writes a tagged reply; Qwen3-TTS (fine-tuned) speaks it as it is written"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-codec12hz.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true
+nextsycl-audio.workspace = true
+serde_json.workspace = true
+unicode-normalization = "0.1"

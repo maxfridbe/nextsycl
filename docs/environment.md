@@ -341,7 +341,7 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 
 ## Audio
 
-ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), VoxCPM2 (`NS_VCP_`), Whisper (`NS_WH_`). A per-request option's variable is only its name: it rides in the request (`"options"`), the engine does not read the environment for it.
+ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Sophon-Realtime (`NS_SOPHON_`), VoxCPM2 (`NS_VCP_`), Whisper (`NS_WH_`). A per-request option's variable is only its name: it rides in the request (`"options"`), the engine does not read the environment for it.
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
@@ -451,6 +451,17 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 | `NS_VCP_SAMPLER_CHECK` | 0 | Debug: 1 (with NS_VCP_GRAPH=0): each of the silo's sampler steps checked against the host's on the same values (stderr: the worst difference; 0 expected) | audio voxcpm2 |
 | `NS_VCP_INT8` | 0 | 1: the language models' matrices in int8 (less VRAM, faster patches) (--opt-int8) | audio voxcpm2 |
 | `NS_VCP_MAX_RATIO` | 6 | the per-request option max-ratio's name: the most patches a text token (a runaway's bound); a request's options only, the variable itself is not read (--opt-max-ratio) | audio voxcpm2 |
+| `NS_SOPHON_*` | - | every NS_SOPHON_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
+| `NS_SOPHON_BITS` | 4 | Sophon-Realtime's brain (Qwen3-32B): 4 (q4, made on the card from the FP8 checkpoint: ~19.5 GiB, one card) or 8 (q8: ~33 GiB, split over two cards; the close one, for checks) (--opt-bits) | audio sophon |
+| `NS_SOPHON_SPLIT` | 30 | with two cards and bits 8: the brain's first layer on the second card (--opt-split) | audio sophon |
+| `NS_SOPHON_Q8_LAYERS` | 62,63 | with bits 4: the brain's layers kept in q8 (comma-separated; `none`: all q4) - the last ones, where Qwen3's large activations make 4-bit codes cost the most (~0.2 GiB a layer) (--opt-q8-layers) | audio sophon |
+| `NS_SOPHON_CTX` | 6144 | the positions a conversation's context holds (its history: 8 turns, 120 s of the user's speech at most) (--opt-ctx) | audio sophon |
+| `NS_SOPHON_TALKER_INT8` | 0 | 1: the talker's matrices in int8 (less VRAM) (--opt-talker-int8) | audio sophon |
+| `NS_SOPHON_GREEDY` | 0 | 1: the brain's tokens and the talker's codes the most likely every time (deterministic; for checks); also a request's / session's option greedy (--opt-greedy) | audio sophon |
+| `NS_SOPHON_TURN_CHECKS` | 0.2,0.35,0.5,0.8,1.3,2.0 | the pauses (seconds of silence) at which the brain is asked whether the user has finished (duplex.py's SOPHON_TURN_CHECKS) (--opt-turn-checks) | audio sophon |
+| `NS_SOPHON_TURN_THRESHOLDS` | 0.95,0.85,0.7,0.5,0.35,0.25 | P(finished) that answers at each of those pauses (--opt-turn-thresholds) | audio sophon |
+| `NS_SOPHON_LOG` | 0 | Debug: 1 logs each turn check's P(finished) and each reply's prompt / speeds / text on stderr | audio sophon |
+| `NS_SOPHON_PROFILE` | 0 | Debug: 1 times the talker's frame stages (synchronised: slower) | audio sophon |
 | `NS_WH_*` | - | every NS_WH_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
 | `NS_WH_CONDITION` | 0 | 1: Whisper prompts each 30 s window with the text before it (openai's condition_on_previous_text: a steadier style, but a mistake carries on); also a request's option condition (--opt-condition) | audio whisper |
 | `NS_WH_FALLBACK` | 1 | 0: a window that runs on without ending, or decodes unsure (average log-probability under -1), is kept as greedy decoding left it instead of decoded again at rising temperatures (openai's fallback); also a request's option fallback (--opt-fallback) | audio whisper |

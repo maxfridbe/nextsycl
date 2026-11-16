@@ -1,0 +1,31 @@
+# Talking with Sophon-Realtime
+
+A live voice conversation, not a request and an answer: open `/v1/realtime` (a WebSocket of OpenAI Realtime's
+events, docs/api/realtime.md) or the model's page (Conversation), stream your microphone, and talk.
+
+## How it takes turns
+- It hears your speech itself (no transcription): tone, hesitation and laughter reach it. When you pause it asks
+  itself whether you have finished; a short pause after a clear question answers in about a second, a hesitation
+  ("um, so...") waits. Two seconds of silence answer anyway (`turn_detection.silence_duration_ms` sets that).
+- Speak over it to stop it: what you heard of its answer is what it remembers having said.
+- Starting again within two seconds of its answer means it answered too early: that answer is dropped and your two
+  stretches of speech are taken as one turn.
+
+## The session
+- `instructions`: a system prompt of your own (a persona, a task). Without one it is Sophon, answering in one or two
+  natural spoken sentences. It was tuned with its own; keep yours short and spoken in style, and say it may use sound
+  tags, or it uses fewer.
+- `voice`: `chelsie` (default) or `brand`, or a saved voice by its name (its recording cloned: 3-15 s of one speaker,
+  clean). Only clone your own voice or one you have permission to use.
+- `nextsycl.language`: `en` (default), `zh`, `de`, `fr`, `es`, `it`, `pt`, `ja`, `ru` - the language it speaks;
+  Chinese and English are its best.
+- `tools`: functions it may call (OpenAI's shape). It says a short phrase ("let me check"), calls, and speaks the
+  result when your `function_call_output` comes back.
+
+## What it writes
+Its text keeps the sound tags it performs: `[laughter]`, `[breath]`, `[sigh]`, `[cough]`, `[quick_breath]`,
+`<laughter>...</laughter>` (laughing while speaking) and `<strong>...</strong>` (emphasis). Strip them for display.
+
+## Speaking a text
+`audio.speak` / `/v1/audio/speech` with this model speaks `input` in its voice (the talker alone, no brain): the same
+tags are performed.

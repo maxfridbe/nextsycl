@@ -76,6 +76,9 @@ audio/                     AUDIO
                                  (decoder, encoder, quantizers), stage checks
   voxtraltts nextsycl-audio-voxtraltts  Voxtral 4B TTS: the Ministral backbone, the flow-matching acoustic transformer,
                                  the Voxtral codec decoder from CrispASR's GGUF, the preset voices' prompt, stage checks
+  sophon     nextsycl-audio-sophon  Sophon-Realtime: the full-duplex conversation (Conversation: VAD, turn question,
+                                 replies, barge-in, tools), the ear (Qwen3-ASR encoder + projector), the 32B brain (q4 /
+                                 q8 made on the card from FP8), the talker fed as the reply is written, stage checks
   example    nextsycl-audio-example  a template
 
 model3d/                   3D
@@ -547,6 +550,19 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   kernels (`kernels/audio/yue2`): the Q8_0 decode product, the attention's inputs from a host rotary table, the decode's
   attention, the flow's fixed-order heads; the flow's attention is the shared flash kernel, the VAE MiniMax Music's
   convolutions and ACE-Step's snake. Its silo repacks the Q8_0 matrices (decode 3x, the same samples). Checked against upstream's dumps on the B65.
+
+- **Sophon-Realtime** (`audio/sophon`, arch `sophon-realtime`; [ports/sophon-realtime.md](ports/sophon-realtime.md)): a
+  full-duplex voice conversation, the contract's `Conversation` (`AudioEngine::realtime` / `converse`), served as
+  `/v1/realtime` (OpenAI Realtime's events, [api/realtime.md](api/realtime.md); glue/serve `realtime.rs`). The brain
+  (DuplexJev: Qwen3-ASR's encoder and an Ultravox projector in float32 - `ear.rs` -, Qwen3-32B - `brain.rs`) and the
+  talker (Qwen3-TTS-12Hz-1.7B fine-tuned: `talker.rs`, a copy of the Qwen3-TTS engine's without its silo, on mm3's
+  kernels; `speak.rs` feeds it the reply as it is written). Its kernels (`kernels/audio/sophon`): the brain's matrices
+  made on the card from the checkpoint's FP8 rows into q4 (4-bit codes with a half scale and offset every 32 weights,
+  least-squares fitted) or q8, their decode product, their expansion to half for oneDNN's prompt products, attention
+  against a half [position, heads x 128] cache (split over the keys for a few rows), the ear's convolution patches. A
+  conversation (`duplex.rs`, the release's duplex.py): a 20 ms energy VAD, the turn question at the pauses, replies
+  over the history with earlier turns as audio, barge-in, tool calls. Settings: `NS_SOPHON_BITS`, `NS_SOPHON_SPLIT`,
+  `NS_SOPHON_CTX`, `NS_SOPHON_TALKER_INT8`, `NS_SOPHON_GREEDY`, `NS_SOPHON_TURN_CHECKS` / `_THRESHOLDS`.
 
 ## The 3D engines
 

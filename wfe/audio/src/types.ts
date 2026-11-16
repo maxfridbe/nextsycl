@@ -25,6 +25,20 @@ export interface Info {
   speech?: Speech | null;
   /** whether it hands its sound out as it is made (a streamed answer plays before the end) */
   streams?: boolean;
+  /** a full-duplex speech model: a live conversation over /v1/realtime (none: it does not converse) */
+  realtime?: Realtime | null;
+}
+
+export interface Realtime {
+  input_rate: number;
+  output_rate: number;
+  /** a lockstep model's frame (one in, one out every frame_ms); 0: it answers when the user has finished */
+  frame_ms: number;
+  voices: string[];
+  /** whether a saved voice can be spoken (cloned) */
+  clone: boolean;
+  languages: string[];
+  tools: boolean;
 }
 
 export interface Speech {

@@ -25,6 +25,8 @@
 //!                                 options} -> {text, language, duration, segments [{start, end, text}], words [{start,
 //!                                 end, text, probability}], nextsycl: {took, wh}} (JSON only, no multipart form)
 //!   GET  /v1/audio/files/<f>      a song made here (saved in the output directory; byte ranges for seeking)
+//!   GET  /v1/realtime             a live conversation with a full-duplex speech model (Sophon-Realtime): the request
+//!                                 upgraded to a WebSocket of OpenAI Realtime's events (crate::realtime)
 //!   POST /api/cancel              stops the request running (between frames or steps)
 //!   GET  /v1/models, /health
 //!   GET  /api/info                the model, its defaults and limits, its options
@@ -78,6 +80,8 @@ pub struct AudioServer {
     /// the front door starts a fresh server for the next request, so a leak never fills the card
     vram_loaded: AtomicU64,
     retire: AtomicBool,
+    /// live conversations open (/v1/realtime): the server is busy while one is
+    sessions: AtomicUsize,
 }
 
 /// A float32 setting as JSON without its binary tail (1.7, not 1.7000000476837158)
@@ -152,7 +156,7 @@ impl AudioServer {
         let history = Mutex::new(out_dir.as_deref().map(earlier).unwrap_or_default());
         Ok(AudioServer { model, out_dir, wfe, cors, gpu, tele, engine: RwLock::new(engine), slots: Default::default(), progress: Mutex::new(json!({"busy": false})),
                          idle: None, waiting: AtomicUsize::new(0), cancel: Default::default(), history,
-                         vram_loaded: AtomicU64::new(own_vram_mb()), retire: AtomicBool::new(false) })
+                         vram_loaded: AtomicU64::new(own_vram_mb()), retire: AtomicBool::new(false), sessions: AtomicUsize::new(0) })
     }
 
     /// Answers on `addr` until the process ends
@@ -161,7 +165,8 @@ impl AudioServer {
         if let Some(i) = self.idle {
             let me = self.clone();
             i.watch("nextsycl audio", Box::new(move || {
-                me.waiting.load(Ordering::Relaxed) > 0 || me.progress.lock().map(|p| p["busy"] == true).unwrap_or(true)
+                me.waiting.load(Ordering::Relaxed) > 0 || me.sessions.load(Ordering::Relaxed) > 0
+                    || me.progress.lock().map(|p| p["busy"] == true).unwrap_or(true)
             }));
         }
         eprintln!("nextsycl audio: {} on http://{addr}/v1/audio/speech{}", self.model,
@@ -198,9 +203,17 @@ impl AudioServer {
             ("GET", "/v1/models") | ("GET", "/models") => http::respond_with(&mut s, 200, &json!({"object": "list", "data": [
                 {"id": self.model, "object": "model", "owned_by": "nextsycl", "created": 0}]}), &cors),
             ("GET", "/api/info") => http::respond_with(&mut s, 200, &self.info(), &cors),
+            ("GET", "/v1/realtime") | ("GET", "/realtime") if http::is_upgrade(&req.head) => self.realtime(s, &req),
             ("GET", "/api/progress") => {
                 let mut p = self.progress.lock().unwrap().clone();
                 p["waiting"] = json!(self.waiting.load(Ordering::Relaxed));
+                // a live conversation is running work (the front door neither stops nor counts it idle)
+                let live = self.sessions.load(Ordering::Relaxed);
+                p["realtime_sessions"] = json!(live);
+                if live > 0 && p["busy"] != true {
+                    p["busy"] = json!(true);
+                    p["phase"] = json!("conversation");
+                }
                 p["request_id"] = json!(self.cancel.current());
                 http::respond_with(&mut s, 200, &p, &cors)
             }
@@ -363,6 +376,8 @@ impl AudioServer {
             "report": e.report(),
             "saves": self.out_dir.is_some(),
             "streams": e.streams(),
+            "realtime": e.realtime().map(|r| json!({"input_rate": r.input_rate, "output_rate": r.output_rate, "frame_ms": r.frame_ms, "voices": r.voices,
+                                                    "clone": r.clone, "languages": r.languages, "tools": r.tools})),
         })
     }
 
@@ -378,6 +393,29 @@ impl AudioServer {
         match range(head, b.len()) {
             Some((a, z)) => http::respond_bytes(s, 206, "audio/wav", &b[a..=z], &format!("{cors}{cache}Content-Range: bytes {a}-{z}/{}\r\n", b.len())),
             None => http::respond_bytes(s, 200, "audio/wav", &b, &format!("{cors}{cache}")),
+        }
+    }
+
+    /// A live conversation (/v1/realtime upgraded to a WebSocket: crate::realtime) until either side closes; saved
+    /// voices by name are their recordings, cloned
+    fn realtime(&self, s: Conn, req: &http::Request) {
+        self.sessions.fetch_add(1, Ordering::SeqCst);
+        if let Some(i) = self.idle {
+            i.touch();
+        }
+        let lib = self.voices();
+        let lookup = |name: &str| -> Option<(Vec<f32>, u32)> {
+            let p = lib.as_ref()?.sample_path(name)?;
+            nextsycl_audio::decode_audio(&std::fs::read(p).ok()?).ok()
+        };
+        let e = self.engine.read().unwrap_or_else(|x| x.into_inner());
+        if let Err(m) = crate::realtime::serve(s, req, &**e, &self.model, &lookup) {
+            eprintln!("nextsycl audio: a conversation ended: {m}");
+        }
+        drop(e);
+        self.sessions.fetch_sub(1, Ordering::SeqCst);
+        if let Some(i) = self.idle {
+            i.touch();
         }
     }
 

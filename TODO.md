@@ -81,14 +81,20 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
       64-dim continuous audio latent from an MLP head with one MeanFlow step; a character card (fixed layout, see the
       repo README) sets the character, a 3 s - 3 min reference clip the voice. Nine languages. Base model, research
       release.
-- [ ] A new back-and-forth WebSocket endpoint on the front door for it (audio frames both ways, text alongside,
-      session start with card + voice, barge-in; a session holds the card it runs on), documented with the other
-      /rpc + /v1 APIs.
-- [ ] A live-conversation mode in the nextsycl wfe (microphone in, speaker out, the running transcript, character
-      card + voice picker from the saved voices). Not started.
+- [x] A new back-and-forth WebSocket endpoint on the front door (2026-11-15, built with Sophon-Realtime first):
+      `/v1/realtime` (OpenAI Realtime's events, docs/api/realtime.md) on the audio server, the front door's splice
+      (`?model=`, `/open/<id>/v1/realtime`), the audio contract's `Conversation`. For Haru: its lockstep frames as the
+      designed extension (api/realtime.md "Lockstep models": one response.audio.delta per input frame, the card under
+      `nextsycl.card`) - to build with the engine.
+- [x] A live-conversation mode in the nextsycl wfe (2026-11-15): the audio page's Conversation panel (microphone in,
+      speaker out, the running transcript, the model's voices and the saved voices). For Haru: the character card.
 
 ## Port: Sophon-Realtime (right after Haru-4B; user asked 2026-11-15)
 
+- [x] Flash ported 2026-11-15 (audio/sophon, arch sophon-realtime; docs/ports/sophon-realtime.md): the brain q4 made on
+      the card from FP8, the Flash talker, the conversation (VAD, turn question, barge-in, history as audio, tools),
+      /v1/realtime, the wfe Conversation panel, card sophon-realtime-32b-flash. Not deployed. Open: q8 parity on two
+      cards, the last layers' q4 error, speculative drafting, decode speed, Tag / E2E / 4B builds.
 - [ ] github.com/adventists-ai/sophon-realtime (Apache-2.0 code and weights): a second full-duplex voice system, to
       flesh out the back-and-forth API Haru-4B starts. One 32B "brain" (listens, decides when the user has finished
       via DuplexJev, writes a tagged reply: [laughter], [sigh], <strong>) and three voices for it: Tag (expressive
@@ -96,11 +102,14 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
       continuous voice vectors -> decoder). Zero-shot voice cloning from 3-12 s, barge-in, tool calls ("Live mode"
       hands lookups to a bigger backend model). Weights: huggingface.co/adventists-ai/Sophon-Realtime-32B-{Tag,Flash,E2E},
       Sophon-Realtime-32B-Flash-4bit-MLX (Mac; see flash/README.md for the 32 GB GPU build).
-- [ ] Its server speaks the OpenAI Realtime / GPT-Live interface: make our WebSocket endpoint compatible with that
+- [x] (2026-11-15: the beta and GA event shapes, Sophon's extra_body, tool calls; GPT-Live's live/ gateway not.)
+      Its server speaks the OpenAI Realtime / GPT-Live interface: make our WebSocket endpoint compatible with that
       (session.update, input_audio_buffer.append, response.* / conversation.item.* events, tool calls), so Haru and
       Sophon share one API and the wfe conversation mode drives both; check what Haru needs that the format lacks
       (its 133 ms frame-in/frame-out lockstep) and add it as an extension.
-- [ ] Fit on hardac1: the 32B brain at 4-bit on one card or split over the B70 + B65, the talker on the other.
+- [x] Fit on hardac1: the 32B brain at 4-bit on one card or split over the B70 + B65, the talker on the other.
+      (q4 18.9 GiB of matrices; the card sophon-realtime-32b-flash: brain on GPU 0, talker on GPU 1; both fit one
+      32 GB card too, 27 GiB planned.)
 
 ## Port: ZONOS3-Mini speech (platform peer asked 2026-11-15; live on nextcuda)
 

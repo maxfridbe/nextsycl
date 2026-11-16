@@ -429,8 +429,110 @@ impl LoadOptions {
     }
 }
 
+/// What a full-duplex speech model offers a live conversation (`AudioEngine::realtime`): the front door's
+/// /v1/realtime WebSocket (OpenAI Realtime's events, docs/api/realtime.md) drives it through `Conversation`
+#[derive(Clone, Debug, Default)]
+pub struct Realtime {
+    /// the rate it hears at (the server resamples what a client sends) and the rate it speaks at
+    pub input_rate: u32,
+    pub output_rate: u32,
+    /// a lockstep model's frame (Haru-4B: every frame_ms one frame of the user's audio in, one of its own out, silence
+    /// included); 0: free-running (it listens, decides when the user has finished, then answers - Sophon)
+    pub frame_ms: u32,
+    /// its built-in voices, and whether it clones a recording (a saved voice) for a session
+    pub voices: Vec<String>,
+    pub clone: bool,
+    pub languages: Vec<String>,
+    /// whether it calls the functions a session offers
+    pub tools: bool,
+}
+
+/// A conversation's settings (OpenAI Realtime's session.update); None fields take the model's defaults
+#[derive(Clone, Debug, Default)]
+pub struct RealtimeSession {
+    /// the system prompt (None: the model's own)
+    pub instructions: Option<String>,
+    /// a built-in voice
+    pub voice: Option<String>,
+    /// a recording whose voice to speak in (a saved voice's)
+    pub reference: Option<Reference>,
+    /// the language it speaks ("en", "zh" ...)
+    pub language: Option<String>,
+    pub temperature: Option<f32>,
+    /// tokens a reply at most
+    pub max_tokens: Option<u32>,
+    /// the functions it may call: OpenAI's tool objects ({"type": "function", "name", "description", "parameters"}), as JSON
+    pub tools: Vec<String>,
+    /// earlier turns as text, (role, text): "user" / "assistant"
+    pub history: Vec<(String, String)>,
+    /// the server decides when the user has finished (turn_detection server_vad / semantic_vad); false: only the
+    /// client's commit (input_audio_buffer.commit, response.create) ends a turn
+    pub turn_detection: bool,
+    /// the turn ends after this much silence at the latest (seconds)
+    pub silence_s: Option<f32>,
+    pub seed: u64,
+    /// the engine's own options by name
+    pub extra: Given,
+}
+
+/// What a conversation tells its client, in order
+#[derive(Clone, Debug)]
+pub enum RealtimeEvent {
+    /// the user started / stopped speaking, at this many ms of the session's input
+    SpeechStarted { audio_ms: u64 },
+    SpeechStopped { audio_ms: u64 },
+    /// the user's turn taken: the item that holds it
+    Committed { item: String },
+    /// a reply begins (its response id)
+    ResponseStarted { id: String },
+    /// its text as written (sound tags kept: [laughter], <strong>...</strong>)
+    TextDelta { id: String, delta: String },
+    /// its sound as spoken (mono, `Realtime::output_rate`)
+    AudioDelta { id: String, samples: Vec<f32> },
+    /// a function call it makes (arguments: JSON); the client answers with `Conversation::tool_output`
+    ToolCall { id: String, call_id: String, name: String, arguments: String },
+    /// the reply ended: "completed", "cancelled" (barge-in, a cancel) or "failed"; its whole text and sound length
+    ResponseDone { id: String, status: String, text: String, audio_ms: u64 },
+    Error { message: String },
+}
+
+/// A live conversation with a full-duplex model: the client's audio in as it is recorded, events out. Every method
+/// returns at once; the model works on threads of its own
+pub trait Conversation: Send + Sync {
+    /// new settings (a later session.update)
+    fn update(&self, s: &RealtimeSession) -> Result<()>;
+    /// the user's audio, mono at any rate
+    fn append(&self, samples: &[f32], rate: u32) -> Result<()>;
+    /// the user's turn is over now (input_audio_buffer.commit)
+    fn commit(&self) -> Result<()>;
+    /// drop the user's audio not yet taken (input_audio_buffer.clear)
+    fn clear(&self);
+    /// answer now (response.create), the user's audio so far taken as the turn
+    fn respond(&self) -> Result<()>;
+    /// stop the reply being made (response.cancel)
+    fn cancel(&self);
+    /// the client played only `audio_ms` of a reply (conversation.item.truncate): what it heard is what is kept
+    fn truncate(&self, response: &str, audio_ms: u64);
+    /// a function call's result (conversation.item.create of a function_call_output); the model answers from it
+    fn tool_output(&self, call_id: &str, output: &str) -> Result<()>;
+    /// a turn given as text (conversation.item.create of a message): "user" or "assistant"
+    fn add_text(&self, role: &str, text: &str) -> Result<()>;
+    /// the next event, waiting at most `wait` (None: nothing yet)
+    fn next(&self, wait: std::time::Duration) -> Option<RealtimeEvent>;
+    /// the end of the conversation (its threads stop)
+    fn close(&self);
+}
+
 /// The runtime one audio architecture brings
 pub trait AudioEngine: Send + Sync {
+    /// a full-duplex speech model's live conversation (None: it does not converse)
+    fn realtime(&self) -> Option<Realtime> {
+        None
+    }
+    /// a live conversation with these settings
+    fn converse(&self, _s: &RealtimeSession) -> Result<Box<dyn Conversation>> {
+        Err(Error(format!("{} does not hold live conversations (realtime needs a full-duplex speech model: sophon-realtime)", self.arch())))
+    }
     /// its architecture (the registry entry's "arch")
     fn arch(&self) -> &'static str;
     fn defaults(&self) -> Defaults;

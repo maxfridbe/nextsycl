@@ -561,7 +561,13 @@ impl Home {
                     Ok(l) => l,
                     Err((c, e)) => return http::respond(s, c, &err(e)),
                 };
-                if let Err(e) = http::forward_to(&mut *s, &lease, req, &format!("/{sub}{query}")) {
+                // the page's live conversation (/v1/realtime): the WebSocket copied both ways while it lasts
+                let r = if http::is_upgrade(&req.head) {
+                    http::splice(s, &lease, req, &format!("/{sub}{query}"))
+                } else {
+                    http::forward_to(&mut *s, &lease, req, &format!("/{sub}{query}"))
+                };
+                if let Err(e) = r {
                     http::respond(s, 502, &err(e));
                 }
                 return;

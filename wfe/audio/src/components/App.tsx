@@ -3,6 +3,7 @@
 import { jsx } from "../jsx.js";
 import { state } from "../state.js";
 import { Spinner } from "./Spinner.js";
+import { Converse } from "./Converse.js";
 import { Create } from "./Create.js";
 import { Panel } from "./Panel.js";
 import { Progress } from "./Progress.js";
@@ -42,6 +43,11 @@ export function App() {
       {!info ? <Spinner label="Connecting to the model…" /> : null}
       <Stats />
       {state.error && !state.busy ? <pre class="err">{state.error}</pre> : null}
+      {info?.realtime
+        ? <Panel id="converse" icon="&#xf086;" title="Conversation" hint="live: talk, it answers; cut in to stop it">
+            <Converse />
+          </Panel>
+        : null}
       <Panel id="create" icon="&#xf040;" title="Create" hint={info?.arch ?? "connecting…"}>
         {info?.speech ? <Speak /> : <Create />}
       </Panel>

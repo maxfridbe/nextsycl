@@ -561,6 +561,7 @@ dependencies = [
  "nextsycl-audio-minimaxmusic3",
  "nextsycl-audio-qwen3tts",
  "nextsycl-audio-s2pro",
+ "nextsycl-audio-sophon",
  "nextsycl-audio-vibevoice",
  "nextsycl-audio-voxcpm2",
  "nextsycl-audio-voxtraltts",
@@ -693,6 +694,20 @@ name = "nextsycl-audio-s2pro"
 version = "0.0.0"
 dependencies = [
  "nextsycl-audio",
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-tok",
+ "serde_json",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "nextsycl-audio-sophon"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-audio",
+ "nextsycl-codec12hz",
  "nextsycl-core",
  "nextsycl-diffusion",
  "nextsycl-gguf",

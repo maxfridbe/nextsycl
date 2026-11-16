@@ -168,3 +168,19 @@ body{max-width:1100px}
 .spin.small{padding:4px 0;font-size:12px}.spin.small::before{width:12px;height:12px}
 @keyframes nsspin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.spin::before{animation-duration:2.8s}}
+
+/* --- the live conversation (Converse.tsx) ---------------------------------------------- */
+.converse .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.converse .go{min-width:180px}
+.converse .go.stop{background:#b91c1c;border-color:#b91c1c}
+.converse textarea.small{height:56px}
+.converse .meter{display:inline-block;width:120px;height:8px;background:#181b22;border:1px solid #2a2f3a;border-radius:4px;overflow:hidden}
+.converse .meter .bar{display:block;height:100%;background:#22c55e;transition:width .08s linear}
+.converse .transcript{max-height:360px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding:8px;background:#11141a;border:1px solid #23272f;border-radius:8px}
+.converse .turn{display:flex;gap:10px;font-size:14px;line-height:1.45}
+.converse .turn .who{flex:0 0 auto;min-width:64px;color:#94a3b8;font-size:12px;padding-top:2px}
+.converse .turn.assistant .said{color:#e2e8f0}
+.converse .turn.user .said{color:#93c5fd}
+.converse .turn.tool .said{color:#fbbf24;font:12px/1.4 ui-monospace,monospace}
+.converse .turn.live .said{opacity:.85}
+.converse .turn.cut .said{text-decoration:line-through;text-decoration-color:#64748b}
