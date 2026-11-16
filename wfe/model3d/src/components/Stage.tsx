@@ -14,7 +14,7 @@ function sync(): void {
   const url = state.shown?.url ?? "";
   if (url && viewer.url !== url) {
     state.stats = "loading…";
-    viewer.load(url).then((l) => {
+    viewer.load(url, state.shown?.camera).then((l) => {
       state.stats = l.gaussians ? `${kilo(l.gaussians)} Gaussian splats` :
         `${kilo(l.triangles)} triangles · ${kilo(l.vertices)} vertices${l.textured ? " · textured" : ""}` +
         `${l.joints ? ` · ${l.joints} bones` : ""}${l.frames ? ` · ${l.frames} frames at ${Math.round(l.fps)} fps` : ""}`;

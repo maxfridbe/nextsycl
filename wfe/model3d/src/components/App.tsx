@@ -32,7 +32,7 @@ function GpuPill() {
 export function App() {
   const info = state.info;
   const ab = info?.abilities;
-  const what = ab ? [ab.generate ? (ab.texture ? "textured meshes" : "meshes") : "", ab.views > 1 ? `${ab.views} views` : "", ab.rig ? "rigging" : "", ab.animate ? "animation" : ""]
+  const what = ab ? [ab.generate ? (ab.splats ? "3D Gaussian splats" : ab.texture ? "textured meshes" : "meshes") : "", ab.views > 1 ? `${ab.views} views` : "", ab.rig ? "rigging" : "", ab.animate ? "animation" : ""]
     .filter(Boolean).join(" · ") : "connecting…";
   return (
     <div id="app">

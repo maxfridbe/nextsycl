@@ -223,6 +223,8 @@ pub struct Budget3d {
     remover: Slot<Remover>,
     resident: bool,
     profile: bool,
+    /// NS_M3D_B3D_PROFILE=2: the denoiser's parts too
+    profile_level: u32,
     load_s: f64,
     run: Mutex<()>,
 }
@@ -259,7 +261,8 @@ impl Budget3d {
         let gs = decoder::GaussianDecoder::load(&St::open(role(files, "decoder_gs")?)?, gpu)?;
         gpu.sync()?;
         let e = Budget3d { files: files.clone(), cx, dit, dec, gs, dino: Slot::new(), vae: Slot::new(), remover: Slot::new(), resident: flag("NS_M3D_B3D_RESIDENT"),
-                           profile: flag("NS_M3D_B3D_PROFILE"), load_s: t0.elapsed().as_secs_f64(), run: Mutex::new(()) };
+                           profile: flag("NS_M3D_B3D_PROFILE"),
+                           profile_level: o.setting("NS_M3D_B3D_PROFILE").and_then(|v| v.parse().ok()).unwrap_or(0), load_s: t0.elapsed().as_secs_f64(), run: Mutex::new(()) };
         log(format!("{ARCH}: {} denoiser ({:.2} GB) and the decoders on {} in {:.1} s{}", if e.dit.turbo { "Turbo" } else { "the 50-step" },
                     e.dit.bytes as f64 / 1e9, gpu.name, e.load_s,
                     if files.contains_key("dino") && files.contains_key("vae") { "" } else { "; no image encoders (gated): pictures cannot be turned into splats until they are added" }));
@@ -375,6 +378,11 @@ impl Budget3d {
         } else {
             vec![self.dit.context(cx, &w, f1, f2, 0)?]
         };
+        let deep = self.profile_level >= 2;
+        if deep {
+            *self.dit.prof.lock().unwrap() = Some([0.0; 5]);
+        }
+        let t_loop = Instant::now();
         let (mut z, mut cam) = noise(p.seed);
         let grid = time_grid(p.steps, 3.0);
         let mut lay: Option<Layout> = None;
@@ -403,6 +411,11 @@ impl Budget3d {
             on(i, &z, &cam, ly);
             step(i as u32 + 1, p.steps as u32)?;
         }
+        if let Some(t) = self.dit.prof.lock().unwrap().take() {
+            eprintln!("{ARCH}: {} steps in {:.2} s: RePo {:.2} s, norm + qkv + rotation {:.2} s, attention {:.2} s, out {:.2} s, MLP {:.2} s (synced)",
+                      p.steps, t_loop.elapsed().as_secs_f64(), t[0], t[1], t[2], t[3], t[4]);
+        }
+        let _ = deep;
         Ok((z, cam, lay.unwrap_or_else(Layout::dense)))
     }
 

@@ -65,6 +65,9 @@ interface Part {
   targets: Float32Array[];
 }
 
+/** The camera a result says it was seen from (the server's camera_json), in the PLY's frame (up along -y) */
+export interface ResultCamera { eye?: number[]; target?: number[]; up?: number[]; fov?: number; projection?: string }
+
 export interface Loaded {
   triangles: number; vertices: number; textured: boolean; joints: number; frames: number; fps: number;
   /** a PLY's splats (0 for a mesh) */
@@ -245,6 +248,10 @@ export class Viewer {
   private radius = 1;
   private yaw = 0.6;
   private pitch = 0.35;
+  /** the vertical field of view (radians) */
+  private fovy = 0.75;
+  /** where a double-click goes back to: the result's camera, or the default view */
+  private home = { yaw: 0.6, pitch: 0.35, dist: 3, fovy: 0.75, center: [0, 0, 0] };
   private dist = 3;
   private pan = [0, 0, 0];
   private raf = 0;
@@ -288,11 +295,11 @@ export class Viewer {
   }
 
   /** Shows the GLB (or the PLY of splats) at `url` (its stats when it loads) */
-  async load(url: string): Promise<Loaded> {
+  async load(url: string, camera?: ResultCamera | null): Promise<Loaded> {
     this.url = url;
     const r = await fetch(url);
     if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
-    if (url.split("?")[0]!.toLowerCase().endsWith(".ply")) return this.loadSplats(url, await r.arrayBuffer());
+    if (url.split("?")[0]!.toLowerCase().endsWith(".ply")) return this.loadSplats(url, await r.arrayBuffer(), camera ?? null);
     const { parts, bones, fps, frames } = await parse(await r.arrayBuffer());
     if (this.url !== url) throw new Error("superseded");
     this.clear();
@@ -358,6 +365,10 @@ export class Viewer {
     this.radius = Math.max(Math.hypot(hi[0]! - lo[0]!, hi[1]! - lo[1]!, hi[2]! - lo[2]!) / 2, 1e-3);
     this.dist = this.radius * 2.6;
     this.pan = [0, 0, 0];
+    this.yaw = 0.6;
+    this.pitch = 0.35;
+    this.fovy = 0.75;
+    this.home = { yaw: this.yaw, pitch: this.pitch, dist: this.dist, fovy: this.fovy, center: [...this.center] };
     this.frames = frames;
     this.fps = fps;
     this.t0 = performance.now();
@@ -365,8 +376,10 @@ export class Viewer {
     return { triangles: tris, vertices: verts, textured, joints: this.bones ? this.bones.count / 2 : 0, frames, fps, gaussians: 0 };
   }
 
-  /** Shows a PLY's splats: framed by their bounds, drawn back to front */
-  private loadSplats(url: string, buf: ArrayBuffer): Loaded {
+  /** Shows a PLY's splats, drawn back to front: from the camera the result was seen from when it says one (the picture's
+   *  view: its eye, distance and field of view, turned into the viewer's y-up frame as the splats are), else framed by
+   *  their bounds */
+  private loadSplats(url: string, buf: ArrayBuffer, camera: ResultCamera | null): Loaded {
     const data = parsePly(buf);
     if (this.url !== url) throw new Error("superseded");
     this.clear();
@@ -375,6 +388,23 @@ export class Viewer {
     this.center = [0, 1, 2].map((k) => (lo[k]! + hi[k]!) / 2);
     this.radius = Math.max(Math.hypot(hi[0]! - lo[0]!, hi[1]! - lo[1]!, hi[2]! - lo[2]!) / 2, 1e-3);
     this.dist = this.radius * 2.6;
+    this.yaw = 0.6;
+    this.pitch = 0.35;
+    this.fovy = 0.75;
+    const e = camera?.eye, t = camera?.target ?? [0, 0, 0];
+    if (e && e.length === 3 && camera?.projection !== "orthographic") {
+      // the PLY's frame to the viewer's: (x, y, z) -> (x, -y, -z)
+      const d = [e[0]! - t[0]!, -(e[1]! - t[1]!), -(e[2]! - t[2]!)];
+      const r = Math.hypot(d[0]!, d[1]!, d[2]!);
+      if (r > 1e-6) {
+        this.center = [t[0]!, -t[1]!, -t[2]!];
+        this.dist = r;
+        this.yaw = Math.atan2(d[0]!, d[2]!);
+        this.pitch = Math.asin(Math.max(-1, Math.min(1, d[1]! / r)));
+        if (camera?.fov && camera.fov > 1 && camera.fov < 170) this.fovy = camera.fov * Math.PI / 180;
+      }
+    }
+    this.home = { yaw: this.yaw, pitch: this.pitch, dist: this.dist, fovy: this.fovy, center: [...this.center] };
     this.pan = [0, 0, 0];
     this.frames = 0;
     this.draw();
@@ -428,7 +458,11 @@ export class Viewer {
       this.dist = Math.min(Math.max(this.dist * Math.exp(e.deltaY * 0.0012), this.radius * 0.3), this.radius * 20);
       this.draw();
     }, { passive: false });
-    c.addEventListener("dblclick", () => { this.yaw = 0.6; this.pitch = 0.35; this.dist = this.radius * 2.6; this.pan = [0, 0, 0]; this.draw(); });
+    c.addEventListener("dblclick", () => {
+      const h = this.home;
+      this.yaw = h.yaw; this.pitch = h.pitch; this.dist = h.dist; this.fovy = h.fovy; this.center = [...h.center]; this.pan = [0, 0, 0];
+      this.draw();
+    });
   }
 
   private panBy(dx: number, dy: number): void {
@@ -474,9 +508,9 @@ export class Viewer {
     const eye = [target[0]! + this.dist * Math.cos(this.pitch) * Math.sin(this.yaw), target[1]! + this.dist * Math.sin(this.pitch),
                  target[2]! + this.dist * Math.cos(this.pitch) * Math.cos(this.yaw)];
     const view = lookAt(eye, target, [0, 1, 0]);
-    const proj = perspective(0.75, w / h, this.radius * 0.01, this.radius * 60);
+    const proj = perspective(this.fovy, w / h, this.radius * 0.01, this.radius * 60);
     if (this.splats) {
-      this.splats.draw(view, proj, eye, target, w, h, 0.75);
+      this.splats.draw(view, proj, eye, target, w, h, this.fovy);
       return;
     }
     const vp = mul(proj, view);

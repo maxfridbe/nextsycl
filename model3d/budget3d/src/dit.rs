@@ -127,6 +127,9 @@ pub struct Dit {
     ref2: Stage,
     ref4: Stage,
     pub bytes: usize,
+    /// NS_M3D_B3D_PROFILE=2: seconds in a block's parts over the calls [RePo, norm + qkv + rotation, attention,
+    /// out + gated add, MLP] (each part synced: slower)
+    pub prof: std::sync::Mutex<Option<[f64; 5]>>,
 }
 
 /// The phase whose matrices a call uses (Idol-turbo: slow at t >= 0.5; the base model has one)
@@ -364,6 +367,7 @@ impl Dit {
             ref4: stage("4", 8, &layout::cube_child_offsets())?,
             octree,
             bytes,
+            prof: std::sync::Mutex::new(None),
         };
         g.sync()?;
         Ok(d)
@@ -451,11 +455,22 @@ impl Dit {
         // SAFETY: the 6 x 1024 modulation row's parts.
         let m = |j: usize| md.map_or(std::ptr::null(), |p| unsafe { p.add(j * D) });
         let hp = |buf: &DevBuf, off: usize| -> *mut std::ffi::c_void { buf.ptr().cast::<u16>().wrapping_add(off).cast() };
+        let mut prof = *self.prof.lock().unwrap();
+        let mut t0 = std::time::Instant::now();
+        let mut tick = |i: usize| -> Result<()> {
+            if let Some(p) = prof.as_mut() {
+                cx.gpu.sync()?;
+                p[i] += t0.elapsed().as_secs_f64();
+                t0 = std::time::Instant::now();
+            }
+            Ok(())
+        };
         // RePo: the block's input -> a 3-D offset a head
         nsd.layer_norm(h.ptr(), Dt::F32, rows, D, b.repo.norm.0.ptr(), b.repo.norm.1.ptr(), 1e-5, w.rp_ln.ptr(), Dt::F32)?;
         b.repo.gc.apply(nsd, k, w.rp_ln.ptr(), rows, w.rp_gc.ptr(), Dt::F32)?;
         nsd.swiglu(w.rp_gc.ptr(), Dt::F32, rows, REPO, w.rp_sw.ptr(), Dt::F32)?;
         b.repo.fin.apply(nsd, k, w.rp_sw.ptr(), rows, w.delta.ptr(), Dt::F32)?;
+        tick(0)?;
         // the attention
         let (nw, nb, md1) = match &b.norms {
             Some(n) => (n[0].0.fp() as *const f32, n[0].1.fp() as *const f32, Rows::none()),
@@ -465,13 +480,16 @@ impl Dit {
         ls.qkv.apply(nsd, k, w.hn.ptr(), rows, w.qkv.ptr(), Dt::F16)?;
         k.rope_norm(w.qkv.ptr(), rows, HEADS, HD, 3 * D, w.delta.fp(), b.repo.freqs.fp(), AXES.0, AXES.1, b.q_gamma.fp())?;
         k.rope_norm(hp(&w.qkv, D), rows, HEADS, HD, 3 * D, w.delta.fp(), b.repo.freqs.fp(), AXES.0, AXES.1, b.k_gamma.fp())?;
+        tick(1)?;
         for s in 0..rows / seq {
             let r0 = s * seq;
             nsd.attention_qk(hp(&w.qkv, r0 * 3 * D), seq, 3 * D, hp(&w.qkv, r0 * 3 * D + D), hp(&w.qkv, r0 * 3 * D + 2 * D), seq, 3 * D, Dt::F16, HEADS, HD,
                              hp(&w.att, r0 * D), Dt::F16)?;
         }
+        tick(2)?;
         ls.out.apply(nsd, k, w.att.ptr(), rows, w.tmp.ptr(), Dt::F32)?;
         k.gate_add(h.fp(), rows, D, w.tmp.ptr(), Dt::F32, m(2), 0, 0)?;
+        tick(3)?;
         // the MLP
         let (nw, nb, md2) = match &b.norms {
             Some(n) => (n[1].0.fp() as *const f32, n[1].1.fp() as *const f32, Rows::none()),
@@ -481,7 +499,12 @@ impl Dit {
         ls.mlp0.apply(nsd, k, w.hn.ptr(), rows, w.mlp.ptr(), Dt::F16)?;
         nsd.gelu(w.mlp.ptr(), Dt::F16, rows * MLP, true)?;
         ls.mlp2.apply(nsd, k, w.mlp.ptr(), rows, w.tmp.ptr(), Dt::F32)?;
-        k.gate_add(h.fp(), rows, D, w.tmp.ptr(), Dt::F32, m(5), 0, 0)
+        k.gate_add(h.fp(), rows, D, w.tmp.ptr(), Dt::F32, m(5), 0, 0)?;
+        tick(4)?;
+        if prof.is_some() {
+            *self.prof.lock().unwrap() = prof;
+        }
+        Ok(())
     }
 
     /// The picture's tokens refined (feature1 [4101, 1280] DINOv3, feature2 [4101, 128] FLUX.2 VAE): [4101, 1024]

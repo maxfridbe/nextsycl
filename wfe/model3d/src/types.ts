@@ -47,6 +47,8 @@ export interface Made {
   /** splats made (a PLY) */
   gaussians?: number;
   kind?: "mesh" | "splats";
+  /** splats: the camera the picture was seen from (the server's camera_json; the PLY's frame) */
+  camera?: { yaw?: number; pitch?: number; radius?: number; fov?: number; projection?: string; eye?: number[]; target?: number[]; up?: number[] } | null;
   texture?: boolean;
   textured?: boolean;
   rigged?: number | null;
