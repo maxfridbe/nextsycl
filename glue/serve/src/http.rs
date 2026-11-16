@@ -368,18 +368,55 @@ pub fn content_type(path: &str) -> &'static str {
     }
 }
 
-fn reason(status: u16) -> &'static str {
+/// The status line's reason phrase for a status (an unlisted one gets its class's name, never a wrong specific one)
+pub fn reason(status: u16) -> &'static str {
     match status {
+        100 => "Continue",
+        101 => "Switching Protocols",
         200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
         204 => "No Content",
         206 => "Partial Content",
+        301 => "Moved Permanently",
         302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        408 => "Request Timeout",
         409 => "Conflict",
+        410 => "Gone",
+        411 => "Length Required",
+        412 => "Precondition Failed",
+        413 => "Content Too Large",
+        415 => "Unsupported Media Type",
+        416 => "Range Not Satisfiable",
+        422 => "Unprocessable Content",
+        423 => "Locked",
+        425 => "Too Early",
+        426 => "Upgrade Required",
+        428 => "Precondition Required",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
         499 => "Client Closed Request",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
-        _ => "Internal Server Error",
+        504 => "Gateway Timeout",
+        507 => "Insufficient Storage",
+        100..=199 => "Informational",
+        200..=299 => "Success",
+        300..=399 => "Redirection",
+        400..=499 => "Client Error",
+        _ => "Server Error",
     }
 }
 
@@ -541,6 +578,27 @@ pub fn call(t: &Target, method: &str, path: &str, body: Option<&Value>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_lines_carry_their_own_reason_phrase() {
+        // 2026-11-16: a 401 went out as "401 Internal Server Error"
+        for (status, phrase) in [(200, "OK"), (206, "Partial Content"), (302, "Found"), (400, "Bad Request"), (401, "Unauthorized"),
+                                 (403, "Forbidden"), (404, "Not Found"), (405, "Method Not Allowed"), (409, "Conflict"),
+                                 (413, "Content Too Large"), (429, "Too Many Requests"), (499, "Client Closed Request"),
+                                 (500, "Internal Server Error"), (502, "Bad Gateway"), (503, "Service Unavailable"), (504, "Gateway Timeout")] {
+            let mut out = Vec::new();
+            respond(&mut out, status, &serde_json::json!({}));
+            let line = String::from_utf8(out).unwrap().lines().next().unwrap().to_string();
+            assert_eq!(line, format!("HTTP/1.1 {status} {phrase}"));
+            let mut out = Vec::new();
+            respond_bytes(&mut out, status, "text/plain", b"x", "");
+            assert!(String::from_utf8(out).unwrap().starts_with(&format!("HTTP/1.1 {status} {phrase}\r\n")));
+        }
+        // an unlisted status never claims another's name
+        assert_eq!(reason(418), "Client Error");
+        assert_eq!(reason(599), "Server Error");
+        assert_ne!(reason(401), reason(500));
+    }
 
     #[test]
     fn base64_round_trips_and_multipart_splits() {
