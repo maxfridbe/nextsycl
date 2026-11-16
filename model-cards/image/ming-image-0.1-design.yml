@@ -40,3 +40,21 @@ guide: guides/ming-image.md
 encoder:                         # its text encoder (image.describe describer native: none - it reads no pictures)
   name: Ling-Mini-2.0
   sees: false
+controls:                        # its request rules (model-cards/README.md, Image controls; schema 1)
+  version: 1
+  steps: {min: 8, max: 50, default: 12}       # 8, 12 and 20 looked at: whole
+  cfg: {min: 1, max: 10, default: 1}          # above 1: against an empty condition (it reads no negative prompt)
+  negative: false
+  size:
+    min_side: 512
+    max_side: 4096
+    multiple: 32
+    max_pixels: 4194304
+    default: 1024x1024
+  seed: true
+  n: 8
+  loras: false                   # the engine takes none (dropped at load)
+  edit: null                     # its edit model is Ming-Image-0.1-Design-Layer's
+  transparent: false             # with these GGUF files the alpha comes back opaque (240 - 255): the subject on a plain background
+  sampler: {values: [euler], default: euler}
+  note: 'A design model (UI, posters, slides, logos with their words spelled right): made at its nearest trained size (1024 or 2048) and resized'

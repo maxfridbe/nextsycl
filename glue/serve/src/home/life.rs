@@ -124,6 +124,19 @@ fn needs_more_mb(why: &str) -> Option<u64> {
 /// A model's licence field (license, commercial, license_note): its registry entry's, else its model card's; null when
 /// neither says
 fn licence(m: &Value, cards: &[Value], k: &str) -> Value {
+    from_card(m, cards, k)
+}
+
+/// A picture-making image model's request rules (`controls`, schema 1: glue/models controls.rs, model-cards/README.md):
+/// its registry entry's, else its model card's; null for every other model (describers, OCR, upscalers, background
+/// removers make no pictures)
+fn controls(m: &Value, cards: &[Value], caps: &[&str]) -> Value {
+    if registry::kind_of(m) == "image" && caps.contains(&"generate") { from_card(m, cards, "controls") } else { Value::Null }
+}
+
+/// A field of a model's registry entry, else of its model card (the card it was pulled from, else the one of its id);
+/// null when neither has it
+fn from_card(m: &Value, cards: &[Value], k: &str) -> Value {
     let card = cards.iter().find(|c| [s(m, "catalog"), s(m, "id")].iter().any(|i| !i.is_empty() && c["id"] == i.as_str()));
     Some(&m[k]).filter(|v| !v.is_null()).or_else(|| card.map(|c| &c[k])).cloned().unwrap_or(Value::Null)
 }
@@ -610,7 +623,8 @@ impl Home {
         // and for an image model whether its text encoder describes (a native describer card reads its file)
         let dc = if need("image") && mc.is_empty() { self.o.cfg.cards() } else { Vec::new() };
         let dc = if mc.is_empty() { &dc } else { &mc };
-        // and for every model its licence (license, commercial, license_note: its entry's, else its card's)
+        // and for every model its licence (license, commercial, license_note: its entry's, else its card's), and for a
+        // picture-making one its request rules (controls)
         let lc_read;
         let lc = if dc.is_empty() { lc_read = self.o.cfg.cards(); &lc_read } else { dc };
         let holds = self.holds();
@@ -684,6 +698,7 @@ impl Home {
             json!({"concurrency": concurrency, "coexistence": coexistence, "copies_now": copies_now,
                    "max_copies": max_copies, "recommended_copies": recommended_copies, "at_once": at_once,
                    "license": licence(m, lc, "license"), "commercial": licence(m, lc, "commercial"), "license_note": licence(m, lc, "license_note"),
+                   "controls": controls(m, lc, &caps),
                    "id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "gpus_one_of": registry::one_of(m), "state": state,
                    "spans": spans_all(m, &mc),
                    "pinned": enabled && m["pinned"] == true, "held_s": holds.get(s(m, "id").as_str()).map_or(0.0, |h| h.reserved(now()).round()),
@@ -1515,6 +1530,26 @@ fn vouched_rows(on: &[&Value], gi: &str) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+    /// A picture-making model's row carries its request rules: its entry's, else its card's (by the card it was pulled
+    /// from); a model that makes no pictures carries none, whatever a card says
+    #[test]
+    fn a_picture_makers_row_carries_its_cards_controls() {
+        use serde_json::json;
+        let cards = vec![json!({"id": "zi", "kind": "image", "controls": {"version": 1, "n": 8}}),
+                         json!({"id": "ocr", "kind": "image", "controls": {"version": 1}})];
+        let caps = |m: &serde_json::Value| super::capabilities(m).0;
+        let m = json!({"id": "zi-local", "catalog": "zi", "kind": "image", "arch": "z-image"});
+        assert_eq!(super::controls(&m, &cards, &caps(&m))["n"], 8);
+        let own = json!({"id": "zi", "kind": "image", "arch": "z-image", "controls": {"version": 1, "n": 2}});
+        assert_eq!(super::controls(&own, &cards, &caps(&own))["n"], 2, "the entry's first");
+        let ocr = json!({"id": "ocr", "kind": "image", "arch": "unlimited-ocr"});
+        assert!(super::controls(&ocr, &cards, &caps(&ocr)).is_null(), "a reader makes no pictures");
+        let up = json!({"id": "x", "kind": "image", "arch": "realesrgan"});
+        assert!(super::controls(&up, &cards, &caps(&up)).is_null());
+        let none = json!({"id": "nocard", "kind": "image", "arch": "z-image"});
+        assert!(super::controls(&none, &cards, &caps(&none)).is_null(), "no card: null");
+    }
+
     #[test]
     fn copies_are_the_backplanes_never_a_cards() {
         use super::{backplane_copies, Profile};

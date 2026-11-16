@@ -43,3 +43,26 @@ guide: guides/qwen-image-2.1.md
 encoder:                         # its text encoder (image.describe describer native: qwen3-vl-8b-instruct reads the same file)
   name: Qwen3-VL-8B-Instruct
   sees: true
+controls:                        # its request rules (model-cards/README.md, Image controls; schema 1)
+  version: 1
+  steps: {min: 20, max: 100, default: 40}   # 12 looked at: whole but softer; 20 and 40 sharp (nextcuda's floor of 20 kept)
+  cfg: {min: 1, max: 30, default: 1}        # above 1 needs a negative prompt (true_cfg_scale); 1: one pass a step, as the card's default
+  negative: true
+  size:
+    min_side: 256
+    max_side: 4096
+    multiple: 16
+    max_pixels: 4194304
+    default: 1024x1024
+    presets: {ratios: ['1:1', '4:3', '3:4', '3:2', '2:3', '16:9', '9:16'], pixels: [1048576, 1638400, 2359296]}
+  seed: true
+  n: 8
+  loras: true                    # on the side path, for the request only
+  edit:                          # the pictures as references (instructions), and a strength below 1 starts from picture 1 - with or without them
+    images: 8
+    mask: false
+    strength: true
+    reference: true
+    strength_with_reference: true
+  transparent: true              # the RGBA VAE (the prompt given the alpha sentences)
+  note: 'Qwen-Image 2.1: 40 steps; edits with up to 7 references, transparency, lettering'

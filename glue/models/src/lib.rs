@@ -3,6 +3,7 @@
 
 pub mod catalog;
 pub mod config;
+pub mod controls;
 pub mod registry;
 
 pub use config::Config;

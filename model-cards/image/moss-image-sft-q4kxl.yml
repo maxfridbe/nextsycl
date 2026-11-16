@@ -38,3 +38,23 @@ guide: guides/moss-image.md
 encoder:                         # its text encoder (image.describe describer native: none - its file holds no vision tower)
   name: Qwen3.5-9B, text weights only
   sees: false
+controls:                        # its request rules (model-cards/README.md, Image controls; schema 1)
+  version: 1
+  steps: {min: 20, max: 100, default: 50}     # 20 misspelled a word, 50 right
+  cfg: {min: 1, max: 30, default: 3}
+  negative: true
+  size:
+    min_side: 64
+    max_side: 4096
+    multiple: 16
+    max_pixels: 4220160
+    default: 1024x1024
+    presets: {ratios: ['1:8', '1:4', '1:3', '1:2', '9:16', '2:3', '3:4', '1:1', '4:3', '3:2', '16:9', '2:1', '3:1', '4:1', '8:1'], pixels: [262144, 1048576, 1572864, 2097152, 4194304]}
+  seed: true
+  n: 8
+  loras: true                    # merged at a reload with them
+  edit: null
+  transparent: false
+  sampler: {values: [euler], default: euler}
+  shift: {min: 0.1, max: 20, default: 5}
+  note: 'OpenMOSS''s SFT model: 50 steps with guidance and a negative prompt; 1:8 to 8:1 up to 4 MP'

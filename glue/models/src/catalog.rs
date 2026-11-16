@@ -71,6 +71,10 @@ impl Catalog {
                 }
                 // its concurrency and coexistence (crates/scheduler `profile`; absent: one copy, shared): bad values refused here, by file
                 backplane_scheduler::profile::Profile::from_card(&v).map_err(|e| format!("{}: {e}", p.display()))?;
+                // a picture-making model's request rules (crate::controls; schema 1): bad values refused here, by file
+                if let Some(c) = v.get("controls") {
+                    crate::controls::check(c).map_err(|e| format!("{}: {e}", p.display()))?;
+                }
                 cards.push((p, v));
             }
         }
@@ -629,6 +633,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every picture-making image card states its request rules (controls, schema 1: what the platform's one image
+    /// control may send it), whole and ordered; no other card has them (nextcuda's test of the same name)
+    #[test]
+    fn every_picture_making_card_states_its_request_rules() {
+        let cat = repo_cards();
+        let mut makers = 0;
+        for m in &cat.models {
+            let id = s(m, "id");
+            if crate::controls::makes_pictures(m) {
+                makers += 1;
+                let c = m.get("controls").unwrap_or_else(|| panic!("{id}: a picture-making card states its controls (model-cards/README.md, Image controls)"));
+                crate::controls::check(c).unwrap_or_else(|e| panic!("{id}: {e}"));
+                assert_eq!(c["version"], 1, "{id}");
+                // the card's own defaults are within its rules
+                let d = &m["defaults"];
+                let st = d["steps"].as_u64().unwrap();
+                assert_eq!(c["steps"]["default"].as_u64(), Some(st), "{id}: controls.steps.default is the card's defaults.steps");
+                if let Some(sz) = d["size"].as_str() {
+                    assert_eq!(c["size"]["default"].as_str(), Some(sz), "{id}: controls.size.default is the card's defaults.size");
+                }
+                // no guidance: the card's cfg is 1; guidance: its default within the range
+                match (&c["cfg"], d["cfg"].as_f64()) {
+                    (Value::Null, Some(x)) => assert_eq!(x, 1.0, "{id}: cfg null, defaults.cfg 1"),
+                    (r, Some(x)) if !r.is_null() => assert_eq!(r["default"].as_f64(), Some(x), "{id}: controls.cfg.default is the card's defaults.cfg"),
+                    _ => {}
+                }
+                if let Some(smp) = d["sampler"].as_str() {
+                    if !c["sampler"].is_null() {
+                        assert_eq!(c["sampler"]["default"].as_str(), Some(smp), "{id}: controls.sampler.default is the card's");
+                    }
+                }
+            } else {
+                assert!(m.get("controls").is_none(), "{id}: makes no pictures, states no controls");
+            }
+        }
+        assert!(makers >= 20, "the picture-making cards were not found ({makers})");
     }
 
     #[test]

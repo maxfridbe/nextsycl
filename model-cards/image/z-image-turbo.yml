@@ -50,3 +50,23 @@ guide: guides/z-image-turbo.md
 encoder:                         # its text encoder (image.describe describer native: none - it reads no pictures)
   name: Qwen3-4B
   sees: false
+controls:                        # its request rules (model-cards/README.md, Image controls; schema 1)
+  version: 1
+  steps: {min: 4, max: 16, default: 8}        # distilled for 8: 2 left rough lettering, 4 - 16 whole
+  cfg: null                      # guidance-distilled: no CFG, no negative prompt
+  negative: false
+  size:
+    min_side: 256                # 512 x 512 looked at: whole
+    max_side: 2048
+    multiple: 16
+    max_pixels: 4194304          # 2048 x 2048 looked at: whole, sharp, one subject (nextcuda caps at 2,359,296 for its 12 GB cards)
+    default: 1024x1024
+    presets: {ratios: ['1:1', '9:7', '7:9', '4:3', '3:4', '3:2', '2:3', '16:9', '9:16', '21:9', '9:21'], pixels: [1048576, 1638400, 2359296]}
+  seed: true
+  n: 8
+  loras: false                   # it takes none (refused)
+  edit: null                     # text to image only (no VAE encoder)
+  transparent: false
+  sampler: {values: [euler], default: euler}
+  shift: {min: 0.1, max: 20, default: 3}
+  note: 'Photographs and lettering in English and Chinese, 8 steps without guidance; up to 2048 x 2048'

@@ -94,3 +94,49 @@ coexistence:
 
 Recommended is where one more copy still gains at least 25% total; exclusive when co-running fails or either side drops below 50%.
 
+## Image controls (schema 1)
+
+Every picture-making image card (an `image` card with `defaults.steps`: text to image, edits) states its request
+rules under `controls`; describers, OCR, upscalers, vectorizers and background removers have none. The front door
+copies the block into the model's row of `system.models` and `system.state` (its registry entry's `controls`, else
+its card's; null for the others), and the platform's one image control reads it to refuse a request outside them.
+The block is nextcuda's (docs/models.md, "Image controls (schema 1)"), field for field. It says what the model makes
+**well**, not all its engine accepts: full Qwen-Image 2.1 runs any step count but stops half made under 20, so it says
+20-100; a few-step model gives its real, narrow range. Bad values refuse the whole catalog at load, naming the file
+(`glue/models/src/controls.rs` is the check; `cargo test`: `every_picture_making_card_states_its_request_rules`).
+
+```yaml
+controls:
+  version: 1                     # integer; a reader treats a version above its own as unknown rules; fields added within a version are optional
+  steps: {min: 6, max: 6, default: 6}          # min = max: fixed (the box's own count: a client leaves steps out)
+  cfg: {min: 1, max: 30, default: 4}           # null: no guidance (cfg 1 only)
+  negative: true                 # a negative prompt is read (only with cfg)
+  size:
+    min_side: 256                # each side
+    max_side: 4096
+    multiple: 16                 # each side a multiple of this (refused otherwise - a client does not rely on rounding)
+    max_pixels: 4194304          # width x height at most (optional)
+    default: 1024x1024
+    sizes: []                    # optional: only these WxH
+    presets: {ratios: ['16:9'], pixels: [1048576]}   # optional: what the model was trained around, for a picker (capped by max_side / max_pixels)
+  seed: true                     # the seed is honoured (picture i: seed + i)
+  n: 8                           # pictures one request makes at most
+  loras: true                    # per-request LoRAs are applied (false: the model takes none)
+  edit:                          # null: text to image only (no pictures, no img2img)
+    images: 8                    # pictures one edit takes (the first is the one changed)
+    mask: false                  # a mask picture (no engine receives one today)
+    strength: true               # img2img strength below 1
+    reference: true              # the pictures condition the model (the instruction edit)
+    strength_with_reference: false   # strength below 1 also applies with reference true (else it needs reference false)
+  transparent: true              # background "transparent" gives a picture with real transparency (RGBA)
+  sampler: {values: [euler], default: euler}         # optional
+  shift: {min: 0.1, max: 20, default: 3}             # optional: the schedule's shift a client may set; absent: its own
+  options:                       # optional: the engine's own per-request options (`options: {name: value}`)
+    - {name: eta, type: number, min: 0, max: 1, default: 0, help: '...'}   # type number | bool | text
+  note: '...'                    # optional: one sentence for a picker
+```
+
+The values come from the engine (image/<arch>/src: its step, guidance and size checks, edits, LoRAs, samplers,
+shift, options) and, for what it makes well, from pictures made and looked at; a model nextcuda serves too states the
+same rules unless the engine here differs (the card's comment then says where and why).
+

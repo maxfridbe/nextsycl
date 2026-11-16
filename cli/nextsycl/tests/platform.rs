@@ -6,6 +6,9 @@
 //!    (`every_engine_has_a_card`) - an engine nobody can pull is dead weight.
 //! 3. A card's `does` (model3d) names abilities the front door routes (`cards_say_only_what_the_door_routes`).
 //! 4. No two engines of a kind claim one architecture (`no_architecture_is_claimed_twice`).
+//! 5. A picture-making card's request rules (`controls`) promise no more than its engine takes: sizes within the
+//!    engine's own limits and on its grid, no edits from a text-to-image engine, a fixed step count where the engine
+//!    runs only its own (`picture_cards_promise_no_more_than_their_engines_take`).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -141,4 +144,53 @@ fn cards_say_only_what_the_door_routes() {
             assert!(does.contains(&"texture"), "{}: paints a mesh but does not texture", s(c, "id"));
         }
     }
+}
+
+/// A picture-making card's `controls` (model-cards/README.md, Image controls) within what its engine takes: the
+/// platform refuses requests outside them, so a rule wider than the engine would pass requests the engine refuses
+#[test]
+fn picture_cards_promise_no_more_than_their_engines_take() {
+    use nextsycl_image_h3image as h3i;
+    use nextsycl_image_ph3image as ph3;
+    use nextsycl_image_zimage as zi;
+    let mut seen = 0;
+    for c in cards().iter().filter(|c| nextsycl_models::controls::makes_pictures(c)) {
+        let (id, k) = (s(c, "id").to_string(), &c["controls"]);
+        let sz = &k["size"];
+        let num = |v: &Value| v.as_u64().unwrap_or(0);
+        let (lo, hi, mult, px) = (num(&sz["min_side"]), num(&sz["max_side"]), num(&sz["multiple"]), sz["max_pixels"].as_u64());
+        // every engine refuses a side under 64, and takes multiples of 16 (Qwen-Image, Z-Image, MOSS) or 32 (the rest)
+        assert!(lo >= 64 && mult > 0 && mult.is_multiple_of(16), "{id}: sides");
+        match s(c, "arch") {
+            "z-image" => {
+                assert!(lo as usize >= zi::MIN_SIDE && hi as usize <= zi::MAX_SIDE && px.is_some_and(|p| p as usize <= zi::MAX_PIXELS), "{id}: z-image's limits");
+                assert!(k["edit"].is_null() && k["cfg"].is_null() && k["loras"] == false && k["transparent"] == false, "{id}: z-image: text to image, no guidance, LoRAs or alpha");
+            }
+            "minimax-h3-image" => {
+                assert!(lo >= h3i::MIN_SIDE as u64 && hi <= h3i::MAX_SIDE as u64 && px.is_some_and(|p| p <= h3i::MAX_PIXELS) && mult.is_multiple_of(h3i::GRID as u64), "{id}: the engine's limits");
+                assert!(k["cfg"].is_null() && k["negative"] == false && num(&k["edit"]["images"]) as usize <= h3i::MAX_PICTURES, "{id}: no guidance, its pictures");
+            }
+            "p-h3-image" => {
+                assert!(lo >= 256 && px.is_some_and(|p| p <= ph3::MAX_PIXELS) && mult.is_multiple_of(ph3::GRID as u64), "{id}: the engine's limits");
+                assert!(k["cfg"].is_null() && k["negative"] == false && num(&k["edit"]["images"]) as usize <= ph3::MAX_PICTURES, "{id}: no guidance, its pictures");
+                // it runs its grid's 8 steps (another grid: options.sigmas) and reads an edit's pictures at strength 1
+                assert!(k["steps"]["min"] == 8 && k["steps"]["max"] == 8 && k["edit"]["strength"] == false, "{id}: 8 fixed steps, no img2img");
+            }
+            "hunyuanimage-2.1" | "ming-image" | "moss-image" => {
+                assert!(k["edit"].is_null() && hi <= 4096, "{id}: text to image only, 4096 a side at most");
+            }
+            "qwen-image-2.1" => {
+                // a few-step distill runs its own sigmas: a fixed count
+                if let Some(sig) = c["env"]["NS_QI_SIGMAS"].as_str() {
+                    let n = sig.split(',').count() as u64;
+                    assert!(num(&k["steps"]["min"]) == n && num(&k["steps"]["max"]) == n, "{id}: its own {n} sigmas");
+                }
+            }
+            a => panic!("{id}: a picture-making architecture {a} this test does not know: add its engine's limits here"),
+        }
+        // the front door takes 1 to 8 pictures a request, and 8 pictures an edit
+        assert!(num(&k["n"]) <= 8 && k["edit"]["images"].as_u64().is_none_or(|n| n <= 8), "{id}: the front door's limits");
+        seen += 1;
+    }
+    assert!(seen >= 20, "the picture-making cards were not found ({seen})");
 }

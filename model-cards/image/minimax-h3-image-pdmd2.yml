@@ -33,3 +33,29 @@ files:
   vision: h3-te-visual
   vae: h3i-vae
 guide: guides/minimax-h3-image.md
+controls:                        # its request rules (model-cards/README.md, Image controls; schema 1)
+  version: 1
+  steps: {min: 2, max: 4, default: 2}         # the pDMD LoRA's 2 steps on shift 12; 1 step is a blur, 3 - 4 when 2 drifts
+  cfg: null
+  negative: false
+  size:
+    min_side: 512
+    max_side: 5056
+    multiple: 32
+    max_pixels: 20971520
+    default: 2048x2048
+    presets: {ratios: ['1:1', '4:3', '3:4', '3:2', '2:3', '16:9', '9:16'], pixels: [1048576, 4194304, 8388608, 16777216]}
+  seed: true
+  n: 8
+  loras: true
+  edit:
+    images: 8
+    mask: false
+    strength: true
+    reference: true
+    strength_with_reference: true
+  transparent: false
+  sampler: {values: [euler], default: euler}
+  options:
+    - {name: start-sigma, type: number, min: 0.05, max: 1, help: 'with a picture: the denoise starts at this sigma of its latents (the detail pass: 0.4 - 0.55, steps 3)'}
+  note: 'The live editor''s card: 2 steps (int8 + the pDMD LoRA), prompts and pictures cached; edits and a detail pass from a picture'

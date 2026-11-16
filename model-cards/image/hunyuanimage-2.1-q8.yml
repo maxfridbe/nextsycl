@@ -50,3 +50,24 @@ encoder:                         # its text encoder (image.describe describer na
   name: Qwen2.5-VL-7B-Instruct
   sees: true
   why: 'its Q4_0 GGUF holds the vision tower and the output head but no model settings or tokenizer, and no engine here writes with Qwen2.5-VL from it'
+controls:                        # its request rules (model-cards/README.md, Image controls; schema 1)
+  version: 1
+  steps: {min: 30, max: 100, default: 50}   # 1024 looked at: 20 garbled a number, 30 and 50 whole
+  cfg: {min: 1, max: 10, default: 3.5}     # with the negative prompt (empty by default), two passes a step
+  negative: true
+  size:
+    min_side: 1024               # 768 x 768 looked at: lettering garbled, softer (1024 whole)
+    max_side: 3072
+    multiple: 32
+    max_pixels: 4194304          # its 2K
+    default: 2048x2048
+    presets: {ratios: ['1:1', '4:3', '3:4', '16:9', '9:16'], pixels: [1048576, 4194304]}
+  seed: true
+  n: 8
+  loras: false                   # not ported (refused)
+  edit: null
+  transparent: false             # an RGBA request gets an opaque alpha channel: no real transparency
+  sampler: {values: [euler, dpmpp_2m, uni_pc], default: euler}
+  options:
+    - {name: guidance, type: text, default: apg, help: 'apg: the pipeline''s CFG then adaptive projected guidance (default); cfg: plain CFG throughout'}
+  note: 'The base 2K model: 50 steps with guidance; text in quotes spelled by its glyph encoder'

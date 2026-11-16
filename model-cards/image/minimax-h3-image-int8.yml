@@ -35,3 +35,29 @@ encoder:                         # its text encoder (image.describe describer na
   name: Qwen3-VL-32B, MiniMax H3's
   sees: true
   why: 'the file stops after layer 50 of the 64, with no final norm or output head: it gives hidden states and cannot write text'
+controls:                        # its request rules (model-cards/README.md, Image controls; schema 1)
+  version: 1
+  steps: {min: 4, max: 12, default: 6}      # the heads are distilled for 6; 3 left stray glyphs, 4 - 12 looked at whole
+  cfg: null                      # distilled: no guidance, no negative prompt
+  negative: false
+  size:
+    min_side: 512
+    max_side: 5056
+    multiple: 32
+    max_pixels: 20971520         # 20 MiPx (4096 x 4096 looked at: sharp, lettering right)
+    default: 2048x2048
+    presets: {ratios: ['1:1', '4:3', '3:4', '3:2', '2:3', '16:9', '9:16'], pixels: [1048576, 4194304, 8388608, 16777216]}
+  seed: true
+  n: 8
+  loras: true                    # on the blocks for the request (the pDMD 2-step LoRA brings its own steps and shift)
+  edit:                          # picture 1 changed, up to 7 more as references; a strength below 1 starts from picture 1 too
+    images: 8
+    mask: false
+    strength: true
+    reference: true
+    strength_with_reference: true
+  transparent: false
+  sampler: {values: [euler], default: euler}
+  options:
+    - {name: start-sigma, type: number, min: 0.05, max: 1, help: 'with a picture: the denoise starts at this sigma of its latents (the detail pass: 0.4 - 0.55)'}
+  note: 'MiniMax-H3-Image (int8): 6 steps without guidance, 1 to 20 MP (tuned for 2048 x 2048); edits with up to 7 references'
