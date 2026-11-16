@@ -21,8 +21,36 @@ vram_gib_per_card: [23.0, 5.5]   # the brain's card, the talker's
 speech:
 - clone                          # a saved voice (its recording's x-vector), or a recording
 - realtime                       # a live conversation: /v1/realtime
-annotations_note: 'None kept as written in a text to speak: this engine declares no markup (AudioEngine::markup is empty), so the /v1/audio/speech text pass makes [laughter] a pause and the word and breaks <strong>...</strong>; its sound tags - [laughter] [breath] [sigh] [cough] [quick_breath] <laughter>...</laughter> <strong>...</strong> - reach the talker only in a request with normalize: false. In a /v1/realtime conversation its own replies carry them (strip them for display).'
-annotations: []
+annotations_note: 'Its sound tags, kept as written in a text to speak (the engine''s markup()); in a /v1/realtime conversation its own replies carry them (strip them for display).'
+annotations:
+- syntax: '[laughter]'
+  keep: '\[laughter\]'
+  does: 'a laugh'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '[breath]'
+  keep: '\[breath\]'
+  does: 'a breath'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '[sigh]'
+  keep: '\[sigh\]'
+  does: 'a sigh'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '[cough]'
+  keep: '\[cough\]'
+  does: 'a cough'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '[quick_breath]'
+  keep: '\[quick_breath\]'
+  does: 'a quick breath'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '<laughter>...</laughter>'
+  keep: '<laughter>[^<\n]{0,300}</laughter>'
+  does: 'the words spoken laughing'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '<strong>...</strong>'
+  keep: '<strong>[^<\n]{0,300}</strong>'
+  does: 'the words stressed'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
 defaults:
   seconds: 60.0
 env: {}

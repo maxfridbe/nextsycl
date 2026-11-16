@@ -458,6 +458,11 @@ impl AudioEngine for S2Pro {
             enrolled: false,
         })
     }
+    fn markup(&self) -> Vec<String> {
+        // free-form bracketed directions ([whisper], [excited tone]) and the speaker turns (<|speaker:N|>) as written:
+        // the server's normalisation would read them aloud
+        vec![r"\[[^\[\]\n]{1,60}\]".to_string(), r"<\|speaker:\d+\|>".to_string()]
+    }
     fn options(&self) -> &'static [EngineOption] {
         OPTIONS
     }

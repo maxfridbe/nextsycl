@@ -89,6 +89,9 @@ impl AudioEngine for Batched {
     fn speech(&self) -> Option<Speech> {
         self.m.speech()
     }
+    fn markup(&self) -> Vec<String> {
+        self.m.markup()
+    }
     fn options(&self) -> &'static [EngineOption] {
         self.m.options()
     }

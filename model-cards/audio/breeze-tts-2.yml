@@ -18,8 +18,40 @@ speech:
 - direction
 - events
 - transcript                    # a clone needs what the recording says (saved voices without it go elsewhere)
-annotations_note: 'None kept as written: this engine declares no markup (AudioEngine::markup is empty), so the server''s speech text pass makes brackets and parentheses pauses and says the word inside. Breeze TTS 2''s own vocal events - (laugh) (sigh) (cough) (clears throat) in English, [笑] [叹气] [咳嗽] [清嗓子] in Chinese - reach the model only in a request with normalize: false. Direction goes in instructions.'
-annotations: []
+annotations_note: 'Its vocal events, kept as written by the speech text pass (the engine''s markup()); other brackets and parentheses are still pauses. Direction goes in instructions.'
+annotations:
+- syntax: '(laugh)'
+  keep: '\(laugh\)'
+  does: 'a laugh'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '(sigh)'
+  keep: '\(sigh\)'
+  does: 'a sigh'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '(cough)'
+  keep: '\(cough\)'
+  does: 'a cough'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '(clears throat)'
+  keep: '\(clears throat\)'
+  does: 'a throat clear'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '[笑]'
+  keep: '\[笑\]'
+  does: 'a laugh (Chinese)'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '[叹气]'
+  keep: '\[叹气\]'
+  does: 'a sigh (Chinese)'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '[咳嗽]'
+  keep: '\[咳嗽\]'
+  does: 'a cough (Chinese)'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '[清嗓子]'
+  keep: '\[清嗓子\]'
+  does: 'a throat clear (Chinese)'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
 defaults:
   seconds: 60.0
   cfg: 4.0                      # used with an instruction (design, direction); a clone or plain read is unguided

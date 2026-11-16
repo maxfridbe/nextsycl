@@ -310,6 +310,9 @@ impl AudioEngine for Sophon {
             speakers: 1,
         })
     }
+    fn markup(&self) -> Vec<String> {
+        text::KEEP.iter().map(|k| k.to_string()).collect()
+    }
     fn options(&self) -> &'static [EngineOption] {
         OPTIONS
     }

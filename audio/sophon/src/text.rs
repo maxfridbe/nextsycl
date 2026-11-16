@@ -244,6 +244,9 @@ pub fn tool_calls(text: &str) -> Vec<(String, String)> {
 
 const POINT: [&str; 5] = ["[laughter]", "[breath]", "[sigh]", "[cough]", "[quick_breath]"];
 const SPAN: [&str; 2] = ["laughter", "strong"];
+/// The sound tags as the server's speech text pass keeps them (AudioEngine::markup): POINT's tags and SPAN's opening
+/// and closing tags, as written (a whole span kept as one: its words untouched, no spaces put inside it) - normalised, "[sigh]" would be a pause and the word "sigh"
+pub const KEEP: [&str; 4] = [r"\[(?:laughter|breath|sigh|cough|quick_breath)\]", r"<laughter>[^<\n]{0,300}</laughter>", r"<strong>[^<\n]{0,300}</strong>", r"</?(?:laughter|strong)>"];
 
 fn close_of(c: char) -> Option<char> {
     match c {

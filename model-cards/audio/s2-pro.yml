@@ -17,8 +17,16 @@ speech:
 - direction                     # a clone (or the model's voice) steered by instructions: an inline tag
 - events                        # inline tags in the text
 - transcript                    # a clone needs what the recording says (saved voices without it go elsewhere)
-annotations_note: 'None kept as written: this engine declares no markup (AudioEngine::markup is empty), so the server''s speech text pass makes brackets pauses and says the word inside, and breaks <|speaker:N|> markers. S2 Pro''s own markup - free-form [tag] directions ([whisper], [laughing], [pause], [excited tone] ...) and <|speaker:N|> turns - reaches the model only in a request with normalize: false. Direction can go in instructions instead (read as a leading [tag]).'
-annotations: []
+annotations_note: 'Free-form bracketed directions and speaker turns, kept as written (the engine''s markup()): any short description in brackets up to 60 characters is a direction, so square brackets are never read aloud. Direction can also go in instructions.'
+annotations:
+- syntax: '[whisper] / [laughing] / [pause] / [excited tone] ...'
+  keep: '\[[^\[\]\n]{1,60}\]'
+  does: 'a free-form direction for what follows (S2 Pro reads any short description)'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+- syntax: '<|speaker:N|>'
+  keep: '<\|speaker:\d+\|>'
+  does: 'the next turn is speaker N'
+  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
 defaults:
   seconds: 60.0
 env: {}

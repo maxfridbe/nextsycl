@@ -1314,6 +1314,13 @@ mod tests {
         assert_eq!(k("[sigh] Fine, a = b."), "[sigh] Fine, a equals b.");
         assert_eq!(k("Wait (really) [laughter]"), "Wait, really [laughter]");
         assert_eq!(super::speakable_keeping("Funny [laughter] yes", &[]), "Funny, laughter, yes");
+        // Breeze TTS 2, S2 Pro and Sophon's patterns (their engines' markup(), copied here: the server does not link them)
+        let breeze: Vec<String> = [r"\(laugh\)", r"\(sigh\)", r"\(cough\)", r"\(clears throat\)", r"\[笑\]", r"\[叹气\]"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(super::speakable_keeping("Well (sigh) fine [笑] ok (really)", &breeze), "Well (sigh) fine [笑] ok, really");
+        let s2 = vec![r"\[[^\[\]\n]{1,60}\]".to_string(), r"<\|speaker:\d+\|>".to_string()];
+        assert_eq!(super::speakable_keeping("<|speaker:0|>Hi [whisper] there [excited tone] yes", &s2), "<|speaker:0|> Hi [whisper] there [excited tone] yes");
+        let sophon: Vec<String> = [r"\[(?:laughter|breath|sigh|cough|quick_breath)\]", r"<laughter>[^<\n]{0,300}</laughter>", r"<strong>[^<\n]{0,300}</strong>", r"</?(?:laughter|strong)>"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(super::speakable_keeping("I <strong>really</strong> mean it [laughter] ok", &sophon), "I <strong>really</strong> mean it [laughter] ok");
     }
 
     use super::{gpu_failed, own_vram_mb, range};

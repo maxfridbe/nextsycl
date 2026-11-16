@@ -419,6 +419,10 @@ impl AudioEngine for BreezeTts2 {
             speakers: 1,
         })
     }
+    fn markup(&self) -> Vec<String> {
+        // its vocal events as written: the server's normalisation would make "(sigh)" a pause and the word "sigh"
+        EVENTS.iter().map(|e| e.chars().map(|c| if "\\^$.|?*+()[]{}".contains(c) { format!("\\{c}") } else { c.to_string() }).collect()).collect()
+    }
     fn options(&self) -> &'static [EngineOption] {
         OPTIONS
     }
