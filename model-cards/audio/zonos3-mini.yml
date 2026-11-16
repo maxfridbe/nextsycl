@@ -16,7 +16,7 @@ title: 'ZONOS3-Mini (speech in 43 languages at 44.1 kHz: 27 preset voices, a voi
 about: 'Zyphra''s ZONOS3-Mini in Rust and SYCL: an 11-layer backbone of 1024 (gated DeltaNet mixers with a global-attention layer in four, Full AttnRes instead of the residual stream, a top-2-of-64 latent MoE) reads SuperBPE text after a voice and writes ten 4096-code books at 15 Hz; the ZAC codec''s MR-iSTFT decoder makes 44.1 kHz. Voices: a preset (voice: savannah, rupert, ...; its shipped codes as a reference prefix, or option speaker-mode embedding), or a recording (ref_audio, a saved voice) cloned by the MECT-B2 speaker encoder''s embedding, or with option speaker-mode reference by its own codes (raw-reference cloning: the reference encoder, 6.3 GiB more for about 6 s on a B70, then freed). options: controls (steering: delivery.tempo, emotions.*, mood.*, delivery.whisper ...), speaking-rate, decoder full, temperature; cfg is speaker guidance (1: off)'
 license: apache-2.0
 commercial: true
-gpus: '0'
+gpus: '0,1'                      # whole on one of them, the first with room (checked on both: docs/ports/zonos3.md); '0' alone kept it waiting behind Sophon on the B70
 vram_gib: 2.5                    # measured 2026-11-16 on the B70 and B65: 1.81 GiB loaded (backbone 0.8, keep2 decoder 0.7, edit adapter 0.25,
                                  # speaker encoder), 2.2 GiB at the peak of a 54 s take
 headroom_gib: 1.0                # a long take's decoder activations; raw-reference cloning and edits load the reference encoder (+6.3 GiB at the
