@@ -13,7 +13,8 @@ extern "C" {
 typedef struct ns_gpu ns_gpu;
 
 /* Whether `sage` runs these sizes (1) or the engine must use the shared attention (0): D 128, S from 64 to what fits int32
- * indexing, and libnextsycl-flash.so's SageAttention entry found */
+ * indexing, and a kernel found: this silo's own (libnextsycl-h3image-tla.so beside it, tla/sage.cpp; unless
+ * NS_H3I_SAGE_TLA=0) or libnextsycl-flash.so's SageAttention entry (ARK's) */
 int ns_image_h3i_silo_sage_supported(ns_gpu* g, int64_t S, int64_t H, int64_t D);
 
 /* SageAttention v1 over the packed qkv rows, as the shared nsd attention's Sage form computes it (q and k - k's mean over
