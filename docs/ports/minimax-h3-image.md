@@ -197,6 +197,96 @@ on the card (8.8 GiB after load against Q4_K_M's 11.1) at Q4_K_M's speed; Q4_K_M
 expansion on the B70 and 0.3 - 4 % on the B65 (5.45 -> 5.25 s at 1 MP); the int8 file stays the fastest overall (1.4 - 2x the
 GGUFs).
 
+## Third pass: the silo's own Sage kernel (2026-11-16)
+
+The open item above: attention is a third of a 16.8 MP step and 92 % of it ARK's Sage kernel. The silo now has its own
+kernel, `kernels/image/h3image/silo/tla/` -> `dist/silo/libnextsycl-h3image-tla.so` (sycl-tla; the silo's `sage.cpp`
+opens it beside itself and falls back to ARK's in `libnextsycl-flash.so` without it, or with `NS_H3I_SAGE_TLA=0`).
+
+**What it is.** ARK's int8 prefill kernel (its `XeSageFwdKernel`, the sycl-tla `FMHAFwdEpilogue`, its runner and tiles:
+256 query rows a work-group, 16 sub-groups of 16 rows, keys 64 a block, two prefetch stages) around a copy of its mainloop
+(`tla/ark/sage_mainloop.hpp`, Intel's BSD notice kept) with two changes:
+
+- the scores' dequantization scale is folded into the exponent: the block maximum is taken on the raw products (times
+  the block's scale once a row) and P = exp2(fma(s, scale, -max)) - one fused multiply-add an element where ARK multiplies
+  every element and then subtracts (one rounding less, one vector instruction an element fewer);
+- the result is written by the epilogue as bfloat16 straight into the activations [S, H * D] (strided 2-D block
+  stores, rounded once from float) instead of a half [H, S, D] buffer that a second pass converted: that pass (46 ms a
+  16.8 MP step) and its 0.22 GiB buffer at 16.8 MP are gone.
+
+**Why it is faster, and why not more.** Measured with a standalone bench (ARK's kernel and variants on the same int8
+inputs, the B65 at 4,096 tokens x 56 heads unless said): taking out the products altogether still left 55 % of the time
+(2.7 of 4.9 ms) - loads, the int32 -> float conversion, the row max / sum (cross-lane), the exponent and the P reorder. The
+kernel is bound by that vector work and its loads more than by the matrix engine.
+Every attempt to shrink it is listed; only the fma fold and the bf16 epilogue won and stayed exact:
+
+| variant (B65, 4,096 tokens, kernel alone, median) | ms | kept |
+|---|---|---|
+| ARK (q 256, kv 64, 16 sub-groups, 2 stages) | 4.94 | baseline |
+| ARK's own tile variants: 1 or 3 stages; q 128 / 8 sub-groups; q 512 / 32; kv 32; d chunk 64; v chunk 64 | 4.96 - 11.2 | no (ARK's default is the best of them) |
+| mainloop copy, unchanged | 4.89 | - |
+| + scale in the exponent's fma | 4.78 | **yes** |
+| + no work-group barrier a key block | 4.81 | no |
+| + rescale the accumulator only when a row's max moved (sub-group vote) | 10.3 | no (the branch wrecks the schedule) |
+| transposed kernel (S^T = K Q^T, O^T = V^T P^T: one query a lane, the row max / sum in-lane, P^T straight into the DPAS B operand; own cute kernel, v stored [H, D, S]) | 5.0 - 5.4 (kv 32 / 64, d chunk 16 / 32) | no |
+| transposed + lazy max (rescale only when a score passes the max by 2^8) + hand-packed P (vISA: exp, hf pack, sum) + own DPAS calls | 5.0 - 5.4; B70 16,434 tokens 50.5 ms | no (0.6 % over the kept kernel for ~300 lines of inline vISA) |
+| transposed, the next block's Q K^T issued before this block's softmax (software pipeline) | 6.0 - 25 (spills) | no |
+| debug: no Q K^T / P V products | 2.7 (ARK form), 3.7 (transposed) | - |
+
+**Exact.** The attention output against float32 attention (`reference/h3-image/sagebench.cpp`, the silo's
+`tla/sage.cpp` compiled in; 56 heads, random q / k / v with a per-column k offset, quantized as the silo's preparation
+does; "int8 math" = float32 attention of the dequantized int8 q / k and half v, i.e. what the kernel should compute;
+ARK's half result rounded to bfloat16 as the engine's conversion pass did), B70:
+
+| tokens | kernel | vs int8 math: max / mean abs | vs float32 q k v: max / mean abs, relative |
+|---|---|---|---|
+| 1,074 | ARK | 1.228e-2 / 2.892e-4 | 1.188e-1 / 4.853e-3, 2.434e-2 |
+| 1,074 | silo | 1.228e-2 / 2.848e-4 | 1.188e-1 / 4.853e-3, 2.434e-2 |
+| 16,434 | ARK | 8.788e-3 / 1.264e-4 | 1.067e-1 / 2.454e-3, 2.781e-2 |
+| 16,434 | silo | 7.821e-3 / 1.245e-4 | 1.067e-1 / 2.454e-3, 2.781e-2 |
+
+Both errors against the int8 math are the bfloat16 result's rounding (the half results before it: 1.0e-3 / 4.2e-5 at
+1,074, 9.8e-4 / 1.9e-5 at 16,434, ARK's and the fma'd mainloop's identical to the printed digits, 4,096 too); the silo
+rounds once (float -> bf16) where ARK's path rounded twice (float -> half -> bf16), so its max / mean is no larger.
+
+**Parity, 576 x 384 seed 3, Sage forced on the 237-token test** (`NS_H3I_SAGE_MIN_S=64`; the default runs oneDNN there and
+its table above is unchanged), B70, the same day; ARK's int8 row repeats the first pass's to the last digit:
+
+| | int8: silo kernel | int8: ARK | Q4_K_M: silo kernel | Q4_K_M: ARK |
+|---|---|---|---|---|
+| stream after block 49, step 0 | 7.07e-2 | 7.40e-2 | 1.96e-1 | 1.91e-1 |
+| velocity, steps 0 .. 5 | 3.15e-2 - 8.27e-2 (mean 5.73e-2) | 3.54e-2 - 7.32e-2 (mean 5.91e-2) | 9.75e-2 - 1.42e-1 (mean 1.23e-1) | 9.97e-2 - 1.51e-1 (mean 1.25e-1) |
+| velocity cosine, worst | 0.99658 | 0.99727 | 0.98985 | 0.98851 |
+| final latents (free run) | 1.63e-1 | 2.07e-1 | 4.08e-1 | 3.58e-1 |
+
+The per-step errors move both ways by about as much as the rounding paths differ; neither kernel is looser.
+
+**Speed, B70** (kernel alone: the bench, 56 heads of 128, median of 20 (min - median spread ~5 % at 16,434 tokens; the
+order alternated, each figure seen twice), TFLOPS as 4 S^2 D H; steps: `image gen --local`,
+Q4_K_M, seed 7, the second picture of n = 2, 6 denoiser steps, two runs each alternated, same day):
+
+| | ARK | silo kernel |
+|---|---|---|
+| kernel, 1,074 tokens (1 MP) | 0.301 ms (109.9 TFLOPS) | 0.288 ms (114.7) |
+| kernel, 4,096 tokens (4 MP) | 3.18 ms median, 2.72 min (151) | 2.73 ms (176; the fma change with the half result) |
+| kernel, 16,434 tokens (16.8 MP) | 52.9 ms (146.3 TFLOPS) | 50.8 ms (152.5) |
+| + the result's conversion pass, 16.8 MP | 0.9 ms a call | none |
+| 6 steps, 1024 x 1024 | 3.67 / 3.67 s | 3.65 / 3.65 s |
+| 6 steps, 4096 x 4096 | 49.74 / 49.76 s | 48.89 / 49.01 s |
+| in the engine, 16.8 MP, NS_H3I_PROFILE (a step: 50 calls) | kernel 2,556 ms (151.5 TFLOPS) + result 46 ms; attention 2,766 ms of an 8,205 ms step (34 %) | kernel 2,449 ms (158.1 TFLOPS), no result pass; attention 2,614 ms of 8,080 ms (32 %) |
+| card memory | the half result buffer (0.22 GiB at 16.8 MP) | none |
+
+So: 4 - 4.5 % on the kernel, 5.5 % on the attention op at 16.8 MP (2,766 -> 2,614 ms a step), 1.6 % on a 16.8 MP picture
+(49.75 -> 48.95 s), 0.5 % at 1 MP - real and
+exact, but far from the doubling a better tile shape was hoped to give: in every form tried the kernel is held by its
+vector work and loads, not by the matrix engine.
+
+- **P-H3-Image** has the same layout (56 heads of 128, the same packed qkv) but does not use this yet: its silo
+  (`kernels/image/ph3image/silo`) would need its own copy of `tla/` (silos are per model) and its own parity run.
+- **Build** (`kernels/build.sh`): a silo with both plain sources (`silo/*.cpp` -> `libnextsycl-<arch>.so`) and sycl-tla
+  ones (`silo/tla/*.cpp`) now builds the latter as `dist/silo/libnextsycl-<arch>-tla.so` (FlashVSR's tla-only silo keeps
+  its name); its up-to-date check now also sees headers below `tla/` (`ark/*.hpp`).
+
 ## Kept and lost
 
 - Kept: text to image and edits (up to 16 pictures), 1 - 16.9 MP, the heads' 6-step grid and other step counts read off
@@ -210,8 +300,10 @@ GGUFs).
 
 ## Open
 
-- Attention at 16.8 MP is a third of a step and 92 % of it is ARK's Sage kernel at 147 TFLOPS: tile / pipeline variants
-  need a sycl-tla silo (see above). The int8 P V variant ARK has would be faster and looser; not tried as a default.
+- Attention at 16.8 MP is still a third of a step: the silo's own Sage kernel (third pass) took it from 147 - 152 to 158
+  TFLOPS; ARK's tile variants and a transposed kernel did not beat it (the table there). What is left needs less vector
+  work per score (or int8 P V, which ARK has and which is looser: not tried as a default). P-H3-Image can take the same
+  kernel with a copy of the silo's tla/.
 - GGUF speed: the bf16 products run at 160 - 175 TFLOPS of the B70's; what is left is int8 math, which only the int8
   file gives exactly. A Q4_K kernel that reads nibbles inside an XMX GEMM could save the expansion (53 ms a step) and
   the extra weight traffic at 1 MP; oneDNN's own (u4) was slower.
