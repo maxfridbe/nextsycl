@@ -36,8 +36,10 @@ constexpr size_t MAX_PRIMS = 256;
 struct Dnn {
     dnnl::engine eng;
     dnnl::stream st;
-    // (transposed, B, Ci, L, Co, K, stride, dil, left pad, right pad) -> the primitive
-    std::map<std::tuple<int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>, Prim> prims;
+    // (transposed, biased, B, Ci, L, Co, K, stride, dil, left pad, right pad) -> the primitive
+    // keyed by everything the primitive was made for, a bias or not among it: one made without a bias ignores the bias it is handed (a biased
+    // convolution after an unbiased one of the same shape lost its bias, 2026-11-16)
+    std::map<std::tuple<int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>, Prim> prims;
     // (weight pointer, primitive key's transposed / Ci / Co / K) -> the weight in the primitive's layout
     std::map<std::tuple<const void*, int, int64_t, int64_t, int64_t>, memory> weights;
     // the scratchpad every primitive uses (one stream: one call at a time), grown to the largest asked
@@ -75,7 +77,7 @@ memory mem(const memory::desc& md, const dnnl::engine& eng, const void* p) {
 int run(ns_gpu* g, bool tr, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K, const float* bias,
         int64_t stride, int64_t dil, int64_t pl, int64_t pr, float* out, int64_t Lo) {
     Dnn& d = dnn(g);
-    auto key = std::make_tuple((int) tr, B, Ci, L, Co, K, stride, dil, pl, pr);
+    auto key = std::make_tuple((int) tr, (int) (bias != nullptr), B, Ci, L, Co, K, stride, dil, pl, pr);
     auto it = d.prims.find(key);
     if (it == d.prims.end()) {
         memory::desc src({B, Ci, L}, memory::data_type::f32, tag::ncw);
