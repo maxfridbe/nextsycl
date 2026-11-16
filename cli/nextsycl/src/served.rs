@@ -109,7 +109,11 @@ impl Served {
                 return Ok(());
             }
             if !ce.running(&name) {
-                return Err(format!("{name} ended while loading: {} {} logs", me(), self.kind));
+                // what it said last, in the error itself (the front door's answer and log carry it): a server that ends
+                // in its first second leaves nothing else to see
+                let said = ce.last_lines(&name, 12);
+                let said = if said.is_empty() { String::new() } else { format!(" - its last lines: {said}") };
+                return Err(format!("{name} ended while loading{said} ({} {} logs)", me(), self.kind));
             }
             if t0.elapsed() > Duration::from_secs(600) {
                 return Err(format!("{name} did not answer in 10 minutes ({} logs)", self.kind));

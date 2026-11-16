@@ -90,6 +90,13 @@ impl Ce {
         }
     }
 
+    /// A container's last `n` log lines (stdout and stderr), joined by " | ": what a server said before it ended
+    pub fn last_lines(&self, name: &str, n: usize) -> String {
+        let o = self.cmd().args(["logs", "--tail", &n.to_string(), name]).output();
+        let text = o.map(|o| format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))).unwrap_or_default();
+        tail_lines(&text, n)
+    }
+
     pub fn remove(&self, name: &str) {
         let _ = self.cmd().args(["rm", "-f", name]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
@@ -98,6 +105,12 @@ impl Ce {
     pub fn stop(&self, name: &str, secs: u32) {
         let _ = self.cmd().args(["stop", "-t", &secs.to_string(), name]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
+}
+
+/// The last `n` non-empty lines of `text`, joined by " | " (one line for an error message)
+pub fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join(" | ")
 }
 
 pub fn mount(host: &Path, inside: &str, ro: bool) -> Vec<String> {
@@ -211,6 +224,13 @@ mod tests {
 
     fn a(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_server_that_ended_says_its_last_lines_in_one() {
+        assert_eq!(tail_lines("loading\n\nGPU 1: no such device\r\nnextsycl: ended\n", 2), "GPU 1: no such device | nextsycl: ended");
+        assert_eq!(tail_lines("one\n", 12), "one");
+        assert_eq!(tail_lines("", 12), "");
     }
 
     #[test]
