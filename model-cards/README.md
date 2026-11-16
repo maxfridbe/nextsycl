@@ -73,7 +73,7 @@ Other keys: `local` (role: what it is - a part made on the machine rather than d
 or another registry entry), `base` (a lora: the model it rides on), `defaults` (image / video / audio: the
 request's defaults - steps, cfg, size, seconds ...), `speech` (audio: `voices`, `design`, `clone`, `direction` - a clone steered by `instructions` -, `events` - vocal events in the text, `transcript` - a clone needs what the recording says, `speakers` - a script of several speakers, a voice each: `voices` / `ref_audios`, `enrolled` - a saved voice fitted for it is spoken: a model without an encoder, `edit` - it edits a recording's words: audio.edit, `realtime` - a live conversation over /v1/realtime: capability realtime, and with nothing else no audio.speak, `lockstep` - a frame in, a frame out: the row's lockstep: true), `voices` / `languages` (audio: a speech model's built-in voices and languages when its files hold them
 where the front door cannot read them - Voxtral TTS's GGUF: a request naming one goes to a model that has it), `does` (model3d: `generate`, `texture`, `paint` (paints a mesh it is given), `rig`, `animate` - what it is
-asked for).
+asked for; video: `regen2k` - it makes a draft again at 2K, and only that: capabilities regenerate_2k, video_to_video, sound).
 
 The rules, checked when the cards load and by `cargo test` (`the_model_cards_are_whole`): the id is the file's
 name and the kind its folder; a file key is defined once (defining it again the same way is allowed) and every key

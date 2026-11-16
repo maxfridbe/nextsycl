@@ -12,11 +12,13 @@ id: minimax-h3-regen2k-ic
 kind: video
 arch: minimax-h3
 title: 'MiniMax H3 Regenerate-2K IC (a 768p draft to 2560x1440; Open-H3-Regenerate-2K-IC)'
-about: NVlabs' Open-H3-Regenerate-2K-IC on the int8 Ref2VA denoiser - a 1344x768 draft (124 frames) made again at 2560x1440 with its faces, lip sync and lettering, its own sound kept; HyperFlow 8-step + LMS Sharp + the IC LoRA, 3 steps
+about: NVlabs' Open-H3-Regenerate-2K-IC on the int8 Ref2VA denoiser - a 16:9 draft of 4.7 to 15.1 s (any size; longer than 124 frames in overlapping windows) made again at 2560x1440 with its faces, lip sync and lettering, its own sound kept; HyperFlow 8-step + LMS Sharp + the IC LoRA, 3 steps
 license: minimax-h3-community
 commercial: true
 license_note: 'MiniMax H3 and its derivatives (the IC LoRA, HyperFlow, the fast decoder): the MiniMax H3 Community License (not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; its Acceptable Use Policy; outputs may not train another model). The latent upscaler: Apache-2.0 weights. LMS Sharp: its author''s terms. Qwen3-VL text encoder: its licence. Not an official MiniMax product.'
 gpus: '0'
+does:
+- regen2k                        # a draft made again at 2K: capabilities regenerate_2k, video_to_video, sound (the row); video.generate with regen2k
 ram_gib: 12
 defaults:
   steps: 3

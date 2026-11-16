@@ -402,6 +402,8 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
             }
             (c, methods)
         }
+        // a draft made again at 2K (its card: does regen2k): video.generate with regen2k naming the draft, nothing else
+        "video" if m["does"].as_array().is_some_and(|a| a.iter().any(|x| x == "regen2k")) => (vec!["regenerate_2k", "video_to_video", "sound"], vec!["video.generate"]),
         "video" => {
             let mut c = vec!["text_to_video", "image_to_video", "sound", "chain", "first_last_frame", "voice_reference"];
             if s(m, "id").contains("ref2va") {
@@ -1770,6 +1772,8 @@ mod tests {
 
     #[test]
     fn a_recogniser_transcribes_and_speaks_nothing() {
+        let (caps, _) = capabilities(&json!({"id": "minimax-h3-regen2k-ic", "kind": "video", "arch": "minimax-h3", "does": ["regen2k"]}));
+        assert_eq!(caps, vec!["regenerate_2k", "video_to_video", "sound"], "a 2K regeneration makes no clip from a prompt alone");
         let (caps, methods) = capabilities(&json!({"id": "haru-4b", "kind": "audio", "arch": "haru", "speech": ["realtime", "lockstep"]}));
         assert_eq!((caps, methods), (vec!["realtime", "lockstep"], vec![]), "a live conversation only: no audio.speak");
         let (caps, methods) = capabilities(&json!({"id": "sophon", "kind": "audio", "arch": "sophon-realtime", "speech": ["clone", "realtime"]}));
