@@ -193,6 +193,8 @@ impl Tls {
     /// socket's own peer and local addresses
     pub fn accept(&self, tcp: TcpStream) -> io::Result<Conn> {
         let (peer, local) = (tcp.peer_addr()?, tcp.local_addr()?);
+        // records out at once (a WebSocket's small frames: crate::http::Conn::nodelay)
+        let _ = tcp.set_nodelay(true);
         self.accept_as(tcp, peer, local)
     }
 

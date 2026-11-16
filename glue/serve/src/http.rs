@@ -297,6 +297,8 @@ pub fn splice(client: &Conn, upstream: &Target, req: &Request, target: &str) -> 
     }
     out.push_str("\r\n");
     let mut up = Conn::connect(upstream).map_err(|e| format!("{upstream} does not answer ({e})"))?;
+    client.nodelay();
+    up.nodelay();
     up.write_all(out.as_bytes()).and_then(|_| up.flush()).map_err(|e| e.to_string())?;
     let (mut c_in, mut c_out) = (client.try_clone().map_err(|e| e.to_string())?, client.try_clone().map_err(|e| e.to_string())?);
     let (mut u_in, mut u_out) = (up.try_clone().map_err(|e| e.to_string())?, up);
@@ -311,6 +313,15 @@ pub fn splice(client: &Conn, upstream: &Target, req: &Request, target: &str) -> 
 }
 
 impl Conn {
+    /// Small writes go out at once (TCP_NODELAY): a WebSocket's frames are small and each waits for the other side's,
+    /// so Nagle's delay is paid on every one (nextcuda 24d27fa: a lockstep frame's turnaround 60.5 -> 17.5 ms). A Unix
+    /// socket has no such delay; an HTTPS connection's TCP side is set when it is accepted (crate::tls)
+    pub fn nodelay(&self) {
+        if let Conn::Tcp(s) = self {
+            let _ = s.set_nodelay(true);
+        }
+    }
+
     /// Both directions closed (a splice's end: the other copy's read returns)
     pub fn shutdown(&self) {
         let _ = match self {

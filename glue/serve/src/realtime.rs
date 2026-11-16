@@ -466,6 +466,7 @@ fn describe(s: &Session, model: &str, rt: &nextsycl_audio::Realtime) -> Value {
 /// A live conversation on `c` (the request was its upgrade) with `engine`, until either side closes. `busy` is set
 /// while it runs (the server's progress shows it; an idle server does not end under it)
 pub fn serve(mut c: Conn, req: &Request, engine: &dyn AudioEngine, model: &str, voices: VoiceLookup) -> Result<(), String> {
+    c.nodelay();
     let rt = engine.realtime().ok_or_else(|| format!("{model} does not hold live conversations (/v1/realtime needs a full-duplex speech model)"))?;
     upgrade(&mut c, req).map_err(|e| e.to_string())?;
     let out = WsOut(Arc::new(Mutex::new(c.try_clone().map_err(|e| e.to_string())?)));
