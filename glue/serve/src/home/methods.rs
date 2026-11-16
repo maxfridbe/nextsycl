@@ -217,6 +217,26 @@ pub enum H3Speed {
     PikaFlex,
 }
 
+/// Open-H3-Regenerate-2K-IC's sampler: up3 (3 steps from the upscaled draft, the release's default) | up4 (4 steps) | hf8 (8 steps from noise)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Rpc)]
+pub enum RegenSampler {
+    #[serde(rename = "up3")]
+    Up3,
+    #[serde(rename = "up4")]
+    Up4,
+    #[serde(rename = "hf8")]
+    Hf8,
+}
+
+/// Open-H3-Regenerate-2K-IC's output: 2k (2560x1440) | 1080p (1920x1080)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Rpc)]
+pub enum RegenResolution {
+    #[serde(rename = "2k")]
+    TwoK,
+    #[serde(rename = "1080p")]
+    P1080,
+}
+
 /// A reference picture's size: match | max
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Rpc)]
 pub enum RefImageSize {
@@ -2566,6 +2586,19 @@ pub struct VideoGenerateReq {
     #[serde(rename = "ref_videos", default, skip_serializing_if = "Option::is_none")]
     #[schema(max_items = 3)]
     pub ref_videos: Option<Vec<String>>,
+    /// anchor or file: a 768p draft clip (1344x768, at least 113 frames at 24 fps; an H3 clip of 5.17 s) made again at 2560x1440 by Open-H3-Regenerate-2K-IC (feature video.regen2k: the minimax-h3-regen2k-ic model) - its faces, lip sync, lettering and layout kept, its own sound laid back under it, its first 124 frames. prompt is the draft's caption (the prompt it was made from, unchanged); width, height, seconds, steps, references and control are its own. About half an hour a clip on the B70
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regen2k: Option<String>,
+    /// with regen2k: up3 (default: the upscaled draft noised to 0.835, 3 steps) | up4 (from 0.923, 4 steps) | hf8 (8 steps from noise)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regen_sampler: Option<RegenSampler>,
+    /// with regen2k: 2k (2560x1440, default) | 1080p (1920x1080)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regen_resolution: Option<RegenResolution>,
+    /// with regen2k: LMS Sharp's strength (default 1; 0 off)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0, max = 2, default = 1)]
+    pub sharp: Option<f64>,
     /// "from-to" seconds to regenerate in source; a source shorter than the clip is extended
     #[serde(rename = "regen", default, skip_serializing_if = "Option::is_none")]
     pub regen: Option<String>,

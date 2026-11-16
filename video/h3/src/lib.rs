@@ -21,15 +21,19 @@ use serde_json::{json, Value};
 pub const ARCH: &str = "minimax-h3";
 
 /// The files it takes, by role (the denoiser at load; the others go into each job, where a job does not name its own)
-pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "vae", "audio-vae", "vision", "controlnet"];
+pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "vae", "audio-vae", "vision", "controlnet", "ic-lora", "hyperflow", "adaln", "sharp-lora",
+                             "silence"];
 
 /// A role and the job key it fills
 const ROLE_KEYS: &[(&str, &str)] = &[("text-encoder", "te"), ("tokenizer", "tokenizer"), ("vae", "vae"), ("audio-vae", "audio_vae"),
-                                     ("upscaler", "upscaler"), ("pixel-upscaler", "pixel_upscaler"), ("vision", "te_visual"), ("controlnet", "controlnet")];
+                                     ("upscaler", "upscaler"), ("pixel-upscaler", "pixel_upscaler"), ("vision", "te_visual"), ("controlnet", "controlnet"),
+                                     // Open-H3-Regenerate-2K-IC's parts (the regen2k job)
+                                     ("ic-lora", "ic_lora"), ("hyperflow", "hyperflow"), ("adaln", "adaln"), ("sharp-lora", "sharp_lora"), ("silence", "silence")];
 
 /// The options it takes (`--opt-NAME`): at load the variables they set; per request the generate job's own keys
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "threads", env: "H3_THREADS", value: "N", help: "threads reading the checkpoint at load (default 8)", at: At::Load },
+    EngineOption { name: "resident-blocks", env: "H3_RESIDENT_BLOCKS", value: "N", help: "keep only the first N denoiser blocks on the card and stream the rest from the int8 file as they run (the card for the activations: Open-H3-Regenerate-2K's 2560x1440 sequences; default all)", at: At::Load },
     EngineOption { name: "te-pin", env: "H3_TE_PIN", value: "0|1", help: "keep the text encoder in pinned host memory between clips (default 1)", at: At::Load },
     EngineOption { name: "vae-attn-per-tile", env: "H3_VAE_ATTN_PER_TILE", value: "0|1", help: "the video decoder's attention a tile at a time", at: At::Load },
     EngineOption { name: "attn", env: "NSD_ATTN", value: "sage|onednn", help: "long sequences' attention: SageAttention (int8 q, k) or oneDNN's", at: At::Load },
@@ -62,6 +66,10 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "shift_video", env: "", value: "X", help: "the video schedule's shift (default 12)", at: At::Request },
     EngineOption { name: "shift_audio", env: "", value: "X", help: "the audio schedule's shift (default 3)", at: At::Request },
     EngineOption { name: "pixel_upscaler", env: "", value: "FILE", help: "an ESRGAN network to enlarge the frames (instead of the latents)", at: At::Request },
+    EngineOption { name: "regen2k", env: "", value: "MP4", help: "Open-H3-Regenerate-2K-IC: this 768p draft made again at 2560x1440 (the regen2k job; the model's ic-lora, hyperflow, adaln and silence files; its own sound kept)", at: At::Request },
+    EngineOption { name: "regen_sampler", env: "", value: "up3|up4|hf8", help: "with regen2k: 3 or 4 steps from the upscaled draft, or 8 from noise (default up3)", at: At::Request },
+    EngineOption { name: "regen_resolution", env: "", value: "2k|1080p", help: "with regen2k: 2560x1440 (default) or 1920x1080", at: At::Request },
+    EngineOption { name: "sharp", env: "", value: "X", help: "with regen2k: LMS Sharp's strength (default 1; 0 off)", at: At::Request },
 ];
 
 /// This engine's registry entry
@@ -77,7 +85,8 @@ fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn Fn
     let t0 = std::time::Instant::now();
     // its own context on the GPU (H3's device), as each worker process had
     let dev = device::Device::open_index(gpu).map_err(ve)?;
-    let e = jobs::Engine::load_on(dev, denoiser, None, threads, log).map_err(ve)?;
+    let resident = o.setting("H3_RESIDENT_BLOCKS").and_then(|v| v.parse().ok());
+    let e = jobs::Engine::load_resident(dev, denoiser, None, resident, threads, log).map_err(ve)?;
     Ok(Box::new(H3 { e, files: files.clone(), load_s: t0.elapsed().as_secs_f64() }))
 }
 
@@ -129,7 +138,7 @@ impl VideoEngine for H3 {
         OPTIONS
     }
     fn jobs(&self) -> &'static [&'static str] {
-        &["generate", "encode", "decode", "denoise", "check-block", "bench-blocks"]
+        &["generate", "encode", "decode", "denoise", "check-block", "bench-blocks", "regen2k"]
     }
     fn run_job(&self, spec: &Value, ctl: &mut JobCtl) -> nextsycl_video::Result<Value> {
         let spec = self.with_files(spec);
@@ -161,6 +170,15 @@ impl VideoEngine for H3 {
         }
         for (k, v) in &req.extra {
             spec[k] = v.parse::<f64>().map_or_else(|_| json!(v), |n| json!(n));
+        }
+        // a draft to regenerate at 2K: the regen2k job, the request's prompt as the draft's caption
+        if let Some(draft) = req.extra.get("regen2k") {
+            spec = json!({"kind": "regen2k", "draft": draft, "caption": req.prompt, "out": req.out, "seed": req.seed,
+                          "sampler": req.extra.get("regen_sampler").map_or("up3", String::as_str),
+                          "resolution": req.extra.get("regen_resolution").map_or("2k", String::as_str)});
+            if let Some(x) = req.extra.get("sharp").and_then(|v| v.parse::<f64>().ok()) {
+                spec["sharp"] = json!(x);
+            }
         }
         let flag = AtomicBool::new(false);
         let t0 = std::time::Instant::now();

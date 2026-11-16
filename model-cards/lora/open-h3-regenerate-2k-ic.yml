@@ -1,0 +1,20 @@
+# Open-H3-Regenerate-2K-IC, the in-context LoRA (NVlabs; Sana sol-engine): on the Ref2VA denoiser with a 768p draft as
+# <Video 1>, it makes the same clip at 2560x1440. Rank 384, alpha 384, float32, 312 linears in Diffusers' names (q, k, v
+# apart; the MLP's [value; gate] rows) - the engine maps them onto ComfyUI's fused layout (crates/h3/src/lora.rs). It
+# runs with HyperFlow's 8-step adapter and LMS Sharp under it: the minimax-h3-regen2k-ic card.
+id: open-h3-regenerate-2k-ic
+kind: lora
+arch: minimax-h3
+base: minimax-h3-ref2va
+license: minimax-h3-community
+commercial: true
+license_note: 'A MiniMax H3 Model Derivative: the MiniMax H3 Community License applies (not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; its Acceptable Use Policy; its outputs may not train another model). Not an official MiniMax product.'
+title: Open-H3-Regenerate-2K-IC (IC LoRA, rank 384)
+about: NVlabs' in-context LoRA that regenerates a 768p MiniMax H3 draft at 2560x1440 on the Ref2VA denoiser, keeping faces, lip sync, lettering and layout
+files:
+  lora:
+    key: h3-regen2k-ic-lora
+    url: https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K-IC/resolve/54a7104b204fb46486cf85c2f600942118186d57/lora/open_h3_regenerate_2k_ic_lora.safetensors
+    size: 8301660800
+    sha256: 1b657ce3ddfdf5bfa4dd9728bf0a694793adcb90fba245b7c4b9d0bd05c52251
+    path: open-h3-regenerate-2k-ic/lora/open_h3_regenerate_2k_ic_lora.safetensors

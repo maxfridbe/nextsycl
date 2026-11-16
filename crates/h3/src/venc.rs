@@ -236,6 +236,14 @@ impl VideoEncoder {
 
     /// Pixels [frames, H, W, 3] in [0, 1] (H, W multiples of 16) -> normalized latents [24, T, H/16, W/16] and T.
     pub fn encode(&self, px: &[f32], frames: usize, h: usize, w: usize, tick: &mut dyn FnMut() -> Result<()>) -> Result<(Vec<f32>, usize)> {
+        self.encode_with(px, frames, h, w, None, tick)
+    }
+
+    /// As `encode`; `sample`: a draw from the posterior instead of its mean - mean + exp(logvar / 2) x noise, the noise
+    /// torch.randn's on the CPU from that seed over [1, 24, T, H/16, W/16] (as Diffusers' encode(...).sample(generator)
+    /// draws it: Open-H3-Regenerate-2K's draft latent)
+    pub fn encode_with(&self, px: &[f32], frames: usize, h: usize, w: usize, sample: Option<u64>, tick: &mut dyn FnMut() -> Result<()>)
+                       -> Result<(Vec<f32>, usize)> {
         if !h.is_multiple_of(RATIO) || !w.is_multiple_of(RATIO) || px.len() != frames * h * w * 3 {
             return Err(Error(format!("encode: {} values for {frames} frames of {w}x{h} (multiples of 16)", px.len())));
         }
@@ -262,12 +270,18 @@ impl VideoEncoder {
         let n = lh * lw;
         let mut z = vec![0f32; 24 * keep_t * n];
         let first_t = if frames == 1 { total_t - 1 } else { 0 };
+        let eps = sample.map(|seed| crate::noise::Mt19937::new(seed).randn(24 * keep_t * n));
         for t in 0..keep_t {
             for i in 0..n {
                 let m = &all[((first_t + t) * n + i) * 48..][..48];
+                let q = |o: usize| self.quant_b[o] + self.quant_w[o * 48..(o + 1) * 48].iter().zip(m).map(|(a, b)| a * b).sum::<f32>();
                 for o in 0..24 {
-                    let q = self.quant_b[o] + self.quant_w[o * 48..(o + 1) * 48].iter().zip(m).map(|(a, b)| a * b).sum::<f32>();
-                    z[(o * keep_t + t) * n + i] = (q - self.mean[o]) / self.std[o];
+                    let j = (o * keep_t + t) * n + i;
+                    let mut v = q(o);
+                    if let Some(e) = &eps {
+                        v += (0.5 * q(24 + o).clamp(-30.0, 20.0)).exp() * e[j];
+                    }
+                    z[j] = (v - self.mean[o]) / self.std[o];
                 }
             }
         }

@@ -1,0 +1,20 @@
+# HyperFlow 8-step v1.0 (Video Rebirth): MiniMax H3 in 8 steps (CFG 1). LoRAs on the blocks' linears (rank 256) and on
+# the time embedder, plus an endpoint copy of the time embedder: a step's embedding mixes its timestep's and its target's
+# (gate 0.25). The engine runs the two-time embedding from the full AdaLN projections (crates/h3/src/hyperflow.rs; the
+# minimax-h3-regen2k-ic card's adaln file), so the linears alone, as a plain LoRA, are not the adapter.
+id: minimax-h3-hyperflow-8step
+kind: lora
+arch: minimax-h3
+base: minimax-h3-ref2va
+license: minimax-h3-community
+commercial: true
+license_note: 'A MiniMax H3 Model Derivative (Video Rebirth): the MiniMax H3 Community License applies (not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; its Acceptable Use Policy). Copied unchanged into Open-H3-Regenerate-2K-IC.'
+title: HyperFlow 8-step v1.0 (Video Rebirth; two-time adapter)
+about: Video Rebirth's 8-step adapter for MiniMax H3 (t2va, fl2va, ref2va), as Open-H3-Regenerate-2K-IC ships it
+files:
+  lora:
+    key: h3-hyperflow-8step
+    url: https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K-IC/resolve/54a7104b204fb46486cf85c2f600942118186d57/lora/minimax_h3_hyperflow_8step_v1.0.safetensors
+    size: 2795328008
+    sha256: 9297f4505bfdef59c3014d11274411809c19b0abfe26161cab2b425a696df447
+    path: open-h3-regenerate-2k-ic/lora/minimax_h3_hyperflow_8step_v1.0.safetensors

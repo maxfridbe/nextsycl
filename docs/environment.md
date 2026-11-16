@@ -313,6 +313,7 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 |---|---|---|---|
 | `H3_*` | - | every H3_ setting in nextsycl.conf is passed to the video daemon's container (and set before the GPU opens) | cli (video serve), video |
 | `H3_STALL_S` | 1200 | the studio's watchdog: a running job that writes nothing this many seconds is stopped | studio |
+| `H3_RESIDENT_BLOCKS` | all on the card | keep only the first N denoiser blocks on the card and read the rest from the int8 file as each runs (one card copy, ~0.4 GB a block; the page cache keeps the file hot). 0: every block streamed - the card for the activations of Open-H3-Regenerate-2K's 2560x1440 sequences (the minimax-h3-regen2k-ic card) (--opt-resident-blocks) | video h3 |
 | `H3_TE_PIN` | 1 | 0: no pinned host copy of the text encoder between clips (two pinned layer slots instead) (--opt-te-pin) | video h3 |
 | `H3_TE_PIN_LOCK` | /tmp/h3-te-pin.lock | the lock file that lets one worker a host hold the pinned text-encoder copy | video h3 |
 | `H3_THREADS` | 8 | threads reading the checkpoint at load (--opt-threads) | video h3 |

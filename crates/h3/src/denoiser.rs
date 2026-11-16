@@ -353,6 +353,8 @@ pub struct Conditions {
     /// noise`, the caller's draw: P-H3-Image takes it from the request's generator, before the image's own noise);
     /// they are still presented at max(t, visual_aug)
     pub premixed: bool,
+    /// the MLP half that many rows at a time (a long sequence's memory: `Scratch::chunked`); None: all rows at once
+    pub mlp_rows: Option<usize>,
 }
 
 /// A reference's normalized latents
@@ -385,6 +387,7 @@ impl Default for Conditions {
             seed: 0,
             refs: Vec::new(),
             premixed: false,
+            mlp_rows: None,
         }
     }
 }
@@ -410,6 +413,8 @@ pub struct Denoiser<'a> {
     pub masks: Option<RowMasks>,
     /// a ControlNet and what it runs on (`set_control`)
     control: Option<ControlRun<'a>>,
+    /// HyperFlow's two-time tables for this run's noise levels (hyperflow.rs), in place of the curve's
+    pub hyperflow: Option<&'a crate::hyperflow::Prepared>,
 }
 
 /// A ControlNet's per-clip state: its hint rows per video-like segment, the audio rows it leaves alone, and the
@@ -513,7 +518,7 @@ impl<'a> Denoiser<'a> {
         let s = layout.tokens();
         Ok(Denoiser {
             x: Tensor::new(&dev, DType::BF16, &[s, cfg.hidden])?,
-            scratch: Scratch::new(&dev, cfg, s, DType::BF16)?,
+            scratch: Scratch::chunked(&dev, cfg, s, DType::BF16, cond.mlp_rows.unwrap_or(s))?,
             blocks,
             outer,
             shape,
@@ -526,7 +531,15 @@ impl<'a> Denoiser<'a> {
             cond_t: (cond.visual_aug as f64, cond.audio_aug as f64),
             masks: None,
             control: None,
+            hyperflow: None,
         })
+    }
+
+    /// The distinct timesteps one net call at `sigma` uses, and the generated rows' one (hyperflow::points)
+    pub fn values_at(&self, sigma: f32) -> (Vec<f64>, f64) {
+        let (ts, _, _) = self.timesteps(sigma);
+        let t_gen = ts.values[ts.video_index];
+        (ts.values, t_gen)
     }
 
     /// A ControlNet on this clip: `hint` [channels, T, H, W] on the target's latent grid (its channels padded with
@@ -644,7 +657,13 @@ impl<'a> Denoiser<'a> {
         let dev = self.x.buf.device().clone();
         let (ts, final_v, final_a) = self.timesteps(sigma);
         let t_emb = ts.embeddings(&o.t_table, cfg.t_dim);
-        let step = Step::new(&dev, self.blocks, &ts.rows, &self.layout.positions, &o.inv_freq, &t_emb)?;
+        let (step, hf_final) = match self.hyperflow {
+            Some(hf) => {
+                let (tables, shift, scale) = hf.tables_at(&ts.values, ts.values[ts.video_index], sigma, cfg.hidden, cfg.modalities)?;
+                (Step::from_tables(&dev, self.blocks, &ts.rows, &self.layout.positions, &o.inv_freq, ts.values.len(), tables)?, Some((shift, scale)))
+            }
+            None => (Step::new_with(&dev, self.blocks, &ts.rows, &self.layout.positions, &o.inv_freq, &t_emb, self.lora.map(|l| l.adaln.as_slice()))?, None),
+        };
 
         // embed: the patch projections write bfloat16 rows, copied into place after the text
         let seg = |k: Kind| self.layout.segment(k).ok_or_else(|| Error(format!("no {k:?} rows in the layout")));
@@ -677,7 +696,12 @@ impl<'a> Denoiser<'a> {
         };
         for i in 0..self.blocks.blocks.len() {
             between(i)?;
-            let lora = self.lora.and_then(|l| l.blocks.get(i));
+            // LoRAs kept in host memory come to the card for their block
+            let staged = match self.lora {
+                Some(l) if l.on_host() => l.device_block(&dev, i)?,
+                _ => None,
+            };
+            let lora = staged.as_ref().or_else(|| self.lora.and_then(|l| l.blocks.get(i)));
             self.blocks.block(i, &self.x, &step, &self.scratch, lora, None)?;
             if let (Some(c), Some(cs)) = (control, cstep.as_ref()) {
                 if let Some(k) = c.net.at.iter().position(|l| *l == i) {
@@ -691,7 +715,10 @@ impl<'a> Denoiser<'a> {
         }
 
         // final layer, per stream, in chunks of rows
-        let (shift, scale) = o.final_tables(&cfg, &t_emb);
+        let (shift, scale) = match hf_final {
+            Some(t) => t,
+            None => o.final_tables(&cfg, &t_emb),
+        };
         let r = ts.values.len();
         let shift = Tensor::from_bytes(&dev, DType::F32, &[r, cfg.hidden], &f32_bytes(&shift))?;
         let scale = Tensor::from_bytes(&dev, DType::F32, &[r, cfg.hidden], &f32_bytes(&scale))?;

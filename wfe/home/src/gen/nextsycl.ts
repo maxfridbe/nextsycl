@@ -1678,6 +1678,12 @@ export interface Model3dUploadReq {
 /** A reference picture's size: match | max */
 export type RefImageSize = "match" | "max";
 
+/** Open-H3-Regenerate-2K-IC's output: 2k (2560x1440) | 1080p (1920x1080) */
+export type RegenResolution = "2k" | "1080p";
+
+/** Open-H3-Regenerate-2K-IC's sampler: up3 (3 steps from the upscaled draft, the release's default) | up4 (4 steps) | hf8 (8 steps from noise) */
+export type RegenSampler = "up3" | "up4" | "hf8";
+
 /** A repaint's balance: balanced | conservative | aggressive */
 export type RepaintMode = "balanced" | "conservative" | "aggressive";
 
@@ -2148,6 +2154,19 @@ export interface VideoGenerateReq {
    * @maxItems 3
    */
   ref_videos?: string[] | null;
+  /** anchor or file: a 768p draft clip (1344x768, at least 113 frames at 24 fps; an H3 clip of 5.17 s) made again at 2560x1440 by Open-H3-Regenerate-2K-IC (feature video.regen2k: the minimax-h3-regen2k-ic model) - its faces, lip sync, lettering and layout kept, its own sound laid back under it, its first 124 frames. prompt is the draft's caption (the prompt it was made from, unchanged); width, height, seconds, steps, references and control are its own. About half an hour a clip on the B70 */
+  regen2k?: string | null;
+  /** with regen2k: up3 (default: the upscaled draft noised to 0.835, 3 steps) | up4 (from 0.923, 4 steps) | hf8 (8 steps from noise) */
+  regen_sampler?: RegenSampler | null;
+  /** with regen2k: 2k (2560x1440, default) | 1080p (1920x1080) */
+  regen_resolution?: RegenResolution | null;
+  /**
+   * with regen2k: LMS Sharp's strength (default 1; 0 off)
+   * @minimum 0
+   * @maximum 2
+   * @default 1
+   */
+  sharp?: number | null;
   /** "from-to" seconds to regenerate in source; a source shorter than the clip is extended */
   regen?: string | null;
   /** "x0,y0,x1,y1" pixels: regenerate only inside */

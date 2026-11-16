@@ -94,6 +94,23 @@ impl Studio {
             "engine": super::queue::engine_id(&super::queue::engine_name(item["engine"].as_str())),
         });
         let mut resolved = json!({});
+        // Open-H3-Regenerate-2K-IC: the draft (an anchor or a clip in out/) made again at 2K - the regen2k job, the prompt
+        // as its caption
+        let draft = s(item, "regen2k");
+        if !draft.is_empty() {
+            if let Some(src) = self.resolve(st, item, "regen2k", &draft) {
+                resolved["regen2k"] = json!(src);
+                let mut r = json!({
+                    "kind": "regen2k", "draft": self.clip_file(&src, &[".mp4"]), "caption": item["prompt"], "seed": item["seed"],
+                    "sampler": item["regen_sampler"].as_str().unwrap_or("up3"), "resolution": item["regen_resolution"].as_str().unwrap_or("2k"),
+                    "out": spec["out"], "engine": spec["engine"],
+                });
+                if let Some(x) = item["sharp"].as_f64() {
+                    r["sharp"] = json!(x);
+                }
+                return (r, resolved);
+            }
+        }
         let mode = s(item, "chain_mode");
         let image = |f: &str| [".png", ".jpg", ".jpeg", ".webp"].iter().any(|e| f.to_lowercase().ends_with(e));
         if mode != "none" {

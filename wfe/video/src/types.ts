@@ -21,6 +21,11 @@ export type H3Speed = "standard" | "pika-flex";
 export interface GenerateRequest {
   knots?: string | null;
   speed?: H3Speed | null;
+  /** Open-H3-Regenerate-2K-IC: this 768p draft (a clip in out/ or an anchor) made again at 2560x1440 (or 1080p), its sound kept; prompt = its caption */
+  regen2k?: string | null;
+  regen_sampler?: "up3" | "up4" | "hf8" | null;
+  regen_resolution?: "2k" | "1080p" | null;
+  sharp?: number | null;
   prompt: string;
   seconds?: number;
   steps?: number;

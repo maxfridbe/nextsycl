@@ -5,6 +5,30 @@ import { render, state } from "../state.js";
 import { navigate } from "../router.js";
 import type { Job } from "../types.js";
 import { fmtT } from "../util.js";
+import { rpc } from "../api.js";
+
+/** A made clip again at 2560x1440 (Open-H3-Regenerate-2K-IC on the Regenerate-2K IC model): queued as its own clip,
+ *  the draft's prompt as the caption, the same label with " 2K" */
+async function regen2k(name: string, j: Job): Promise<void> {
+  regenSent = "sending…";
+  render();
+  try {
+    const r = await rpc("generate", {
+      prompt: j.prompt ?? "", regen2k: `${name}.mp4`, seed: j.seed ?? 0, queue: true,
+      label: j.label ? `${j.label} 2K`.slice(0, 80) : undefined, title: `${j.title || j.label || name} (2K)`,
+      project: j.project, batch: j.batch,
+    });
+    regenSent = r.queued ? `2K queued at position ${r.position ?? "?"}` : "2K started";
+    state.error = null;
+  } catch (e) {
+    regenSent = "";
+    state.error = `2K regeneration: ${String(e)}`;
+  }
+  render();
+}
+
+/** What the last Regenerate 2K did, shown beside the button */
+let regenSent = "";
 
 const row = (icon: string, k: string, v: unknown) => (
   <tr>
@@ -27,6 +51,7 @@ const settings = (j: Job) => [
   row("&#xf03a;", "camera", j.camera),
   row("&#xf07b;", "project", j.project ? `${j.project}${j.batch ? ` · ${j.batch}` : ""}` : null),
   row("&#xf00e;", "upscale", j.upscale ? `${j.upscale}×` : null),
+  row("&#xf065;", "regenerated", j.regen2k ? `${j.regen2k} at 2K (${j.regen_sampler ?? "up3"})` : null),
   row("&#xf0d0;", "loras", (j.loras ?? []).map((x) => x.split("/").pop()).join(", ")),
 ];
 
@@ -51,6 +76,11 @@ export function Detail() {
               } }}
             >Play</button>
           : null}
+        {d.kind === "job" && !j.regen2k
+          ? <button type="button" class="tbtn" attrs={{ title: "made again at 2560x1440 by Open-H3-Regenerate-2K-IC: faces, lip sync and lettering kept, its sound kept (about half an hour)" }}
+              on={{ click: () => void regen2k(d.name, j) }}>Regenerate 2K</button>
+          : null}
+        {regenSent ? <span class="hint">{regenSent}</span> : null}
         <button type="button" class="tbtn" on={{ click: () => navigate({ clip: null }) }}>Close</button>
       </div>
       <div class="dtables">

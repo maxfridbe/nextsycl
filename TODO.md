@@ -62,7 +62,14 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
       upscaler (minimax_h3_latent_upscaler_3d_conv_v1_bf16), fast H3 VAE v2 (24 layers), its own base_model
       (transformer_ref, text encoder, VAE - compare with our MiniMax-H3 before downloading). Pipeline: draft as
       <Video 1> Ref2VA conditioning -> VAE encode -> latent upscaler -> HyperFlow + LMS Sharp + IC LoRA, up3/up4/hf8
-      sigma grid -> fast VAE decode -> mux the draft's audio. Goes in video/ (crates/h3); not started.
+      sigma grid -> fast VAE decode -> mux the draft's audio. Goes in video/ (crates/h3).
+      Done (docs/ports/open-h3-regenerate-2k.md): the regen2k job (crates/h3/src/regen.rs), card minimax-h3-regen2k-ic
+      (reuses our int8 Ref2VA, TE, VAE, upscaler, LMS; 26 GB of the bf16 checkpoint's AdaLN tensors for HyperFlow's
+      two-time embedding), video.generate regen2k + the studio's "Regenerate 2K"; one denoiser call vs the release's
+      Diffusers code: cosine 0.99988.
+- [ ] Open-H3-Regenerate-2K-IC: the fast H3 VAE v2 decoder (24 layers, shifted 5x16x16 windows + per-block global
+      tokens; needs a masked / varlen window attention kernel) - the H3 decoder is used meanwhile; faster streaming
+      (pinned double-buffered block uploads, or HyperFlow + LMS + IC merged into the int8 weights once); run 1080p, up4, hf8.
 
 ## Port: Haru-4B full-duplex speech (user asked 2026-11-15)
 

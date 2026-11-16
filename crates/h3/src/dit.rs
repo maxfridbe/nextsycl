@@ -78,10 +78,11 @@ impl Config {
     }
 }
 
-/// A block matrix in either of the checkpoint forms.
+/// A block matrix in either of the checkpoint forms, or an int8 one left in the file (`Blocks::load_streamed`)
 pub enum Weight {
     I8(Int8Linear),
     K(KLinear),
+    Streamed(StreamedLinear),
 }
 
 impl Weight {
@@ -89,8 +90,29 @@ impl Weight {
         match self {
             Weight::I8(l) => (l.outputs(), l.inputs()),
             Weight::K(l) => (l.n, l.k),
+            Weight::Streamed(l) => (l.n, l.k),
         }
     }
+}
+
+/// An int8 block matrix read from the checkpoint each time its block runs: where its weights and scales are in the file
+#[derive(Clone, Copy, Debug)]
+pub struct StreamedLinear {
+    w_offset: u64,
+    w_bytes: usize,
+    s_offset: u64,
+    s_bytes: usize,
+    pub n: usize,
+    pub k: usize,
+    group: Option<usize>,
+}
+
+/// The card's copy of one streamed block at a time: its four int8 matrices and their scales, and which block it holds
+struct Staging {
+    lins: [Int8Linear; 4],
+    file: std::path::PathBuf,
+    host: std::sync::Mutex<Vec<u8>>,
+    current: std::sync::atomic::AtomicUsize,
 }
 
 /// One block's weights, on the device (the big ones) and on the host (the small table projection).
@@ -122,11 +144,21 @@ pub fn host(ck: &Checkpoint, name: &str) -> Result<Vec<f32>> {
 }
 
 impl Block {
-    /// `big`: the int8 weights and their scales, already on the device (see `Blocks::load`).
-    fn assemble(dev: &Arc<Device>, ck: &Checkpoint, prefix: &str, index: usize, big: &mut BTreeMap<String, Tensor>) -> Result<Block> {
+    /// `big`: the int8 weights and their scales, already on the device (see `Blocks::load`); `streamed`: none of them
+    /// are, the block's matrices are read from the file when it runs.
+    fn assemble(dev: &Arc<Device>, ck: &Checkpoint, prefix: &str, index: usize, big: &mut BTreeMap<String, Tensor>, streamed: bool) -> Result<Block> {
         let p = format!("{prefix}.{index}");
         let mut linear = |l: &str| -> Result<Weight> {
             let name = format!("{p}.{l}");
+            if streamed {
+                let q = ck.quant(&name)?.ok_or_else(|| Error(format!("{name}: only int8 checkpoints stream their blocks")))?;
+                let (w, sc) = (ck.get(&format!("{name}.weight"))?, ck.get(&format!("{name}.weight_scale"))?);
+                if w.dtype != DType::I8 || sc.dtype != DType::F32 || w.kquant.is_some() {
+                    return Err(Error(format!("{name}: int8 weights with float32 scales expected to stream")));
+                }
+                return Ok(Weight::Streamed(StreamedLinear { w_offset: w.offset, w_bytes: w.bytes, s_offset: sc.offset, s_bytes: sc.bytes, n: w.shape[0],
+                                                            k: w.shape[1], group: q.convrot.then_some(q.group) }));
+            }
             let mut take = |k: String| big.remove(&k).ok_or_else(|| Error(format!("{k} was not loaded")));
             let wn = format!("{name}.weight");
             if let Some(kind) = ck.kquant_of(&wn) {
@@ -158,7 +190,14 @@ impl Block {
     /// The block's six tables for the timestep embeddings `t_emb` [R, t_dim]: shift, scale, gate for the attention
     /// half, then for the MLP half; each [R * modalities, hidden], row = timestep index * modalities + modality.
     pub fn tables(&self, cfg: &Config, t_emb: &[f32]) -> [Vec<f32>; 6] {
+        self.tables_with(cfg, t_emb, None)
+    }
+
+    /// As `tables`, the projection plus `extra` [rows, t_dim] (a LoRA's AdaLN branch on the curve: LMS Sharp's)
+    pub fn tables_with(&self, cfg: &Config, t_emb: &[f32], extra: Option<&[f32]>) -> [Vec<f32>; 6] {
         let (c, m, td) = (cfg.hidden, cfg.modalities, cfg.t_dim);
+        let merged: Option<Vec<f32>> = extra.filter(|e| e.len() == self.adaln_w.len()).map(|e| self.adaln_w.iter().zip(e).map(|(a, b)| a + b).collect());
+        let adaln_w = merged.as_deref().unwrap_or(&self.adaln_w);
         let r = t_emb.len() / td;
         let mut out: [Vec<f32>; 6] = std::array::from_fn(|_| vec![0f32; r * m * c]);
         for ri in 0..r {
@@ -169,7 +208,7 @@ impl Block {
                     let row = &mut table[(ri * m + mi) * c..(ri * m + mi + 1) * c];
                     for (i, v) in row.iter_mut().enumerate() {
                         let o = o0 + i;
-                        let w = &self.adaln_w[o * td..(o + 1) * td];
+                        let w = &adaln_w[o * td..(o + 1) * td];
                         *v = self.adaln_b[o] + w.iter().zip(t).map(|(a, b)| a * b).sum::<f32>();
                     }
                 }
@@ -213,22 +252,43 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
 
 impl Step {
     pub fn new(dev: &Arc<Device>, model: &Blocks, rows: &[i32], positions: &[f64], inv_freq: &[f32], t_emb: &[f32]) -> Result<Step> {
+        Self::new_with(dev, model, rows, positions, inv_freq, t_emb, None)
+    }
+
+    /// As `new`; `adaln`: per block what LoRAs add to its AdaLN projection on the curve (`LoraSet::adaln`)
+    pub fn new_with(dev: &Arc<Device>, model: &Blocks, rows: &[i32], positions: &[f64], inv_freq: &[f32], t_emb: &[f32], adaln: Option<&[Option<Vec<f32>>]>)
+                    -> Result<Step> {
+        let cfg = &model.cfg;
+        if !t_emb.len().is_multiple_of(cfg.t_dim) {
+            return Err(Error("step: the timestep embedding does not fit the model".into()));
+        }
+        let tables: Vec<[Vec<f32>; 6]> = model.blocks.iter().enumerate()
+            .map(|(i, b)| b.tables_with(cfg, t_emb, adaln.and_then(|a| a.get(i)).and_then(|x| x.as_deref()))).collect();
+        Self::from_tables(dev, model, rows, positions, inv_freq, t_emb.len() / cfg.t_dim, tables)
+    }
+
+    /// A step from tables made elsewhere (HyperFlow's two-time embedding, hyperflow.rs): per block the six tables, each
+    /// [values * modalities, hidden]
+    pub fn from_tables(dev: &Arc<Device>, model: &Blocks, rows: &[i32], positions: &[f64], inv_freq: &[f32], values: usize, host_tables: Vec<[Vec<f32>; 6]>)
+                       -> Result<Step> {
         let cfg = &model.cfg;
         let tokens = rows.len();
-        if positions.len() != tokens * 3 || inv_freq.len() * 6 != cfg.rot_dim || !t_emb.len().is_multiple_of(cfg.t_dim) {
-            return Err(Error("step: positions, frequencies or timestep embedding do not fit the model".into()));
+        if positions.len() != tokens * 3 || inv_freq.len() * 6 != cfg.rot_dim || host_tables.len() != model.blocks.len() {
+            return Err(Error("step: positions, frequencies or tables do not fit the model".into()));
         }
-        let r = t_emb.len() / cfg.t_dim * cfg.modalities;
+        let r = values * cfg.modalities;
         if let Some(bad) = rows.iter().find(|x| **x < 0 || **x as usize >= r) {
             return Err(Error(format!("step: table row {bad} of {r}")));
         }
         let cs = rotations(positions, inv_freq);
         let row_bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
         let mut tables = Vec::with_capacity(model.blocks.len());
-        for b in &model.blocks {
-            let t = b.tables(cfg, t_emb);
+        for t in &host_tables {
             let mut dev_t = Vec::with_capacity(6);
-            for v in &t {
+            for v in t {
+                if v.len() != r * cfg.hidden {
+                    return Err(Error(format!("step: a table of {} values for {r} rows", v.len())));
+                }
                 dev_t.push(Tensor::from_bytes(dev, DType::F32, &[r, cfg.hidden], &f32_bytes(v))?);
             }
             tables.push(dev_t.try_into().map_err(|_| Error("six tables per block".into()))?);
@@ -252,6 +312,9 @@ pub struct Scratch {
     pub(crate) act: Tensor,
     /// a LoRA's middle product [tokens, rank]
     pub(crate) lora: Tensor,
+    /// the MLP in row chunks (`Scratch::chunked`): the chunk's input and output rows [rows, hidden]; fc1 and act are
+    /// then [rows, ...] too
+    mlp_chunk: Option<(Tensor, Tensor)>,
 }
 
 /// The widest LoRA the scratch has room for.
@@ -259,16 +322,36 @@ pub const MAX_LORA_RANK: usize = 384;
 
 impl Scratch {
     pub fn new(dev: &Arc<Device>, cfg: &Config, tokens: usize, dtype: DType) -> Result<Scratch> {
+        Self::chunked(dev, cfg, tokens, dtype, tokens)
+    }
+
+    /// The MLP half `mlp_rows` rows at a time (its two widest buffers that many rows instead of every token's: a long
+    /// sequence's memory); `tokens` or more: all at once, as `new`
+    pub fn chunked(dev: &Arc<Device>, cfg: &Config, tokens: usize, dtype: DType, mlp_rows: usize) -> Result<Scratch> {
         let w = cfg.heads * cfg.head_dim;
+        let mr = mlp_rows.clamp(1, tokens.max(1));
+        let chunk = match mr < tokens {
+            true => Some((Tensor::new(dev, dtype, &[mr, cfg.hidden])?, Tensor::new(dev, dtype, &[mr, cfg.hidden])?)),
+            false => None,
+        };
         Ok(Scratch {
             h: Tensor::new(dev, dtype, &[tokens, cfg.hidden])?,
             qkv: Tensor::new(dev, dtype, &[tokens, 3 * w])?,
             att: Tensor::new(dev, dtype, &[tokens, w])?,
             proj: Tensor::new(dev, dtype, &[tokens, cfg.hidden])?,
-            fc1: Tensor::new(dev, dtype, &[tokens, 2 * cfg.ffn])?,
-            act: Tensor::new(dev, dtype, &[tokens, cfg.ffn])?,
+            fc1: Tensor::new(dev, dtype, &[mr, 2 * cfg.ffn])?,
+            act: Tensor::new(dev, dtype, &[mr, cfg.ffn])?,
             lora: Tensor::new(dev, dtype, &[tokens, MAX_LORA_RANK])?,
+            mlp_chunk: chunk,
         })
+    }
+
+    /// Bytes a 16-bit scratch of `tokens` with the MLP `mlp_rows` at a time holds
+    pub fn bytes(cfg: &Config, tokens: usize, mlp_rows: usize) -> usize {
+        let w = cfg.heads * cfg.head_dim;
+        let mr = mlp_rows.min(tokens);
+        let chunk = if mr < tokens { 2 * mr * cfg.hidden } else { 0 };
+        2 * (tokens * (2 * cfg.hidden + 4 * w + MAX_LORA_RANK) + mr * 3 * cfg.ffn + chunk)
     }
 }
 
@@ -305,6 +388,8 @@ pub struct Blocks {
     /// the k-quant products, when an engine brings its own (MiniMax-H3-Image's silo); else the shared expansion and
     /// product
     pub product: Option<ProductFn>,
+    /// the streamed blocks' card copy (`load_streamed`): one block's matrices at a time
+    staging: Option<Staging>,
 }
 
 impl Blocks {
@@ -315,20 +400,44 @@ impl Blocks {
         Self::load_from(dev, ck, "blocks", cfg, threads)
     }
 
+    /// As `load`, the first `resident` blocks on the card and the rest left in the int8 checkpoint: each streamed block's
+    /// matrices are read and sent to one card copy when it runs (about 0.4 GB a block; the page cache keeps the file
+    /// hot when the host has the room). For sequences whose activations need the card: a 2560x1440 refine.
+    pub fn load_streamed(dev: &Arc<Device>, ck: &Checkpoint, threads: usize, resident: usize) -> Result<Blocks> {
+        let cfg = Config::from_checkpoint(ck)?;
+        Self::load_part(dev, ck, "blocks", cfg, threads, resident.min(cfg.blocks))
+    }
+
     /// `cfg.blocks` blocks under `prefix` (`blocks`; a ControlNet's `control_blocks`), shaped as `cfg` says
     pub fn load_from(dev: &Arc<Device>, ck: &Checkpoint, prefix: &str, cfg: Config, threads: usize) -> Result<Blocks> {
+        Self::load_part(dev, ck, prefix, cfg, threads, cfg.blocks)
+    }
+
+    fn load_part(dev: &Arc<Device>, ck: &Checkpoint, prefix: &str, cfg: Config, threads: usize, resident: usize) -> Result<Blocks> {
         let n = cfg.blocks;
         let lead = format!("{prefix}.");
         let wanted = |name: &str| -> bool {
             let Some(rest) = name.strip_prefix(lead.as_str()) else { return false };
             let Some((idx, tail)) = rest.split_once('.') else { return false };
-            idx.parse::<usize>().is_ok_and(|i| i < n) && LINEARS.iter().any(|l| tail == format!("{l}.weight") || tail == format!("{l}.weight_scale"))
+            idx.parse::<usize>().is_ok_and(|i| i < resident) && LINEARS.iter().any(|l| tail == format!("{l}.weight") || tail == format!("{l}.weight_scale"))
         };
         let mut loaded = load::load(dev, ck, threads, wanted).ctx("loading the denoiser's weights")?;
         let mut blocks = Vec::with_capacity(n);
         for i in 0..n {
-            blocks.push(Block::assemble(dev, ck, prefix, i, &mut loaded.tensors).ctx(format!("block {i}"))?);
+            blocks.push(Block::assemble(dev, ck, prefix, i, &mut loaded.tensors, i >= resident).ctx(format!("block {i}"))?);
         }
+        let staging = match blocks.iter().find(|b| matches!(b.qkv, Weight::Streamed(_))) {
+            Some(b) => {
+                let lin = |w: &Weight| -> Result<Int8Linear> {
+                    let Weight::Streamed(l) = w else { return Err(Error("a streamed block with a resident matrix".into())) };
+                    Ok(Int8Linear { weight: Tensor::new(dev, DType::I8, &[l.n, l.k])?, scale: Tensor::new(dev, DType::F32, &[l.s_bytes / 4])?, bias: None,
+                                    group: l.group })
+                };
+                let lins = [lin(&b.qkv)?, lin(&b.out_proj)?, lin(&b.fc1)?, lin(&b.fc2)?];
+                Some(Staging { lins, file: ck.path.clone(), host: std::sync::Mutex::new(Vec::new()), current: std::sync::atomic::AtomicUsize::new(usize::MAX) })
+            }
+            None => None,
+        };
         let kquant = ck.kquant_of(&format!("{prefix}.0.mlp.fc1.weight"));
         let wbuf = match kquant {
             Some(_) => {
@@ -337,13 +446,49 @@ impl Blocks {
             }
             None => None,
         };
-        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf, attention: None, product: None })
+        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf, attention: None, product: None, staging })
+    }
+
+    /// How many blocks stay on the card (the rest stream from the file)
+    pub fn resident(&self) -> usize {
+        self.blocks.iter().filter(|b| !matches!(b.qkv, Weight::Streamed(_))).count()
+    }
+
+    /// Block `index`'s matrices on the card copy, when it is a streamed block not already there: read from the file
+    /// and sent (the write waits for the work queued before it, which may still read the copy)
+    fn stage(&self, index: usize) -> Result<()> {
+        let Some(st) = &self.staging else { return Ok(()) };
+        let b = &self.blocks[index];
+        if !matches!(b.qkv, Weight::Streamed(_)) || st.current.load(std::sync::atomic::Ordering::Relaxed) == index {
+            return Ok(());
+        }
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::File::open(&st.file).ctx(format!("opening {}", st.file.display()))?;
+        let mut host = st.host.lock().map_err(|_| Error("the staging buffer's lock".into()))?;
+        for (w, lin) in b.linears().iter().zip(&st.lins) {
+            let Weight::Streamed(l) = w else { return Err(Error(format!("block {index}: a streamed block with a resident matrix"))) };
+            for (off, n, dst) in [(l.w_offset, l.w_bytes, &lin.weight), (l.s_offset, l.s_bytes, &lin.scale)] {
+                if n != dst.buf.len() {
+                    return Err(Error(format!("block {index}: {n} bytes for a {}-byte card copy", dst.buf.len())));
+                }
+                host.resize(n, 0);
+                f.read_exact_at(&mut host[..n], off).ctx("reading a streamed block")?;
+                dst.buf.write(0, &host[..n])?;
+            }
+        }
+        st.current.store(index, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// `out = linear(x)` with one of the blocks' matrices.
     fn mm(&self, w: &Weight, x: &Tensor, out: &Tensor) -> Result<()> {
         match w {
             Weight::I8(l) => l.forward(x, out),
+            Weight::Streamed(l) => {
+                let st = self.staging.as_ref().ok_or("a streamed matrix without its card copy")?;
+                let c = st.lins.iter().find(|c| c.outputs() == l.n && c.inputs() == l.k).ok_or("no card copy of that shape")?;
+                c.forward(x, out)
+            }
             Weight::K(l) => {
                 let wbuf = self.wbuf.as_ref().ok_or("a k-quant matrix without its expansion buffer")?;
                 if let Some(f) = &self.product {
@@ -366,6 +511,7 @@ impl Blocks {
     pub fn block(&self, index: usize, x: &Tensor, step: &Step, s: &Scratch, lora: Option<&crate::lora::BlockLora>, mut tap: Option<Tap>) -> Result<()> {
         let cfg = &self.cfg;
         let b = &self.blocks[index];
+        self.stage(index)?;
         let [shift_a, scale_a, gate_a, shift_m, scale_m, gate_m] = &step.tables[index];
         let mut tap = |name: &str, t: &Tensor| -> Result<()> {
             match tap.as_mut() {
@@ -396,12 +542,32 @@ impl Blocks {
         // MLP half
         ops::rms_norm_mod(x, &b.norm2, cfg.norm_eps, Some(&Mod { rows: &step.rows, scale: scale_m, shift: shift_m }), &s.h)?;
         tap("h2", &s.h)?;
-        self.mm(&b.fc1, &s.h, &s.fc1)?;
-        side(lora, 2, &s.h, &s.fc1, &s.lora)?;
-        tap("fc1", &s.fc1)?;
-        ops::swiglu(&s.fc1, &s.act)?;
-        self.mm(&b.fc2, &s.act, &s.proj)?;
-        side(lora, 3, &s.act, &s.proj, &s.lora)?;
+        match &s.mlp_chunk {
+            None => {
+                self.mm(&b.fc1, &s.h, &s.fc1)?;
+                side(lora, 2, &s.h, &s.fc1, &s.lora)?;
+                tap("fc1", &s.fc1)?;
+                ops::swiglu(&s.fc1, &s.act)?;
+                self.mm(&b.fc2, &s.act, &s.proj)?;
+                side(lora, 3, &s.act, &s.proj, &s.lora)?;
+            }
+            Some((hc, pc)) => {
+                // a chunk of rows through the MLP (the last chunk's rows past the sequence are stale; never copied back)
+                let mr = hc.shape[0];
+                let mut r0 = 0;
+                while r0 < step.tokens {
+                    let m = mr.min(step.tokens - r0);
+                    hc.copy_rows(0, &s.h, r0, m)?;
+                    self.mm(&b.fc1, hc, &s.fc1)?;
+                    side(lora, 2, hc, &s.fc1, &s.lora)?;
+                    ops::swiglu(&s.fc1, &s.act)?;
+                    self.mm(&b.fc2, &s.act, pc)?;
+                    side(lora, 3, &s.act, pc, &s.lora)?;
+                    s.proj.copy_rows(r0, pc, 0, m)?;
+                    r0 += m;
+                }
+            }
+        }
         tap("mlp", &s.proj)?;
         ops::gate_add(x, &s.proj, &step.rows, gate_m)?;
         tap("x2", x)

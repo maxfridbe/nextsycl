@@ -244,6 +244,16 @@ impl Upscaler {
     /// Normalized latents [24, T, H, W] -> [24, T, Ho, Wo], Ho = round(s H), Wo = round(s W).
     pub fn upscale(&self, z: &[f32], t: usize, h: usize, w: usize, scale: f32, tick: &mut dyn FnMut() -> Result<()>) -> Result<(Vec<f32>, usize, usize)> {
         let (ho, wo) = ((h as f32 * scale).round() as usize, (w as f32 * scale).round() as usize);
+        self.upscale_to(z, (t, h, w), (ho, wo), scale, true, tick)
+    }
+
+    /// To a target size `(ho, wo)` (the node's "target dimensions": the scale embedding then reads the mean of the two
+    /// sides' factors); `chunked` false: the whole clip in one piece, as Open-H3-Regenerate-2K runs it
+    pub fn upscale_to(&self, z: &[f32], (t, h, w): (usize, usize, usize), (ho, wo): (usize, usize), scale: f32, chunked: bool,
+                      tick: &mut dyn FnMut() -> Result<()>) -> Result<(Vec<f32>, usize, usize)> {
+        if z.len() != 24 * t * h * w {
+            return Err(Error(format!("upscale: {} values for 24 x {t} x {h} x {w}", z.len())));
+        }
         let n = h * w;
         // channels-last and normalized once more by the latent statistics (as the reference does)
         let mut x = vec![0f32; z.len()];
@@ -254,7 +264,7 @@ impl Upscaler {
         }
         let frame = n * 24;
         let out_frame = ho * wo * 24;
-        let out: Vec<f32> = if t <= CHUNK {
+        let out: Vec<f32> = if t <= CHUNK || !chunked {
             self.segment(&x, (t, h, w), (t, ho, wo), scale, tick)?
         } else {
             // overlapping pieces of 32 frames: each piece reads `ov` frames more on each side (replicate-padded at

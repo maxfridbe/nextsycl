@@ -309,10 +309,10 @@ fn fetch(cat: &Catalog, root: &Path, key: &str, f: &Value, from: &[PathBuf], ver
         // published as byte ranges of the file (name.part01-of-40 ...): each downloaded and checked, then joined
         println!("  {key}: downloading {:.2} GiB in {} parts", gib(size), pieces.len());
         join_parts(pieces, &target, &part)?;
-    } else if let Some(prefix) = f["tensors"].as_str() {
-        // a part of a larger safetensors file: its header, then only the tensors under `prefix`, by byte range
+    } else if let Some(patterns) = tensor_patterns(&f["tensors"]) {
+        // a part of a larger safetensors file: its header, then only the tensors the patterns name, by byte range
         println!("  {key}: downloading {:.2} GiB\n    {url}", gib(size));
-        fetch_tensors(&url, prefix, &part)?;
+        fetch_tensors(&url, &patterns, &part)?;
     } else if let Some(member) = f["member"].as_str() {
         // one file of a zip archive (a release's bundle: realesrgan-ncnn-vulkan's models/): the archive downloaded once
         // under <root>/.archives (resumed like any file), the member taken out of it
@@ -433,17 +433,35 @@ fn range(url: &str, a: u64, b: u64) -> Result<Vec<u8>, String> {
     Ok(o.stdout)
 }
 
-/// The tensors of a remote safetensors file whose names start with `prefix`, as a safetensors file of their own (the
-/// header rewritten - compact, keys sorted - the data in the source's order, read in 64 MiB ranges); the same bytes
-/// every time, so its SHA-256 can be in the catalog
-fn fetch_tensors(url: &str, prefix: &str, out: &Path) -> Result<(), String> {
+/// A card file's `tensors`: one prefix (`visual.`), or a list of them, where `*` stands for any run of characters
+/// (`blocks.*.adaln_proj.`); a name is kept when it starts with what one of them matches
+fn tensor_patterns(v: &Value) -> Option<Vec<String>> {
+    match v {
+        Value::String(s) => Some(vec![s.clone()]),
+        Value::Array(a) => Some(a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).filter(|p: &Vec<String>| !p.is_empty()),
+        _ => None,
+    }
+}
+
+/// Whether `name` starts with what `pattern` matches (`*`: any run of characters)
+fn tensor_match(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        None => name.starts_with(pattern),
+        Some((head, rest)) => name.strip_prefix(head).is_some_and(|tail| (0..=tail.len()).filter(|i| tail.is_char_boundary(*i)).any(|i| tensor_match(rest, &tail[i..]))),
+    }
+}
+
+/// The tensors of a remote safetensors file that the patterns name (`tensor_match`), as a safetensors file of their own
+/// (the header rewritten - compact, keys sorted - the data in the source's order, read in 64 MiB ranges); the same
+/// bytes every time, so its SHA-256 can be in the catalog
+fn fetch_tensors(url: &str, patterns: &[String], out: &Path) -> Result<(), String> {
     use std::io::Write;
     let n = u64::from_le_bytes(range(url, 0, 8)?.try_into().map_err(|_| "a short header")?);
     let head: Value = serde_json::from_slice(&range(url, 8, 8 + n)?).map_err(|e| format!("{url}: its header: {e}"))?;
     let mut keep: Vec<(String, Value)> = head.as_object().into_iter().flatten()
-        .filter(|(k, _)| k.as_str() != "__metadata__" && k.starts_with(prefix)).map(|(k, v)| (k.clone(), v.clone())).collect();
+        .filter(|(k, _)| k.as_str() != "__metadata__" && patterns.iter().any(|p| tensor_match(p, k))).map(|(k, v)| (k.clone(), v.clone())).collect();
     if keep.is_empty() {
-        return Err(format!("{url}: no tensor starts with {prefix}"));
+        return Err(format!("{url}: no tensor matches {patterns:?}"));
     }
     let off = |v: &Value, i: usize| v["data_offsets"][i].as_u64().unwrap_or(0);
     keep.sort_by_key(|(_, v)| off(v, 0));
@@ -671,6 +689,16 @@ mod tests {
             }
         }
         assert!(makers >= 20, "the picture-making cards were not found ({makers})");
+    }
+
+    #[test]
+    fn a_files_tensors_are_a_prefix_or_patterns() {
+        assert_eq!(tensor_patterns(&json!("visual.")), Some(vec!["visual.".to_string()]));
+        let p = tensor_patterns(&json!(["time_embedder.", "blocks.*.adaln_proj.", "final_layer.adaln_proj."])).unwrap();
+        let keep = |n: &str| p.iter().any(|x| tensor_match(x, n));
+        assert!(keep("blocks.12.adaln_proj.linear.weight") && keep("time_embedder.proj_in.bias") && keep("final_layer.adaln_proj.linear.bias"));
+        assert!(!keep("blocks.12.attn.qkv_proj.weight") && !keep("final_layer.norm.weight") && !keep("token_refiner.blocks.0.adaln_proj.x"));
+        assert!(tensor_patterns(&json!([])).is_none() && tensor_patterns(&json!(null)).is_none());
     }
 
     #[test]

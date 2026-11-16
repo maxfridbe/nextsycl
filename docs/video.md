@@ -47,5 +47,6 @@ What a clip can be made from (ComfyUI's H3 nodes, each checked against them wher
 | ControlNet (Fun ControlNet-Union 2.0) | a control video - canny, depth, HED, MLSD or pose frames, made beforehand - the clip follows | `control_video`, `control_strength`, `control_start`, `control_end` |
 | video inpainting | a mask (white: regenerate; a picture or a video) over a source video, through the same ControlNet | `control_mask`, `control_source` |
 | regenerate a stretch / box, extend | a clip's latents kept outside the seconds and box asked for | `source`, `regen`, `regen_box` |
+| a 768p draft at 2560x1440 (Open-H3-Regenerate-2K-IC) | the draft as `<Video 1>` on the Ref2VA denoiser + HyperFlow 8-step + LMS Sharp + the IC LoRA, 3 steps from the upscaled draft; its sound kept (the `regen2k` job, the `minimax-h3-regen2k-ic` model; docs/ports/open-h3-regenerate-2k.md) | `regen2k`, `regen_sampler`, `regen_resolution`, `sharp` |
 
 ![the video studio](screenshots/video-studio.webp)

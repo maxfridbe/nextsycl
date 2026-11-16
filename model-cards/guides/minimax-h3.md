@@ -57,6 +57,9 @@ non_diegetic_music: <a score the people in the scene cannot hear, or "None.">
 - `control_video` (canny / depth / HED / MLSD / pose frames) the clip follows; `control_mask` + `control_source`
   regenerate the white part of the mask: describe the whole result.
 - Steps: 8 for a draft, 12-20 when dialogue or motion matter. Canvases: 768x576 is the house size; 4-15 s.
+- `regen2k` (the Regenerate-2K IC model, `minimax-h3-regen2k-ic`): a finished 1344x768 draft (5.17 s, 124 frames)
+  made again at 2560x1440 with its faces, lip sync and lettering - the prompt is the draft's own prompt, unchanged (or
+  empty); no new instructions, the model only restores detail. Make the draft at 1344x768 and at least 4.7 s.
 
 ## Films: a recipe for each kind
 A clip is 4-15 s; a film is several, each carrying on from the last, then joined (`nextsycl video join`, or your

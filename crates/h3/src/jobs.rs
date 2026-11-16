@@ -40,10 +40,21 @@ impl Engine {
 
     /// The same, on a GPU already opened.
     pub fn load_on(dev: Arc<Device>, path: &Path, count: Option<usize>, threads: usize, log: &mut dyn FnMut(String)) -> Result<Engine> {
+        Self::load_resident(dev, path, count, None, threads, log)
+    }
+
+    /// `resident`: that many blocks on the card, the rest streamed from the file as they run (`Blocks::load_streamed`;
+    /// None: all on the card)
+    pub fn load_resident(dev: Arc<Device>, path: &Path, count: Option<usize>, resident: Option<usize>, threads: usize, log: &mut dyn FnMut(String))
+                         -> Result<Engine> {
         let ck = Checkpoint::open(path)?;
         log(format!("device : {}", dev.name()));
-        let model = dit::Blocks::load(&dev, &ck, count, threads)?;
-        log(format!("blocks : {} loaded, {:.2} GiB in {:.1} s", model.blocks.len(), gib(model.load_bytes), model.load_seconds));
+        let model = match resident {
+            Some(r) => dit::Blocks::load_streamed(&dev, &ck, threads, r)?,
+            None => dit::Blocks::load(&dev, &ck, count, threads)?,
+        };
+        log(format!("blocks : {} ({} on the card, the rest streamed), {:.2} GiB in {:.1} s", model.blocks.len(), model.resident(), gib(model.load_bytes),
+                    model.load_seconds));
         let outer = Outer::load(&dev, &ck)?;
         denoiser::check_fits(&model.cfg, &outer)?;
         Ok(Engine { dev, ck, model, outer, threads })
@@ -69,7 +80,7 @@ impl Ctl<'_> {
         }
     }
 
-    fn say(&mut self, s: String) {
+    pub(crate) fn say(&mut self, s: String) {
         (self.log)(s)
     }
     /// Between blocks: stop here if the job was cancelled. The GPU queue is asynchronous - without a wait, a job
@@ -80,7 +91,7 @@ impl Ctl<'_> {
         self.check()
     }
 
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         if self.cancel.load(Ordering::Relaxed) {
             Err(Error("cancelled".into()))
         } else {
@@ -1359,15 +1370,7 @@ fn clip_refs(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frames): (
         };
         n_video += 1;
         pieces.push(Piece::Text(format!("<Video {n_video}>: ")));
-        // the encoder sees it at 2 fps, two frames a block (an odd last one repeated), each block labelled with its
-        // middle time
-        let picks: Vec<usize> = (0..n).step_by(12).collect();
-        for (j, pair) in picks.chunks(2).enumerate() {
-            let (a, b) = (pair[0], *pair.last().expect("non-empty"));
-            let t = if pair.len() == 2 { (2 * j) as f64 / 2.0 + 0.25 } else { (2 * j) as f64 / 2.0 };
-            pieces.push(Piece::Text(format!("<{t:.1} seconds>")));
-            pieces.push(Piece::Vision(Frames { frames: vec![px[a * fsz..(a + 1) * fsz].to_vec(), px[b * fsz..(b + 1) * fsz].to_vec()], w: cw, h: ch }));
-        }
+        pieces.extend(ref_video_blocks(&px, n, cw, ch));
         let (z, vt) = venc.as_ref().expect("loaded for clips").encode(&px[..n * fsz], n, ch, cw, &mut || ctl.check())?;
         ctl.say(format!("ref    : <Video {n_video}> = {} ({cw}x{ch}, {n} frames{})", p.display(),
                         audio.as_ref().map_or(String::new(), |a| format!(", its sound as <Audio {n_audio}>: {} latent frames", a.1))));
@@ -1382,6 +1385,21 @@ fn clip_refs(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frames): (
         refs.push(RefIn::Audio { latent: z, t });
     }
     Ok((pieces, refs))
+}
+
+/// A reference clip's vision blocks for the text encoder (frames [n, h, w, 3] at 24 fps): it sees the clip at 2 fps,
+/// two frames a block (an odd last one repeated), each block labelled with its middle time
+pub(crate) fn ref_video_blocks(px: &[f32], n: usize, w: usize, h: usize) -> Vec<Piece> {
+    let fsz = w * h * 3;
+    let mut pieces = Vec::new();
+    let picks: Vec<usize> = (0..n).step_by(12).collect();
+    for (j, pair) in picks.chunks(2).enumerate() {
+        let (a, b) = (pair[0], *pair.last().expect("non-empty"));
+        let t = if pair.len() == 2 { (2 * j) as f64 / 2.0 + 0.25 } else { (2 * j) as f64 / 2.0 };
+        pieces.push(Piece::Text(format!("<{t:.1} seconds>")));
+        pieces.push(Piece::Vision(Frames { frames: vec![px[a * fsz..(a + 1) * fsz].to_vec(), px[b * fsz..(b + 1) * fsz].to_vec()], w, h }));
+    }
+    pieces
 }
 
 /// The model's frame grid: frames at 24 fps snapped up to 17k + 5; (frames, video latent frames, audio latent frames).
@@ -1869,6 +1887,55 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                 generate(e, &c, Path::new(out), ctl)
             }
         }
+        "regen2k" => {
+            let s = |k: &str| spec.get(k).and_then(|d| d.as_str());
+            let n = |k: &str| spec.get(k).and_then(|d| d.as_f64());
+            let need = |k: &str, what: &str| s(k).map(Path::new).ok_or_else(|| Error(format!("regen2k needs \"{k}\": {what}")));
+            let out = need("out", "where to write the .mp4")?;
+            let res = s("resolution").unwrap_or("2k");
+            let (mut lw, mut lh, mut tw, mut th, mut keep) = crate::regen::resolution(res).ok_or_else(|| Error(format!("resolution {res}? (2k, 1080p)")))?;
+            // other sizes ("WxH"), for checks at small sizes: the draft's canvas and the computed size
+            let size = |k: &str| s(k).and_then(|v| v.split_once('x')).and_then(|(a, b)| Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?)));
+            if let Some((w, h)) = size("lq") {
+                (lw, lh) = (w, h);
+            }
+            if let Some((w, h)) = size("size") {
+                (tw, th, keep) = (w, h, h);
+            }
+            let caption = match (s("caption").or(s("prompt")), s("prompt_file")) {
+                (Some(p), _) => p.to_string(),
+                (None, Some(f)) => std::fs::read_to_string(f).map_err(|e| Error(format!("{f}: {e}")))?.trim().to_string(),
+                _ => String::new(),
+            };
+            let sharp = n("sharp").unwrap_or(1.0) as f32;
+            let r = crate::regen::RegenSpec {
+                draft: need("draft", "the 768p draft clip (.mp4)")?,
+                caption,
+                seed: n("seed").unwrap_or(0.0) as u64,
+                sampler: s("sampler").unwrap_or("up3").to_string(),
+                sigmas: s("sigmas").map(|x| x.split(',').filter_map(|v| v.trim().parse().ok()).collect()),
+                lq: (lw, lh),
+                target: (tw, th),
+                keep_h: keep,
+                frames: n("frames").map_or(crate::regen::FRAMES, |f| f as usize),
+                te: TeFiles {
+                    te: need("te", "the text encoder's GGUF")?,
+                    tokenizer: Path::new(s("tokenizer").unwrap_or("/app/tokenizer")),
+                    visual: s("te_visual").map(Path::new).filter(|p| p.exists()),
+                    embeddings: None,
+                },
+                vae: need("vae", "the H3 video VAE")?,
+                upscaler: need("upscaler", "the 3D-conv latent upscaler")?,
+                ic_lora: need("ic_lora", "the IC LoRA")?,
+                hyperflow: need("hyperflow", "HyperFlow's 8-step adapter")?,
+                adaln: need("adaln", "the bf16 Ref2VA time embedder and AdaLN projections")?,
+                sharp: s("sharp_lora").map(|p| (Path::new(p), sharp)),
+                silence: need("silence", "the silence latent")?,
+                mlp_rows: n("mlp_rows").map_or(16384, |v| v as usize),
+                check_dump: s("check_dump").map(Path::new),
+            };
+            crate::regen::regen2k(e, &r, out, ctl)
+        }
         "encode" => {
             let s = |k: &str| spec.get(k).and_then(|d| d.as_str());
             let prompt = match (s("prompt"), s("prompt_file")) {
@@ -1882,7 +1949,7 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
             let files = TeFiles { te: Path::new(te), tokenizer: Path::new(tokenizer), visual: s("te_visual").map(Path::new), embeddings: s("embeddings").map(Path::new) };
             encode_with(&e.dev, e.threads, &pictures, &prompt, &files, s("out").map(Path::new), s("check").map(Path::new), ctl)
         }
-        other => Err(Error(format!("unknown job kind {other:?} (known: bench-blocks, check-block, denoise, decode, encode, generate)"))),
+        other => Err(Error(format!("unknown job kind {other:?} (known: bench-blocks, check-block, denoise, decode, encode, generate, regen2k)"))),
     }
 }
 

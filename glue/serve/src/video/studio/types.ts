@@ -65,6 +65,11 @@ export interface GenerateRequest {
   sampler?: string; schedule?: string; knots?: string;
   /** H3: `pika-flex` is the model's six-step mode in one word (the Pika H3 Flex adapter, the lcm sampler on its knots, six steps; the adapter must be pulled: nextsycl models pull pika-h3-flex-fl2va); standard or none: the options as named */
   speed?: H3Speed | null;
+  /** Open-H3-Regenerate-2K-IC: this 768p draft (a clip in out/ or an anchor) made again at 2560x1440 (or 1080p), its sound kept; prompt = its caption */
+  regen2k?: string | null;
+  regen_sampler?: "up3" | "up4" | "hf8" | null;
+  regen_resolution?: "2k" | "1080p" | null;
+  sharp?: number | null;
 }
 
 export interface Chain {

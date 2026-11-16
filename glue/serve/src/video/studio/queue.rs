@@ -215,7 +215,12 @@ fn ignored_keys() -> Vec<String> {
 pub fn inputs_of(quant: &str) -> Value {
     let common = ["prompt", "title", "seconds", "frames", "steps", "seed", "width", "height", "te", "first_frame", "last_frame", "exposure_ref", "guide_clip",
                   "first_audio", "first_audio_s", "soundtrack", "soundtrack_start", "exposure_fix", "exposure_offset", "exposure_ease", "exposure_target", "ref_audios", "loras", "upscale", "upscaler", "shift_video", "shift_audio", "sampler", "schedule", "knots", "speed", "chain", "source", "regen", "regen_box"];
-    if quant == "REF2VA" {
+    if quant == "REGEN2K" {
+        json!({"takes": ["prompt", "title", "seed", "regen2k", "regen_sampler", "regen_resolution", "sharp"],
+               "not": ["width", "height", "seconds", "frames", "steps", "first_frame", "last_frame", "guide_clip", "ref_images", "ref_videos", "ref_audios", "loras",
+                       "control_video", "control_mask", "source", "upscale"],
+               "chosen": "by itself when regen2k (a draft clip) is given", "ignored": ignored_keys()})
+    } else if quant == "REF2VA" {
         json!({"takes": common.iter().chain(["ref_images", "ref_videos", "ref_image_size", "ref_video_sound", "te_pictures"].iter()).collect::<Vec<_>>(),
                "not": ["control_video", "control_mask", "control_source", "control_strength", "control_start", "control_end"],
                "chosen": "by itself when ref_images or ref_videos are given", "ignored": ignored_keys()})
@@ -284,6 +289,8 @@ pub fn quant_of(id: &str) -> &'static str {
         "q4km" => "Q4_K_M",
         "q8" => "Q8_0",
         "ref2va" => "REF2VA",
+        // minimax-h3-regen2k-ic: Open-H3-Regenerate-2K-IC (the regen2k job)
+        "ic" => "REGEN2K",
         _ => "INT8",
     }
 }
@@ -465,6 +472,53 @@ impl Studio {
         }
         for k in ["ref_video_sound", "te_pictures"] {
             it.insert(k.into(), p.get(k).filter(|v| v.is_boolean()).cloned().unwrap_or(Value::Null));
+        }
+        // Open-H3-Regenerate-2K-IC: a draft clip made again at 2560x1440 (or 1080p) - the Regenerate-2K IC model, the
+        // prompt as the draft's caption; the draft sets the length, the resolution the canvas
+        match p.get("regen2k").and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()) {
+            Some(d) => {
+                let _ = self.engines();
+                if !engine_known("REGEN2K") {
+                    return Err(RpcError::param("regen2k needs the Regenerate-2K IC model (nextsycl models pull minimax-h3-regen2k-ic, then add it to NS_VIDEO_ENGINES)"));
+                }
+                if it["ref_images"].is_array() || it["ref_videos"].is_array() || p.get("source").is_some_and(|v| !v.is_null()) {
+                    return Err(RpcError::param("regen2k takes a draft and its caption: no references or source beside it"));
+                }
+                let d = if MAGIC.contains(&d) {
+                    d.to_string()
+                } else {
+                    let b = basename(d);
+                    if !self.here_or_coming(&b) {
+                        return Err(RpcError::not_found(&format!("regen2k draft {b} not found in out/")));
+                    }
+                    b
+                };
+                let pick = |k: &str, ok: &[&str], dflt: &str| -> Result<String, RpcError> {
+                    match p.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()) {
+                        None => Ok(dflt.to_string()),
+                        Some(v) if ok.contains(&v) => Ok(v.to_string()),
+                        Some(v) => Err(RpcError::param(&format!("{k} {v}? ({})", ok.join(", ")))),
+                    }
+                };
+                let sampler = pick("regen_sampler", &["up3", "up4", "hf8"], "up3")?;
+                let res = pick("regen_resolution", &["2k", "1080p"], "2k")?;
+                let (w, h) = if res == "1080p" { (1920, 1080) } else { (2560, 1440) };
+                it.insert("regen2k".into(), json!(d));
+                it.insert("regen_sampler".into(), json!(sampler));
+                it.insert("regen_resolution".into(), json!(res));
+                it.insert("sharp".into(), num(p, "sharp", 1.0, 0.0, 2.0, false)?);
+                it.insert("engine".into(), json!("REGEN2K"));
+                it.insert("width".into(), json!(w));
+                it.insert("height".into(), json!(h));
+                it.insert("frames".into(), json!(124));
+                it.insert("seconds".into(), json!(124.0 / 24.0));
+                it.insert("steps".into(), json!(match sampler.as_str() { "up4" => 4, "hf8" => 8, _ => 3 }));
+            }
+            None => {
+                for k in ["regen2k", "regen_sampler", "regen_resolution", "sharp"] {
+                    it.insert(k.into(), Value::Null);
+                }
+            }
         }
         // the ControlNet: a control video, a mask over a source; files beside the clips
         for k in ["control_video", "control_mask", "control_source"] {

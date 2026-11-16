@@ -13,7 +13,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use nextsycl_h3::device::Device;
-use nextsycl_h3::lora::{BlockLora, LoraSet};
+use nextsycl_h3::lora::LoraSet;
 use nextsycl_h3::safetensors::Checkpoint;
 use nextsycl_image::{LoraUse, Picture};
 
@@ -126,8 +126,7 @@ pub struct Loras {
 }
 
 fn empty(blocks: usize, refiner: usize) -> LoraSet {
-    let none = || -> BlockLora { std::array::from_fn(|_| Vec::new()) };
-    LoraSet { blocks: (0..blocks).map(|_| none()).collect(), refiner: (0..refiner).map(|_| none()).collect(), max_rank: 0, layers: 0 }
+    LoraSet::empty(blocks, refiner)
 }
 
 /// Each block's (then each refiner block's) number of LoRAs per linear
