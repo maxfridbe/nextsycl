@@ -463,7 +463,9 @@ fn finish(out: &Path, draft: &Path, real: usize, frames: usize, (w, h): (usize, 
 }
 
 /// The draft's sound under the clip, the whole clip kept: the output cut at the clip's own length (`-shortest` with the
-/// picture copied ends a few frames early - a 185-frame clip came out with 181)
+/// picture copied ends a few frames early - a 185-frame clip came out with 181). The sound is the draft's own stream,
+/// copied - never encoded a second time (a lossy generation more); a draft whose sound an MP4 cannot hold as it is
+/// is refused here rather than stepped down
 fn mux_draft_sound(clip: &Path, draft: &Path, seconds: f64) -> Result<()> {
     let tmp = clip.with_extension("mux.mp4");
     let st = std::process::Command::new("ffmpeg")
@@ -471,7 +473,7 @@ fn mux_draft_sound(clip: &Path, draft: &Path, seconds: f64) -> Result<()> {
         .arg(clip)
         .arg("-i")
         .arg(draft)
-        .args(["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-t", &format!("{seconds:.6}")])
+        .args(["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "copy", "-t", &format!("{seconds:.6}")])
         .arg(&tmp)
         .status()
         .map_err(|e| Error(format!("starting ffmpeg: {e}")))?;

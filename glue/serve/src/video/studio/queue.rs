@@ -490,7 +490,11 @@ impl Studio {
                 let d = if MAGIC.contains(&d) {
                     d.to_string()
                 } else {
-                    let b = basename(d);
+                    // a finished clip by its bare name too (clips are .mp4): h3_20261113_150714 is h3_20261113_150714.mp4
+                    let mut b = basename(d);
+                    if Path::new(&b).extension().is_none() {
+                        b.push_str(".mp4");
+                    }
                     if !self.here_or_coming(&b) {
                         return Err(RpcError::not_found(&format!("regen2k draft {b} not found in out/")));
                     }

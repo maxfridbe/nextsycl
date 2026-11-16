@@ -458,7 +458,10 @@ impl Studio {
         let eta = if done || failed {
             0.0
         } else if regen {
-            regen_eta(&job.rec, elapsed, has("tokens :"), j["progress"]["done"].as_f64(), j["progress"]["total"].as_f64(), has("sampled:"))
+            // its steps as they ended ("step   : 1/3 in 581.5 s (window 1/2)"): the pace of the rest
+            let step_s: Vec<f64> = log.iter().filter(|l| l.starts_with("step   :")).filter_map(|l| l.split(" in ").nth(1)?.split_whitespace().next()?.parse().ok()).collect();
+            let frac = j["progress"]["done"].as_f64().zip(j["progress"]["total"].as_f64()).filter(|(_, t)| *t > 0.0).map(|(d, t)| (d / t).clamp(0.0, 1.0));
+            regen_eta(&job.rec, elapsed, has("tokens :"), frac, &step_s, has("sampled:"))
         } else if steps_done > 0 && steps_done < steps_total {
             let per = (elapsed - 30.0).max(1.0) / steps_done as f64;
             per * (steps_total - steps_done) as f64 + 0.15 * frames as f64
@@ -674,22 +677,26 @@ pub fn regen_estimate_s(frames: f64, windows: f64, steps_per_window: f64) -> f64
     40.0 + windows * (160.0 + 627.0 * steps_per_window) + 1.8 * frames
 }
 
-/// A running regeneration's time left: the estimate less what has gone before it samples; while it samples, its blocks'
-/// pace (the engine reports each: `progress`) for the rest, then the decode
-fn regen_eta(rec: &Value, elapsed: f64, sampling: bool, done: Option<f64>, total: Option<f64>, sampled: bool) -> f64 {
+/// A running regeneration's time left, the whole job's (never one stage's): before a step has ended, the first estimate
+/// less the time gone; once one has, the steps' own pace for the steps left (`frac`: the share of all windows' blocks
+/// done), the text encoder of each window still to start, and the decode
+fn regen_eta(rec: &Value, elapsed: f64, sampling: bool, frac: Option<f64>, step_s: &[f64], sampled: bool) -> f64 {
     let frames = rec["frames"].as_f64().unwrap_or(124.0);
     let windows = rec["regen_windows"].as_f64().unwrap_or(1.0).max(1.0);
-    let per_window = rec["steps"].as_f64().unwrap_or(3.0) / windows;
+    let steps = rec["steps"].as_f64().unwrap_or(3.0).max(1.0);
+    let decode = (1.1 * frames).max(10.0);
     if sampled {
-        return (1.1 * frames).max(10.0);
+        return decode;
     }
-    match (sampling, done, total) {
-        (true, Some(d), Some(t)) if d > 0.0 && t > d => {
-            // the time before sampling: the encode and the first window's text encoder
-            let before = 40.0 + 0.8 * frames + 160.0;
-            (elapsed - before).max(1.0) / d * (t - d) + 1.1 * frames
+    let first = (regen_estimate_s(frames, windows, steps / windows) - elapsed).max(60.0);
+    match (sampling, frac) {
+        (true, Some(f)) if !step_s.is_empty() => {
+            let per = step_s.iter().sum::<f64>() / step_s.len() as f64;
+            let done = (f * steps).max(step_s.len() as f64).min(steps);
+            let windows_started = ((done / (steps / windows)).floor() + 1.0).min(windows);
+            per * (steps - done) + 160.0 * (windows - windows_started) + decode
         }
-        _ => (regen_estimate_s(frames, windows, per_window) - elapsed).max(60.0),
+        _ => first,
     }
 }
 
@@ -772,6 +779,26 @@ pub fn failure(state: &str, error: &str, log: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::failure;
+    use super::regen_eta;
+    use serde_json::json;
+
+    /// A regeneration's eta is the whole job's time left and only falls: the platform saw 2,200 s at the text encoder,
+    /// then 210 s at sampling 1/3, then 785 (one stage's pace taken for the job's)
+    #[test]
+    fn a_regeneration_eta_is_the_whole_jobs_and_falls() {
+        let rec = json!({"frames": 124, "regen_windows": 1, "steps": 3});
+        let te = regen_eta(&rec, 300.0, false, None, &[], false);
+        let early = regen_eta(&rec, 420.0, true, Some(0.05), &[], false);
+        let one = regen_eta(&rec, 1000.0, true, Some(0.34), &[580.0], false);
+        let two = regen_eta(&rec, 1580.0, true, Some(0.67), &[580.0, 580.0], false);
+        let decoding = regen_eta(&rec, 2160.0, true, Some(1.0), &[580.0, 580.0, 580.0], true);
+        assert!(te > early && early > one && one > two && two > decoding, "{te} {early} {one} {two} {decoding}");
+        assert!(early > 1500.0, "before a step has ended: the estimate, not a fraction's pace ({early})");
+        assert!((1250.0..1350.0).contains(&one), "two steps of 580 s and the decode ({one})");
+        let rec2 = json!({"frames": 185, "regen_windows": 2, "steps": 6});
+        let w1 = regen_eta(&rec2, 1500.0, true, Some(0.30), &[600.0], false);
+        assert!(w1 > 4.0 * 600.0 + 160.0, "the second window's steps and text encoder still ahead ({w1})");
+    }
 
     #[test]
     fn failures_say_whether_to_retry() {
