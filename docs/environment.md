@@ -503,7 +503,7 @@ The `model3d` kind (meshes from pictures, rigging, animation) and its engines' s
 | `NS_M3D_B3D_VAE` | the model's vae file | Budget3D-Idol: the FLUX.2 VAE's vae/diffusion_pytorch_model.safetensors (the cards pull FLUX.2-klein-4B's, Apache-2.0; FLUX.2-dev's works too) when the files do not name it (--opt-vae) | model3d budget3d |
 | `HF_TOKEN` (`HF_TOKEN_PATH`, `HF_HOME`) | `~/.cache/huggingface/token` | `models pull`: the Hugging Face token a card's gated file (`gated:`, DINOv3 ViT-H+) is downloaded with - huggingface_hub's own variables and file; sent to curl on its standard input, never on a command line; without one the pull says which terms to accept | models |
 | `NS_M3D_B3D_RESIDENT` | off | Budget3D-Idol: set: the image encoders and the background remover stay loaded between requests (DINOv3 ViT-H+ is 3.4 GB in float32) - by default they load for a request and go after it; the denoiser and the decoders always stay (--opt-resident) | model3d budget3d |
-| `NS_M3D_B3D_PROFILE` | off | Budget3D-Idol: set: each stage's time and the card's memory on stderr, and the run's peak (--opt-profile) | model3d budget3d |
+| `NS_M3D_B3D_PROFILE` | off | Budget3D-Idol: set: each stage's time and the card's memory on stderr, and the run's peak; 2: the denoiser's parts too (RePo, norm + qkv + rotation, attention, out, MLP; each synced, slower) (--opt-profile) | model3d budget3d |
 
 ## Diffusion kernels: `NSD_*`
 

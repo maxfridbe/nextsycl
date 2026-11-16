@@ -21,7 +21,7 @@ use std::sync::Arc;
 use nextsycl_core::{DevBuf, Error, Gpu, Result};
 use nextsycl_diffusion::kernels::{none, Dt};
 
-use crate::ffi::Rows;
+use crate::ffi::{Epi, Rows};
 use crate::layout::{self, Layout, Octree, N_CELL, N_CUBE, N_SOBOL};
 use crate::w::{self, gelu_tanh, sinusoid, HostLin, Lin, St};
 use crate::Ctx;
@@ -467,9 +467,9 @@ impl Dit {
         };
         // RePo: the block's input -> a 3-D offset a head
         nsd.layer_norm(h.ptr(), Dt::F32, rows, D, b.repo.norm.0.ptr(), b.repo.norm.1.ptr(), 1e-5, w.rp_ln.ptr(), Dt::F32)?;
-        b.repo.gc.apply(nsd, k, w.rp_ln.ptr(), rows, w.rp_gc.ptr(), Dt::F32)?;
+        b.repo.gc.apply_tf32(nsd, k, w.rp_ln.ptr(), rows, w.rp_gc.ptr())?;
         nsd.swiglu(w.rp_gc.ptr(), Dt::F32, rows, REPO, w.rp_sw.ptr(), Dt::F32)?;
-        b.repo.fin.apply(nsd, k, w.rp_sw.ptr(), rows, w.delta.ptr(), Dt::F32)?;
+        b.repo.fin.apply_tf32(nsd, k, w.rp_sw.ptr(), rows, w.delta.ptr())?;
         tick(0)?;
         // the attention
         let (nw, nb, md1) = match &b.norms {
@@ -477,7 +477,7 @@ impl Dit {
             None => (std::ptr::null(), std::ptr::null(), Rows::one(m(1), m(0))),
         };
         k.ln_mod(h.ptr(), Dt::F32, rows, D, 1e-6, nw, nb, md1, w.hn.ptr(), Dt::F16)?;
-        ls.qkv.apply(nsd, k, w.hn.ptr(), rows, w.qkv.ptr(), Dt::F16)?;
+        ls.qkv.apply_epi(nsd, k, w.hn.ptr(), rows, w.qkv.ptr(), Dt::F16, Epi::Plain, None)?;
         k.rope_norm(w.qkv.ptr(), rows, HEADS, HD, 3 * D, w.delta.fp(), b.repo.freqs.fp(), AXES.0, AXES.1, b.q_gamma.fp())?;
         k.rope_norm(hp(&w.qkv, D), rows, HEADS, HD, 3 * D, w.delta.fp(), b.repo.freqs.fp(), AXES.0, AXES.1, b.k_gamma.fp())?;
         tick(1)?;
@@ -487,8 +487,7 @@ impl Dit {
                              hp(&w.att, r0 * D), Dt::F16)?;
         }
         tick(2)?;
-        ls.out.apply(nsd, k, w.att.ptr(), rows, w.tmp.ptr(), Dt::F32)?;
-        k.gate_add(h.fp(), rows, D, w.tmp.ptr(), Dt::F32, m(2), 0, 0)?;
+        ls.out.apply_epi(nsd, k, w.att.ptr(), rows, h.ptr(), Dt::F32, Epi::Resid(m(2)), Some(&w.tmp))?;
         tick(3)?;
         // the MLP
         let (nw, nb, md2) = match &b.norms {
@@ -496,10 +495,8 @@ impl Dit {
             None => (std::ptr::null(), std::ptr::null(), Rows::one(m(4), m(3))),
         };
         k.ln_mod(h.ptr(), Dt::F32, rows, D, 1e-6, nw, nb, md2, w.hn.ptr(), Dt::F16)?;
-        ls.mlp0.apply(nsd, k, w.hn.ptr(), rows, w.mlp.ptr(), Dt::F16)?;
-        nsd.gelu(w.mlp.ptr(), Dt::F16, rows * MLP, true)?;
-        ls.mlp2.apply(nsd, k, w.mlp.ptr(), rows, w.tmp.ptr(), Dt::F32)?;
-        k.gate_add(h.fp(), rows, D, w.tmp.ptr(), Dt::F32, m(5), 0, 0)?;
+        ls.mlp0.apply_epi(nsd, k, w.hn.ptr(), rows, w.mlp.ptr(), Dt::F16, Epi::Gelu, None)?;
+        ls.mlp2.apply_epi(nsd, k, w.mlp.ptr(), rows, h.ptr(), Dt::F32, Epi::Resid(m(5)), Some(&w.tmp))?;
         tick(4)?;
         if prof.is_some() {
             *self.prof.lock().unwrap() = prof;

@@ -62,7 +62,7 @@ pub const OPTIONS: &[EngineOption] = &[
                    help: "the FLUX.2 VAE's diffusion_pytorch_model.safetensors (FLUX.2-klein-4B's vae/, or FLUX.2-dev's), when the model's files do not name it",
                    at: At::Load },
     EngineOption { name: "resident", env: "NS_M3D_B3D_RESIDENT", value: "", help: "keep the image encoders and the background remover loaded between requests", at: At::Load },
-    EngineOption { name: "profile", env: "NS_M3D_B3D_PROFILE", value: "", help: "each stage's time and the card's memory, on stderr", at: At::Load },
+    EngineOption { name: "profile", env: "NS_M3D_B3D_PROFILE", value: "[2]", help: "each stage's time and the card's memory, on stderr (2: the denoiser's parts too, synced)", at: At::Load },
 ];
 
 /// This engine's registry entry
@@ -263,7 +263,11 @@ impl Budget3d {
         let e = Budget3d { files: files.clone(), cx, dit, dec, gs, dino: Slot::new(), vae: Slot::new(), remover: Slot::new(), resident: flag("NS_M3D_B3D_RESIDENT"),
                            profile: flag("NS_M3D_B3D_PROFILE"),
                            profile_level: o.setting("NS_M3D_B3D_PROFILE").and_then(|v| v.parse().ok()).unwrap_or(0), load_s: t0.elapsed().as_secs_f64(), run: Mutex::new(()) };
-        log(format!("{ARCH}: {} denoiser ({:.2} GB) and the decoders on {} in {:.1} s{}", if e.dit.turbo { "Turbo" } else { "the 50-step" },
+        let silo = match e.cx.k.silo() {
+            Some(s) => format!("silo {}", s.path.display()),
+            None => "no silo: its own and the shared kernels".to_string(),
+        };
+        log(format!("{ARCH}: {} denoiser ({:.2} GB) and the decoders on {} in {:.1} s ({silo}){}", if e.dit.turbo { "Turbo" } else { "the 50-step" },
                     e.dit.bytes as f64 / 1e9, gpu.name, e.load_s,
                     if files.contains_key("dino") && files.contains_key("vae") { "" } else { "; no image encoders (gated): pictures cannot be turned into splats until they are added" }));
         Ok(e)

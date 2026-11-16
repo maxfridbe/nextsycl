@@ -10,7 +10,7 @@ use nextsycl_core::{DevBuf, Error, Gpu, Result};
 use nextsycl_diffusion::kernels::{Dt, Nsd};
 use nextsycl_gguf::safetensors::SafeTensors;
 
-use crate::ffi::K;
+use crate::ffi::{Epi, K};
 
 pub fn ge(e: nextsycl_gguf::Error) -> Error {
     Error(e.0)
@@ -164,6 +164,42 @@ impl Lin {
             k8.linear_f32(x, m, self.k, self.w.ptr(), self.n, self.bias_p(), out.cast())
         } else {
             nsd.linear(x, Dt::F16, m, self.k, self.w.ptr(), self.n, self.bias_p().cast(), out, Dt::F16)
+        }
+    }
+}
+
+impl Lin {
+    /// `apply` for a float32 matrix, multiplied in TF32 by the silo when there is one (else float32 proper)
+    pub fn apply_tf32(&self, nsd: &Nsd, k8: &K, x: *const std::ffi::c_void, m: usize, out: *mut std::ffi::c_void) -> Result<()> {
+        if !self.half && m > 0 && k8.linear_tf32(x.cast(), m, self.k, self.w.fp(), self.n, self.bias_p(), out.cast())? {
+            return Ok(());
+        }
+        self.apply(nsd, k8, x, m, out, Dt::F32)
+    }
+
+    /// `apply` (a half matrix, half x) with an epilogue: the silo's product with it fused when the silo takes it (one
+    /// pass), else the product and then a pass of the engine's kernels (a residual's product through `tmp`, float32
+    /// [m, n], first)
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_epi(&self, nsd: &Nsd, k8: &K, x: *const std::ffi::c_void, m: usize, out: *mut std::ffi::c_void, out_dt: Dt, epi: Epi, tmp: Option<&DevBuf>)
+                     -> Result<()> {
+        if m == 0 {
+            return Ok(());
+        }
+        if self.half && k8.linear_epi(x, m, self.k, self.w.ptr(), self.n, self.bias_p(), out, out_dt, epi)? {
+            return Ok(());
+        }
+        match epi {
+            Epi::Plain => self.apply(nsd, k8, x, m, out, out_dt),
+            Epi::Gelu => {
+                self.apply(nsd, k8, x, m, out, out_dt)?;
+                nsd.gelu(out, out_dt, m * self.n, true)
+            }
+            Epi::Resid(gate) => {
+                let t = tmp.filter(|t| t.len >= m * self.n * 4).ok_or_else(|| Error("a residual product without its float32 buffer".into()))?;
+                self.apply(nsd, k8, x, m, t.ptr(), Dt::F32)?;
+                k8.gate_add(out.cast(), m, self.n, t.ptr(), Dt::F32, gate, 0, 0)
+            }
         }
     }
 }
