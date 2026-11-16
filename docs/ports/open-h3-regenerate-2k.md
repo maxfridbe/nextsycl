@@ -128,6 +128,51 @@ reference/regen2k/look.py), viewed side by side and as full-resolution crops of 
 Frames on hardac1: `~/src/regen2k/look1/` (pair_N.png, crop_N.png), `~/src/regen2k/look1sign/`; clips
 `~/src/regen2k/draft1.mp4`, `~/src/regen2k/regen1.mp4`.
 
+## Drafts of any length, in production (2026-11-16)
+
+The first live production job (a platform clip, 864x480) was stopped by the studio's watchdog and had been cut to 124
+frames. Since e6f0d14:
+
+- **The whole draft is regenerated.** 4.7 to 15.1 s, landscape 16:9 within 10%, any size (cover-fitted to 1344x768;
+  864x480 works). Past 124 frames it goes in overlapping windows of the model's own clip (`regen::windows`: 37 latent
+  frames each, starting on 17-frame groups, spread evenly, the overlap - at least 2 latent frames - kept from the window
+  before as masked frames). Each window has its own part of the draft as `<Video 1>`; the joined latents are decoded
+  once, cut to the draft's length, and the draft's sound is muxed back. Anything else is a 400 from video.generate
+  naming the limit (the studio probes the draft). The kernels' scratch is given back between windows (`Device::trim`,
+  `nsd_trim`): without it the second window found 22.1 GiB free, not 30.4.
+- **The watchdog sees progress.** It stopped a clip after 20 min without a new log line; it now also counts the engine's
+  progress (every block, ~13 s at 2K). The job logs each step as it ends.
+- **Status:** the studio's item carries the draft's frames, its windows and all their steps (`sampling 4/6` over two
+  windows), and a regen ETA: the measured figures until it samples, then the blocks' pace.
+- **ETA at the door:** a regen request runs on `minimax-h3-regen2k-ic` (its own history, not H3's 45 s clips); with no
+  history the answer's eta is a first figure from these measurements (`basis: "estimate"`).
+
+End to end as production runs it (2026-11-16, B65, under gpu_lock): a test video daemon (`regen2k-e2e-nextsycl-video`,
+GPU 1 only) and a test studio (127.0.0.1:8197) from the build copy, with their own sockets and out dir, and
+video.generate's body `{"prompt": <the clip's own prompt>, "regen2k": "h3_20261113_150714.mp4", "regen_sampler":
+"up3", "regen_resolution": "2k", "queue": true}` sent to the studio. The production clip that had failed is **864x480
+and 7.71 s (185 frames)**; its record says 10.125 s, but that is the length asked for, not the length made.
+
+- First try: window 1 went through without the watchdog firing; window 2 was refused by the memory check (22.1 GiB
+  free). The kernels' scratch had not been given back, which `Device::trim` now does.
+- Second try: **done in 4,395 s (73 min) from the request**: two windows, 6 steps of 177k tokens (628, 630, 607,
+  599, 581, 581 s), the text encoder 162 s a window, the 2K decode of 57 latent frames 196 s. The card peak was
+  28,668 MB (driver); the second window started on a trimmed card.
+- The studio showed `starting` -> `text encoder` -> `conditioning done` -> `sampling 1/6` ... `sampling 6/6` ->
+  `sampling done, decoding` -> `done`, with pct 2 -> 100. Its ETA at the request was 4,394 s (the measured figure), then
+  from the blocks' pace 3,843 s at 13 min, 2,154 s at 37 min, 229 s at 69 min.
+- Frames 20, 90 and 150 against the draft enlarged to 2560x1440: the same shot, pose and mouth. The face, hair, the
+  microphone's mesh and the jacket's embroidery are sharper. Laplacian variance, whole frame 2.1-2.2 -> 8.4-8.6; face
+  crop 2.2-3.3 -> 9.8-13.0. The change from frame to frame follows the draft's all through, including frames 68-80
+  where window 2 takes over: no seam.
+- The sound is the draft's (7.71 s). **But the picture came out at 181 frames**: muxing with `-shortest` and the
+  picture copied ends a few frames early. Fixed after the run (`mux_draft_sound`: the output cut at the clip's own
+  length). The ffmpeg command was checked on the same 185-frame clip (185 frames out, sound 7.708 s); the 73-min run
+  was not repeated.
+
+Files on hardac1: `~/src/regen2k/e2e/out/h3_20261116_082306.mp4`, frames `~/src/regen2k/e2e/look/`, the
+studio's progress `~/src/regen2k/e2e/run.log`.
+
 ## Use
 
 ```sh

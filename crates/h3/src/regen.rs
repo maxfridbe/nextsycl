@@ -455,10 +455,31 @@ fn finish(out: &Path, draft: &Path, real: usize, frames: usize, (w, h): (usize, 
         }
         std::fs::rename(&tmp, out)?;
     }
-    match crate::media::mux_sound(out, draft, 0.0, real as f64 / 24.0) {
+    match mux_draft_sound(out, draft, real as f64 / 24.0) {
         Ok(()) => ctl.say(format!("sound  : the draft's, {:.2} s", real as f64 / 24.0)),
         Err(e) => ctl.say(format!("sound  : none kept ({e})")),
     }
+    Ok(())
+}
+
+/// The draft's sound under the clip, the whole clip kept: the output cut at the clip's own length (`-shortest` with the
+/// picture copied ends a few frames early - a 185-frame clip came out with 181)
+fn mux_draft_sound(clip: &Path, draft: &Path, seconds: f64) -> Result<()> {
+    let tmp = clip.with_extension("mux.mp4");
+    let st = std::process::Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-i"])
+        .arg(clip)
+        .arg("-i")
+        .arg(draft)
+        .args(["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-t", &format!("{seconds:.6}")])
+        .arg(&tmp)
+        .status()
+        .map_err(|e| Error(format!("starting ffmpeg: {e}")))?;
+    if !st.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error(format!("{}: ffmpeg could not lay {}'s sound under the clip", clip.display(), draft.display())));
+    }
+    std::fs::rename(&tmp, clip)?;
     Ok(())
 }
 
