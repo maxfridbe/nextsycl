@@ -14,6 +14,7 @@ nextsycl models add <id> <file.gguf> [--title T] [--gpu 0[,1] | all] [--ctx N[,M
                     [--no-tools] [--no-tasks] [--disabled]
 nextsycl models search [TEXT] [--kind llm|image|video|audio|lora]   # the catalog of supported models
 nextsycl models pull <id>... [--dir DIR] [--from DIR]... [--verify] [--again]   # download (resumable), SHA-256, register
+nextsycl models refresh <id>... | --all [--dry-run] [--keep F,..] [--reset F,..] [--adopt]   # an entry up to its card, files untouched
 nextsycl models remove <id> [--files]        # --files deletes the GGUF shards too
 nextsycl models enable <id> | disable <id>
 nextsycl llm start <id>
@@ -35,6 +36,42 @@ added or disabled shows at once. With `NS_STUDIO_MODES` set to a mode file (one 
 `nextsycl llm start <id>`), every registry change rewrites that file's nextsycl entries (`"managed_by": "nextsycl"`) and
 leaves the others alone. `nextsycl llm start <id>` mounts the entry's files at the same paths in the container, so an
 entry can point anywhere on the machine.
+
+## A changed model card: `models refresh`
+
+`pull` skips a model that is installed (`--again` fetches or relinks its files and replaces the whole entry). When
+only its card changed - `gpus`, `vram_gib`, `spans`, `speech`, `does`, `env`, a licence field ... -, `nextsycl models
+refresh <id>` (or `--all`) makes the entry's card fields again from the card, as `pull` would, and touches no file:
+
+- **From the card:** `kind`, `arch`, `title`, `gpus`, `env` and what `pull` copies as is (`ctx`, `tools`, `tasks`,
+  `base`, `defaults`, `speech`, `voices`, `languages`, `does`, `silo`, `spans`, `vram_gib`, `vram_gib_per_card`,
+  `headroom_gib`, `ram_gib`, `ram_cache_gib`, `streams`, `sidecars`); `license`, `commercial`, `license_note`,
+  `controls`, `annotations` only where the entry has its own (else the front door reads them from the card anyway).
+  A `{role}` setting gets the entry's file for that role where it is now (after a drive move too); a made-locally
+  part keeps the path the entry has. A file role the card names that the entry lacks is a note (`pull --again`).
+- **Kept:** `file`, `files`, `enabled`, `pinned`, the front door's own figures (`vouch_mb`), every other key, every
+  setting the card does not name - and a card field the user changed. `pull` and `refresh` record the card's values
+  on the entry (`from_card`); a field that differs from them was changed on the entry and stays. An entry pulled
+  before that record keeps its `gpus` (the front door's enable and card picker set them); its other card fields
+  become the card's. `--keep FIELD[,FIELD]` keeps any field (`env.NAME` one setting, `env` all), `--reset FIELD`
+  takes the card's over the entry's.
+- Each model's changes are printed field by field (`title: "old" -> "new"`, `gpus: kept "0,1" (set on the entry; the
+  card says "0" ...)`); `--dry-run` writes nothing. Before a write the registry is copied to
+  `<registry>.bak-<YYYYmmdd-HHMMSS>`; the studio's chat modes (`NS_STUDIO_MODES`) follow as for any registry change.
+- **A build copy never writes another install's registry.** The record names the cards directory it came from
+  (`NS_MODEL_CARDS`, else the program's own `model-cards/`): a registry whose entries came from another one is
+  refused - a build copy whose nextsycl.conf still points `NS_REGISTRY` at production's - and so is the first
+  refresh of a registry no pull or refresh has recorded yet. `--adopt` takes it over for this program's cards, once,
+  on purpose (check `NS_REGISTRY` first; `--dry-run` shows what would change and needs no `--adopt`).
+
+```
+$ nextsycl models refresh qwen-image-2.1-q8 --dry-run
+qwen-image-2.1-q8 (card qwen-image-2.1-q8): 2 field(s) from the card
+  title: "Qwen-Image 2.1 Q8_0 (text to image, edit, RGBA)" -> "Qwen-Image 2.1 Q8_0 (text to image, RGBA)"
+  gpus: kept "0,1" (set on the entry; the card says "0"; --reset gpus takes the card's)
+  vram_gib: 25.0 (new)
+dry run: 1 entry would change; nothing written (/var/lib/nextsycl/models.json)
+```
 
 ## Drives: where the files are, and moving them
 

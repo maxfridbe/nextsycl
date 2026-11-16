@@ -3,7 +3,8 @@
 One YAML file a model, `<kind>/<id>.yml` (kind: `llm`, `image`, `video`, `audio`, `model3d`, `lora`): everything nextsycl knows
 about a model it offers, read when it is needed - not built into the program. `nextsycl models search` lists the
 cards, `nextsycl models pull <id>` downloads a card's files, checks them and registers the model with the card's
-settings; the front door's `describePromptGuideMD` answers with the card's guide. A release carries this folder
+settings, and `nextsycl models refresh <id>` brings an installed model's entry up to its changed card without touching
+its files (docs/registry.md: A changed model card); the front door's `describePromptGuideMD` answers with the card's guide. A release carries this folder
 beside the program; `NS_MODEL_CARDS` names another one. A new model is a new card: no code changes unless its
 architecture is new (an engine: CONTRIBUTING.md).
 

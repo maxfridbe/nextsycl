@@ -136,7 +136,7 @@ impl Catalog {
     }
 
     /// A model's files: (role, key, the file's entry)
-    fn files_of<'a>(&'a self, m: &'a Value) -> Vec<(&'a str, &'a str, &'a Value)> {
+    pub(crate) fn files_of<'a>(&'a self, m: &'a Value) -> Vec<(&'a str, &'a str, &'a Value)> {
         m["files"].as_object().map_or_else(Vec::new, |o| {
             o.iter().filter_map(|(role, key)| {
                 let k = key.as_str()?;
@@ -506,7 +506,12 @@ fn sorted(v: Value) -> Value {
     }
 }
 
-fn entry(m: &Value, paths: &BTreeMap<String, PathBuf>, local: &BTreeMap<String, String>) -> Value {
+/// The keys a registry entry copies from its card as they are (beside kind, arch, title, gpus and env, which `entry`
+/// derives): what `models refresh` brings up to the card
+pub const CARD_KEYS: &[&str] = &["ctx", "tools", "tasks", "base", "defaults", "speech", "voices", "languages", "does", "silo", "spans", "vram_gib",
+                                 "vram_gib_per_card", "headroom_gib", "ram_gib", "ram_cache_gib", "streams", "sidecars"];
+
+pub(crate) fn entry(m: &Value, paths: &BTreeMap<String, PathBuf>, local: &BTreeMap<String, String>) -> Value {
     let sub = |v: &str| -> Option<String> {
         let mut out = v.to_string();
         while let Some(a) = out.find('{') {
@@ -544,9 +549,9 @@ fn entry(m: &Value, paths: &BTreeMap<String, PathBuf>, local: &BTreeMap<String, 
         "files": files, "gpus": m.get("gpus").cloned().unwrap_or(json!("0")), "env": env, "enabled": true,
         "catalog": m["id"],
     });
-    for k in ["ctx", "tools", "tasks", "base", "defaults", "speech", "voices", "languages", "does", "silo", "spans", "vram_gib", "vram_gib_per_card", "headroom_gib", "ram_gib", "ram_cache_gib", "streams", "sidecars"] {
-        if let Some(v) = m.get(k) {
-            e[k] = v.clone();
+    for k in CARD_KEYS {
+        if let Some(v) = m.get(*k) {
+            e[*k] = v.clone();
         }
     }
     e
@@ -606,7 +611,7 @@ pub fn pull(cfg: &Config, installed: &[Value], ids: &[String], raw: &[String]) -
     for id in ids {
         let m = cat.model(id).ok_or_else(|| format!("{id}: not in the catalog (nextsycl models search)"))?;
         if installed.iter().any(|x| x["id"] == id.as_str()) && !raw.iter().any(|a| a == "--again") {
-            println!("{id}: installed already (nextsycl models list; --again pulls it anew)");
+            println!("{id}: installed already (nextsycl models refresh {id} brings its entry up to its card; --again pulls it anew)");
             continue;
         }
         println!("{id}: {} ({:.1} GiB) into {}", s(m, "title"), gib(cat.bytes(m)), root.display());
@@ -624,7 +629,7 @@ pub fn pull(cfg: &Config, installed: &[Value], ids: &[String], raw: &[String]) -
                 None => println!("  {role}: not found - {}", about.as_str().unwrap_or("")),
             }
         }
-        out.push(entry(m, &paths, &local));
+        out.push(crate::refresh::stamped(entry(m, &paths, &local), &crate::refresh::cards_tag(cfg)));
     }
     Ok(out)
 }

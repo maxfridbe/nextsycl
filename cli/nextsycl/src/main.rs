@@ -52,6 +52,9 @@ every kind:
                                 (the same file already here; --from DIR: copies elsewhere on the machine), registered
   nextsycl models pull <id> <url | hf:org/repo/path/file.gguf> [--dir DIR] [add's options]
                                 a file outside the catalog (every shard of a split file); then added
+  nextsycl models refresh <id>... | --all [--dry-run] [--keep FIELD,..] [--reset FIELD,..] [--adopt]
+                                an installed entry's card fields (gpus, vram_gib, env, speech, does ...) made again from
+                                its card, files untouched; what was set on the entry stays; the registry backed up first
   nextsycl models remove <id> [--files]     --files: its files deleted too
   nextsycl models enable <id> | disable <id>
   nextsycl models move <id> --to <drive | mount> [--yes]   its files to another drive: copied, read back (SHA-256),

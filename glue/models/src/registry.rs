@@ -15,6 +15,8 @@
 //!   nextsycl models pull <id>... [--dir DIR] [--from DIR]... [--verify] [--again]
 //!                                           a catalog model's files downloaded (or linked), checked, registered
 //!   nextsycl models pull <id> <url | hf:org/repo/path/file.gguf> [--dir DIR] [add's options]   a file outside it
+//!   nextsycl models refresh <id>... | --all [--dry-run] [--keep FIELD,..] [--reset FIELD,..] [--adopt]
+//!                                           an installed entry's card fields made again from its card (refresh.rs)
 //!   nextsycl models remove <id> [--files]      (--files: the model's GGUF shards are deleted too)
 //!   nextsycl models enable <id> | disable <id>
 //! ```
@@ -147,7 +149,7 @@ pub fn cmd(cfg: &Config, raw: &[String], describe: Describe) -> Result<(), Strin
     let flag = |k: &str| raw.iter().any(|a| a == k);
     let pos: Vec<&String> = {
         // the positional arguments: those that are not an option or an option's value
-        let with_value = ["--title", "--gpu", "--ctx", "--set", "--dir", "--from", "--kind"];
+        let with_value = ["--title", "--gpu", "--ctx", "--set", "--dir", "--from", "--kind", "--keep", "--reset"];
         let mut v = Vec::new();
         let mut i = 1;
         while i < raw.len() {
@@ -214,6 +216,15 @@ pub fn cmd(cfg: &Config, raw: &[String], describe: Describe) -> Result<(), Strin
             }
             Ok(())
         }
+        // an installed model's entry brought up to its card, its files untouched (refresh.rs)
+        Some("refresh") => {
+            let ids: Vec<String> = pos.iter().map(|s| s.to_string()).collect();
+            if crate::refresh::cmd(cfg, &path, &mut models, &ids, raw)? {
+                save(cfg, &path, &models)?;
+                println!("wrote {}", path.display());
+            }
+            Ok(())
+        }
         Some("download") => {
             let (id, src) = match (pos.first(), pos.get(1)) {
                 (Some(i), Some(u)) => ((*i).clone(), (*u).clone()),
@@ -276,7 +287,7 @@ pub fn cmd(cfg: &Config, raw: &[String], describe: Describe) -> Result<(), Strin
             println!("{id}: {c}d");
             Ok(())
         }
-        Some(other) => Err(format!("nextsycl models {other}: list | add | download | remove | enable | disable")),
+        Some(other) => Err(format!("nextsycl models {other}: list | add | search | pull | refresh | download | remove | enable | disable")),
     }
 }
 
