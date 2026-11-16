@@ -83,6 +83,10 @@ audio/                     AUDIO
   sophon     nextsycl-audio-sophon  Sophon-Realtime: the full-duplex conversation (Conversation: VAD, turn question,
                                  replies, barge-in, tools), the ear (Qwen3-ASR encoder + projector), the 32B brain (q4 /
                                  q8 made on the card from FP8), the talker fed as the reply is written, stage checks
+  haru       nextsycl-audio-haru  Haru-4B: full-duplex in lockstep (Conversation: a frame in, a frame out), Qwen3.5-4B's
+                                 Gated DeltaNet + attention layers over the three summed streams, the MeanFlow head, the
+                                 streaming VibeVoice codec (the vibevoice engine's code on its kernels), the character
+                                 card, stage checks
   example    nextsycl-audio-example  a template
 
 model3d/                   3D
@@ -580,6 +584,20 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   conversation (`duplex.rs`, the release's duplex.py): a 20 ms energy VAD, the turn question at the pauses, replies
   over the history with earlier turns as audio, barge-in, tool calls. Settings: `NS_SOPHON_BITS`, `NS_SOPHON_SPLIT`,
   `NS_SOPHON_CTX`, `NS_SOPHON_TALKER_INT8`, `NS_SOPHON_GREEDY`, `NS_SOPHON_TURN_CHECKS` / `_THRESHOLDS`.
+
+- **Haru-4B** (`audio/haru`, arch `haru`; [ports/haru-4b.md](ports/haru-4b.md)): full-duplex spoken dialogue in
+  lockstep - every 133 ms one frame of the user's audio in, one of its own out (silence included) - through the same
+  `Conversation` and `/v1/realtime` with the lockstep extension (one long response, an audio delta a frame in; the
+  character card as `nextsycl.card`). A position is the sum of the model's text token, its last audio latent and the
+  user's, each latent through its projector; Qwen3.5-4B's text layers (`lm.rs`: 24 Gated DeltaNet layers - causal conv,
+  the gated delta rule's [128 x 128] state a head, gated norm - and 8 gated attention layers over a half cache, rows in
+  groups of 16) give the hidden state; its tied embedding the next text token (DRY, top-k 25, 0.7), the MeanFlow head
+  (`head.rs`, one step) the next latent, the streaming codec (`codec.rs`: the VibeVoice engine's tokenizer code on its
+  vv.h kernels) the frame's audio. Its kernels (`kernels/audio/haru`): the DeltaNet's convolution, recurrence and
+  gated norm, attention's q / k norm with partial RoPE and cache store, the split attention and its gated merge; the
+  products are vv.h's bfloat16 ones (the checkpoint's values). The safetensors are read as they are; 10.9 GiB on one
+  card with an hour's context. Settings: `NS_HARU_CTX`, `NS_HARU_GUIDANCE`, `NS_HARU_TOP_K`, `NS_HARU_EOP_BIAS`,
+  `NS_HARU_SPEAK_FIRST`, `NS_HARU_DRY`, `NS_HARU_PROFILE`.
 
 ## The 3D engines
 

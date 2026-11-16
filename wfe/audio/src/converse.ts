@@ -1,7 +1,12 @@
-/** A live conversation with a full-duplex speech model (Sophon-Realtime; later Haru-4B): the microphone streamed to
- *  the server's /v1/realtime WebSocket (OpenAI Realtime's events, docs/api/realtime.md), its spoken answers played as
+/** A live conversation with a full-duplex speech model (Sophon-Realtime; Haru-4B in lockstep): the microphone streamed
+ *  to the server's /v1/realtime WebSocket (OpenAI Realtime's events, docs/api/realtime.md), its spoken answers played as
  *  they come, the running transcript. Opened through the front door (/open/<id>/) the socket goes to
- *  /open/<id>/v1/realtime, which the door passes on; on the model's own server to /v1/realtime. */
+ *  /open/<id>/v1/realtime, which the door passes on; on the model's own server to /v1/realtime.
+ *
+ *  A lockstep model (info.realtime.frame_ms > 0: Haru-4B) answers every 133 ms frame of the microphone with one of its
+ *  own, silence included, in one long response: nothing is stopped when the user speaks (the model hears it and stops
+ *  itself), its audio plays behind a short jitter buffer, and its text is split into lines where the user spoke. Its
+ *  character is a card (nextsycl.card). */
 import { render, state } from "./state.js";
 
 export interface Line {
@@ -28,9 +33,13 @@ export interface Talk {
   voice: string;
   language: string;
   instructions: string;
+  /** a lockstep model's character card (its fields: persona, name, gender, backchannel, other_name, relationship,
+   *  situation; empty ones keep the model's own) */
+  card: Record<string, string>;
 }
 
-export const talk: Talk = { on: false, connecting: false, phase: "", lines: [], level: 0, error: null, latency: null, voice: "", language: "en", instructions: "" };
+export const talk: Talk = { on: false, connecting: false, phase: "", lines: [], level: 0, error: null, latency: null, voice: "", language: "en", instructions: "",
+                             card: {} };
 
 let ws: WebSocket | null = null;
 let ctx: AudioContext | null = null;
@@ -44,6 +53,16 @@ let playhead = 0;
 let playing: { id: string; start: number; samples: number } | null = null;
 let stoppedAt = 0;
 const OUT_RATE = 24000;
+/** a lockstep model's audio plays this far behind (s): its frames come every 133 ms, give or take the network */
+const JITTER = 0.2;
+/** lockstep: the user spoke since the model's last text (its next text starts a new line), and the lines made */
+let splitNext = false;
+let part = 0;
+
+/** whether the model runs in lockstep (a frame in, a frame out) */
+export function lockstep(): boolean {
+  return (state.info?.realtime?.frame_ms ?? 0) > 0;
+}
 
 const CAPTURE = `class Cap extends AudioWorkletProcessor {
   process(inputs) { const c = inputs[0] && inputs[0][0]; if (c) this.port.postMessage(c.slice(0)); return true; }
@@ -113,7 +132,8 @@ function play(id: string, delta: string): void {
   const src = ctx.createBufferSource();
   src.buffer = buf;
   src.connect(ctx.destination);
-  const at = Math.max(ctx.currentTime + 0.04, playhead);
+  // lockstep: a steady stream of frames, played behind a jitter buffer (again after an underrun)
+  const at = lockstep() ? (playhead < ctx.currentTime + 0.01 ? ctx.currentTime + JITTER : playhead) : Math.max(ctx.currentTime + 0.04, playhead);
   src.start(at);
   src.onended = () => {
     sources = sources.filter((s) => s !== src);
@@ -132,7 +152,23 @@ function play(id: string, delta: string): void {
     }
   }
   playing.samples += pcm.length;
-  talk.phase = "speaking";
+  if (!lockstep()) talk.phase = "speaking";
+}
+
+/** A lockstep model's text: a new line after the user spoke, else the running one */
+function lockstepText(id: string, delta: string): void {
+  // a silent frame after its words: it has stopped
+  if (!delta.trim() && talk.phase === "it is speaking") talk.phase = "listening";
+  let l = find(`${id}#${part}`);
+  if (!l || splitNext) {
+    if (!delta.trim()) return;
+    if (l) l.status = "done";
+    part += 1;
+    splitNext = false;
+    l = line("assistant", "", `${id}#${part}`, "live");
+  }
+  l.text += delta;
+  if (delta.trim()) talk.phase = "it is speaking";
 }
 
 /** The user cut in: what plays stops, and the server hears how much of the answer was heard */
@@ -168,26 +204,42 @@ function onEvent(v: Record<string, unknown>): void {
       if (!talk.phase) talk.phase = "listening";
       break;
     case "input_audio_buffer.speech_started":
-      bargeIn();
+      // lockstep: the model heard it too and stops itself if it wants to; nothing is cut here
+      if (!lockstep()) bargeIn();
       talk.phase = "you are speaking";
+      splitNext = true;
       line("user", "", String(v.item_id ?? `u${Date.now()}`), "live");
       break;
-    case "input_audio_buffer.speech_stopped":
+    case "input_audio_buffer.speech_stopped": {
+      if (lockstep()) {
+        const l = find(String(v.item_id ?? ""));
+        if (l) l.status = "done";
+        talk.phase = "listening";
+        break;
+      }
       talk.phase = "thinking";
       if (ctx) stoppedAt = ctx.currentTime;
       break;
+    }
     case "input_audio_buffer.committed": {
       const l = find(String(v.item_id ?? ""));
       if (l) l.status = "done";
       break;
     }
     case "response.created":
-      line("assistant", "", id, "live");
+      if (lockstep()) {
+        talk.phase = "listening";
+        splitNext = true;
+      } else line("assistant", "", id, "live");
       break;
     case "response.audio_transcript.delta":
     case "response.output_audio_transcript.delta":
     case "response.text.delta":
     case "response.output_text.delta": {
+      if (lockstep()) {
+        lockstepText(id, String(v.delta ?? ""));
+        break;
+      }
       const l = find(id) ?? line("assistant", "", id, "live");
       l.text += String(v.delta ?? "");
       break;
@@ -201,7 +253,7 @@ function onEvent(v: Record<string, unknown>): void {
       break;
     case "response.done": {
       const r = v.response as Record<string, unknown>;
-      const l = find(String(r?.id ?? ""));
+      const l = find(lockstep() ? `${String(r?.id ?? "")}#${part}` : String(r?.id ?? ""));
       if (l) {
         l.status = r?.status === "completed" ? (l.status === "cut" ? "cut" : "done") : "cut";
         const ns = r?.nextsycl as Record<string, unknown> | undefined;
@@ -254,6 +306,10 @@ export async function start(): Promise<void> {
     };
     if (talk.voice) session.voice = talk.voice;
     if (talk.instructions.trim()) session.instructions = talk.instructions.trim();
+    if (lockstep()) {
+      const card = Object.fromEntries(Object.entries(talk.card).map(([k, x]) => [k, x.trim()]).filter(([, x]) => x));
+      if (Object.keys(card).length) (session.nextsycl as Record<string, unknown>).card = card;
+    }
     send({ type: "session.update", session });
   };
   ws.onmessage = (e: MessageEvent) => {
@@ -273,6 +329,8 @@ export async function start(): Promise<void> {
 }
 
 export function stop(): void {
+  splitNext = false;
+  playhead = 0;
   talk.on = false;
   talk.connecting = false;
   talk.phase = "";
@@ -313,6 +371,12 @@ export function setVoice(v: string): void {
 export function setLanguage(l: string): void {
   talk.language = l;
   if (talk.on) send({ type: "session.update", session: { nextsycl: { language: l } } });
+  render();
+}
+
+/** A card field (before starting: the card is the prompt, a change while it runs starts the conversation over) */
+export function setCard(field: string, value: string): void {
+  talk.card[field] = value;
   render();
 }
 

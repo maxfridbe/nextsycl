@@ -1480,7 +1480,7 @@ impl Home {
                     Some(n) => self.pick("audio", &json!({"model": n}), &all)?,
                     None => self.loaded_of("audio").into_iter().find(|l| live.iter().any(|m| m["id"] == l.as_str()))
                         .or_else(|| live.first().and_then(|m| m["id"].as_str().map(str::to_string)))
-                        .ok_or((409, "no full-duplex speech model is enabled (a card whose speech list says realtime: sophon-realtime)".to_string()))?,
+                        .ok_or((409, "no full-duplex speech model is enabled (a card whose speech list says realtime: sophon-realtime-32b-flash, haru-4b)".to_string()))?,
                 };
                 let t = self.ensure(&id)?;
                 let target = if query.is_empty() { "/v1/realtime".to_string() } else { format!("/v1/realtime?{query}") };

@@ -73,7 +73,11 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
 
 ## Port: Haru-4B full-duplex speech (user asked 2026-11-15)
 
-- [ ] huggingface.co/higurashi-ai/Haru-4B (Apache-2.0; code github.com/higurashi-ai/Haru; bf16 safetensors with LM,
+- [x] Ported 2026-11-16 (audio/haru, arch haru, card haru-4b; docs/ports/haru-4b.md): the safetensors read as they are
+      (bfloat16), parity against the release's PyTorch code per stage (codec rel 2e-5 / 3e-6, prompt logits 1e-4, 17
+      teacher-forced frames argmax 17/17), a 133 ms frame in 25 ms on the B65; /v1/realtime's lockstep extension built,
+      the wfe Conversation panel with the character card. Not deployed. Open: see the port doc.
+- [x] huggingface.co/higurashi-ai/Haru-4B (Apache-2.0; code github.com/higurashi-ai/Haru; bf16 safetensors with LM,
       audio projections, MeanFlow head and codec in one file) and its GGUFs huggingface.co/sakasegawa/Haru-4B-GGUF
       (F16, Q8_0, Q6_K, Q5_K, Q4_K; made for speech.cpp - check the tensor layout against the safetensors). A
       full-duplex speech-to-speech model: every 133 ms (7.5 Hz) one 3200-sample 24 kHz frame of the user's audio in,
@@ -85,9 +89,10 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
       `/v1/realtime` (OpenAI Realtime's events, docs/api/realtime.md) on the audio server, the front door's splice
       (`?model=`, `/open/<id>/v1/realtime`), the audio contract's `Conversation`. For Haru: its lockstep frames as the
       designed extension (api/realtime.md "Lockstep models": one response.audio.delta per input frame, the card under
-      `nextsycl.card`) - to build with the engine.
+      `nextsycl.card`) - built 2026-11-16 with the engine (docs/api/realtime.md "Lockstep models").
 - [x] A live-conversation mode in the nextsycl wfe (2026-11-15): the audio page's Conversation panel (microphone in,
-      speaker out, the running transcript, the model's voices and the saved voices). For Haru: the character card.
+      speaker out, the running transcript, the model's voices and the saved voices). For Haru: the character card
+      (2026-11-16: lockstep play-out behind a 0.2 s jitter buffer, no barge-in cut, the card's fields).
 
 ## Port: Sophon-Realtime (right after Haru-4B; user asked 2026-11-15)
 

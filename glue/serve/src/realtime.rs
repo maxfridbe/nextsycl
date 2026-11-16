@@ -20,8 +20,9 @@
 //! or pcm_f32le (Sophon's own server's); in at any rate (`sample_rate_hz` / the GA shape's `rate`), resampled for the
 //! model. The GA shape (session.type "realtime", audio.input / audio.output, response.output_audio.delta ...) is
 //! spoken back to a client that uses it; beta names otherwise. Extensions under `nextsycl` in session.update: language,
-//! saved voices by name (the voice library's recording, cloned), the engine's options; session.created tells the model's
-//! rates, voices and whether it runs in lockstep (`frame_ms`: Haru-4B's one frame in, one out).
+//! saved voices by name (the voice library's recording, cloned), the engine's options, a lockstep model's character
+//! card; session.created tells the model's rates, voices and whether it runs in lockstep (`frame_ms`: Haru-4B's one
+//! frame in, one out - every input frame answered by one audio delta of its own within one long-running response).
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -409,10 +410,23 @@ fn apply(s: &mut Session, v: &Value, voices: VoiceLookup, built_in: &[String]) -
     if let Some(seed) = ns["seed"].as_u64() {
         s.conf.seed = seed;
     }
+    // a lockstep model's character card (Haru-4B): its fields as an object, or the card's text; null: the model's own
+    if let Some(c) = ns.get("card") {
+        s.conf.card = match c {
+            Value::Null => None,
+            Value::Object(_) | Value::String(_) => Some(c.to_string()),
+            _ => return Err("nextsycl.card: an object of the card's fields (persona, name, gender, backchannel, other_name, relationship, situation) or \
+                             its text".into()),
+        };
+    }
     let voice = v["voice"].as_str().or_else(|| v["audio"]["output"]["voice"].as_str()).or_else(|| ns["voice"].as_str());
     if let Some(name) = voice {
         let low = name.to_lowercase();
-        if built_in.contains(&low) {
+        if name.trim().is_empty() {
+            // no voice named: the model's own (its default voice, or - a model without built-in ones - none cloned)
+            s.conf.voice = built_in.first().cloned();
+            s.conf.reference = None;
+        } else if built_in.contains(&low) {
             s.conf.voice = Some(low);
             s.conf.reference = None;
         } else if let Some((samples, rate)) = voices(name) {
@@ -421,7 +435,7 @@ fn apply(s: &mut Session, v: &Value, voices: VoiceLookup, built_in: &[String]) -
         } else {
             return Err(format!("voice {name:?}: one of {} or a saved voice", built_in.join(", ")));
         }
-        s.voice = Some(name.to_string());
+        s.voice = if name.trim().is_empty() { built_in.first().cloned() } else { Some(name.to_string()) };
     }
     s.raw = v.clone();
     Ok(())
@@ -443,7 +457,8 @@ fn describe(s: &Session, model: &str, rt: &nextsycl_audio::Realtime) -> Value {
     v["temperature"] = json!(s.conf.temperature);
     v["nextsycl"] = json!({"input_rate": rt.input_rate, "output_rate": rt.output_rate, "frame_ms": rt.frame_ms, "lockstep": rt.frame_ms > 0,
                            "voices": rt.voices, "clone": rt.clone, "languages": rt.languages, "tools": rt.tools,
-                           "input_sample_rate": s.input.rate(), "output_sample_rate": s.output.rate(), "language": s.conf.language});
+                           "input_sample_rate": s.input.rate(), "output_sample_rate": s.output.rate(), "language": s.conf.language,
+                           "card": s.conf.card.as_deref().and_then(|c| serde_json::from_str::<Value>(c).ok())});
     v
 }
 
@@ -942,5 +957,155 @@ mod tests {
         let saved = |n: &str| (n == "alice").then(|| (vec![0.0; 16000], 16000));
         apply(&mut s, &json!({"voice": "alice"}), &saved, &voices).unwrap();
         assert!(s.conf.reference.is_some() && s.conf.voice.is_none());
+        // an empty voice: the model's own (its first built-in one; none for a model without)
+        apply(&mut s, &json!({"voice": ""}), &saved, &voices).unwrap();
+        assert!(s.conf.reference.is_none() && s.conf.voice.as_deref() == Some("chelsie"));
+        apply(&mut s, &json!({"voice": ""}), &saved, &[]).unwrap();
+        assert!(s.conf.reference.is_none() && s.conf.voice.is_none());
+        // a lockstep model's card: an object kept as JSON, null back to the model's own, anything else refused
+        apply(&mut s, &json!({"nextsycl": {"card": {"name": "Kai", "persona": "A pirate."}}}), &none, &voices).unwrap();
+        let c: Value = serde_json::from_str(s.conf.card.as_deref().unwrap()).unwrap();
+        assert_eq!(c["name"], "Kai");
+        apply(&mut s, &json!({"nextsycl": {"card": null}}), &none, &voices).unwrap();
+        assert!(s.conf.card.is_none());
+        assert!(apply(&mut s, &json!({"nextsycl": {"card": 3}}), &none, &voices).is_err());
+    }
+
+    /// A lockstep model as Haru-4B is one: every whole frame in answered by a frame out within one long response
+    struct LockConv {
+        q: Mutex<VecDeque<RealtimeEvent>>,
+        buf: Mutex<(usize, bool)>,
+        card: Mutex<Option<String>>,
+    }
+
+    impl Conversation for LockConv {
+        fn update(&self, s: &RealtimeSession) -> AResult<()> {
+            *self.card.lock().unwrap() = s.card.clone();
+            Ok(())
+        }
+        fn append(&self, samples: &[f32], _rate: u32) -> AResult<()> {
+            let mut b = self.buf.lock().unwrap();
+            let mut q = self.q.lock().unwrap();
+            if !b.1 {
+                b.1 = true;
+                q.push_back(RealtimeEvent::ResponseStarted { id: "resp_l".into() });
+            }
+            b.0 += samples.len();
+            while b.0 >= 3200 {
+                b.0 -= 3200;
+                q.push_back(RealtimeEvent::TextDelta { id: "resp_l".into(), delta: "mm ".into() });
+                q.push_back(RealtimeEvent::AudioDelta { id: "resp_l".into(), samples: vec![0.25; 3200] });
+            }
+            Ok(())
+        }
+        fn commit(&self) -> AResult<()> {
+            Ok(())
+        }
+        fn clear(&self) {}
+        fn respond(&self) -> AResult<()> {
+            Ok(())
+        }
+        fn cancel(&self) {}
+        fn truncate(&self, _r: &str, _ms: u64) {}
+        fn tool_output(&self, _c: &str, _o: &str) -> AResult<()> {
+            Ok(())
+        }
+        fn add_text(&self, _r: &str, _t: &str) -> AResult<()> {
+            Ok(())
+        }
+        fn next(&self, wait: Duration) -> Option<RealtimeEvent> {
+            let e = self.q.lock().unwrap().pop_front();
+            if e.is_none() {
+                std::thread::sleep(wait.min(Duration::from_millis(10)));
+            }
+            e
+        }
+        fn close(&self) {}
+    }
+
+    struct LockEngine(Arc<LockConv>);
+
+    impl AudioEngine for LockEngine {
+        fn arch(&self) -> &'static str {
+            "lock"
+        }
+        fn defaults(&self) -> Defaults {
+            Defaults { seconds: 1.0, max_seconds: 1.0, steps: 0, cfg: 1.0, rate: 24000 }
+        }
+        fn load_seconds(&self) -> f64 {
+            0.0
+        }
+        fn generate(&self, _r: &AudioRequest, _p: &mut dyn FnMut(Step) -> AResult<()>) -> AResult<Audio> {
+            Ok(Audio::default())
+        }
+        fn realtime(&self) -> Option<Realtime> {
+            Some(Realtime { input_rate: 24000, output_rate: 24000, frame_ms: 133, clone: true, ..Default::default() })
+        }
+        fn converse(&self, _s: &RealtimeSession) -> AResult<Box<dyn Conversation>> {
+            struct Fwd(Arc<LockConv>);
+            impl Conversation for Fwd {
+                fn update(&self, s: &RealtimeSession) -> AResult<()> { self.0.update(s) }
+                fn append(&self, x: &[f32], r: u32) -> AResult<()> { self.0.append(x, r) }
+                fn commit(&self) -> AResult<()> { self.0.commit() }
+                fn clear(&self) { self.0.clear() }
+                fn respond(&self) -> AResult<()> { self.0.respond() }
+                fn cancel(&self) { self.0.cancel() }
+                fn truncate(&self, r: &str, ms: u64) { self.0.truncate(r, ms) }
+                fn tool_output(&self, c: &str, o: &str) -> AResult<()> { self.0.tool_output(c, o) }
+                fn add_text(&self, r: &str, t: &str) -> AResult<()> { self.0.add_text(r, t) }
+                fn next(&self, w: Duration) -> Option<RealtimeEvent> { self.0.next(w) }
+                fn close(&self) { self.0.close() }
+            }
+            Ok(Box::new(Fwd(self.0.clone())))
+        }
+    }
+
+    /// The lockstep extension end to end: session.created says lockstep and the frame, the card reaches the model, and
+    /// three frames of audio in (in two appends of any size) come back as one response's three audio deltas of a frame
+    /// each - no turn events, no response.done while the conversation runs
+    #[test]
+    fn a_lockstep_model_answers_every_frame() {
+        let conv = Arc::new(LockConv { q: Mutex::new(VecDeque::new()), buf: Mutex::new((0, false)), card: Mutex::new(None) });
+        let engine = LockEngine(conv.clone());
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let (c, _) = l.accept().unwrap();
+            let mut conn = Conn::Tcp(c);
+            let req = http::read_request(&mut conn).unwrap();
+            serve(conn, &req, &engine, "lock", &|_| None).unwrap();
+        });
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(s, "GET /v1/realtime HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").unwrap();
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            s.read_exact(&mut b).unwrap();
+            head.push(b[0]);
+        }
+        let first = read_text(&mut s).unwrap();
+        assert_eq!((first["session"]["nextsycl"]["lockstep"].as_bool(), first["session"]["nextsycl"]["frame_ms"].as_u64()), (Some(true), Some(133)));
+        send_masked(&mut s, &json!({"type": "session.update", "session": {"nextsycl": {"card": {"name": "Kai"}}}}).to_string());
+        assert_eq!(read_text(&mut s).unwrap()["type"], "session.updated");
+        assert!(conv.card.lock().unwrap().as_deref().is_some_and(|c| c.contains("Kai")));
+        for n in [4000i16, 5600] {
+            let pcm: Vec<u8> = (0..n).flat_map(|i| (i % 300).to_le_bytes()).collect();
+            send_masked(&mut s, &json!({"type": "input_audio_buffer.append", "audio": http::base64(&pcm)}).to_string());
+        }
+        let (mut types, mut deltas) = (Vec::new(), Vec::new());
+        while deltas.len() < 3 {
+            let v = read_text(&mut s).unwrap();
+            let t = v["type"].as_str().unwrap_or("").to_string();
+            if t == "response.audio.delta" {
+                deltas.push(http::unbase64(v["delta"].as_str().unwrap()).unwrap().len());
+            }
+            types.push(t);
+        }
+        assert_eq!(deltas, vec![6400, 6400, 6400], "a frame of 16-bit audio for each frame in");
+        assert_eq!(types.iter().filter(|t| *t == "response.created").count(), 1, "{types:?}");
+        assert!(!types.iter().any(|t| t == "response.done" || t == "input_audio_buffer.committed"), "{types:?}");
+        send_masked(&mut s, &json!({"type": "session.close"}).to_string());
+        srv.join().unwrap();
     }
 }

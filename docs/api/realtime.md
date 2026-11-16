@@ -3,7 +3,7 @@
 A WebSocket for talking with a full-duplex speech model: the microphone streams in, the model listens, decides when
 you have finished, and answers with speech (and its text) as it makes it; you can cut in. It speaks OpenAI Realtime's
 events, so an OpenAI Realtime client works by changing the URL and key. One API for every full-duplex model here:
-Sophon-Realtime now (docs/ports/sophon-realtime.md), Haru-4B next (its lockstep frames are the extension below).
+Sophon-Realtime (docs/ports/sophon-realtime.md) and Haru-4B (docs/ports/haru-4b.md: lockstep frames, the extension below).
 
 ```text
 ws://<box>:8000/v1/realtime?model=<id>          the front door: Authorization: Bearer <token>, or the browser's
@@ -25,7 +25,7 @@ conversation`), so it is neither stopped for room nor idled out. Maintenance mod
 | `g711_ulaw`, `g711_alaw` | 8 kHz | 8 kHz |
 | `pcm_f32le` | float32 mono, at `sample_rate_hz` (Sophon's own server's) | float32 |
 
-What comes in is resampled for the model (Sophon hears at 16 kHz, speaks at 24 kHz). `input_audio_buffer.append`
+What comes in is resampled for the model (Sophon hears at 16 kHz, speaks at 24 kHz; Haru hears and speaks at 24 kHz). `input_audio_buffer.append`
 carries base64; a binary WebSocket message is taken as raw audio in the session's input format (an extension).
 
 ## Client events
@@ -64,13 +64,27 @@ A client using the GA shape (`session.type: "realtime"`, or `?flavor=ga` in the 
 ## Lockstep models (Haru-4B)
 
 OpenAI's events assume a model that answers a turn; Haru-4B is full duplex in lockstep: every 133 ms (7.5 Hz) one
-3,200-sample 24 kHz frame of yours in, one of its own out (silence included), its text alongside. Such a model's
-`session.created` says `nextsycl.frame_ms: 133, lockstep: true`; the plan for it on this socket: frames are sent as
-they are recorded (`input_audio_buffer.append`, any size - the server cuts them), each input frame answered by one
-`response.audio.delta` of the same length within one long-running response, `response.audio_transcript.delta` as its
-text comes, no turn events (speech_started / stopped only as it hears them); `response.cancel` silences it, a session
-holds the character card it runs on (`nextsycl.card`) and its voice (a saved voice's recording). Not built yet
-(TODO.md: Haru-4B).
+3,200-sample 24 kHz frame of yours in, one of its own out (silence included), its text alongside. It hears and
+speaks at once: when to answer, back-channel ("mm-hm" while you talk) or stop because you cut in is the model's own
+doing, not a turn rule's. On this socket:
+
+| | |
+|---|---|
+| `session.created` | `nextsycl.frame_ms: 133, lockstep: true` (Sophon: 0, false), `voices: []` (its voice is a recording: `clone: true`), `languages` (the card's), `tools: false` |
+| the card | `session.update {session: {nextsycl: {card: {...}}}}` - `persona`, `name`, `gender` (`female` / `male`), `backchannel` (`low` / `mid` / `high`), `other_name`, `relationship`, `situation`; fields left out keep the model's own card (the release's "chat" character), `null` goes back to it; a string is a whole card's text. `instructions` alone becomes the persona. `nextsycl.language` picks the card's wording (`en` `ja` `zh` `ko` `es` `fr` `de` `pt` `ru`); `session.nextsycl.card` echoes it |
+| the voice | `voice`: a saved voice by name - its recording (3 s - 3 min, trimmed of silence, the last 3 min) is the voice reference. Needed: without one Haru stays silent (the release's server refuses such a session), so nothing starts and an `error` asks for one |
+| options | `nextsycl.options`: `guidance` (1-2), `eop-bias`, `speak-first` (1: it opens), `top-k`, `dry`; `temperature`; `nextsycl.seed` (0: a new one) |
+| your audio | `input_audio_buffer.append` (or a binary message) of any size as it is recorded; the server cuts it into frames (resampled to 24 kHz first). The prompt (card, voice) runs when the first audio comes (or a `response.create`); a later `session.update` that changes the card, the voice, the language or the sampling starts the conversation over |
+| its audio | one long-running response (`response.created` once): each frame of yours is answered by exactly one `response.audio.delta` of one frame (133 ms) in the session's output format, in order, and its new text (`response.audio_transcript.delta`: word pieces as said; a run of silent frames is one space). It is one frame ahead: the first delta (frame 0) comes from the prompt, frame k + 1 answers your frame k. Sent as fast as made: a client that sends faster than real time gets the answers faster; one that stops sending stops it with it |
+| turn events | none (`input_audio_buffer.committed` / `response.done` do not come while it runs); `input_audio_buffer.speech_started` / `speech_stopped` as an energy gate hears you (for a display: a frame above max(0.01, 3 x the noise floor) starts, 4 quiet frames end) - a client does not stop its playback on them, the model stops itself |
+| `response.cancel` | ends the response (`response.done` cancelled) and silences the model: its text held at PAD and its own audio stream at silence while it keeps listening; nothing goes out until `response.create`, which starts a new response |
+| `input_audio_buffer.commit` / `clear` | commit: nothing (no turns); clear: your audio not yet framed is dropped |
+| not taken | `conversation.item.create` (a turn as text: it hears audio only), function calls (`tools`: it calls none) |
+| the end | the context (`NS_HARU_CTX`: about an hour) full: an `error`, `response.done` failed; a new session starts over |
+
+A client plays the deltas back to back behind a short jitter buffer (the wfe's Conversation panel keeps 0.2 s) and
+records with echo cancellation (or headphones): the model hears whatever the microphone picks up, its own voice
+included. `reference/haru/client.py` streams a recording at real time and records both sides.
 
 ## Example
 
@@ -81,3 +95,13 @@ python3 -I reference/sophon/client.py --url ws://localhost:8000/v1/realtime --to
 (the client streams a recording at real time, then silence, and writes what the model said - DIR/answer-1.wav -, its
 text, the events and the timings; `--then` a second turn, `--barge-at S` that turn spoken S seconds into the answer,
 `--tools` a get_weather function offered and answered).
+
+A lockstep conversation with Haru-4B (a saved voice, a card of its own; `--say` / `--gap` the user's script):
+
+```sh
+python3 -I reference/haru/client.py --url "ws://localhost:8000/v1/realtime?model=haru-4b" --token $TOKEN --voice MYVOICE \
+    --card card.json --say hello.wav --gap 5 --say question.wav --gap 8 --out DIR
+```
+
+(it writes DIR/model.wav, DIR/user.wav, DIR/call.wav - you left, it right -, its text with times and the frames'
+turnaround; `--barge-at S` speaks the last line S seconds into its talk, `--speak-first` lets it open).

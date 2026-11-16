@@ -1,0 +1,13 @@
+[package]
+name = "nextsycl-audio-haru"
+description = "Haru-4B on Intel Arc (SYCL): a full-duplex spoken dialogue model in lockstep at 7.5 Hz - every 133 ms one frame of the user's audio in, one frame of its own audio and text out; a Qwen3.5-4B language model over the three streams summed, a one-step MeanFlow head for the 64-value audio latent, the causal VibeVoice codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true
+nextsycl-audio.workspace = true
+serde_json.workspace = true

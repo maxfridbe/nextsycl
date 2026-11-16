@@ -1,0 +1,42 @@
+# Haru-4B (full-duplex spoken dialogue in lockstep at 7.5 Hz; /v1/realtime)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets.
+# higurashi-ai/Haru-4B @ 8d6e83bc (Apache-2.0 code and weights): one model.safetensors in bfloat16 - the language model
+# (Qwen3.5-4B's text layers), the two audio projectors, the MeanFlow head and the causal VibeVoice codec - with its
+# config.json and tokenizer.json. audio/haru reads the safetensors as they are (bfloat16 matrices on the card,
+# 9.9 GiB loaded); one conversation holds its context (NS_HARU_CTX, an hour: 1.0 GiB). docs/ports/haru-4b.md has the checks.
+id: haru-4b
+kind: audio
+arch: haru
+license: apache-2.0
+commercial: true
+license_note: 'Apache-2.0 code and weights (higurashi.ai); a pretrained base model, released for research - it holds a natural conversation but is not a reliable source of facts and does not follow instructions as an assistant does; it imitates the voice of a reference clip: clone only your own voice or one you have permission to use'
+title: 'Haru-4B (full-duplex voice conversation in lockstep; Rust + SYCL)'
+about: 'A live voice conversation over /v1/realtime in lockstep: every 133 ms one frame of your audio in, one frame of its own out (silence included), so it listens while it speaks - back-channels, interruptions and overlaps are its own. A character card (persona, names, relationship, situation; nine languages) sets who it is, a saved voice (3 s - 3 min of one speaker) how it sounds. One card'
+gpus: '0|1'
+vram_gib: 11.5                   # measured on the B65: 9.9 GiB loaded, 10.9 with a conversation of an hour (28,672 positions)
+speech:
+- realtime                       # a live conversation: /v1/realtime (lockstep; a saved voice's recording is its voice). It
+                                 #   does not read text aloud: no clone / voices here, so speech requests never come to it
+defaults:
+  seconds: 20.0
+env: {}
+files:
+  model:
+    key: haru-4b-model
+    url: https://huggingface.co/higurashi-ai/Haru-4B/resolve/8d6e83bcd3701a76fc27a764965665da1df7da78/model.safetensors
+    size: 10540113510
+    sha256: ad2c3534ef6bd88525e22e5da3ac4fb739368406bf3b1c852cbafbade647c0fa
+    path: haru-4b/model.safetensors
+  config:
+    key: haru-4b-config
+    url: https://huggingface.co/higurashi-ai/Haru-4B/resolve/8d6e83bcd3701a76fc27a764965665da1df7da78/config.json
+    size: 2735
+    sha256: ff29b2dab25780d33fe1ea8efc3d1364d31e7bef95b0b08514b935305ba2f427
+    path: haru-4b/config.json
+  tokenizer:
+    key: haru-4b-tokenizer
+    url: https://huggingface.co/higurashi-ai/Haru-4B/resolve/8d6e83bcd3701a76fc27a764965665da1df7da78/tokenizer.json
+    size: 19989325
+    sha256: 06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523
+    path: haru-4b/tokenizer.json
+guide: guides/haru.md

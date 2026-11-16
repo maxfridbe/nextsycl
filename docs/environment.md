@@ -341,7 +341,7 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 
 ## Audio
 
-ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Sophon-Realtime (`NS_SOPHON_`), VoxCPM2 (`NS_VCP_`), Whisper (`NS_WH_`). A per-request option's variable is only its name: it rides in the request (`"options"`), the engine does not read the environment for it.
+ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-TTS (`NS_Q3T_`), Sophon-Realtime (`NS_SOPHON_`), Haru-4B (`NS_HARU_`), VoxCPM2 (`NS_VCP_`), Whisper (`NS_WH_`). A per-request option's variable is only its name: it rides in the request (`"options"`), the engine does not read the environment for it.
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
@@ -467,6 +467,15 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 | `NS_SOPHON_GREEDY` | 0 | 1: the brain's tokens and the talker's codes the most likely every time (deterministic; for checks); also a request's / session's option greedy (--opt-greedy) | audio sophon |
 | `NS_SOPHON_TURN_CHECKS` | 0.2,0.35,0.5,0.8,1.3,2.0 | the pauses (seconds of silence) at which the brain is asked whether the user has finished (duplex.py's SOPHON_TURN_CHECKS) (--opt-turn-checks) | audio sophon |
 | `NS_SOPHON_TURN_THRESHOLDS` | 0.95,0.85,0.7,0.5,0.35,0.25 | P(finished) that answers at each of those pauses (--opt-turn-thresholds) | audio sophon |
+| `NS_HARU_*` | - | every NS_HARU_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
+| `NS_HARU_CTX` | 28672 | the positions a Haru-4B conversation holds: 7.5 a second plus the prompt (the card's tokens, the voice's frames); 28672 is about an hour, ~0.9 GiB of keys and values (--opt-ctx) | audio haru |
+| `NS_HARU_GUIDANCE` | 1.5 | Haru-4B's audio head guidance (1-2): higher keeps the voice closer to the reference; also a session's option guidance (--opt-guidance) | audio haru |
+| `NS_HARU_TOP_K` | 25 | Haru-4B's text stream top-k (0: all); also a session's option top-k (--opt-top-k) | audio haru |
+| `NS_HARU_EOP_BIAS` | 0 | added to Haru-4B's end-of-padding logit (start speaking): above 0 it starts sooner; also a session's option eop-bias (--opt-eop-bias) | audio haru |
+| `NS_HARU_SPEAK_FIRST` | 0 | 1: Haru-4B opens the conversation; also a session's option speak-first (--opt-speak-first) | audio haru |
+| `NS_HARU_DRY` | 1 | 0: no DRY repetition penalty on Haru-4B's words; also a session's option dry (--opt-dry) | audio haru |
+| `NS_HARU_STEREO` | - | a request's option only (stereo=1): an offline answer to a recording as two channels, the user left, the model right | audio haru |
+| `NS_HARU_PROFILE` | 0 | 1: each Haru-4B frame's operations timed one by one (the GPU waited for after each: slower), the table on stderr after a check or an offline answer (--opt-profile) | audio haru |
 | `NS_SOPHON_LOG` | 0 | Debug: 1 logs each turn check's P(finished) and each reply's prompt / speeds / text on stderr | audio sophon |
 | `NS_SOPHON_PROFILE` | 0 | Debug: 1 times the talker's frame stages (synchronised: slower) | audio sophon |
 | `NS_WH_*` | - | every NS_WH_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |

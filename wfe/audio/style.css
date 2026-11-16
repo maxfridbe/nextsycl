@@ -184,3 +184,5 @@ body{max-width:1100px}
 .converse .turn.tool .said{color:#fbbf24;font:12px/1.4 ui-monospace,monospace}
 .converse .turn.live .said{opacity:.85}
 .converse .turn.cut .said{text-decoration:line-through;text-decoration-color:#64748b}
+.converse .cardf{display:flex;flex-direction:column;gap:2px;flex:1 1 160px}
+.converse .cardf input,.converse .cardf select{width:100%}

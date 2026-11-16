@@ -20,6 +20,8 @@ nextsycl audio gen \"<new style>\" --model yue2-3b-q8 --source RECORDING --lyric
                    recording's score by SheetSage2 sung in the new style with the words given; --opt-score-only true: only the score, RECORDING's .abc)
 nextsycl audio gen \"<description>\" --model acestep-1.5 --source FILE --opt-task cover | repaint | edit | lego [--opt-repaint-start S]
                    [--opt-repaint-end S] [--opt-cover-strength X] [--opt-source-lyrics TEXT] ...   (a song made from a recording)
+nextsycl audio gen \"<persona or card>\" --model haru-4b --source USER.wav --ref-audio VOICE.wav [--opt-stereo 1]   (Haru-4B
+                   offline: its side of a conversation with the recording, as long as it, in the voice given; no --source: --seconds of it alone)
 nextsycl audio serve [MODEL] [--port 8087] [--host 127.0.0.1] [--gpu N | --gpus A,B] [--set NAME=VALUE]... [--wfe] [--out DIR] [--cors ORIGIN]
 nextsycl audio start [serve's options] [--slot N]   (in the background; slot N: another server beside the first) | ps | logs [-f] | stop  [--slot N]
 nextsycl audio voice list                                   the saved voices (spoken by name: --voice NAME, \"voice\": NAME)
@@ -33,14 +35,15 @@ nextsycl audio voice enroll NAME [--gpu N] [--steps 2000] [--replace] [--direct]
 nextsycl audio voice rm NAME            (addvoice / clonevoice NAME ... = voice add; designvoice = voice design)
 nextsycl audio transcribe FILE [--model ID | --dir DIR] [--language L] [--translate] [--no-words] [--prompt TEXT] [--opt-NAME VALUE]...
                    [--json] [--gpu N]   (speech to text: a recogniser, whisper-large-v3-turbo; any rate, WAV, MP3, FLAC, Ogg, M4A)
-nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | mel,encoder,logits,transcribe | prompt,lm,head,codec,run | prompt,frames,flow,codec | mel,ear,lm,check,write | prompt,encode,pass,run,codec,post] [--gpu N | --gpus A,B]
+nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | mel,encoder,logits,transcribe | prompt,lm,head,codec,run | prompt,frames,flow,codec | mel,ear,lm,check,write | prompt,encode,pass,run,codec,post | codec,prompt,frames,speed] [--gpu N | --gpus A,B]
 nextsycl audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
 pub fn engines() -> Vec<nextsycl_audio::AudioKind> {
     vec![nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_qwen3tts::kind(), nextsycl_audio_voxcpm2::kind(), nextsycl_audio_breezetts2::kind(),
          nextsycl_audio_vibevoice::kind(), nextsycl_audio_s2pro::kind(), nextsycl_audio_omnivoice::kind(),
-         nextsycl_audio_voxtraltts::kind(), nextsycl_audio_whisper::kind(), nextsycl_audio_acestep::kind(), nextsycl_audio_yue2::kind(), nextsycl_audio_sophon::kind(), nextsycl_audio_example::kind()]
+         nextsycl_audio_voxtraltts::kind(), nextsycl_audio_whisper::kind(), nextsycl_audio_acestep::kind(), nextsycl_audio_yue2::kind(), nextsycl_audio_sophon::kind(), nextsycl_audio_haru::kind(),
+         nextsycl_audio_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -54,7 +57,10 @@ fn model(cfg: &Config, args: &[String]) -> Result<(Value, ModelFiles), String> {
         let dir = Path::new(d);
         let whisper = std::fs::read_to_string(dir.join("config.json")).is_ok_and(|c| c.contains("\"model_type\": \"whisper\""));
         let sophon = std::fs::read_to_string(dir.join("config.json")).is_ok_and(|c| c.contains("sophon_realtime"));
-        let (arch, files) = if whisper {
+        let haru = std::fs::read_to_string(dir.join("config.json")).is_ok_and(|c| c.contains("\"model_type\": \"haru\""));
+        let (arch, files) = if haru {
+            (nextsycl_audio_haru::ARCH, nextsycl_audio_haru::files_in(dir).map_err(|e| e.0)?)
+        } else if whisper {
             (nextsycl_audio_whisper::ARCH, nextsycl_audio_whisper::files_in(dir).map_err(|e| e.0)?)
         } else if sophon {
             (nextsycl_audio_sophon::ARCH, nextsycl_audio_sophon::files_in(dir).map_err(|e| e.0)?)
@@ -438,16 +444,20 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         // the brain and its ear alone (the talker is checked by speaking: audio generate)
         let e = nextsycl_audio_sophon::Sophon::load_with(&files, &gpus(args)?, &options(&m, args)?, false, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_sophon::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextsycl_audio_haru::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("codec,prompt,frames").split(',').collect();
+        let e = nextsycl_audio_haru::Haru::load(&files, &gpus(args)?, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextsycl_audio_haru::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else if m["arch"] == nextsycl_audio_whisper::ARCH {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("mel,encoder,logits,transcribe").split(',').collect();
         let e = nextsycl_audio_whisper::Whisper::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_whisper::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else {
-        return Err(format!("check knows {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH,
+        return Err(format!("check knows {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH,
                            nextsycl_audio_voxcpm2::ARCH, nextsycl_audio_breezetts2::ARCH, nextsycl_audio_vibevoice::ARCH, nextsycl_audio_s2pro::ARCH,
                            nextsycl_audio_omnivoice::ARCH,
                            nextsycl_audio_voxtraltts::ARCH, nextsycl_audio_whisper::ARCH, nextsycl_audio_acestep::ARCH, nextsycl_audio_yue2::ARCH,
-                           nextsycl_audio_sophon::ARCH));
+                           nextsycl_audio_sophon::ARCH, nextsycl_audio_haru::ARCH));
     };
     println!("worst relative error {worst:.2e}");
     Ok(())
@@ -518,7 +528,7 @@ fn serve(cfg: &Config, args: &[String], detach: bool) -> Result<(), String> {
     a.extend(mount(&out, &out.to_string_lossy(), false));
     a.extend(["-e".into(), format!("NS_REGISTRY={}", reg.display()), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
     // the engines' own settings from the configuration (NS_MM3_INT8=1 ...)
-    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NS_Q3T_")).chain(cfg.with_prefix("NS_VCP_")).chain(cfg.with_prefix("NS_BZ2_")).chain(cfg.with_prefix("NS_WH_")).chain(cfg.with_prefix("NS_SOPHON_"))
+    for (k, v) in cfg.with_prefix("NS_MM3_").into_iter().chain(cfg.with_prefix("NS_Q3T_")).chain(cfg.with_prefix("NS_VCP_")).chain(cfg.with_prefix("NS_BZ2_")).chain(cfg.with_prefix("NS_WH_")).chain(cfg.with_prefix("NS_SOPHON_")).chain(cfg.with_prefix("NS_HARU_"))
         .chain(cfg.with_prefix("NSD_")) {
         a.extend(["-e".into(), format!("{k}={v}")]);
     }

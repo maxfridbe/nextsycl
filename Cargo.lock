@@ -558,6 +558,7 @@ dependencies = [
  "nextsycl-audio-acestep",
  "nextsycl-audio-breezetts2",
  "nextsycl-audio-example",
+ "nextsycl-audio-haru",
  "nextsycl-audio-minimaxmusic3",
  "nextsycl-audio-omnivoice",
  "nextsycl-audio-qwen3tts",
@@ -660,6 +661,17 @@ version = "0.0.0"
 dependencies = [
  "nextsycl-audio",
  "nextsycl-core",
+]
+
+[[package]]
+name = "nextsycl-audio-haru"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-audio",
+ "nextsycl-core",
+ "nextsycl-gguf",
+ "nextsycl-tok",
+ "serde_json",
 ]
 
 [[package]]

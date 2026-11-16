@@ -13,7 +13,7 @@ members = [
     "image/contract", "image/example", "image/qwenimage21", "image/unlimitedocr", "image/paddleocrvl", "image/olmocr2", "image/hunyuanimage21", "image/starvector", "image/upscale", "image/mingimage", "image/mossimage", "image/seedvr2", "image/flashvsr", "image/rembg", "image/ph3image", "image/h3image", "image/zimage", "image/vldescribe",
     "video/contract", "video/example", "video/h3",
     "audio/contract", "audio/example", "audio/minimaxmusic3", "audio/qwen3tts", "audio/voxcpm2", "audio/breezetts2", "audio/vibevoice",
-    "audio/s2pro", "audio/omnivoice", "audio/voxtraltts", "audio/whisper", "audio/acestep", "audio/yue2", "audio/sophon",
+    "audio/s2pro", "audio/omnivoice", "audio/voxtraltts", "audio/whisper", "audio/acestep", "audio/yue2", "audio/sophon", "audio/haru",
     "glue/models", "glue/serve",
     "cli/nextsycl",
 ]
@@ -82,6 +82,7 @@ nextsycl-audio-whisper = { path = "audio/whisper" }
 nextsycl-audio-acestep = { path = "audio/acestep" }
 nextsycl-audio-yue2 = { path = "audio/yue2" }
 nextsycl-audio-sophon = { path = "audio/sophon" }
+nextsycl-audio-haru = { path = "audio/haru" }
 nextsycl-model3d = { path = "model3d/contract" }
 nextsycl-model3d-example = { path = "model3d/example" }
 nextsycl-model3d-hunyuan3d = { path = "model3d/hunyuan3d" }

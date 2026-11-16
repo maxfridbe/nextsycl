@@ -452,6 +452,9 @@ pub struct Realtime {
 pub struct RealtimeSession {
     /// the system prompt (None: the model's own)
     pub instructions: Option<String>,
+    /// a lockstep model's character card (Haru-4B: `nextsycl.card`), as JSON: an object of its fields (persona, name,
+    /// gender, backchannel, other_name, relationship, situation) or a string (the card's text); None: the model's own
+    pub card: Option<String>,
     /// a built-in voice
     pub voice: Option<String>,
     /// a recording whose voice to speak in (a saved voice's)
@@ -531,7 +534,7 @@ pub trait AudioEngine: Send + Sync {
     }
     /// a live conversation with these settings
     fn converse(&self, _s: &RealtimeSession) -> Result<Box<dyn Conversation>> {
-        Err(Error(format!("{} does not hold live conversations (realtime needs a full-duplex speech model: sophon-realtime)", self.arch())))
+        Err(Error(format!("{} does not hold live conversations (realtime needs a full-duplex speech model: sophon-realtime, haru)", self.arch())))
     }
     /// its architecture (the registry entry's "arch")
     fn arch(&self) -> &'static str;
