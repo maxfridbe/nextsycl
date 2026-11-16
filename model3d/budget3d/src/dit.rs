@@ -467,9 +467,9 @@ impl Dit {
         };
         // RePo: the block's input -> a 3-D offset a head
         nsd.layer_norm(h.ptr(), Dt::F32, rows, D, b.repo.norm.0.ptr(), b.repo.norm.1.ptr(), 1e-5, w.rp_ln.ptr(), Dt::F32)?;
-        b.repo.gc.apply_tf32(nsd, k, w.rp_ln.ptr(), rows, w.rp_gc.ptr())?;
+        b.repo.gc.apply(nsd, k, w.rp_ln.ptr(), rows, w.rp_gc.ptr(), Dt::F32)?;
         nsd.swiglu(w.rp_gc.ptr(), Dt::F32, rows, REPO, w.rp_sw.ptr(), Dt::F32)?;
-        b.repo.fin.apply_tf32(nsd, k, w.rp_sw.ptr(), rows, w.delta.ptr())?;
+        b.repo.fin.apply(nsd, k, w.rp_sw.ptr(), rows, w.delta.ptr(), Dt::F32)?;
         tick(0)?;
         // the attention
         let (nw, nb, md1) = match &b.norms {

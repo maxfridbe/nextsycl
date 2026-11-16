@@ -93,29 +93,3 @@ int ns_b3s_linear(ns_gpu* g, const void* x, int64_t M, int64_t K, const void* w,
 
 }  // extern "C"
 
-// RePo's float32 products (the block input's layer norm into its 256-wide gate|content map, and on to the 48 offsets)
-// on the XMX engines: float32 in and out, the multiply in TF32 (oneDNN's fpmath mode), accumulated in float32. In
-// float32 proper they ran on the vector engines: 7-11% of a step.
-extern "C" int ns_b3s_linear_tf32(ns_gpu* g, const float* x, int64_t M, int64_t K, const float* w, int64_t N, const float* bias, float* out) {
-    NS_TRY
-    if (M <= 0 || K <= 0 || N <= 0) return 0;
-    std::lock_guard<std::mutex> l(mu);
-    Dnn& d = dnn(g);
-    memory::desc smd({M, K}, memory::data_type::f32, memory::format_tag::ab);
-    memory::desc wmd({K, N}, memory::data_type::f32, memory::format_tag::ba);
-    memory::desc bmd({1, N}, memory::data_type::f32, memory::format_tag::ab);
-    memory::desc dmd({M, N}, memory::data_type::f32, memory::format_tag::ab);
-    auto key = std::make_tuple(M, K, N, bias ? 1 : 0, 0, 100, 0);
-    auto it = d.prims.find(key);
-    if (it == d.prims.end()) {
-        dnnl::primitive_attr attr;
-        attr.set_fpmath_mode(dnnl::fpmath_mode::tf32);
-        auto pd = bias ? dnnl::matmul::primitive_desc(d.eng, smd, wmd, bmd, dmd, attr) : dnnl::matmul::primitive_desc(d.eng, smd, wmd, dmd, attr);
-        it = d.prims.emplace(key, dnnl::matmul(pd)).first;
-    }
-    std::unordered_map<int, memory> args{{DNNL_ARG_SRC, usm(smd, d.eng, x)}, {DNNL_ARG_WEIGHTS, usm(wmd, d.eng, w)}, {DNNL_ARG_DST, usm(dmd, d.eng, out)}};
-    if (bias) args.insert({DNNL_ARG_BIAS, usm(bmd, d.eng, bias)});
-    it->second.execute(d.st, args);
-    return 0;
-    NS_CATCH
-}

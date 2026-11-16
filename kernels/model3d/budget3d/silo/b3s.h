@@ -29,10 +29,6 @@ int ns_b3s_linear_supported(int epi, int out_dt);
 int ns_b3s_linear(ns_gpu* g, const void* x, int64_t M, int64_t K, const void* w, int64_t N, const float* bias, void* out, int out_dt, int epi,
                   const float* gate);
 
-/* out [M, N] float32 = x [M, K] float32 . w [N, K] float32 ^T + bias, multiplied in TF32 on the matrix engines and
- * accumulated in float32 (RePo's products) */
-int ns_b3s_linear_tf32(ns_gpu* g, const float* x, int64_t M, int64_t K, const float* w, int64_t N, const float* bias, float* out);
-
 /* Whether ns_b3s_ln_mod takes rows of C at these types (C 1..2048) */
 int ns_b3s_ln_mod_supported(int64_t C, int x_dt, int out_dt);
 /* b3d.h's ns_model3d_budget3d_ln_mod (the same arithmetic and arguments: row r's scale / shift at (r / group) * stride,

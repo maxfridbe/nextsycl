@@ -169,14 +169,6 @@ impl Lin {
 }
 
 impl Lin {
-    /// `apply` for a float32 matrix, multiplied in TF32 by the silo when there is one (else float32 proper)
-    pub fn apply_tf32(&self, nsd: &Nsd, k8: &K, x: *const std::ffi::c_void, m: usize, out: *mut std::ffi::c_void) -> Result<()> {
-        if !self.half && m > 0 && k8.linear_tf32(x.cast(), m, self.k, self.w.fp(), self.n, self.bias_p(), out.cast())? {
-            return Ok(());
-        }
-        self.apply(nsd, k8, x, m, out, Dt::F32)
-    }
-
     /// `apply` (a half matrix, half x) with an epilogue: the silo's product with it fused when the silo takes it (one
     /// pass), else the product and then a pass of the engine's kernels (a residual's product through `tmp`, float32
     /// [m, n], first)

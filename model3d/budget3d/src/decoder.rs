@@ -15,7 +15,7 @@ use nextsycl_core::{DevBuf, Error, Gpu, Result};
 use nextsycl_diffusion::kernels::Dt;
 use nextsycl_model3d::Splats;
 
-use crate::ffi::{Epi, Rows};
+use crate::ffi::Rows;
 use crate::w::{self, sinusoid, HostLin, Lin, St};
 use crate::Ctx;
 
@@ -77,14 +77,13 @@ impl Cross {
     }
 
     /// x [m, 1024] (half, in hn) attending to kv: the output projection in float32 into tmp
-    /// ... then added into the stream h times `gate` (the silo fuses the add into the product)
-    fn apply(&self, cx: &Ctx, b: &Buf, m: usize, kv: &DevBuf, gate: *const f32) -> Result<()> {
+    fn apply(&self, cx: &Ctx, b: &Buf, m: usize, kv: &DevBuf) -> Result<()> {
         let (nsd, k) = (&cx.nsd, &cx.k);
         self.q.apply(nsd, k, b.hn.ptr(), m, b.q.ptr(), Dt::F16)?;
         k.rope_norm(b.q.ptr(), m, HEADS, HD, D, std::ptr::null(), std::ptr::null(), 0, 0, self.q_gamma.fp())?;
         let vp: *const std::ffi::c_void = kv.ptr().cast::<u16>().wrapping_add(D).cast();
         nsd.attention_qk(b.q.ptr(), m, D, kv.ptr(), vp, LAT, 2 * D, Dt::F16, HEADS, HD, b.att.ptr(), Dt::F16)?;
-        self.out.apply_epi(nsd, k, b.att.ptr(), m, b.h.ptr(), Dt::F32, Epi::Resid(gate), Some(&b.tmp))
+        self.out.apply(nsd, k, b.att.ptr(), m, b.tmp.ptr(), Dt::F32)
     }
 }
 
@@ -123,9 +122,10 @@ impl Mlp {
         Ok(Mlp { a: Lin::load(f, g, &format!("{p}.mlp.0"), true)?, b: Lin::load(f, g, &format!("{p}.mlp.2"), true)? })
     }
     /// hn (half) -> tmp (float32)
-    fn apply(&self, cx: &Ctx, b: &Buf, m: usize, gate: *const f32) -> Result<()> {
-        self.a.apply_epi(&cx.nsd, &cx.k, b.hn.ptr(), m, b.mlp.ptr(), Dt::F16, Epi::Gelu, None)?;
-        self.b.apply_epi(&cx.nsd, &cx.k, b.mlp.ptr(), m, b.h.ptr(), Dt::F32, Epi::Resid(gate), Some(&b.tmp))
+    fn apply(&self, cx: &Ctx, b: &Buf, m: usize) -> Result<()> {
+        self.a.apply(&cx.nsd, &cx.k, b.hn.ptr(), m, b.mlp.ptr(), Dt::F16)?;
+        cx.nsd.gelu(b.mlp.ptr(), Dt::F16, m * MLP, true)?;
+        self.b.apply(&cx.nsd, &cx.k, b.mlp.ptr(), m, b.tmp.ptr(), Dt::F32)
     }
 }
 
@@ -213,9 +213,11 @@ impl OctreeDecoder {
         let k = &cx.k;
         for ((cr, mlp), kv) in self.blocks.iter().zip(kvs) {
             k.ln_mod(b.h.ptr(), Dt::F32, m, D, 1e-6, std::ptr::null(), std::ptr::null(), Rows::one(p(1), p(0)), b.hn.ptr(), Dt::F16)?;
-            cr.apply(cx, &b, m, kv, p(2))?;
+            cr.apply(cx, &b, m, kv)?;
+            k.gate_add(b.h.fp(), m, D, b.tmp.ptr(), Dt::F32, p(2), 0, 0)?;
             k.ln_mod(b.h.ptr(), Dt::F32, m, D, 1e-6, std::ptr::null(), std::ptr::null(), Rows::one(p(4), p(3)), b.hn.ptr(), Dt::F16)?;
-            mlp.apply(cx, &b, m, p(5))?;
+            mlp.apply(cx, &b, m)?;
+            k.gate_add(b.h.fp(), m, D, b.tmp.ptr(), Dt::F32, p(5), 0, 0)?;
         }
         k.ln_mod(b.h.ptr(), Dt::F32, m, D, 1e-5, std::ptr::null(), std::ptr::null(), Rows::none(), b.tmp.ptr(), Dt::F32)?;
         let o = DevBuf::f32(g, m * 8)?;
@@ -335,12 +337,15 @@ impl GaussianDecoder {
             k.rope_norm(hp(0), m, HEADS, HD, 3 * D, n, n, 0, 0, blk.q_gamma.fp())?;
             k.rope_norm(hp(D), m, HEADS, HD, 3 * D, n, n, 0, 0, blk.k_gamma.fp())?;
             nsd.attention_qk(hp(0), m, 3 * D, hp(D), hp(2 * D), m, 3 * D, Dt::F16, HEADS, HD, b.att.ptr(), Dt::F16)?;
-            blk.out.apply_epi(nsd, k, b.att.ptr(), m, b.h.ptr(), Dt::F32, Epi::Resid(n), Some(&b.tmp))?;
+            blk.out.apply(nsd, k, b.att.ptr(), m, b.tmp.ptr(), Dt::F32)?;
+            k.gate_add(b.h.fp(), m, D, b.tmp.ptr(), Dt::F32, n, 0, 0)?;
             k.ln_mod(b.h.ptr(), Dt::F32, m, D, 1e-6, blk.norm2.0.fp(), blk.norm2.1.fp(), Rows::none(), b.hn.ptr(), Dt::F16)?;
             let kv = blk.cross.kv_of(cx, lat)?;
-            blk.cross.apply(cx, &b, m, &kv, n)?;
+            blk.cross.apply(cx, &b, m, &kv)?;
+            k.gate_add(b.h.fp(), m, D, b.tmp.ptr(), Dt::F32, n, 0, 0)?;
             k.ln_mod(b.h.ptr(), Dt::F32, m, D, 1e-6, n, n, Rows::none(), b.hn.ptr(), Dt::F16)?;
-            blk.mlp.apply(cx, &b, m, n)?;
+            blk.mlp.apply(cx, &b, m)?;
+            k.gate_add(b.h.fp(), m, D, b.tmp.ptr(), Dt::F32, n, 0, 0)?;
         }
         k.ln_mod(b.h.ptr(), Dt::F32, m, D, 1e-5, n, n, Rows::none(), b.tmp.ptr(), Dt::F32)?;
         let o = DevBuf::f32(g, m * 480)?;

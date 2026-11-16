@@ -84,7 +84,6 @@ pub struct Silo {
     pub path: std::path::PathBuf,
     linear_supported: unsafe extern "C" fn(c_int, c_int) -> c_int,
     linear: unsafe extern "C" fn(G, P, i64, i64, P, i64, *const f32, M, c_int, c_int, *const f32) -> c_int,
-    linear_tf32: unsafe extern "C" fn(G, *const f32, i64, i64, *const f32, i64, *const f32, *mut f32) -> c_int,
     ln_mod_supported: unsafe extern "C" fn(i64, c_int, c_int) -> c_int,
     ln_mod: unsafe extern "C" fn(G, P, c_int, i64, i64, f32, *const f32, *const f32, *const f32, *const f32, i64, i64, M, c_int) -> c_int,
 }
@@ -118,7 +117,6 @@ pub fn silo() -> Result<Option<&'static Silo>> {
             path: lib.path.clone(),
             linear_supported: sym!("ns_b3s_linear_supported"),
             linear: sym!("ns_b3s_linear"),
-            linear_tf32: sym!("ns_b3s_linear_tf32"),
             ln_mod_supported: sym!("ns_b3s_ln_mod_supported"),
             ln_mod: sym!("ns_b3s_ln_mod"),
         }))
@@ -222,14 +220,6 @@ impl K {
     pub fn linear_f32(&self, x: P, m: usize, k: usize, w: P, n: usize, bias: *const f32, out: *mut f32) -> Result<()> {
         // SAFETY: sizes as named (b3d.h).
         check(unsafe { (self.k.linear_f32)(self.g, x, m as i64, k as i64, w, n as i64, bias, out) }, "linear (float32 out)")
-    }
-    /// The silo's float32 product in TF32 (out [m, n] = x [m, k] w [n, k]^T + bias): false without a silo
-    #[allow(clippy::too_many_arguments)]
-    pub fn linear_tf32(&self, x: *const f32, m: usize, k: usize, w: *const f32, n: usize, bias: *const f32, out: *mut f32) -> Result<bool> {
-        let Some(s) = self.s else { return Ok(false) };
-        // SAFETY: sizes as named (b3s.h).
-        check(unsafe { (s.linear_tf32)(self.g, x, m as i64, k as i64, w, n as i64, bias, out) }, "linear (silo, tf32)")?;
-        Ok(true)
     }
     /// Layer norm (affine `w`, `b` when given), then the modulation `md`
     #[allow(clippy::too_many_arguments)]
