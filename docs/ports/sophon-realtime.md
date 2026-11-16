@@ -133,7 +133,8 @@ Two cards (the card's layout: brain on the B70, talker on the B65) were not meas
 ## Open items
 
 - q8 parity on two cards (the close check of the brain's maths without q4's error), when the B70 is free.
-- The last two layers' q4 error: keep them (and the first) in q8 - a few hundred MB - and measure the logits again.
+- The last two layers' q4 error: they are kept in q8 by default now (`NS_SOPHON_Q8_LAYERS=62,63`, +0.4 GiB); the
+  logits with them not yet measured.
 - Speed: the brain's decode product reaches about half the B65's bandwidth (tg ~13 tok/s); the prompt pass expands
   every matrix to half per pass (fine at a few hundred rows, wasteful at 30); a q4 XMX prompt product, decode graphs.
 - Speculative drafting (duplex.py's SOPHON_SPEC_AT: a reply drafted from the first 50 ms of a pause, released when

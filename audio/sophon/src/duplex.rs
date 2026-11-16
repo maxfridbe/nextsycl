@@ -353,7 +353,8 @@ fn listen(s: Arc<Shared>) {
     let mut last = Instant::now();
     while !s.closed.load(Ordering::SeqCst) {
         let mut st = lock(&s.st);
-        if st.rem.is_empty() && !st.want_reply && st.followup_at.is_none() {
+        // nothing to frame and nothing asked: wait (a tool follow-up's time is checked every 20 ms)
+        if st.rem.is_empty() && !st.want_reply {
             st = s.wake.wait_timeout(st, Duration::from_millis(20)).map(|(g, _)| g).unwrap_or_else(|e| e.into_inner().0);
         }
         let frame = (st.rate / 50).max(1) as usize;
