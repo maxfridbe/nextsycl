@@ -165,7 +165,9 @@ impl Sophon {
             + std::fs::metadata(role(files, "codec")?).map(|m| m.len()).unwrap_or(0) + (1u64 << 30);
         let ear_bytes = 900u64 << 20;
         let kv_per_pos = (n_layer * 2 * 8 * brain::HEAD * 2) as u64;
-        let work = 1100u64 << 20;
+        // a card's work buffers: a prompt chunk's activations (~0.6 GiB at 512 rows) and the largest matrix expanded
+        // to half (0.5 GiB)
+        let work = 1600u64 << 20;
         // memory on each card, checked before anything loads
         let mut need: Vec<(Arc<Gpu>, u64)> = Vec::new();
         let mut add = |g: &Arc<Gpu>, b: u64| match need.iter_mut().find(|(x, _)| Arc::ptr_eq(x, g)) {

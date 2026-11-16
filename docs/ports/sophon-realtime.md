@@ -119,10 +119,11 @@ Measured on the B65 (GPU 1) with the brain and the talker on the same card (the 
 
 | what | B65 |
 |---|---|
-| load (the release on the 4 TB P310) | 51-60 s: the brain 13 s (page cache warm) to 43 s (cold), the talker 5-7 s, the prompt shapes warmed 18 s |
+| load (the release on the 4 TB P310) | 27-60 s: the brain 13 s (page cache warm) to 43 s (cold), the talker 5-7 s, the prompt shapes warmed 4 s |
 | memory planned / measured | 27.4 GiB planned on one card (brain matrices 18.9 GiB, ear 0.9, KV for 4K + 1K, work, talker 5.5); brain alone (2K context) 21.6 GiB |
 | brain decode | tg 12.3-13.0 tok/s (q4: 19.5 GB read a token, ~250 GB/s) |
-| brain prompt pass | ~2.7 s a pass whatever its rows (27-152): the matrices' expansion to half was the cost (byte loads, 2-byte stores); vectorized since, not yet measured |
+| brain prompt pass (`--stages bench`) | 32 rows 417 ms, 128 rows 456 ms (pp ~280 tok/s), 512 rows 872 ms (pp ~590 tok/s); a layer at 32 rows: the q4 matrices expanded to half 4.6 ms (~210 GB/s written), oneDNN's half products 1.7 ms. Before: 2.7 s a pass whatever its rows (the expansion in byte loads and 2-byte stores), then 1.6 s (products in slices stitched by ~900 2-D copies a pass) |
+| brain decode product (`bench`) | q4 at ~280 GB/s for one row (gate|up 0.57 ms); a pass of 1 row 73 ms |
 | prompt cache | a second turn computes only its new rows (191 positions, 66 computed; 462, 48 after a tool result) |
 | ear | a 2.7 s clip in ~50 ms (warm) |
 | talker | 98 frames (7.8 s of speech) in 2.64 s: real-time factor 0.34; first audio 0.18 s after its first text |

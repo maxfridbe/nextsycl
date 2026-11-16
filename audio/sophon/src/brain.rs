@@ -33,7 +33,9 @@ const EPS: f32 = 1e-6;
 /// prompt rows a pass at most
 pub const CHUNK: usize = 512;
 /// a wide product's matrix expanded to half this much at a time (bytes)
-const SLICE_BYTES: usize = 96 << 20;
+/// (512 MiB: every matrix of the 32B whole - gate|up is 500 MiB in half - so a product is one oneDNN call, its output
+/// in place; slices stitched back by 2-D copies cost a 32-row pass ~1.2 s of its 1.6)
+const SLICE_BYTES: usize = 512 << 20;
 const P: &str = "language_model.model.";
 
 /// The engine's weight layouts (sp.h)
@@ -506,7 +508,8 @@ impl Brain {
             let gb = (m.n * m.k * 2) as f64 / 1e9;
             let mut line = format!("{name:<8} [{} x {}] {}: expand {:.2} ms ({:.0} GB/s written)", m.n, m.k, m.wt.name(), deq * 1e3, gb / deq);
             for rows in [32usize, 128, 512] {
-                let t = time(&mut || d.nsd.linear(d.xh.ptr(), Dt::F16, rows, m.k, d.wh.ptr(), per, none(), d.slice.ptr(), Dt::F32))? * (m.n / per) as f64;
+                // (out into gu: [CHUNK, 2 x ffn] floats, the largest output)
+                let t = time(&mut || d.nsd.linear(d.xh.ptr(), Dt::F16, rows, m.k, d.wh.ptr(), per, none(), d.gu.ptr(), Dt::F32))? * (m.n / per) as f64;
                 line += &format!(", half GEMM {rows}: {:.2} ms", t * 1e3);
             }
             for rows in [1usize, 4] {
@@ -583,7 +586,10 @@ impl Dev {
         let q = heads * HEAD;
         let w = q + 2 * kv * HEAD;
         let widest_k = hidden.max(q).max(ffn);
-        let slice_rows = (SLICE_BYTES / (hidden.min(q).min(ffn) * 2)).max(64);
+        // the expanded matrix: the largest whole when it fits SLICE_BYTES (then no slices to stitch), else a slice
+        let biggest = [w * hidden, hidden * q, 2 * ffn * hidden, hidden * ffn].into_iter().max().unwrap_or(0) * 2;
+        let wh_bytes = biggest.min(SLICE_BYTES) + (64 << 10);
+        let slice_rows = if biggest <= SLICE_BYTES { 1 } else { (SLICE_BYTES / (hidden.min(q).min(ffn) * 2)).max(64) };
         // decode attention splits the keys (scratch): at most 32 chunks a head for up to 4 rows
         let part = ops.sp_attn_scratch(1, heads, kv, HEAD, 1 << 20).max(ops.sp_attn_scratch(4, heads, kv, HEAD, 1 << 20)).max(1);
         Ok(Dev {
@@ -596,7 +602,7 @@ impl Dev {
             gu: DevBuf::f32(g, r * 2 * ffn)?,
             act: DevBuf::f32(g, r * ffn)?,
             tmp: DevBuf::f32(g, r * hidden)?,
-            wh: DevBuf::new(g, SLICE_BYTES + (64 << 10))?,
+            wh: DevBuf::new(g, wh_bytes)?,
             slice: DevBuf::f32(g, r * slice_rows)?,
             part: DevBuf::f32(g, part)?,
             ops,
