@@ -443,7 +443,7 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let e = nextsycl_audio_whisper::Whisper::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_whisper::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else {
-        return Err(format!("check knows {}, {}, {}, {}, {}, {}, {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH,
+        return Err(format!("check knows {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH,
                            nextsycl_audio_voxcpm2::ARCH, nextsycl_audio_breezetts2::ARCH, nextsycl_audio_vibevoice::ARCH, nextsycl_audio_s2pro::ARCH,
                            nextsycl_audio_omnivoice::ARCH,
                            nextsycl_audio_voxtraltts::ARCH, nextsycl_audio_whisper::ARCH, nextsycl_audio_acestep::ARCH, nextsycl_audio_yue2::ARCH,
