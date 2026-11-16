@@ -93,8 +93,9 @@ lighthouse keeper on a drifting space station. Do not stop early."), unique-word
 
 - [x] Flash ported 2026-11-15 (audio/sophon, arch sophon-realtime; docs/ports/sophon-realtime.md): the brain q4 made on
       the card from FP8, the Flash talker, the conversation (VAD, turn question, barge-in, history as audio, tools),
-      /v1/realtime, the wfe Conversation panel, card sophon-realtime-32b-flash. Not deployed. Open: q8 parity on two
-      cards, the last layers' q4 error, speculative drafting, decode speed, Tag / E2E / 4B builds.
+      /v1/realtime, the wfe Conversation panel, card sophon-realtime-32b-flash. Not deployed. q8 matches the reference
+      (logits cos 0.99988); B70 + B65: tg ~21 tok/s, first audio ~1.5 s after the user's last word. Open: q4's error in
+      the last layers, speculative drafting, decode speed, Tag / E2E / 4B builds.
 - [ ] github.com/adventists-ai/sophon-realtime (Apache-2.0 code and weights): a second full-duplex voice system, to
       flesh out the back-and-forth API Haru-4B starts. One 32B "brain" (listens, decides when the user has finished
       via DuplexJev, writes a tagged reply: [laughter], [sigh], <strong>) and three voices for it: Tag (expressive

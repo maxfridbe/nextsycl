@@ -101,7 +101,17 @@ resampled to 16 kHz. `nextsycl audio check <dump> --dir <release> --stages mel,e
 - The turn question over the same clip: P(finished) 0.9980 here, 0.9976 in the reference (logits cos 0.99976).
 - The error is q4's (4-bit codes over FP8 weights, least-squares fitted a group of 32): it is ~3-4 % through the
   stack and grows in the last two layers, where Qwen3's few huge activation channels (|x| ~ 900) meet the
-  quantization. q8 (two cards) is the close one; it has not been run yet (the B70 was serving).
+  quantization. q8 shows the maths is the reference's:
+
+| q8 (both cards, layers 0-29 on the B70, 30-63 and the head on the B65) | rel RMS | cos |
+|---|---|---|
+| brain after layer 0 / 1 / 15 / 31 / 47 | 2.2e-3 / 2.4e-3 / 2.3e-3 / 2.4e-3 / 2.7e-3 | 0.999998 / 0.999997 / 0.999998 / 0.999997 / 0.999997 |
+| brain after layer 62 / 63 | 1.3e-2 / 2.1e-2 | 0.999917 / 0.999776 |
+| logits (the prompt's last row) | 1.7e-2 | 0.999876 |
+
+  Every row's argmax agrees on 141 of 147 (q4: 125); the same next token. Served q4 keeps layers 62 and 63 in q8
+  (`NS_SOPHON_Q8_LAYERS`, +0.4 GiB): logits cos 0.966 -> 0.980, argmax 125 -> 127 of 147 (with layers 0 and 1 in q8
+  too, their residual matches at rel 2.2e-3 / cos 0.999998 - the q8 numbers - on one card).
 
 ## Heard
 
@@ -112,6 +122,14 @@ The answers' audio, written down by the box's Whisper (`nextsycl audio transcrib
 - a two-turn conversation over /v1/realtime (en_know, then en_chat "how are you"): "because sunlight is made up of
   different colors and blue light scatters more in the atmosphere than other colors, making the sky appear blue to
   us." / "I'm doing well thank you for asking, how about you?" - each the text the brain wrote.
+- a barge-in (en_weather spoken 1.5 s into the first answer, no tools offered): the first answer cancelled, then "I
+  don't know the weather in Melbourne tomorrow. You can check a weather app or website for the most accurate
+  information."
+- a tool call (en_weather with a get_weather function; client.py answers the call): "Let me check that." ->
+  get_weather({"city": "Melbourne"}) -> "No, it's not going to rain in Melbourne tomorrow. The forecast is sunny with
+  a high of 21 degrees and a low of 12 degrees."
+- a saved voice (cloned from a 4 s recording): the first answer, word for word.
+- every answer's text and audio agree (`reference/sophon/client.py` sessions on hardac1: ~/src/sophon-out/convo5).
 
 ## Speed and memory (hardac1)
 
@@ -127,17 +145,32 @@ Measured on the B65 (GPU 1) with the brain and the talker on the same card (the 
 | prompt cache | a second turn computes only its new rows (191 positions, 66 computed; 462, 48 after a tool result) |
 | ear | a 2.7 s clip in ~50 ms (warm) |
 | talker | 98 frames (7.8 s of speech) in 2.64 s: real-time factor 0.34; first audio 0.18 s after its first text |
-| first audio after the user stopped | 4.5-6.6 s: the turn check (one prompt pass) was slower than the 2 s fallback, then the reply's prompt pass, 3 tokens, the talker's first frames |
+| turn check | 0.49 s (the ear and a ~100-position pass); on a clip with mid-sentence pauses P(finished) 0.03 / 0.10 / 0.01 at 0.2 / 0.35 / 0.5 s (waits), 1.00 at its end |
+| first audio after the user's speech ended (one card) | ~3.2 s: 0.2 s pause + 0.49 s check, the reply's prompt (144 positions, 0.54 s) and 3 tokens, then the talker - which feeds a text token a frame and waits for the brain (13 tok/s, on the same card) for its first frames, the reply's leading silence trimmed. From the reply's start to its first audio 1.7-2.9 s (`reference/sophon/client.py`: five sessions). Before the prompt-pass fixes: 4.5-6.6 s (the turn check lost to the 2 s fallback) |
 
-Two cards (the card's layout: brain on the B70, talker on the B65) were not measured: the B70 was serving.
+The card's own layout - the brain on the B70, the talker on the B65 (`--gpus 0,1`), q4 with layers 62-63 in q8:
+
+| what | B70 + B65 |
+|---|---|
+| memory planned (checked before loading, 1.5 GiB kept free) | B70 23.0 GiB (brain matrices 19.3 GiB, ear 0.9, KV 4K + 1K, work 1.6); B65 5.2 GiB (talker 3.9, codec 0.7, work) |
+| load | 19 s (the release in page cache; prompt shapes 3.4 s) |
+| brain decode | tg 20.4-21.4 tok/s |
+| brain prompt | pp 306 tok/s (144 new positions), 421 tok/s (267) |
+| turn check | 0.46-0.51 s |
+| from the reply's start to its first audio | 0.80-0.95 s (five sessions); ~1.5 s after the user's last word (0.2 s pause, 0.46 s check, then that) |
+| talker | its own card: frames as the brain's text comes, then 3x real time to the end |
+
+q8 on both cards (no talker): tg 12.5 tok/s (each token hops through the host at the split).
 
 ## Open items
 
-- q8 parity on two cards (the close check of the brain's maths without q4's error), when the B70 is free.
 - The last two layers' q4 error: they are kept in q8 by default now (`NS_SOPHON_Q8_LAYERS=62,63`, +0.4 GiB); the
   logits with them not yet measured.
 - Speed: the brain's decode product reaches about half the B65's bandwidth (tg ~13 tok/s); the prompt pass expands
   every matrix to half per pass (fine at a few hundred rows, wasteful at 30); a q4 XMX prompt product, decode graphs.
+- First audio: the talker takes a text token a frame (Qwen3-TTS's streaming layout) and waits for the brain when it
+  has none, so its first frames come at the brain's pace (13 tok/s on the B65, sharing the card); a faster brain (the
+  B70, its own card), fewer frames before the first codec chunk, and drafting (next item) would each cut it.
 - Speculative drafting (duplex.py's SOPHON_SPEC_AT: a reply drafted from the first 50 ms of a pause, released when
   the turn is judged finished) - not ported; replies start after the turn check.
 - Long replies in segments (segreg.py: a fresh talker context past ~25 s of speech) - not ported (replies are a

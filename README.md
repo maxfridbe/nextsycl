@@ -66,7 +66,7 @@ for a chat model. Measured speeds: tg (token generation, decode) / pp (prompt pr
 | `minimax-music3-int8` | **MiniMax Music 3** songs | a minute of song: 89 s |
 | `yue2-3b-q8` | **YuE2-3B** songs with vocals, English and Mandarin; non-commercial (CC BY-NC 4.0) | 142 s of song: 39 s (B70), 54 s (B65) |
 | `qwen3-tts-custom` | **Qwen3-TTS** speech | a minute of speech: 10.7 s (8.2 s int8); a sentence: 0.64 s |
-| `sophon-realtime-32b-flash` | **Sophon-Realtime** live voice conversation (`/v1/realtime`, OpenAI Realtime events; the audio page's Conversation): a 32B brain that hears you and a voice that laughs; barge-in, tools, cloned voices | B65 (q4): tg ~13 tok/s, speech 3x real time; first audio 4.5-6.6 s after you stop (prompt pass being sped up) |
+| `sophon-realtime-32b-flash` | **Sophon-Realtime** live voice conversation (`/v1/realtime`, OpenAI Realtime events; the audio page's Conversation): a 32B brain that hears you and a voice that laughs; barge-in, tools, cloned voices | B70 brain (q4) + B65 voice: tg ~21 tok/s, a turn check 0.46 s, first audio ~1.5 s after your last word (0.8-0.95 s after it decides to answer) |
 
 The earlier VQ GGUF of V4.1 (1.6-bit experts, tg ~23 tok/s) repeated itself past ~2K tokens and was dropped for Unsloth's: [docs/ports/deepseek41-unsloth.md](docs/ports/deepseek41-unsloth.md).
 
