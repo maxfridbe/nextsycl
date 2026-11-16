@@ -208,7 +208,8 @@ steps).
   `audio serve` (B65, seed 7), Whisper large-v3-turbo heard no tag's word in any of the 13, in a clone or a clone
   with instructions: `[laughter]` +0.54 s of sound (+0.74 s in a clone), `[sigh]` +0.28 s (+0.68 s), the interjections
   as their sounds ("Hmm", "Ah", "Oh", "Ye", "Yo, yo"); `[B EY1 S]` heard as "base"; an untrained `[laugh]` is read
-  ("Well, laugh, that is really funny").
+  ("Well, laugh, that is really funny"). The B70 (the final build, the same requests): the same transcripts, the
+  free-text instructions 400, the card at most 2.4 GiB used.
 - **"ended while loading" on a full B70.** The card said `gpus: '0'`, and the engine's own load check asked the
   weights plus a flat 2 GiB (about 3.6 GiB) against a measured peak of 2.4 GiB - with H3 holding 29 GiB the front
   door (vouching the measured peak) started it, the engine refused with a plain error, and the server ended. Now the
