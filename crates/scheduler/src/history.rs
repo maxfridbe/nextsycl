@@ -241,8 +241,11 @@ impl History {
             samples.iter().copied().reduce(f64::min).zip(samples.iter().copied().reduce(f64::max))
         };
         // wait: nothing when hot; else the work ahead and the model's spin-up (waits of its requests that had to start
-        // it: all of them, failed and cancelled included, over 2 s)
-        let spin: Vec<f64> = self.of(&format!("model|{model}")).into_iter().map(|r| r.wait_s).filter(|w| *w > 2.0).collect();
+        // it: all of them, failed and cancelled included, over 2 s - but not one that never started: a request that failed
+        // with no run waited on something else (cards taken by a test run, no room), and its wait, kept, would refuse
+        // every later request before it could prove otherwise)
+        let spin: Vec<f64> = self.of(&format!("model|{model}")).into_iter().filter(|r| r.outcome == "ok" || r.run_s > 0.0)
+            .map(|r| r.wait_s).filter(|w| *w > 2.0).collect();
         let wait_s = if hot { Some(0.0) } else if !samples.is_empty() && self.whole_runs.iter().any(|m| m == method) { ahead_s } else { ahead_s.and_then(|a| if spin.is_empty() { None } else { Some(a + median(&spin).unwrap_or(0.0)) }) };
         let total_s = wait_s.zip(run_s).map(|(w, r)| w + r);
         json!({"wait_s": wait_s, "run_s": run_s, "total_s": total_s, "samples": samples.len(), "basis": basis,
@@ -345,6 +348,20 @@ mod tests {
         assert!(eta["wait_s"].as_f64().unwrap() >= 30.0, "{eta}");
         h.record(rec(s, 40.0, "ok", 0.0));
         assert_eq!(h.eta("image.generate", "m", &p, true, Some(0.0))["run_s"], 40.0);
+    }
+
+    /// Two requests that failed without running after 900 s waiting on taken cards are not the model's spin-up: they
+    /// would refuse every later request at a 900 s limit (zonos3-mini on hardac1, 2026-11-16)
+    #[test]
+    fn a_wait_that_never_started_is_not_a_spin_up() {
+        let h = mem();
+        let s = "image.generate|m|w=1024,h=1024,steps=28";
+        h.record(rec(s, 0.0, "failed", 900.5));
+        h.record(rec(s, 0.0, "failed", 902.2));
+        h.record(rec(s, 9.0, "ok", 0.4));
+        let p = json!({"width": 1024, "height": 1024, "steps": 28});
+        let eta = h.eta("image.generate", "m", &p, false, Some(0.0));
+        assert!(eta["wait_s"].as_f64().is_none_or(|w| w < 10.0), "{eta}");
     }
 
     #[test]
