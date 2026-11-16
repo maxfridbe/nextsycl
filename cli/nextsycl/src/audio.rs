@@ -33,13 +33,13 @@ nextsycl audio voice enroll NAME [--gpu N] [--steps 2000] [--replace] [--direct]
 nextsycl audio voice rm NAME            (addvoice / clonevoice NAME ... = voice add; designvoice = voice design)
 nextsycl audio transcribe FILE [--model ID | --dir DIR] [--language L] [--translate] [--no-words] [--prompt TEXT] [--opt-NAME VALUE]...
                    [--json] [--gpu N]   (speech to text: a recogniser, whisper-large-v3-turbo; any rate, WAV, MP3, FLAC, Ogg, M4A)
-nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | mel,encoder,logits,transcribe | prompt,lm,head,codec,run | prompt,frames,flow,codec | mel,ear,lm,check,write] [--gpu N | --gpus A,B]
+nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | mel,encoder,logits,transcribe | prompt,lm,head,codec,run | prompt,frames,flow,codec | mel,ear,lm,check,write | prompt,encode,pass,run,codec,post] [--gpu N | --gpus A,B]
 nextsycl audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
 pub fn engines() -> Vec<nextsycl_audio::AudioKind> {
     vec![nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_qwen3tts::kind(), nextsycl_audio_voxcpm2::kind(), nextsycl_audio_breezetts2::kind(),
-         nextsycl_audio_vibevoice::kind(), nextsycl_audio_s2pro::kind(),
+         nextsycl_audio_vibevoice::kind(), nextsycl_audio_s2pro::kind(), nextsycl_audio_omnivoice::kind(),
          nextsycl_audio_voxtraltts::kind(), nextsycl_audio_whisper::kind(), nextsycl_audio_acestep::kind(), nextsycl_audio_yue2::kind(), nextsycl_audio_sophon::kind(), nextsycl_audio_example::kind()]
 }
 
@@ -68,6 +68,8 @@ fn model(cfg: &Config, args: &[String]) -> Result<(Value, ModelFiles), String> {
             (nextsycl_audio_vibevoice::ARCH, f)
         } else if let Ok(f) = nextsycl_audio_s2pro::files_in(dir) {
             (nextsycl_audio_s2pro::ARCH, f)
+        } else if let Ok(f) = nextsycl_audio_omnivoice::files_in(dir) {
+            (nextsycl_audio_omnivoice::ARCH, f)
         } else if let Ok(f) = nextsycl_audio_voxtraltts::files_in(dir) {
             (nextsycl_audio_voxtraltts::ARCH, f)
         } else if dir.join("audiovae.pth").exists() {
@@ -242,6 +244,7 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         "voxcpm2" => 6.25,
         "vibevoice" => 7.5,
         nextsycl_audio_s2pro::ARCH => nextsycl_audio_s2pro::FPS as f64,
+        nextsycl_audio_omnivoice::ARCH => nextsycl_audio_omnivoice::FPS as f64,
         _ if e.speech().is_some() => 12.5,
         _ => 25.0,
     };
@@ -402,6 +405,10 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,frames,codec").split(',').collect();
         let e = nextsycl_audio_s2pro::S2Pro::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_s2pro::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextsycl_audio_omnivoice::ARCH {
+        let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,encode,pass,run,codec,post").split(',').collect();
+        let e = nextsycl_audio_omnivoice::OmniVoice::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextsycl_audio_omnivoice::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else if m["arch"] == nextsycl_audio_voxtraltts::ARCH {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("prompt,frames,flow,codec").split(',').collect();
         let e = nextsycl_audio_voxtraltts::VoxtralTts::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
@@ -438,6 +445,7 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     } else {
         return Err(format!("check knows {}, {}, {}, {}, {}, {}, {}, {}, {}, {} and {} only", nextsycl_audio_minimaxmusic3::ARCH, nextsycl_audio_qwen3tts::ARCH,
                            nextsycl_audio_voxcpm2::ARCH, nextsycl_audio_breezetts2::ARCH, nextsycl_audio_vibevoice::ARCH, nextsycl_audio_s2pro::ARCH,
+                           nextsycl_audio_omnivoice::ARCH,
                            nextsycl_audio_voxtraltts::ARCH, nextsycl_audio_whisper::ARCH, nextsycl_audio_acestep::ARCH, nextsycl_audio_yue2::ARCH,
                            nextsycl_audio_sophon::ARCH));
     };

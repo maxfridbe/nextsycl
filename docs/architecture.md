@@ -74,6 +74,10 @@ audio/                     AUDIO
   s2pro      nextsycl-audio-s2pro  Fish Audio S2 Pro: the Dual-AR's slow (Qwen3, 36 layers) and fast (4 layers) models
                                  from s2.cpp's GGUF, fish-speech's conversation prompt and speaker turns, Fish's RVQ codec
                                  (decoder, encoder, quantizers), stage checks
+  omnivoice  nextsycl-audio-omnivoice  OmniVoice: masked diffusion over the Higgs Audio v2 codec's 8 codebooks by a
+                                 bidirectional Qwen3-0.6B from omnivoice.cpp's GGUFs, the codec's decoder and encoder
+                                 (HuBERT, semantic and DAC encoders, the quantizer), upstream's prompt, length estimate,
+                                 voice-design attributes and post-processing, stage checks
   voxtraltts nextsycl-audio-voxtraltts  Voxtral 4B TTS: the Ministral backbone, the flow-matching acoustic transformer,
                                  the Voxtral codec decoder from CrispASR's GGUF, the preset voices' prompt, stage checks
   sophon     nextsycl-audio-sophon  Sophon-Realtime: the full-duplex conversation (Conversation: VAD, turn question,
@@ -533,6 +537,19 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   convolutions and the shared Snake / norms / linear layers; its quantizers on the host. Draws on the host (upstream's
   top-p before the temperature, repetition-aware resampling of the first code). Per-request options: `NS_S2P_GREEDY`,
   `NS_S2P_TEMPERATURE`, `NS_S2P_TOP_P`, `NS_S2P_TOP_K`.
+- **omnivoice** - OmniVoice from omnivoice.cpp's two GGUFs (the backbone and the Higgs Audio v2 codec; any of the
+  release's F32 / BF16 / Q8_0 / Q4_K_M variants, the vocabulary in the backbone's file). The backbone (Qwen3-0.6B, 28
+  layers) runs bidirectionally with no cache: each of the 32 steps is one pass over the conditional sequence (style
+  and text tokens, a recording's codes, the target) and the unconditional one (the target alone) side by side - the
+  products over all the rows, the attention each sequence on its own (the shared fused attention after the 8 key /
+  value heads are laid beside the 16 query heads). Its matrices are expanded to half at load (the shared dequant), the
+  residual stream float32. Its kernels (`kernels/audio/omnivoice`): the audio rows' embeddings (eight codebooks' rows
+  summed), the grouped heads laid out for the attention, the step's scores (guided log-softmax, the best code and its
+  log probability a position), GroupNorm a channel and ELU for the encoder; the products, norms, rotary positions,
+  attention, GELU and Snake are the shared diffusion kernels, the convolutions the MiniMax Music engine's on oneDNN
+  (float32). The unmasking (layer penalty, Gumbel noise on the positions, the schedule), the quantizer's nearest codes
+  and upstream's pydub silence trimming run on the host. Per-request options: `NS_OV_SPEED`, `NS_OV_DURATION`,
+  `NS_OV_T_SHIFT`, `NS_OV_LAYER_PENALTY`, `NS_OV_POSITION_TEMPERATURE`, `NS_OV_DENOISE`, `NS_OV_POSTPROCESS`.
 - **voxtraltts** - Voxtral 4B TTS 2603 from CrispASR's GGUF (q8_0 served, f16 for parity; F16 / Q8_0 / Q4_0 / Q4_K
   expanded to half at load; the Tekken vocabulary, the 20 preset voices and the codec in the file; the text embedding
   and the voices read from the file a row at a time). The backbone (Ministral 3B, adjacent-pair RoPE made rotate-half

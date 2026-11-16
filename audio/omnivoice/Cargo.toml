@@ -1,0 +1,16 @@
+[package]
+name = "nextsycl-audio-omnivoice"
+description = "OmniVoice on Intel Arc (SYCL): zero-shot speech in 646 languages at 24 kHz - masked diffusion over the Higgs Audio v2 codec's 8 codebooks by a bidirectional Qwen3-0.6B; voices cloned from a recording and its transcript or designed from attributes, non-verbal tags"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true
+nextsycl-audio.workspace = true
+serde_json.workspace = true
+fancy-regex = "0.14"
+unicode-normalization = "0.1"

@@ -1,0 +1,39 @@
+# OmniVoice Q8_0 (zero-shot speech in 646 languages, 24 kHz: voices cloned from a recording or designed from attributes;
+# non-verbal tags; non-commercial)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# License: the weights (and omnivoice.cpp's GGUF conversion of them) are CC BY-NC 4.0 - no commercial use (the training
+# data's terms, Emilia among them); upstream's code Apache 2.0, the Higgs Audio v2 codec Apache 2.0. See the guide.
+id: omnivoice
+kind: audio
+arch: omnivoice
+title: 'OmniVoice Q8_0 (speech in 646 languages, 24 kHz: voices cloned from a recording and its transcript or designed from attributes, non-verbal tags; non-commercial)'
+about: 'OmniVoice (k2-fsa / Xiaomi, 2026): a diffusion-language-model TTS - a bidirectional Qwen3-0.6B unmasks the 8 codebooks of the Higgs Audio v2 codec (25 frames a second) in 32 guided steps, the length set up front from the text; the codec''s decoder makes 24 kHz sound. omnivoice.cpp''s Q8_0 GGUFs (the backbone Q8_0, the codec''s convolutions half), expanded to half on the card. Voice cloning from a recording and its transcript, voice design from attributes (male / female; child to elderly; five pitches; whisper; ten English accents; twelve Chinese dialects), the two together, the model''s own voice otherwise; non-verbal tags ([laughter], [sigh], [question-en] ...); 646 languages. No built-in voices, no free-form instructions. Weights: CC BY-NC 4.0 (non-commercial)'
+license: cc-by-nc-4.0
+commercial: false
+license_note: 'the weights CC BY-NC 4.0 (k2-fsa / Xiaomi; the training data''s terms); upstream''s code Apache 2.0, the Higgs Audio v2 codec (Boson AI) Apache 2.0, the GGUF conversion''s tooling (omnivoice.cpp) MIT'
+gpus: '0'
+vram_gib: 3.5                   # its memory on the card when it runs (measured: see docs/ports/omnivoice.md)
+speech:
+- clone                         # a recording, or a saved voice, with its transcript
+- design                        # a voice from attributes alone (instructions)
+- direction                     # a clone steered by attributes (instructions)
+- events                        # non-verbal tags in the text
+- transcript                    # a clone needs what the recording says (saved voices without it go elsewhere)
+defaults:
+  steps: 32
+  cfg: 2.0
+env: {}
+files:
+  model:
+    key: omnivoice-base-q8
+    url: https://huggingface.co/Serveurperso/OmniVoice-GGUF/resolve/017094167b5c9ed565a5076ac9b3b93c5ecf5c73/omnivoice-base-Q8_0.gguf
+    size: 656395008
+    sha256: 2882d887921798aea13d45236556bdf8012842ab6f8cd2690943eead6289f298
+    path: omnivoice/omnivoice-base-Q8_0.gguf
+  codec:
+    key: omnivoice-tokenizer-q8
+    url: https://huggingface.co/Serveurperso/OmniVoice-GGUF/resolve/017094167b5c9ed565a5076ac9b3b93c5ecf5c73/omnivoice-tokenizer-Q8_0.gguf
+    size: 288889600
+    sha256: 75204fa566a8e30984e7a1066da6557184c9fd099c8f1bc0cb5b9415edfec255
+    path: omnivoice/omnivoice-tokenizer-Q8_0.gguf
+guide: guides/omnivoice.md

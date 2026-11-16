@@ -50,7 +50,7 @@ fn engines() -> Vec<(&'static str, Vec<&'static str>)> {
         v.push(("image", k.archs.to_vec()));
     }
     for k in [nextsycl_audio_minimaxmusic3::kind(), nextsycl_audio_qwen3tts::kind(), nextsycl_audio_voxcpm2::kind(), nextsycl_audio_breezetts2::kind(),
-              nextsycl_audio_vibevoice::kind(), nextsycl_audio_s2pro::kind(), nextsycl_audio_voxtraltts::kind(), nextsycl_audio_whisper::kind(),
+              nextsycl_audio_vibevoice::kind(), nextsycl_audio_s2pro::kind(), nextsycl_audio_omnivoice::kind(), nextsycl_audio_voxtraltts::kind(), nextsycl_audio_whisper::kind(),
               nextsycl_audio_acestep::kind(), nextsycl_audio_yue2::kind(), nextsycl_audio_sophon::kind(), nextsycl_audio_example::kind()] {
         v.push(("audio", k.archs.to_vec()));
     }

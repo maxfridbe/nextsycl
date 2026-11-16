@@ -52,6 +52,7 @@ nextsycl-audio-voxcpm2.workspace = true
 nextsycl-audio-breezetts2.workspace = true
 nextsycl-audio-vibevoice.workspace = true
 nextsycl-audio-s2pro.workspace = true
+nextsycl-audio-omnivoice.workspace = true
 nextsycl-audio-voxtraltts.workspace = true
 nextsycl-audio-whisper.workspace = true
 nextsycl-audio-acestep.workspace = true

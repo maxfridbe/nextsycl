@@ -293,6 +293,43 @@ nextsycl audio check <reference dump dir> --model s2-pro [--stages prompt,frames
   `ref_text` or a saved `voice` with its transcript, `instructions` as a tag, `seconds`, `seed`, `options`) and
   `:8000`'s `audio.speak`.
 
+## OmniVoice
+
+OmniVoice (`audio/omnivoice`, k2-fsa / Xiaomi; omnivoice.cpp's GGUFs of it): zero-shot speech in 646 languages at
+24 kHz, a diffusion language model - a bidirectional Qwen3-0.6B unmasks the 8 codebooks of the Higgs Audio v2 codec
+(25 frames a second) in 32 guided steps, the length set before it starts. What it really does:
+
+- **clone** (`--ref-audio` + `--ref-text`, or a saved voice with its transcript): yes; the transcript is required.
+- **design** (`--instructions` alone): yes, from a fixed set of attributes - male / female; child, teenager, young
+  adult, middle-aged, elderly; five pitches; whisper; ten English accents; twelve Chinese dialects (or their Chinese
+  names). Free-form descriptions are refused with the list (the model knows only these).
+- **direction**: a clone plus attributes (consistent ones steady it: a dialect recording and the dialect).
+- **non-verbal tags** in the text: `[laughter]`, `[sigh]`, `[question-en]`, `[surprise-ah]` ... (13).
+- **auto**: neither - the model's own voice for the text (it changes with the seed).
+- **no built-in voices**; 646 languages by name or id (`--language`), auto otherwise.
+
+**License: the weights are CC BY-NC 4.0 - non-commercial** (upstream's code Apache 2.0, the codec Apache 2.0).
+
+```sh
+nextsycl models pull omnivoice
+nextsycl audio gen "The lighthouse keeper counted the ships." --model omnivoice --instructions "male, elderly, low pitch" [--language en]
+nextsycl audio gen "Every morning I walk to the bakery." --model omnivoice --ref-audio r.wav --ref-text "what it says"
+nextsycl audio gen "That is the funniest thing [laughter] tell me again." --model omnivoice [--seed N] [--steps 16]
+                   [--opt-speed 1.2 | --opt-duration 6] [--opt-position-temperature 0] [--opt-postprocess 0]
+nextsycl audio check <reference dump dir> --model omnivoice [--stages prompt,encode,pass,run,codec,post]
+```
+
+- **Ported**: the backbone's matrices expanded to half at load (any of the release's F32 / BF16 / Q8_0 / Q4_K_M), a
+  step one pass over the conditional and unconditional sequences side by side; the codec's decoder and its whole
+  encoder (HuBERT, the semantic and DAC encoders, the quantizer) in float32; upstream's prompt, length estimate,
+  attribute rules, unmasking schedule, long-text chunks and pydub post-processing.
+- **Checked** against upstream's code (`reference/omnivoice/ref.py`, CPU float32, five cases incl. a Chinese design
+  and a clone): prompts identical; logits 2.3-2.5e-4 (F32 files, teacher forced); a recording's 1,912 codes all
+  identical; the decoder 1-2e-6; the post-processing exact. Real clips transcribe word for word. Details and the
+  served Q8_0 file's numbers: [docs/ports/omnivoice.md](ports/omnivoice.md).
+- **Served** like the other speech models: `nextsycl audio serve omnivoice` (`/v1/audio/speech`) and `:8000`'s
+  `audio.speak`.
+
 ## Voxtral TTS
 
 Voxtral 4B TTS 2603 (`audio/voxtraltts`, Mistral; CrispASR's GGUF of it): speech at 24 kHz in English, French,
