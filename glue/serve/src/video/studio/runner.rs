@@ -454,8 +454,11 @@ impl Studio {
         }
         let elapsed = now() - job.rec["started"].as_f64().unwrap_or(now());
         let frames = frames_of(job.rec["seconds"].as_f64().unwrap_or(5.0));
+        let regen = !s(&job.rec, "regen2k").is_empty();
         let eta = if done || failed {
             0.0
+        } else if regen {
+            regen_eta(&job.rec, elapsed, has("tokens :"), j["progress"]["done"].as_f64(), j["progress"]["total"].as_f64(), has("sampled:"))
         } else if steps_done > 0 && steps_done < steps_total {
             let per = (elapsed - 30.0).max(1.0) / steps_done as f64;
             per * (steps_total - steps_done) as f64 + 0.15 * frames as f64
@@ -603,9 +606,10 @@ impl Studio {
         let mut st = self.st.lock().unwrap();
         let es = self.engine_state();
         self.refresh(&mut st, es.as_ref());
-        // the watchdog: no new log line for the stall time -> stop it (becomes a failure -> the retry path)
+        // the watchdog: no new log line and no progress for the stall time -> stop it (becomes a failure -> the retry path).
+        // Progress counts: a 2K regeneration's step is ~10 min of blocks with no line between (its engine reports each block)
         for j in &mut st.running {
-            let n = j.last["log"].as_array().map_or(0, |a| a.len());
+            let n = j.last["log"].as_array().map_or(0, |a| a.len()) + j.last["progress"]["done"].as_u64().unwrap_or(0) as usize * 100_000;
             if n != j.stall.0 {
                 j.stall = (n, now());
             } else if now() - j.stall.1 > self.stall_s as f64 && j.last["state"] == "running" {
@@ -660,6 +664,32 @@ impl Studio {
             std::thread::sleep(Duration::from_secs(1));
             self.tick();
         }
+    }
+}
+
+/// A 2K regeneration's whole time, before it has a history: measured on the B65 2026-11-16 (docs/ports/open-h3-regenerate-2k.md)
+/// per window ~2,040 s (its text encoder ~157, three steps of 177k tokens ~1,880), and per draft frame ~1.8 s (the VAE
+/// encode and the 2K decode), plus ~40 s of LoRAs and time tables
+pub fn regen_estimate_s(frames: f64, windows: f64, steps_per_window: f64) -> f64 {
+    40.0 + windows * (160.0 + 627.0 * steps_per_window) + 1.8 * frames
+}
+
+/// A running regeneration's time left: the estimate less what has gone before it samples; while it samples, its blocks'
+/// pace (the engine reports each: `progress`) for the rest, then the decode
+fn regen_eta(rec: &Value, elapsed: f64, sampling: bool, done: Option<f64>, total: Option<f64>, sampled: bool) -> f64 {
+    let frames = rec["frames"].as_f64().unwrap_or(124.0);
+    let windows = rec["regen_windows"].as_f64().unwrap_or(1.0).max(1.0);
+    let per_window = rec["steps"].as_f64().unwrap_or(3.0) / windows;
+    if sampled {
+        return (1.1 * frames).max(10.0);
+    }
+    match (sampling, done, total) {
+        (true, Some(d), Some(t)) if d > 0.0 && t > d => {
+            // the time before sampling: the encode and the first window's text encoder
+            let before = 40.0 + 0.8 * frames + 160.0;
+            (elapsed - before).max(1.0) / d * (t - d) + 1.1 * frames
+        }
+        _ => (regen_estimate_s(frames, windows, per_window) - elapsed).max(60.0),
     }
 }
 

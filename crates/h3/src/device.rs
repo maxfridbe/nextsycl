@@ -141,6 +141,14 @@ impl Device {
         self.check(unsafe { (self.api.upload_wait)(self.ctx) })
     }
 
+    /// The kernels' scratch, grown to the largest call so far (the int8 linears' row copies, the attention's buffers,
+    /// cached primitives), given back to the card after what is queued has run: between two long sequences that must
+    /// each have the card (a 2K regeneration's windows)
+    pub fn trim(&self) -> Result<()> {
+        // SAFETY: this device's context; the library waits for its queues first.
+        self.check(unsafe { (self.api.trim)(self.ctx) })
+    }
+
     /// Whether `other` is this same context (a cache tied to one context checks it).
     pub fn same(&self, other: &Device) -> bool {
         std::ptr::eq(self.ctx, other.ctx)

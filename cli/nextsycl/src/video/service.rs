@@ -30,7 +30,10 @@ use serde_json::Value;
 use super::client;
 use crate::container::{mount, Ce, SOCKET_DIR_IN};
 
-pub const ENGINE: &str = "nextsycl-video";
+/// The video engine's container: `nextsycl-video` after NS_CONTAINER_PREFIX (a build copy's test daemon beside production's)
+pub fn engine() -> String {
+    format!("{}nextsycl-video", std::env::var("NS_CONTAINER_PREFIX").unwrap_or_default())
+}
 
 pub fn socket(cfg: &Config) -> PathBuf {
     cfg.socket_dir().join("video.sock")
@@ -105,7 +108,7 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
     let (_, opts) = super::kind_and_options(&m)?;
 
     let ce = Ce::new(cfg)?;
-    if ce.running(ENGINE) {
+    if ce.running(&engine()) {
         println!("the video engine is already running");
         return client::status(&["--no-stream".into()], &|| String::new());
     }
@@ -115,14 +118,14 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
             return Err(format!("{}: not built yet (./build.sh)", cfg.dist.join(f).display()));
         }
     }
-    ce.remove(ENGINE); // a stopped one from before
+    ce.remove(&engine()); // a stopped one from before
     let out = out_dir(cfg);
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let sock_dir = cfg.socket_dir();
     std::fs::create_dir_all(&sock_dir).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(socket(cfg));
 
-    let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--init".into(), "--name".into(), ENGINE.into(), "--network".into(), "host".into()];
+    let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--init".into(), "--name".into(), engine(), "--network".into(), "host".into()];
     // a stop waits for the running job's next step boundary (about a second at production size), then unloads
     args.extend(["--stop-timeout".into(), "150".into()]);
     args.extend(ce.user_args());
@@ -194,16 +197,16 @@ pub fn start(cfg: &Config, raw: &[String]) -> Result<(), String> {
 /// `nextsycl video stop`: the running jobs stop at their next step boundary, the engines unload, the daemon ends
 pub fn stop(cfg: &Config) -> Result<(), String> {
     let ce = Ce::new(cfg)?;
-    if ce.running(ENGINE) {
+    if ce.running(&engine()) {
         let _ = client::post("/engine/shutdown", None);
         let t0 = Instant::now();
-        while ce.running(ENGINE) && t0.elapsed() < Duration::from_secs(150) {
+        while ce.running(&engine()) && t0.elapsed() < Duration::from_secs(150) {
             std::thread::sleep(Duration::from_millis(500));
         }
-        if ce.running(ENGINE) {
-            ce.stop(ENGINE, 150); // the backstop: SIGTERM means the same to the daemon
+        if ce.running(&engine()) {
+            ce.stop(&engine(), 150); // the backstop: SIGTERM means the same to the daemon
         }
-        ce.remove(ENGINE);
+        ce.remove(&engine());
         println!("video engine: stopped");
     } else {
         println!("video engine: not running");
@@ -246,11 +249,11 @@ pub fn gpus(cfg: &Config, raw: &[String]) -> Result<(), String> {
 /// `nextsycl video logs`: the daemon's, followed
 pub fn logs(cfg: &Config) -> Result<(), String> {
     let ce = Ce::new(cfg)?;
-    let st = ce.cmd().args(["logs", "-f", ENGINE]).status().map_err(|e| e.to_string())?;
+    let st = ce.cmd().args(["logs", "-f", &engine()]).status().map_err(|e| e.to_string())?;
     if st.success() {
         Ok(())
     } else {
-        Err(format!("no log for {ENGINE} (is it running?)"))
+        Err(format!("no log for {} (is it running?)", engine()))
     }
 }
 

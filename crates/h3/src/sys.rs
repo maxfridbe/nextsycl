@@ -37,6 +37,8 @@ pub struct Api {
     pub free_host: unsafe extern "C" fn(*mut c_void, *mut c_void),
     pub upload: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, u64) -> c_int,
     pub upload_wait: unsafe extern "C" fn(*mut c_void) -> c_int,
+    /// the kernels' grown scratch given back (row-chunk copies, attention buffers, cached primitives)
+    pub trim: unsafe extern "C" fn(*mut c_void) -> c_int,
     #[allow(clippy::type_complexity)]
     pub int8_linear: unsafe extern "C" fn(
         *mut c_void,    // ctx
@@ -204,6 +206,7 @@ impl Api {
             free_host: sym!("nsd_free_host"),
             upload: sym!("nsd_upload"),
             upload_wait: sym!("nsd_upload_wait"),
+            trim: sym!("nsd_trim"),
             int8_linear: sym!("nsd_int8_linear"),
             linear: sym!("nsd_linear"),
             linear_acc: sym!("nsd_linear_acc"),

@@ -5,8 +5,10 @@
 use std::process::Command;
 use std::sync::OnceLock;
 
-/// The video daemon's container (`nextsycl video start`)
-pub const DAEMON: &str = "nextsycl-video";
+/// The video daemon's container (`nextsycl video start`), after NS_CONTAINER_PREFIX
+pub fn daemon() -> String {
+    format!("{}nextsycl-video", std::env::var("NS_CONTAINER_PREFIX").unwrap_or_default())
+}
 
 /// Whether this host's ffmpeg decodes H.264 and encodes it with libx264
 pub fn host_h264() -> bool {
@@ -24,6 +26,6 @@ pub fn tool(name: &str) -> Command {
     }
     let engine = std::env::var("NS_CONTAINER_ENGINE").unwrap_or_else(|_| "podman".into());
     let mut c = Command::new(engine);
-    c.args(["exec", "-i", DAEMON, name]);
+    c.args(["exec", "-i", &daemon(), name]);
     c
 }

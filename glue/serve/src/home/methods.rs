@@ -2660,7 +2660,7 @@ pub struct VideoGenerateReq {
     #[serde(rename = "ref_videos", default, skip_serializing_if = "Option::is_none")]
     #[schema(max_items = 3)]
     pub ref_videos: Option<Vec<String>>,
-    /// anchor or file: a 768p draft clip (1344x768, at least 113 frames at 24 fps; an H3 clip of 5.17 s) made again at 2560x1440 by Open-H3-Regenerate-2K-IC (feature video.regen2k: the minimax-h3-regen2k-ic model) - its faces, lip sync, lettering and layout kept, its own sound laid back under it, its first 124 frames. prompt is the draft's caption (the prompt it was made from, unchanged); width, height, seconds, steps, references and control are its own. About half an hour a clip on the B70
+    /// anchor or file: a draft clip made again at 2560x1440 by Open-H3-Regenerate-2K-IC (feature video.regen2k: the minimax-h3-regen2k-ic model) - its faces, lip sync, lettering and layout kept, its own sound laid back under it, all of it: 4.7 to 15.1 s, landscape 16:9 within 10% (any size: it is cover-fitted to the model's 1344x768; 864x480 works); refused with a 400 otherwise. Past 124 frames (5.17 s) it goes in overlapping windows of the model's own clip (10 s: two). prompt is the draft's caption (the prompt it was made from, unchanged); width, height, seconds, steps, references and control are its own. About 38 min a 5 s window on the B65 (the answer's eta: basis estimate until it has a history)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regen2k: Option<String>,
     /// with regen2k: up3 (default: the upscaled draft noised to 0.835, 3 steps) | up4 (from 0.923, 4 steps) | hf8 (8 steps from noise)
@@ -3088,7 +3088,7 @@ fn system_unpin(h: &Arc<Home>, req: SystemUnpinReq) -> Answer {
     h.legacy("system.unpin", req)
 }
 
-/// The ETA a request would get now - {wait_s, run_s, total_s, samples, basis (shape | model | none), spread} from the last 100 requests of its shape - and whether max_willing_to_wait_s would accept it; nothing is started, queued or loaded, so a caller can ask first and choose another machine
+/// The ETA a request would get now - {wait_s, run_s, total_s, samples, basis (shape | model | estimate: a measured first figure, a 2K regeneration with no history yet | none), spread} from the last 100 requests of its shape - and whether max_willing_to_wait_s would accept it; nothing is started, queued or loaded, so a caller can ask first and choose another machine
 #[rpc(name = "system.eta", tags = "system", example = r#"{"method": "image.generate", "params": {"width": 1024, "height": 1024, "steps": 28}, "max_willing_to_wait_s": 120}"#)]
 fn system_eta(h: &Arc<Home>, req: SystemEtaReq) -> Answer {
     h.legacy("system.eta", req)

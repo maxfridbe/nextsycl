@@ -133,7 +133,9 @@ fn clip_model(row: &Value, all: &[Value]) -> Option<String> {
     let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "video" && m["enabled"] != false).collect();
     let id_with = |w: &str| on.iter().find(|m| s(m, "id").to_lowercase().contains(w)).map(|m| s(m, "id"));
     let engine = s(row, "engine").trim().to_uppercase();
-    let named = if engine == "REF2VA" || row["ref_images"].is_array() || row["ref_videos"].is_array() {
+    let named = if engine == "REGEN2K" || row["regen2k"].as_str().is_some_and(|d| !d.trim().is_empty()) {
+        id_with("regen2k")
+    } else if engine == "REF2VA" || row["ref_images"].is_array() || row["ref_videos"].is_array() {
         id_with("ref2va")
     } else if engine.is_empty() || engine == "INT8" || engine == "Q8_0" {
         None
@@ -141,6 +143,24 @@ fn clip_model(row: &Value, all: &[Value]) -> Option<String> {
         id_with(&engine.to_lowercase().replace('_', ""))
     };
     named.or_else(|| on.iter().find(|m| m["id"] == "minimax-h3").or(on.first()).map(|m| s(m, "id")))
+}
+
+/// A 2K regeneration's ETA before its model has a history: the measured first estimate (studio/runner.rs
+/// `regen_estimate_s`) from the clip's frames and windows when the studio has counted them (a queued item), else one window
+/// of 124 frames; `basis` says "estimate". Other clips, or one with a history, are left as they are.
+fn regen_first_estimate(eta: &mut Value, body: &Value) {
+    if body["regen2k"].as_str().is_none_or(|d| d.trim().is_empty()) || eta["basis"] != "none" {
+        return;
+    }
+    let frames = body["frames"].as_f64().unwrap_or(124.0);
+    let windows = body["regen_windows"].as_f64().unwrap_or(1.0).max(1.0);
+    let per = body["steps"].as_f64().map_or(3.0, |s| s / windows);
+    let run = crate::video::studio::runner::regen_estimate_s(frames, windows, per);
+    eta["run_s"] = json!(run.round());
+    eta["basis"] = json!("estimate");
+    if let Some(w) = eta["wait_s"].as_f64() {
+        eta["total_s"] = json!((w + run).round());
+    }
 }
 
 /// Whether the daemon lacks an enabled model's engine (`running`: its engines; none: it is down)
@@ -362,7 +382,9 @@ impl Home {
         let remaining = rows.iter().map(|c| c["eta"].as_f64().map(|e| e.max(0.0))).collect::<Option<Vec<f64>>>()?;
         let mut queued = Vec::new();
         for it in st["queue_items"].as_array().into_iter().flatten().filter(|i| i["held"] != true) {
-            queued.push(self.history.eta("video.generate", model, it, true, Some(0.0))["run_s"].as_f64()?);
+            let mut e = self.history.eta("video.generate", model, it, true, Some(0.0));
+            regen_first_estimate(&mut e, it);
+            queued.push(e["run_s"].as_f64()?);
         }
         let wait = clip_wait(&remaining, slots_free(&st), &queued);
         let chained = gate.filter(|g| g["gate"] == "series" || g["gate"] == "all").map_or(0.0, |g| {
@@ -405,7 +427,11 @@ impl Home {
                 (hot, if hot { Some(0.0) } else { self.clips_ahead_s(&model, gate.as_ref()) })
             }
         };
-        self.history.eta(method, &model, b, hot, ahead)
+        let mut eta = self.history.eta(method, &model, b, hot, ahead);
+        if method == "video.generate" {
+            regen_first_estimate(&mut eta, b);
+        }
+        eta
     }
 
     /// `system.eta {method, params, model, max_willing_to_wait_s}`: read-only
@@ -498,7 +524,9 @@ impl Home {
 
     /// A clip the studio took: its eta on the answer, the door watching it when it promised anything
     pub(super) fn video_taken(&self, b: &Value, sent: &Value, r: &mut Value) {
-        r["eta"] = self.eta_for("video.generate", sent, None);
+        // a regeneration's size is the studio's to know (its draft's length, its windows): its item answers for it
+        let item = if r["job"]["regen2k"].is_string() { r["job"].clone() } else { sent.clone() };
+        r["eta"] = self.eta_for("video.generate", &item, None);
         let again = r["reentered"] == true;
         // a clip re-entered: named by what it is called there (the door may have made up a label for the request), and past
         // any limit: the limit is on starting a clip, and this one was taken
@@ -531,7 +559,9 @@ impl Home {
         let all = self.models();
         let run_of = |it: &Value| -> Value {
             let id = clip_model(it, &all).unwrap_or_default();
-            self.history.eta("video.generate", &id, it, true, Some(0.0))
+            let mut e = self.history.eta("video.generate", &id, it, true, Some(0.0));
+            regen_first_estimate(&mut e, it);
+            e
         };
         let r = &mut v["result"];
         match method {
@@ -781,6 +811,25 @@ mod tests {
         assert_eq!(clip_model(&json!({"engine": "Q6_K"}), &all).as_deref(), Some("minimax-h3-q6k"));
         assert_eq!(clip_model(&json!({"ref_images": []}), &all).as_deref(), Some("minimax-h3-ref2va"));
         assert_eq!(clip_model(&json!({"prompt": "x"}), &[json!({"id": "other", "kind": "video"})]).as_deref(), Some("other"), "no minimax-h3: the first");
+    }
+
+    /// A 2K regeneration runs on its own model (its ETA history apart from H3's 45 s clips) and, with no history, is given
+    /// the measured first figure for its length
+    #[test]
+    fn a_regeneration_has_its_own_model_and_a_first_estimate() {
+        let all = vec![json!({"id": "minimax-h3", "kind": "video"}), json!({"id": "minimax-h3-regen2k-ic", "kind": "video"})];
+        assert_eq!(clip_model(&json!({"regen2k": "h3_x.mp4", "prompt": "p"}), &all).as_deref(), Some("minimax-h3-regen2k-ic"));
+        assert_eq!(clip_model(&json!({"engine": "REGEN2K"}), &all).as_deref(), Some("minimax-h3-regen2k-ic"));
+        let mut e = json!({"basis": "none", "run_s": null, "wait_s": 0.0});
+        regen_first_estimate(&mut e, &json!({"regen2k": "d.mp4", "frames": 243, "regen_windows": 2, "steps": 6}));
+        assert_eq!(e["basis"], "estimate");
+        assert!((4200.0..4800.0).contains(&e["run_s"].as_f64().unwrap()), "{e}");
+        let mut e = json!({"basis": "none", "run_s": null, "wait_s": 0.0});
+        regen_first_estimate(&mut e, &json!({"regen2k": "d.mp4"}));
+        assert!((2200.0..2400.0).contains(&e["run_s"].as_f64().unwrap()), "one window, as measured (2,311 s): {e}");
+        let mut e = json!({"basis": "shape", "run_s": 2000.0});
+        regen_first_estimate(&mut e, &json!({"regen2k": "d.mp4"}));
+        assert_eq!(e["run_s"], 2000.0, "a history wins");
     }
 }
 

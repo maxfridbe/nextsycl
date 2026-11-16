@@ -65,7 +65,10 @@ pub struct RegenSpec<'a> {
     pub lq: (usize, usize),
     pub target: (usize, usize),
     pub keep_h: usize,
-    pub frames: usize,
+    /// the frames of one window (124: the model's clip; small checks use fewer) and at most how many of the draft are read
+    /// (None: all of it, up to MAX_FRAMES)
+    pub window: usize,
+    pub limit: Option<usize>,
     pub te: TeFiles<'a>,
     /// the H3 VAE (its encoder and its decoder)
     pub vae: &'a Path,
@@ -104,19 +107,79 @@ fn silence(path: &Path, at: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// The draft: `frames` frames at 24 fps cover-fitted to the canvas, the last real one repeated; (pixels, real frames)
-fn read_draft(path: &Path, (w, h): (usize, usize), frames: usize) -> Result<(Vec<f32>, usize)> {
-    let (mut px, got) = crate::media::read_frames_at(path, w, h, crate::media::Fit::Cover, Some((24.0, frames)))?;
-    if got < MIN_REAL.min(frames) {
+/// The longest draft taken: H3's own longest clip (15.1 s at 24 fps, 17k + 5)
+pub const MAX_FRAMES: usize = 362;
+
+/// How far a draft's aspect may be from 16:9 (it is cover-fitted to 1344x768: more would crop away much of it)
+pub const ASPECT_SLACK: f64 = 0.10;
+
+/// The frame grid a draft of `real` frames is made on, at least one window of `window` frames: (frames, latent frames)
+pub fn grid(real: usize, window: usize) -> (usize, usize) {
+    let mut n = real.max(window);
+    while n % 17 != 5 {
+        n += 1;
+    }
+    (n, (n - 5) / 17 * 5 + 2)
+}
+
+/// The windows over `lt` latent frames, `wl` each (the model's 124-frame clip is 37): (first latent frame, frames kept
+/// from the window before). Starts are group starts (multiples of 5: 17 pixel frames), spread evenly, the last ending
+/// with the draft, consecutive windows overlapping by at least 2 latent frames (all of the overlap kept from the window
+/// before, which made them). The front door's ETA and the studio count them the same way (glue/serve video/studio/queue.rs).
+pub fn windows(lt: usize, wl: usize) -> Vec<(usize, usize)> {
+    if lt <= wl {
+        return vec![(0, 0)];
+    }
+    let span = lt - wl;
+    let n = (lt - 2).div_ceil(wl - 2);
+    let mut out = Vec::with_capacity(n);
+    let mut prev_end = 0;
+    for i in 0..n {
+        let s = if i + 1 == n { span } else { (span * i / (n - 1)) / 5 * 5 };
+        out.push((s, if i == 0 { 0 } else { prev_end - s }));
+        prev_end = s + wl;
+    }
+    out
+}
+
+/// The draft at 24 fps cover-fitted to the canvas, every frame (at most `limit`): (pixels, real frames). Too short, too
+/// long, or far from 16:9: refused, saying why.
+fn read_draft(path: &Path, (w, h): (usize, usize), limit: Option<usize>) -> Result<(Vec<f32>, usize)> {
+    let (vw, vh) = crate::media::size(path)?;
+    let aspect = (vw as f64 / vh as f64) / (w as f64 / h as f64);
+    if (aspect - 1.0).abs() > ASPECT_SLACK {
+        return Err(Error(format!("{}: a {vw}x{vh} draft; regen2k takes landscape 16:9 drafts (cover-fitted to {w}x{h}: this one would lose {:.0}% of its picture)",
+                                 path.display(), (1.0 - 1.0 / aspect.max(1.0 / aspect)) * 100.0)));
+    }
+    let cap = limit.unwrap_or(MAX_FRAMES + 1);
+    let (px, got) = crate::media::read_frames_at(path, w, h, crate::media::Fit::Cover, Some((24.0, cap)))?;
+    if limit.is_none() && got > MAX_FRAMES {
+        return Err(Error(format!("{}: over {MAX_FRAMES} frames at 24 fps ({:.1} s); regen2k takes drafts up to {:.1} s", path.display(), got as f64 / 24.0,
+                                 MAX_FRAMES as f64 / 24.0)));
+    }
+    if got < MIN_REAL.min(limit.unwrap_or(MIN_REAL)) {
         return Err(Error(format!("{}: {got} frames at 24 fps; the model needs at least {MIN_REAL} (about 4.7 s)", path.display())));
     }
-    let fsz = w * h * 3;
-    let last = px[(got - 1) * fsz..got * fsz].to_vec();
-    for _ in got..frames {
-        px.extend_from_slice(&last);
-    }
-    px.truncate(frames * fsz);
     Ok((px, got))
+}
+
+/// Frames [from, from + n) of `px` ([frames, h, w, 3]), the last real one repeated past the end
+fn frames_from(px: &[f32], fsz: usize, real: usize, from: usize, n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n * fsz);
+    for f in from..from + n {
+        let f = f.min(real - 1);
+        out.extend_from_slice(&px[f * fsz..(f + 1) * fsz]);
+    }
+    out
+}
+
+/// Latent frames [start, start + t) of [24, total, n] (n values a frame)
+fn latent_frames(v: &[f32], total: usize, n: usize, start: usize, t: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(24 * t * n);
+    for c in 0..24 {
+        out.extend_from_slice(&v[(c * total + start) * n..(c * total + start + t) * n]);
+    }
+    out
 }
 
 /// The run's noise levels: HyperFlow's 8-step grid (shift 12), the last 3 / 4 points or all of it
@@ -130,7 +193,9 @@ pub fn sigmas(grid: &[f32], sampler: &str) -> Result<(Vec<f32>, bool)> {
     }
 }
 
-/// A draft -> its 2K regeneration at `out` (.mp4, the draft's sound)
+/// A draft -> its 2K regeneration at `out` (.mp4, the draft's sound). A draft longer than one window (124 frames) goes in
+/// overlapping windows (`windows`), each the model's own clip with its part of the draft as <Video 1>, the frames a window
+/// shares with the one before kept from it; the joined latents are decoded once and cut to the draft's length.
 pub fn regen2k(e: &Engine, s: &RegenSpec, out: &Path, ctl: &mut Ctl) -> Result<Value> {
     let t_all = Instant::now();
     let dev = &e.dev;
@@ -138,21 +203,26 @@ pub fn regen2k(e: &Engine, s: &RegenSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     if !lw.is_multiple_of(32) || !lh.is_multiple_of(32) || !tw.is_multiple_of(32) || !th.is_multiple_of(32) {
         return Err(Error(format!("the draft canvas {lw}x{lh} and the target {tw}x{th} must be multiples of 32")));
     }
-    let (frames, lt, at) = jobs::temporal_shape(s.frames as f64 / 24.0);
-    if frames != s.frames {
-        return Err(Error(format!("{} frames is not on the model's grid (17k + 5)", s.frames)));
+    let (wf, wl, at) = jobs::temporal_shape(s.window as f64 / 24.0);
+    if wf != s.window {
+        return Err(Error(format!("{} frames is not on the model's grid (17k + 5)", s.window)));
     }
-    let mut report = json!({"draft": s.draft.display().to_string(), "target": [tw, th], "frames": frames});
     let mut peak = dev.mem_used();
     let mut note_peak = |d: &crate::device::Device| peak = peak.max(d.mem_used());
 
-    // 1. the draft, its latent and the upscaled start
+    // 1. the draft, its latents
     let t0 = Instant::now();
-    let (px, real) = read_draft(s.draft, (lw, lh), frames)?;
-    ctl.say(format!("draft  : {} - {real} real frames, {frames} at {lw}x{lh}", s.draft.display()));
+    let (px, real) = read_draft(s.draft, (lw, lh), s.limit)?;
+    let (frames, lt) = grid(real, wf);
+    let plan = windows(lt, wl);
+    let fsz = lw * lh * 3;
+    let all_px = frames_from(&px, fsz, real, 0, frames);
+    drop(px);
+    ctl.say(format!("draft  : {} - {real} real frames ({:.2} s), {frames} at {lw}x{lh}: {} window(s) of {wf} frames", s.draft.display(), real as f64 / 24.0,
+                    plan.len()));
     let (z, zt) = {
         let enc = crate::venc::VideoEncoder::load(dev, &Checkpoint::open(s.vae)?)?;
-        let r = enc.encode_with(&px, frames, lh, lw, Some(s.seed), &mut || ctl.check())?;
+        let r = enc.encode_with(&all_px, frames, lh, lw, Some(s.seed), &mut || ctl.check())?;
         note_peak(dev);
         r
     };
@@ -162,32 +232,9 @@ pub fn regen2k(e: &Engine, s: &RegenSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     let (zh, zw, uh, uw) = (lh / 16, lw / 16, th / 16, tw / 16);
     let encode_s = t0.elapsed().as_secs_f64();
     ctl.say(format!("encode : {frames} frames -> {lt} x {zw}x{zh} latents in {encode_s:.1} s"));
-    let t0 = Instant::now();
-    let up = {
-        let u = crate::upscale::Upscaler::load(dev, &Checkpoint::open(s.upscaler)?)?;
-        let scale = ((tw as f32 / lw as f32) + (th as f32 / lh as f32)) / 2.0;
-        let cancel = ctl.cancel;
-        let (v, _, _) = u.upscale_to(&z, (lt, zh, zw), (uh, uw), scale, false, &mut || {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(Error("cancelled".into()));
-            }
-            Ok(())
-        })?;
-        note_peak(dev);
-        v
-    };
-    let upscale_s = t0.elapsed().as_secs_f64();
-    ctl.say(format!("upscale: {zw}x{zh} -> {uw}x{uh} latents in {upscale_s:.1} s"));
+    let mut report = json!({"draft": s.draft.display().to_string(), "target": [tw, th], "frames": real, "windows": plan.len()});
 
-    // 2. the presentation: the draft as <Video 1>, then the task prompt
-    let mut pieces = vec![Piece::Text("<Video 1>: ".into())];
-    pieces.extend(jobs::ref_video_blocks(&px, frames, lw, lh));
-    pieces.push(Piece::Text(prompt(&s.caption)));
-    drop(px);
-    let (ctx, presented, hidden, te_s) = jobs::encode_pieces(dev, e.threads, &pieces, &s.te, ctl)?;
-    ctl.check()?;
-
-    // 3. the LoRAs: the blocks' in host memory, the refiner's on the card
+    // 2. the LoRAs (the blocks' in host memory, the refiner's on the card) and HyperFlow's time conditioning, once
     let t0 = Instant::now();
     let nb = e.model.blocks.len();
     let mut lora = crate::lora::LoraSet::load_to(dev, &Checkpoint::open(s.hyperflow)?, 1.0, nb, 2, true)?;
@@ -201,102 +248,175 @@ pub fn regen2k(e: &Engine, s: &RegenSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     ctl.say(format!("lora   : HyperFlow + {}IC: {} layers, rank up to {}, {:.2} GiB in host memory, read in {:.1} s",
                     if s.sharp.is_some_and(|x| x.1 != 0.0) { "LMS Sharp + " } else { "" }, lora.layers, lora.max_rank,
                     jobs::gib(lora.host_bytes() as u64), t0.elapsed().as_secs_f64()));
-    let text = {
-        let refiner = TextRefiner::load(dev, &e.ck, e.threads)?;
-        let t = Tensor::from_bytes(dev, DType::BF16, &[presented.ids.len(), hidden], &denoiser::bf16_bytes(&ctx))?;
-        let r = refiner.run(&e.model.cfg, &t, Some(lora.refiner.as_slice()))?;
-        dev.wait()?;
-        note_peak(dev);
-        r
-    };
-
-    // 4. the denoiser: the draft's latent as the reference clip, the upscaled draft as the start, silence kept
-    let shape = Shape { t: lt, h: uh, w: uw, audio_t: at };
-    let cond = Conditions { seed: s.seed, refs: vec![RefIn::Video { latent: z.clone(), t: lt, h: zh, w: zw, audio: None }], mlp_rows: Some(s.mlp_rows),
-                            ..Conditions::default() };
-    let tags = presented.has_vision().then(|| presented.tags.clone());
-    // what the sequence will hold on the card, before any of it is made: the scratch, the stream, the attention's int8
-    // copies and a margin for the kernels' own buffers; refused when the card has less (a clear error, not a spill)
-    let cfg = &e.model.cfg;
-    let tokens = presented.ids.len() + lt * (zh / 2) * (zw / 2) + 2 * at + lt * (uh / 2) * (uw / 2);
-    let need = crate::dit::Scratch::bytes(cfg, tokens, s.mlp_rows) + tokens * cfg.hidden * 4 + tokens * cfg.heads * cfg.head_dim * 3 + (2usize << 30);
-    if let Some(free) = dev.mem_free() {
-        ctl.say(format!("memory : {tokens} tokens need about {:.1} GiB on the card, {:.1} GiB free", jobs::gib(need as u64), jobs::gib(free)));
-        if (need as u64) + (3u64 << 29) > free {
-            return Err(Error(format!("{tokens} tokens need about {:.1} GiB on the card and 1.5 GiB to spare; {:.1} GiB are free (a smaller draft or mlp_rows)",
-                                     jobs::gib(need as u64), jobs::gib(free))));
-        }
-    }
-    let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, Schedule::default(), &cond)?;
-    d.lora = Some(&lora);
-    let source_a = silence(s.silence, at)?;
-    let inpaint = denoiser::Inpaint { source_v: up.clone(), source_a, mask_v: vec![1.0; lt * uh * uw], mask_a: vec![0.0; at] };
-    d.masks = Some(denoiser::RowMasks::new(&inpaint, shape));
-    let t0 = Instant::now();
     let two = crate::hyperflow::TwoTime::load(s.adaln, &Checkpoint::open(s.hyperflow)?)?;
     let (sigmas, from_up) = match &s.sigmas {
         Some(v) => (v.clone(), v.first().is_some_and(|s0| *s0 < 1.0)),
         None => sigmas(&two.grid, &s.sampler)?,
     };
-    let points = crate::hyperflow::points(&sigmas, &mut |sg| d.values_at(sg));
-    let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
-    let prep = two.prepare(&points, &sigmas, Some(&lora.adaln), &e.outer.t_table, e.model.cfg.t_dim, threads)?;
-    drop(two);
-    ctl.say(format!("time   : HyperFlow's two-time tables for {} points in {:.1} s; sigmas {sigmas:?}", points.len(), t0.elapsed().as_secs_f64()));
-    d.hyperflow = Some(&prep);
-    let n_v = 24 * lt * uh * uw;
-    let (noise_v, noise_a) = crate::noise::clip_noise(s.seed, n_v, 32 * 2 * at);
-    let noise_v = match from_up {
-        // (1 - s0) up + s0 noise, as the sampler's s0 x noise
-        true => noise_v.iter().zip(&up).map(|(n, c)| n + c * (1.0 - sigmas[0]) / sigmas[0]).collect(),
-        false => noise_v,
-    };
-    ctl.say(format!("tokens : {} in the denoiser ({} blocks on the card, the rest streamed)", d.tokens(), e.model.resident()));
-    note_peak(dev);
-
-    if let Some(dump) = s.check_dump {
-        return check(&mut d, &z, (lt, zh, zw), &noise_v, &inpaint, &sigmas, &ctx, &presented, s.seed, dump, ctl);
-    }
-
     let steps = sigmas.len() - 1;
-    let t0 = Instant::now();
-    let (v, _) = {
-        let cancel = ctl.cancel;
-        let mut progress = ctl.progress.take();
-        let mut times = Vec::new();
-        let mut t_step = Instant::now();
-        let devc = dev.clone();
-        let r = denoiser::sample_masked(&mut d, &noise_v, &noise_a, &sigmas, Some(&inpaint), &mut |_, _, _| {
-            times.push(t_step.elapsed().as_secs_f64());
-            t_step = Instant::now();
-            Ok(())
-        }, &mut |i, b| {
-            if b == 0 || b == nb / 2 {
-                devc.wait()?;
+    let mut prep: Option<crate::hyperflow::Prepared> = None;
+    let silence_a = silence(s.silence, at)?;
+    let nu = uh * uw;
+    // one noise for the whole draft: a window takes its frames
+    let (noise_all, noise_a) = crate::noise::clip_noise(s.seed, 24 * lt * nu, 32 * 2 * at);
+    let mut joined = vec![0f32; 24 * lt * nu];
+    let (mut te_s, mut upscale_s, mut sample_s) = (0.0, 0.0, 0.0);
+    let mut step_times: Vec<f64> = Vec::new();
+    let total_units = plan.len() * steps * nb;
+
+    for (wi, &(st, keep)) in plan.iter().enumerate() {
+        let tag = format!("window {}/{}", wi + 1, plan.len());
+        if plan.len() > 1 {
+            ctl.say(format!("window : {}/{} - latent frames {st}..{} (pixel frames {}..{}), {keep} kept from the window before", wi + 1, plan.len(),
+                            st + wl, st / 5 * 17, st / 5 * 17 + wf));
+        }
+        // its part of the draft: latents, the upscaled start (the whole window in one piece, as the release), pixels
+        let z_w = latent_frames(&z, lt, zh * zw, st, wl);
+        let t0 = Instant::now();
+        let up = {
+            let u = crate::upscale::Upscaler::load(dev, &Checkpoint::open(s.upscaler)?)?;
+            let scale = ((tw as f32 / lw as f32) + (th as f32 / lh as f32)) / 2.0;
+            let cancel = ctl.cancel;
+            let (v, _, _) = u.upscale_to(&z_w, (wl, zh, zw), (uh, uw), scale, false, &mut || {
                 if cancel.load(Ordering::Relaxed) {
                     return Err(Error("cancelled".into()));
                 }
-            }
-            if let Some(p) = progress.as_mut() {
-                p(i * nb + b, steps * nb);
-            }
-            Ok(())
-        });
+                Ok(())
+            })?;
+            note_peak(dev);
+            v
+        };
+        upscale_s += t0.elapsed().as_secs_f64();
+        ctl.say(format!("upscale: {zw}x{zh} -> {uw}x{uh} latents in {:.1} s ({tag})", t0.elapsed().as_secs_f64()));
+        // the presentation: this window's draft as <Video 1>, then the task prompt
+        let w_px = frames_from(&all_px, fsz, frames, st / 5 * 17, wf);
+        let mut pieces = vec![Piece::Text("<Video 1>: ".into())];
+        pieces.extend(jobs::ref_video_blocks(&w_px, wf, lw, lh));
+        pieces.push(Piece::Text(prompt(&s.caption)));
+        drop(w_px);
+        // the text encoder's own progress (layers) would read as this clip's steps in the studio: the windows' blocks only
+        let progress = ctl.progress.take();
+        let r = jobs::encode_pieces(dev, e.threads, &pieces, &s.te, ctl);
         ctl.progress = progress;
-        let r = r?;
-        ctl.say(format!("sampled: {steps} steps in {:.1} s ({})", t0.elapsed().as_secs_f64(), times.iter().map(|s| format!("{s:.1}")).collect::<Vec<_>>().join(" ")));
-        r
-    };
-    note_peak(dev);
-    let sample_s = t0.elapsed().as_secs_f64();
-    drop(d);
+        let (ctx, presented, hidden, secs) = r?;
+        te_s += secs;
+        ctl.check()?;
+        let text = {
+            let refiner = TextRefiner::load(dev, &e.ck, e.threads)?;
+            let t = Tensor::from_bytes(dev, DType::BF16, &[presented.ids.len(), hidden], &denoiser::bf16_bytes(&ctx))?;
+            let r = refiner.run(&e.model.cfg, &t, Some(lora.refiner.as_slice()))?;
+            dev.wait()?;
+            note_peak(dev);
+            r
+        };
+
+        // the denoiser: the draft window as the reference clip, the upscaled window as the start (the frames shared with the
+        // window before kept from it), the silence kept
+        let shape = Shape { t: wl, h: uh, w: uw, audio_t: at };
+        let cond = Conditions { seed: s.seed, refs: vec![RefIn::Video { latent: z_w.clone(), t: wl, h: zh, w: zw, audio: None }], mlp_rows: Some(s.mlp_rows),
+                                ..Conditions::default() };
+        let tags = presented.has_vision().then(|| presented.tags.clone());
+        // the kernels' scratch from what ran before (the window before's 177k-token sequence: ~8 GiB) given back first
+        dev.trim()?;
+        // what the sequence will hold on the card, before any of it is made: the scratch, the stream, the attention's int8
+        // copies and a margin for the kernels' own buffers; refused when the card has less (a clear error, not a spill)
+        let cfg = &e.model.cfg;
+        let tokens = presented.ids.len() + wl * (zh / 2) * (zw / 2) + 2 * at + wl * (uh / 2) * (uw / 2);
+        let need = crate::dit::Scratch::bytes(cfg, tokens, s.mlp_rows) + tokens * cfg.hidden * 4 + tokens * cfg.heads * cfg.head_dim * 3 + (2usize << 30);
+        if let Some(free) = dev.mem_free() {
+            ctl.say(format!("memory : {tokens} tokens need about {:.1} GiB on the card, {:.1} GiB free", jobs::gib(need as u64), jobs::gib(free)));
+            if (need as u64) + (3u64 << 29) > free {
+                return Err(Error(format!("{tokens} tokens need about {:.1} GiB on the card and 1.5 GiB to spare; {:.1} GiB are free (a smaller draft or mlp_rows)",
+                                         jobs::gib(need as u64), jobs::gib(free))));
+            }
+        }
+        let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, Schedule::default(), &cond)?;
+        d.lora = Some(&lora);
+        let mut source_v = up.clone();
+        let mut mask_v = vec![1.0; wl * nu];
+        if keep > 0 {
+            for c in 0..24 {
+                source_v[c * wl * nu..(c * wl + keep) * nu].copy_from_slice(&joined[(c * lt + st) * nu..(c * lt + st + keep) * nu]);
+            }
+            mask_v[..keep * nu].fill(0.0);
+        }
+        let inpaint = denoiser::Inpaint { source_v, source_a: silence_a.clone(), mask_v, mask_a: vec![0.0; at] };
+        d.masks = Some(denoiser::RowMasks::new(&inpaint, shape));
+        // the time tables: made once, again only when a window asks for points the first did not
+        let points = crate::hyperflow::points(&sigmas, &mut |sg| d.values_at(sg));
+        if prep.as_ref().is_none_or(|p| points.iter().any(|q| !p.points().contains(q))) {
+            let t0 = Instant::now();
+            let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
+            prep = Some(two.prepare(&points, &sigmas, Some(&lora.adaln), &e.outer.t_table, e.model.cfg.t_dim, threads)?);
+            ctl.say(format!("time   : HyperFlow's two-time tables for {} points in {:.1} s; sigmas {sigmas:?}", points.len(), t0.elapsed().as_secs_f64()));
+        }
+        d.hyperflow = prep.as_ref();
+        let noise_v = latent_frames(&noise_all, lt, nu, st, wl);
+        let noise_v: Vec<f32> = match from_up {
+            // (1 - s0) up + s0 noise, as the sampler's s0 x noise
+            true => noise_v.iter().zip(&inpaint.source_v).map(|(n, c)| n + c * (1.0 - sigmas[0]) / sigmas[0]).collect(),
+            false => noise_v,
+        };
+        ctl.say(format!("tokens : {} in the denoiser ({} blocks on the card, the rest streamed; {tag})", d.tokens(), e.model.resident()));
+        note_peak(dev);
+
+        if let Some(dump) = s.check_dump {
+            return check(&mut d, &z_w, (wl, zh, zw), &noise_v, &inpaint, &sigmas, &ctx, &presented, s.seed, dump, ctl);
+        }
+
+        let t0 = Instant::now();
+        let v = {
+            let cancel = ctl.cancel;
+            let mut progress = ctl.progress.take();
+            // each step's line as it ends (the studio shows the log; a step at 2K is ~10 min)
+            let say = &mut *ctl.log;
+            let mut t_step = Instant::now();
+            let devc = dev.clone();
+            let base = wi * steps * nb;
+            let r = denoiser::sample_masked(&mut d, &noise_v, &noise_a, &sigmas, Some(&inpaint), &mut |i, _, _| {
+                let secs = t_step.elapsed().as_secs_f64();
+                step_times.push(secs);
+                say(format!("step   : {}/{steps} in {secs:.1} s ({tag})", i + 1));
+                t_step = Instant::now();
+                Ok(())
+            }, &mut |i, b| {
+                if b == 0 || b == nb / 2 {
+                    devc.wait()?;
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(Error("cancelled".into()));
+                    }
+                }
+                if let Some(p) = progress.as_mut() {
+                    p(base + i * nb + b, total_units);
+                }
+                Ok(())
+            });
+            ctl.progress = progress;
+            r?.0
+        };
+        sample_s += t0.elapsed().as_secs_f64();
+        note_peak(dev);
+        drop(d);
+        // the window's frames into the clip (the kept ones are the window before's, unchanged)
+        for c in 0..24 {
+            joined[(c * lt + st + keep) * nu..(c * lt + st + wl) * nu].copy_from_slice(&v[(c * wl + keep) * nu..(c * wl + wl) * nu]);
+        }
+        if let Some(p) = ctl.progress.as_mut() {
+            p(base_done(wi + 1, steps, nb), total_units);
+        }
+    }
+    drop(two);
     drop(lora);
+    drop(prep);
+    drop(all_px);
+    let total_steps = plan.len() * steps;
+    ctl.say(format!("sampled: {total_steps} steps in {sample_s:.1} s ({})", step_times.iter().map(|s| format!("{s:.1}")).collect::<Vec<_>>().join(" ")));
     crate::safetensors::write_f32(&out.with_extension("latents.safetensors"), &BTreeMap::from([
-        ("samples.video".to_string(), (vec![1, 24, lt, uh, uw], v.clone())),
+        ("samples.video".to_string(), (vec![1, 24, lt, uh, uw], joined.clone())),
     ]), &BTreeMap::new())?;
 
-    // 5. the frames, the draft's length and sound
-    let rep = jobs::decode_latents(dev, e.threads, Latents { video: v, t: lt, h: uh, w: uw, audio: None },
+    // 3. the frames, the draft's length and sound
+    let rep = jobs::decode_latents(dev, e.threads, Latents { video: joined, t: lt, h: uh, w: uw, audio: None },
                                    &Vaes { video: s.vae, audio: None, upscale: None, pixel: None }, Some(out), None, ctl)?;
     note_peak(dev);
     finish(out, s.draft, real, frames, (tw, th), s.keep_h, ctl)?;
@@ -307,8 +427,14 @@ pub fn regen2k(e: &Engine, s: &RegenSpec, out: &Path, ctl: &mut Ctl) -> Result<V
                    ("sampler", json!(s.sampler)), ("sigmas", json!(sigmas)), ("width", json!(tw)), ("height", json!(s.keep_h)), ("out", json!(out))] {
         report[k] = v;
     }
-    ctl.say(format!("regen  : {} ({tw}x{}, {real} frames, {:.2} s) in {total:.1} s, card peak {:.1} GiB", out.display(), s.keep_h, real as f64 / 24.0, jobs::gib(peak)));
+    ctl.say(format!("regen  : {} ({tw}x{}, {real} frames, {:.2} s, {} window(s)) in {total:.1} s, card peak {:.1} GiB", out.display(), s.keep_h, real as f64 / 24.0,
+                    plan.len(), jobs::gib(peak)));
     Ok(report)
+}
+
+/// Progress units done after `windows` whole windows
+fn base_done(windows: usize, steps: usize, nb: usize) -> usize {
+    windows * steps * nb
 }
 
 /// The decoded clip cut to the draft's real frames (and the kept rows), the draft's sound laid under it
@@ -392,6 +518,25 @@ mod tests {
         assert_eq!(super::sigmas(&g, "up4").unwrap().0.len(), 5);
         assert_eq!(super::sigmas(&g, "hf8").unwrap(), (g.to_vec(), false));
         assert!(super::sigmas(&g, "up5").is_err());
+    }
+
+    /// A 10.125 s draft (243 frames) is two windows; a 5.17 s one, one; every latent frame is made once and the overlap kept
+    #[test]
+    fn a_long_draft_goes_in_overlapping_windows() {
+        assert_eq!(super::grid(124, 124), (124, 37));
+        assert_eq!(super::grid(113, 124), (124, 37));
+        assert_eq!(super::grid(243, 124), (243, 72));
+        assert_eq!(super::grid(244, 124), (260, 77));
+        assert_eq!(super::windows(37, 37), vec![(0, 0)]);
+        assert_eq!(super::windows(72, 37), vec![(0, 0), (35, 2)]);
+        for lt in (37..=107).step_by(5) {
+            let w = super::windows(lt, 37);
+            assert_eq!(w.last().map(|x| x.0 + 37), Some(lt), "{lt}: the last ends with the draft");
+            for p in w.windows(2) {
+                assert!(p[1].0 % 5 == 0 && p[1].1 >= 2 && p[1].0 + p[1].1 == p[0].0 + 37, "{lt}: {w:?}");
+            }
+        }
+        assert_eq!(super::windows(107, 37).len(), 3, "the longest draft (362 frames)");
     }
 
     #[test]

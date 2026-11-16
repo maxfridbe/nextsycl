@@ -1917,7 +1917,8 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                 lq: (lw, lh),
                 target: (tw, th),
                 keep_h: keep,
-                frames: n("frames").map_or(crate::regen::FRAMES, |f| f as usize),
+                window: n("frames").map_or(crate::regen::FRAMES, |f| f as usize),
+                limit: n("frames").map(|f| f as usize),
                 te: TeFiles {
                     te: need("te", "the text encoder's GGUF")?,
                     tokenizer: Path::new(s("tokenizer").unwrap_or("/app/tokenizer")),

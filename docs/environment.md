@@ -22,7 +22,7 @@ Where the program, its libraries, its models and its sockets are.
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
 | `NEXTSYCL_LIB` | the library beside the executable, else dist/ of the working directory | the kind's kernel library to load (a `libnextsycl-<kind>.so` path) | runtime (every kind) |
-| `NS_CONTAINER_PREFIX` | (none) | a prefix for the image, audio and 3D servers' container names (`nextsycl-audio` ...), environment only: a second front door on the box (a build copy's test beside production) starts, finds and stops its own servers, never the other's | cli (image, audio, model3d start / stop / ps / logs) |
+| `NS_CONTAINER_PREFIX` | (none) | a prefix for the image, audio, 3D and video servers' container names (`nextsycl-audio`, `nextsycl-video` ...), environment only: a second front door or video studio on the box (a build copy's test beside production) starts, finds and stops its own servers, never the other's (the studio's ffmpeg-in-the-daemon too) | cli (image, audio, model3d, video start / stop / ps / logs), studio |
 | `NS_CONTAINER_ENGINE` | podman, else docker (whichever is on PATH) | the container program | cli (llm, image, audio, video start) |
 | `NS_DIST` | the program's own directory | dist/: where the program, the kernel libraries and wfe/ are looked for; nextsycl.conf is read from its parent | cli, serve |
 | `NS_IMAGE` | localhost/nextsycl-build (`./build.sh image`) | the container image with the oneAPI runtime the servers run in; build.sh builds in it too | cli (llm, image, audio, video start), build (build.sh) |

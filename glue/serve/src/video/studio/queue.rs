@@ -484,12 +484,19 @@ impl Studio {
                 if it["ref_images"].is_array() || it["ref_videos"].is_array() || p.get("source").is_some_and(|v| !v.is_null()) {
                     return Err(RpcError::param("regen2k takes a draft and its caption: no references or source beside it"));
                 }
+                // the draft: its length sets the clip's (all of it is made again, in windows past 124 frames), its shape must
+                // be landscape 16:9 (it is cover-fitted to 1344x768); a draft being made or an anchor is checked when it runs
+                let mut real = REGEN_WINDOW;
                 let d = if MAGIC.contains(&d) {
                     d.to_string()
                 } else {
                     let b = basename(d);
                     if !self.here_or_coming(&b) {
                         return Err(RpcError::not_found(&format!("regen2k draft {b} not found in out/")));
+                    }
+                    if self.out.join(&b).exists() {
+                        let (w, h, secs) = probe(&self.out.join(&b)).ok_or_else(|| RpcError::param(&format!("regen2k draft {b}: not a video ffprobe can read")))?;
+                        real = check_draft(&b, w, h, secs)?;
                     }
                     b
                 };
@@ -510,9 +517,12 @@ impl Studio {
                 it.insert("engine".into(), json!("REGEN2K"));
                 it.insert("width".into(), json!(w));
                 it.insert("height".into(), json!(h));
-                it.insert("frames".into(), json!(124));
-                it.insert("seconds".into(), json!(124.0 / 24.0));
-                it.insert("steps".into(), json!(match sampler.as_str() { "up4" => 4, "hf8" => 8, _ => 3 }));
+                // steps: every window's (the status counts them: "sampling 4/6" over two windows)
+                let per = match sampler.as_str() { "up4" => 4, "hf8" => 8, _ => 3 };
+                it.insert("frames".into(), json!(real));
+                it.insert("seconds".into(), json!(real as f64 / 24.0));
+                it.insert("regen_windows".into(), json!(regen_windows(real)));
+                it.insert("steps".into(), json!(per * regen_windows(real)));
             }
             None => {
                 for k in ["regen2k", "regen_sampler", "regen_resolution", "sharp"] {
@@ -570,6 +580,48 @@ impl Studio {
         it.insert("ref_image_size".into(), ris.map_or(Value::Null, |v| json!(v)));
         Ok(Value::Object(it))
     }
+}
+
+/// Open-H3-Regenerate-2K-IC's limits (crates/h3/src/regen.rs: FRAMES, MIN_REAL, MAX_FRAMES, ASPECT_SLACK): its window is
+/// the model's 124-frame clip; a draft needs 113 frames at least, takes 362 at most, and is landscape 16:9 within 10%
+pub const REGEN_WINDOW: usize = 124;
+const REGEN_MIN: usize = 113;
+const REGEN_MAX: usize = 362;
+
+/// A clip's width, height and seconds (ffprobe; the daemon's container's when the host's cannot read H.264)
+fn probe(p: &Path) -> Option<(f64, f64, f64)> {
+    let o = crate::video::media::tool("ffprobe").args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height:format=duration", "-of",
+                                                       "default=noprint_wrappers=1"]).arg(p).output().ok()?;
+    let text = String::from_utf8_lossy(&o.stdout);
+    let get = |k: &str| text.lines().find_map(|l| l.strip_prefix(&format!("{k}="))).and_then(|v| v.trim().parse::<f64>().ok());
+    Some((get("width")?, get("height")?, get("duration")?))
+}
+
+/// A draft's frames at 24 fps, or why it cannot be regenerated (a 400 naming the limit)
+fn check_draft(name: &str, w: f64, h: f64, secs: f64) -> Result<usize, RpcError> {
+    let aspect = (w / h) / (16.0 / 9.0);
+    if (aspect - 1.0).abs() > 0.10 {
+        return Err(RpcError::param(&format!("regen2k draft {name} is {w}x{h}: Open-H3-Regenerate-2K takes landscape 16:9 drafts (cover-fitted to 1344x768; this one would lose too much of its picture)")));
+    }
+    let frames = (secs * 24.0).round() as usize;
+    if frames < REGEN_MIN {
+        return Err(RpcError::param(&format!("regen2k draft {name} is {secs:.2} s ({frames} frames at 24 fps): the model needs {REGEN_MIN} at least (4.7 s)")));
+    }
+    if frames > REGEN_MAX {
+        return Err(RpcError::param(&format!("regen2k draft {name} is {secs:.2} s ({frames} frames at 24 fps): at most {REGEN_MAX} ({:.1} s) - cut it first", REGEN_MAX as f64 / 24.0)));
+    }
+    Ok(frames)
+}
+
+/// The windows a draft of `frames` frames is made in: one per 124-frame clip of the model, overlapping by 2 latent frames
+/// at least (crates/h3/src/regen.rs `grid`, `windows`: the same count)
+pub fn regen_windows(frames: usize) -> usize {
+    let mut n = frames.max(REGEN_WINDOW);
+    while n % 17 != 5 {
+        n += 1;
+    }
+    let lt = (n - 5) / 17 * 5 + 2;
+    if lt <= 37 { 1 } else { (lt - 2).div_ceil(35) }
 }
 
 /// A request's reentrant_id (reentrantid is read too)
@@ -690,6 +742,21 @@ fn pika_flex_lora(denoisers: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A regen2k draft: the platform's 864x480 10.125 s clip is two windows, all of it; a portrait one, a 3 s one and a
+    /// 20 s one are refused, saying why
+    #[test]
+    fn a_regen_draft_is_taken_whole_or_refused() {
+        assert_eq!(super::check_draft("a", 864.0, 480.0, 10.125).ok(), Some(243));
+        assert_eq!(super::regen_windows(243), 2);
+        assert_eq!(super::regen_windows(124), 1);
+        assert_eq!(super::regen_windows(113), 1);
+        assert_eq!(super::regen_windows(362), 3);
+        assert_eq!(super::check_draft("a", 1344.0, 768.0, 5.17).ok(), Some(124));
+        assert!(super::check_draft("a", 480.0, 864.0, 10.0).is_err());
+        assert!(super::check_draft("a", 1344.0, 768.0, 3.0).is_err());
+        assert!(super::check_draft("a", 1344.0, 768.0, 20.0).is_err());
+    }
+
     #[test]
     fn the_pika_flex_adapter_is_found_beside_the_denoisers() {
         let root = std::env::temp_dir().join(format!("ns-pika-flex-{}", std::process::id()));
