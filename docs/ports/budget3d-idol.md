@@ -135,8 +135,17 @@ From the zero condition (`check --stages bench`: denoise + decode, encoders excl
 
 | model | budget 1 (8192 tokens) | 0.5 (4096) | 0.25 (2048) | card peak |
 |---|---|---|---|---|
-| Budget3D-Idol, 50 steps, CFG 3 | 30.5 | 17.2 | 12.0 | 2.1-2.4 GiB |
-| Budget3D-Idol-Turbo, 5 steps | 2.2 | 1.5 | 1.1 | 2.6-2.7 GiB |
+| Budget3D-Idol, 50 steps, CFG 3 | 26.6 (30.5 before the silo) | 14.3 (17.2) | 9.7 (12.0) | 2.2-2.4 GiB |
+| Budget3D-Idol-Turbo, 5 steps | 2.0 (2.2) | 1.4 (1.5) | 1.0 (1.1) | 2.6-2.7 GiB |
+
+The silo (`kernels/model3d/budget3d/silo`, dist/silo/libnextsycl-budget3d.so; NS_SILO=0 for the A/B) fuses the
+denoiser's products with their epilogues (qkv over all rows; GELU into the first MLP product; the gated residual add
+into the out and second MLP products) and runs the modulated layer norm a sub-group a row. `NS_M3D_B3D_PROFILE=2`
+times the denoiser's parts (synced), 50 steps at budget 1, before -> after: RePo 2.2 -> 3.2 (sync noise; unchanged
+code), norm + qkv + rotation 3.4 -> 2.6, attention 14.2 -> 14.5, out 1.4 -> 0.9, MLP 8.5 -> 4.6. Attention (oneDNN's
+fused SDPA, about 106 TFLOPS) is now over half a step and was left on the shared kernel. Tried and dropped: RePo's
+float32 products in TF32 (no change) and the decoders' products fused (decode 0.45 -> 0.43 s, Turbo's feature
+parity 6.4e-3 -> 1.2e-2).
 
 (The reference's H100 fp32 numbers: 63 s at 100 %, 32 s at 50 %.)
 
@@ -145,10 +154,13 @@ float32 loaded for the request and the VAE included - prepare 1.2 s, encode 2.7 
 
 | model | card | budget 1 | 0.5 | 0.25 | peak |
 |---|---|---|---|---|---|
-| Budget3D-Idol | B70 | 34.7 | 21.5 | 16.3 | 5.0 GiB |
-| Budget3D-Idol-Turbo | B70 | 6.0 | 5.6 | 5.3 | 5.7 GiB |
-| Budget3D-Idol | B65 | 52.0 | 31.0 | 23.4 | 5.0 GiB |
-| Budget3D-Idol-Turbo | B65 | 7.7 | 6.7 | 6.3 | 5.7 GiB |
+| Budget3D-Idol | B70 | 31.2-35.7 (34.7 before the silo) | 18.8 (21.5) | 13.8-14.0 (16.3) | 5.0 GiB |
+| Budget3D-Idol-Turbo | B70 | 5.9-6.0 (6.0) | 5.4-5.5 (5.6) | 5.3 (5.3) | 5.7 GiB |
+| Budget3D-Idol | B65 | 45.0 (52.0) | 25.8-29.2 (31.0) | 18.6-18.7 (23.4) | 5.0 GiB |
+| Budget3D-Idol-Turbo | B65 | 7.1-7.2 (7.7) | 6.3 (6.7) | 5.9-6.0 (6.3) | 5.7 GiB |
+
+(Fox and robot; the picture's part - DINOv3 read from disk a request - moves between 4 and 9 s, which is most of the
+spread and all of Turbo's time.)
 
 Renders (`nextsycl model3d tool render`, 4 sides) of every object are in hardac1:~/src/idol/renders: the fox and the
 robot are themselves from every side at every budget (0.25 visibly coarser; Turbo at 0.25 loses the fox's face), the backs plausible, and the B65's objects the B70's.
@@ -165,9 +177,9 @@ robot are themselves from every side at every budget (0.25 visibly coarser; Turb
 
 ## 7. Open
 
-- The page's WebGL2 splat drawing is type-checked and its PLY reader run on a real result (node), not looked at in a
-  browser (no WebGL in a headless one here); the CPU rasterizer (`nextsycl model3d tool render`) draws the results.
+- The page's WebGL2 splat drawing was looked at in headless Chromium (SwiftShader WebGL2) on a real result: upright,
+  colours right, sorted from every side, and opened from the result's camera (`eye`/`fov`).
 - DINOv3 runs in float32 (Idol: bfloat16): exact but 3.4 GB loaded a request (`NS_M3D_B3D_RESIDENT` keeps it).
-- No silo yet: the blocks run on the shared linears and attention; a fused RePo / norm and graph capture are the
-  obvious next steps.
+- Attention is now over half a denoiser step. The guided pass's unconditioned branch has 4,101 identical context rows
+  through every block; one row with a log(4101) bias in attention would be exact and cut that sequence to ~N+1 rows.
 
