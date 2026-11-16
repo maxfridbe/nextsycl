@@ -182,6 +182,7 @@ const MODEL_STATE: &str = r#"{"type": "object", "properties": {"id": {"type": "s
   "pull": {"description": "not downloaded: its download under way (as system.models.pulls lists it), else null"},
   "vouch_mb": {"type": "object", "additionalProperties": {"type": "integer"}, "description": "VRAM it is counted for, by card"},
   "spans": {"type": "boolean", "description": "one copy over several cards: a chat model spread over every card (its model card: gpus all), or an image, audio or 3D model whose one copy spans its cards (its model card: spans) - its cards are not a choice"},
+  "lockstep": {"type": "boolean", "description": "a live conversation in lockstep over /v1/realtime (capability realtime): every frame of audio in answered by a frame out (Haru-4B, 133 ms); its model card: speech lockstep"},
   "measured": {"type": "boolean"}, "headroom_mb": {"type": "object", "additionalProperties": {"type": "integer"}}, "headroom_given": {"type": "boolean"},
   "license": {"type": ["string", "null"], "description": "SPDX id or the licence's name (its entry's, else its model card's); null: not stated"}, "commercial": {"type": ["boolean", "null"], "description": "whether its weights may be used commercially; null: not stated"}, "license_note": {"type": ["string", "null"]},
   "annotations": {"type": ["array", "null"], "description": "what it reads inline in its text (nextcuda's schema: model-cards/README.md, Annotations) - a client's legend where the text is written; its entry's, else its model card's; null: none stated",

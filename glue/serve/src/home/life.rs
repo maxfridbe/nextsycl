@@ -314,8 +314,20 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
             (c, vec!["image.generate", "image.edit"])
         }
         "audio" if arch == "whisper" => (vec!["transcribe", "speech_to_text", "word_timestamps", "language_detection", "translate_to_english"], vec!["audio.transcribe"]),
+        // a live conversation only (Haru-4B): /v1/realtime, nothing read aloud - no audio.speak; `lockstep` a frame in, a frame out
+        "audio" if speech("realtime") && m["speech"].as_array().is_some_and(|a| a.iter().all(|x| x == "realtime" || x == "lockstep")) => {
+            let mut c = vec!["realtime"];
+            if speech("lockstep") {
+                c.push("lockstep");
+            }
+            (c, vec![])
+        }
         "audio" if m["speech"].is_array() => {
             let mut c = vec!["speech"];
+            // a live conversation as well (Sophon-Realtime): /v1/realtime
+            if speech("realtime") {
+                c.push("realtime");
+            }
             if speech("voices") {
                 c.push("builtin_voices");
             }
@@ -759,6 +771,7 @@ impl Home {
                    "spans": spans_all(m, &mc) || registry::spans(m),
                    "pinned": enabled && m["pinned"] == true, "held_s": holds.get(s(m, "id").as_str()).map_or(0.0, |h| h.reserved(now()).round()),
                    "capabilities": caps, "methods": methods,
+                   "lockstep": m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == "lockstep")),
                    "max_pixels": limits.map(|l| l.0), "min_side": limits.map(|l| l.1), "max_side": limits.map(|l| l.2), "grid": limits.map(|l| l.3),
                    "vouch_mb": vouch.iter().map(|(g, mb)| (g.to_string(), json!(mb))).collect::<serde_json::Map<String, Value>>(),
                    "measured": measured,
@@ -1757,6 +1770,10 @@ mod tests {
 
     #[test]
     fn a_recogniser_transcribes_and_speaks_nothing() {
+        let (caps, methods) = capabilities(&json!({"id": "haru-4b", "kind": "audio", "arch": "haru", "speech": ["realtime", "lockstep"]}));
+        assert_eq!((caps, methods), (vec!["realtime", "lockstep"], vec![]), "a live conversation only: no audio.speak");
+        let (caps, methods) = capabilities(&json!({"id": "sophon", "kind": "audio", "arch": "sophon-realtime", "speech": ["clone", "realtime"]}));
+        assert!(caps.contains(&"realtime") && caps.contains(&"speech") && methods.contains(&"audio.speak"), "{caps:?} {methods:?}");
         let (caps, methods) = capabilities(&json!({"id": "whisper-large-v3-turbo", "kind": "audio", "arch": "whisper"}));
         assert_eq!(methods, vec!["audio.transcribe"]);
         assert!(caps.contains(&"word_timestamps") && !caps.contains(&"speech"));

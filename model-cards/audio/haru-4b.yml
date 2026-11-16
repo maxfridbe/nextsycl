@@ -15,8 +15,9 @@ about: 'A live voice conversation over /v1/realtime in lockstep: every 133 ms on
 gpus: '0|1'
 vram_gib: 11.5                   # measured on the B65: 9.9 GiB loaded, 10.9 with a conversation of an hour (28,672 positions)
 speech:
-- realtime                       # a live conversation: /v1/realtime (lockstep; a saved voice's recording is its voice). It
+- realtime                       # a live conversation: /v1/realtime (lockstep below; a saved voice's recording is its voice). It
                                  #   does not read text aloud: no clone / voices here, so speech requests never come to it
+- lockstep                       # a frame of audio in, a frame out, every 133 ms (the row says lockstep: true)
 defaults:
   seconds: 20.0
 env: {}
