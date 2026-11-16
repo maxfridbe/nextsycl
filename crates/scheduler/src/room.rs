@@ -67,6 +67,10 @@ pub struct ModelInfo {
     /// the cards it may use
     pub gpus: Vec<usize>,
     pub profile: Profile,
+    /// one copy over all of `gpus` together (an image, audio or 3D server started on every card of its: a 32B brain on one,
+    /// its voice on the other): it needs the room on each, its idle holders there go, and it never has a second copy.
+    /// False: its cards are where its copies may go, one card a copy
+    pub spans: bool,
 }
 
 /// One consistent view of the box

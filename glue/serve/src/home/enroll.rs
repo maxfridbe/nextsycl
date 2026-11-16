@@ -137,7 +137,7 @@ impl Home {
             let why = if busy.len() == gpus.len() {
                 format!("a model loading on GPU {}; {what} waits for it", busy.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(", "))
             } else {
-                let who = backplane_scheduler::room::ModelInfo { id: name.to_string(), kind: "enroll".into(), enabled: true, gpus: gpus.to_vec(), profile: Default::default() };
+                let who = backplane_scheduler::room::ModelInfo { id: name.to_string(), kind: "enroll".into(), enabled: true, gpus: gpus.to_vec(), profile: Default::default(), spans: false };
                 self.no_room(&snap, gpus, &who, want)
             };
             self.note(job, "waiting", &why);

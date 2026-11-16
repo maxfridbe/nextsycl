@@ -2,6 +2,13 @@
 
 Bump `VERSION` in `src/lib.rs` and `version` in `Cargo.toml` with each entry.
 
+## 0.1.0+nextsycl.2 - 2026-11-16
+
+- `ModelInfo::spans`: a model whose ONE copy spans its cards (an audio server with a 32B brain on one card and its voice on the other).
+  `place` gives it the room on each of its cards (idle holders on every one of them go; a card that cannot be cleared means it waits,
+  nothing stopped meanwhile), takes it together (`Host::reserve_span`, default card by card) and starts it once, `gpu` its first card;
+  `start_copy` never starts a second. `place::span_want`: a learned refusal raises its first card's figure only. `FakeHost::add_span`.
+
 ## 0.1.0+nextsycl.1 - 2026-10-31
 
 nextsycl's copy of 0.1.0 (nextcuda f6f57a5). To take a later nextcuda version, copy it over and re-apply these; `tests/scenarios.rs` is

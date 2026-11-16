@@ -11,6 +11,9 @@
 //! | `wait_loaded` | wait until a loading server answers |
 //! | `note`, `cancelled` | a job's stage and a cancel flag |
 //! | `learn_ask` | a server refused for want of memory: remember what it asked, say whether that is more than planned |
+//!
+//! A model whose one copy spans its cards (`ModelInfo::spans`) is started with `start` once, `gpu` its first card: the
+//! host starts its server on all of them (nextsycl: `--gpus A,B`).
 
 use crate::room::{Holder, Idleness, ModelInfo, Server, Snapshot};
 use crate::Fail;
@@ -87,6 +90,15 @@ pub trait Host: Idleness {
     /// ([`crate::room::may_start`] is the check). Err: not now, the next try plans again. What closes the gap in which
     /// two kinds plan for one card, or something starts beside an exclusive model still loading.
     fn reserve(&self, _m: &ModelInfo, _slot: usize, _port: u16, _gpu: usize, _want: u64) -> Result<(), String> {
+        Ok(())
+    }
+    /// [`Host::reserve`] for a model whose one copy spans cards ([`crate::room::ModelInfo::spans`]): the room on every one
+    /// of `wants` (card, MiB) taken together or none of it. The default reserves card by card and is only all-or-nothing
+    /// for a host whose `reserve` takes nothing; a host whose `reserve` takes room overrides this.
+    fn reserve_span(&self, m: &ModelInfo, slot: usize, port: u16, wants: &[(usize, u64)]) -> Result<(), String> {
+        for (g, want) in wants {
+            self.reserve(m, slot, port, *g, *want)?;
+        }
         Ok(())
     }
     /// Among the cards with the room now, the first the model lists (the box's fastest card first) rather than the emptiest

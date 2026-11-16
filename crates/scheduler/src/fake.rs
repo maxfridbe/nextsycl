@@ -32,6 +32,8 @@ struct State {
     servers: Vec<FakeServer>,
     models: BTreeMap<String, ModelInfo>,
     vram_mb: BTreeMap<String, u64>,
+    /// a model whose one copy spans cards: its MiB on each
+    span_mb: BTreeMap<String, BTreeMap<usize, u64>>,
     pinned: BTreeSet<String>,
     holds: BTreeMap<String, Hold>,
     cancelled: BTreeSet<String>,
@@ -63,17 +65,27 @@ impl FakeHost {
             }
         }
         FakeHost { st: Mutex::new(State {
-            now: 1000.0, cards: cards_mb.to_vec(), servers: v, models: BTreeMap::new(), vram_mb: BTreeMap::new(), pinned: BTreeSet::new(), holds: BTreeMap::new(),
+            now: 1000.0, cards: cards_mb.to_vec(), servers: v, models: BTreeMap::new(), vram_mb: BTreeMap::new(), span_mb: BTreeMap::new(), pinned: BTreeSet::new(), holds: BTreeMap::new(),
             cancelled: BTreeSet::new(), video_idle: true, chat: None, chat_idle: true, locked: BTreeSet::new(), load_s: 10.0, log: Vec::new(), notes: Vec::new(),
         }) }
     }
 
     /// A model of `kind` that takes `vram_mb` on a card, allowed on `gpus`, with a profile
     pub fn add(&self, id: &str, kind: &str, vram_mb: u64, gpus: &[usize], profile: Profile) -> ModelInfo {
-        let m = ModelInfo { id: id.into(), kind: kind.into(), enabled: true, gpus: gpus.to_vec(), profile };
+        let m = ModelInfo { id: id.into(), kind: kind.into(), enabled: true, gpus: gpus.to_vec(), profile, spans: false };
         let mut st = self.st.lock().unwrap();
         st.models.insert(id.into(), m.clone());
         st.vram_mb.insert(id.into(), vram_mb);
+        m
+    }
+
+    /// A model of `kind` whose one copy spans its cards: `per_card` its (card, MiB) on each, in its cards' order
+    pub fn add_span(&self, id: &str, kind: &str, per_card: &[(usize, u64)], profile: Profile) -> ModelInfo {
+        let m = ModelInfo { id: id.into(), kind: kind.into(), enabled: true, gpus: per_card.iter().map(|x| x.0).collect(), profile, spans: true };
+        let mut st = self.st.lock().unwrap();
+        st.models.insert(id.into(), m.clone());
+        st.vram_mb.insert(id.into(), per_card.first().map_or(0, |x| x.1));
+        st.span_mb.insert(id.into(), per_card.iter().copied().collect());
         m
     }
 
@@ -153,9 +165,18 @@ impl FakeHost {
         rsvp::left(st.holds.get(id), st.now)
     }
 
+    /// What server `s`'s model holds on card `g` (a spanning one on each of its cards)
+    fn on_card(st: &State, s: &FakeServer, g: usize) -> Option<u64> {
+        let m = s.model.as_ref()?;
+        match st.span_mb.get(m) {
+            Some(per) => per.get(&g).copied(),
+            None => (s.gpu == g).then(|| st.vram_mb.get(m).copied().unwrap_or(0)),
+        }
+    }
+
     fn used(st: &State, g: usize) -> u64 {
         BASE_USED_MB
-            + st.servers.iter().filter(|s| s.gpu == g).filter_map(|s| s.model.as_ref()).map(|m| st.vram_mb.get(m).copied().unwrap_or(0)).sum::<u64>()
+            + st.servers.iter().filter_map(|s| FakeHost::on_card(st, s, g)).sum::<u64>()
             + st.chat.as_ref().filter(|c| c.2 == g).map_or(0, |c| c.1)
     }
 
@@ -190,9 +211,9 @@ impl Host for FakeHost {
         let mut snap = Snapshot::default();
         for (g, total) in st.cards.iter().enumerate() {
             let mut procs = Vec::new();
-            for s in st.servers.iter().filter(|s| s.gpu == g) {
-                if let Some(m) = &s.model {
-                    procs.push(Proc { kind: Some(s.kind.clone()), model: m.clone(), port: Some(s.port), mb: st.vram_mb.get(m).copied().unwrap_or(0) });
+            for s in &st.servers {
+                if let (Some(m), Some(mb)) = (&s.model, FakeHost::on_card(&st, s, g)) {
+                    procs.push(Proc { kind: Some(s.kind.clone()), model: m.clone(), port: Some(s.port), mb });
                 }
             }
             if let Some((id, mb, cg)) = &st.chat {
@@ -219,13 +240,23 @@ impl Host for FakeHost {
 
     fn start(&self, kind: &str, id: &str, slot: usize, _port: u16, gpu: usize) -> Result<(), Fail> {
         let mut st = self.st.lock().unwrap();
-        let need = st.vram_mb.get(id).copied().unwrap_or(0);
-        let free = st.cards[gpu].saturating_sub(FakeHost::used(&st, gpu));
-        if free < need {
-            return Err((502, format!("{id} needs about {:.1} GiB on card {gpu}; {:.1} GiB are free", need as f64 / 1024.0, free as f64 / 1024.0)));
+        // a spanning model on each of its cards, else the one named
+        let needs: Vec<(usize, u64)> = match st.span_mb.get(id) {
+            Some(per) => per.iter().map(|(g, mb)| (*g, *mb)).collect(),
+            None => vec![(gpu, st.vram_mb.get(id).copied().unwrap_or(0))],
+        };
+        for (g, need) in &needs {
+            let free = st.cards[*g].saturating_sub(FakeHost::used(&st, *g));
+            if free < *need {
+                return Err((502, format!("{id} needs about {:.1} GiB on card {g}; {:.1} GiB are free", *need as f64 / 1024.0, free as f64 / 1024.0)));
+            }
         }
         let load = st.load_s;
-        let line = format!("start {kind} {id} slot {slot} gpu {gpu}");
+        let line = if st.span_mb.contains_key(id) {
+            format!("start {kind} {id} slot {slot} gpus {}", needs.iter().map(|x| x.0.to_string()).collect::<Vec<_>>().join(","))
+        } else {
+            format!("start {kind} {id} slot {slot} gpu {gpu}")
+        };
         let s = st.servers.iter_mut().find(|s| s.kind == kind && s.slot == slot).ok_or((500, "no such slot".to_string()))?;
         s.model = Some(id.into());
         s.gpu = gpu;

@@ -96,6 +96,19 @@ pub fn one_of(m: &Value) -> bool {
     m.get("gpus").and_then(Value::as_str).is_some_and(|g| g.contains('|'))
 }
 
+/// Whether an image, audio or 3D entry's ONE copy spans its cards (`spans: true`, model-cards/README.md): its server is
+/// started on all of them together (`--gpus A,B`), it needs room on each and it never has a second copy - not the usual
+/// "its cards are where its copies may go". A chat model's spread is its `gpus` alone (life.rs spans_all).
+pub fn spans(m: &Value) -> bool {
+    matches!(kind_of(m), "image" | "audio" | "model3d") && m["spans"] == true
+}
+
+/// A spanning entry's memory on each of its cards, GiB, in its cards' order (`vram_gib_per_card: [23.0, 5.5]`)
+pub fn vram_per_card(m: &Value) -> Option<Vec<f64>> {
+    let v: Vec<f64> = m["vram_gib_per_card"].as_array()?.iter().filter_map(Value::as_f64).collect();
+    (!v.is_empty()).then_some(v)
+}
+
 /// The card the front door chose for a one-of chat model, handed to `llm start` beside the registry `file` (the
 /// studio's start command names the model only)
 pub fn chat_gpu_file(registry_file: &Path) -> PathBuf {

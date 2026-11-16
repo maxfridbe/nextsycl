@@ -333,8 +333,18 @@ impl Home {
         if present.is_empty() {
             return (true, None); // the cards not known yet: no verdict
         }
-        let split = card["split"] == true && present.len() > 1;
+        let split = (card["split"] == true || card["spans"] == true) && present.len() > 1;
         let gib = |mb: u64| mb as f64 / 1024.0;
+        // one copy over its cards with a share each (`vram_gib_per_card`): each share against its own card
+        if let Some(per) = registry::vram_per_card(card).filter(|_| split) {
+            let short: Vec<String> = gpus.iter().enumerate().filter(|(_, g)| total(**g) > 0)
+                .filter_map(|(k, g)| {
+                    let need = (per.get(k).or(per.last()).copied().unwrap_or(0.0) * 1024.0) as u64;
+                    let name = cards.get(*g).and_then(|c| c["name"].as_str()).unwrap_or("its card").replace("NVIDIA GeForce ", "");
+                    (need > total(*g).saturating_sub(1024)).then(|| format!("~{:.1} GiB on {name}, which holds {:.1} GiB", gib(need), gib(total(*g))))
+                }).collect();
+            return if short.is_empty() { (true, None) } else { (false, Some(format!("needs {}", short.join("; ")))) };
+        }
         let need_mb = match card["vram_gib"].as_f64() {
             Some(g) => (g * 1024.0) as u64,
             None => (bytes >> 20) * 11 / 10 / if split { present.len() as u64 } else { 1 },

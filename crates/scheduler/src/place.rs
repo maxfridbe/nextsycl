@@ -125,6 +125,10 @@ pub fn card_contended(snap: &Snapshot, host: &dyn Host, g: usize, port: u16) -> 
 /// started; None when there is no such card or slot, or the start failed (the caller uses the copy it has)
 fn start_copy(host: &dyn Host, req: &PlaceReq, snap: &Snapshot, mine: &[&Server], cards: &dyn Fn(usize) -> bool) -> Option<Outcome> {
     let m = req.model;
+    // one copy over its cards: never a second (its requests share it)
+    if m.spans {
+        return None;
+    }
     let (id, kind, job) = (m.id.as_str(), m.kind.as_str(), req.job);
     let sv = snap.servers_of(kind);
     let kept = |x: &Server| x.model.as_ref().is_some_and(|mm| snap.kept.contains(mm));
@@ -220,6 +224,9 @@ pub fn place(host: &dyn Host, req: &PlaceReq) -> Result<Outcome, Fail> {
     if let Some(why) = host.barred() {
         return Ok(Outcome::Barred(why));
     }
+    if m.spans {
+        return place_span(host, req, &snap);
+    }
     let plans = gpus.iter().map(|&g| (g, card_free(cards, g), room_plan(&snap, host, g, want(g), kind, false, Some(m))));
     let plan = if host.first_listed_card() { pick_first(plans) } else { pick_card(plans) };
     let empty = sv.iter().find(|x| x.model.is_none());
@@ -278,6 +285,92 @@ pub fn place(host: &dyn Host, req: &PlaceReq) -> Result<Outcome, Fail> {
         // the server asked more than was planned for: the next try plans for that (stopping idle work for it)
         if host.learn_ask(id, &e, gpu, want(gpu)) {
             return Ok(Outcome::NotYet(format!("{id} needed more room on GPU {gpu} than planned ({e}); planned again")));
+        }
+        return Err((code, e));
+    }
+    Ok(Outcome::Placed { slot: x.slot, port: x.port })
+}
+
+/// What a model whose one copy spans its cards plans for on card `g`, MiB: its share there and the margin; a refusal
+/// learned (`asked_mb`, which names no card) raises its first card's - the largest share - never another's
+pub fn span_want(req: &PlaceReq, g: usize) -> u64 {
+    let w = req.need_mb.get(&g).copied().unwrap_or(0) + MARGIN_MB;
+    if req.model.gpus.first() == Some(&g) { w.max(req.asked_mb) } else { w }
+}
+
+/// [`place`] for a model not loaded whose one copy spans its cards ([`ModelInfo::spans`]): the room on EACH of its cards
+/// now or once idle holders there go (a card that cannot be cleared is no choice: the model waits, or a busy server of
+/// its kind holding that card's room goes after its requests), a server slot as for any model, the room on every card
+/// taken together, one start on all of them
+fn place_span(host: &dyn Host, req: &PlaceReq, snap: &Snapshot) -> Result<Outcome, Fail> {
+    let m = req.model;
+    let (id, kind, job) = (m.id.as_str(), m.kind.as_str(), req.job);
+    let gpus = &m.gpus;
+    let want = |g: usize| span_want(req, g);
+    let cards = &snap.cards;
+    let sv: Vec<Server> = snap.servers_of(kind).to_vec();
+    let kept = |x: &Server| x.model.as_ref().is_some_and(|mm| snap.kept.contains(mm));
+    let plans: Vec<(usize, Option<Vec<Holder>>)> = gpus.iter().map(|&g| (g, room_plan(snap, host, g, want(g), kind, false, Some(m)))).collect();
+    let short: Vec<usize> = plans.iter().filter(|(_, p)| p.is_none()).map(|(g, _)| *g).collect();
+    if !short.is_empty() {
+        // a busy server of another model of the kind holding a short card's room goes after its requests
+        let on_short = |x: &&Server| x.model.is_some() && x.model.as_deref() != Some(id) && !kept(x)
+            && card_of_port(cards, x.port).is_some_and(|g| short.contains(&g));
+        let frees = |x: &&Server| short.iter().all(|&g| {
+            let mb = cards.iter().find(|c| c.index == g).into_iter().flat_map(|c| c.procs.iter()).filter(|p| p.port == Some(x.port)).map(|p| p.mb).sum::<u64>();
+            room_plan(snap, host, g, want(g).saturating_sub(mb), kind, false, Some(m)).is_some()
+        });
+        if let Some(x) = sv.iter().filter(on_short).filter(frees).min_by_key(|x| x.inflight) {
+            drain(host, x, kind, id, job)?;
+            return Ok(Outcome::NotYet(format!("server {} stopped for {id}", x.slot + 1)));
+        }
+        let lack = short.iter().map(|g| no_room(snap, &[*g], m, want(*g))).collect::<Vec<_>>().join(" / ");
+        return Ok(Outcome::NotYet(lack));
+    }
+    let ram = match host.ram_plan(snap, m) {
+        Ok(p) => p,
+        Err(why) => return Ok(Outcome::NotYet(why)),
+    };
+    // a slot no server holds, else one an idle model holds (one on its cards first), else the one with the fewest requests after them
+    let idle = sv.iter().filter(|x| x.model.is_some() && x.model.as_deref() != Some(id) && !kept(x) && x.idle())
+        .min_by_key(|x| card_of_port(cards, x.port).is_none_or(|g| !gpus.contains(&g)));
+    let x = match (sv.iter().find(|x| x.model.is_none()), idle) {
+        (Some(e), _) => e,
+        (None, Some(i)) => i,
+        _ => {
+            let Some(x) = sv.iter().filter(|x| x.model.is_some() && !kept(x)).min_by_key(|x| x.inflight) else {
+                return Ok(Outcome::NotYet(no_room(snap, gpus, m, want(gpus[0]))));
+            };
+            drain(host, x, kind, id, job)?;
+            x
+        }
+    };
+    stop_slot(host, kind, x, id)?;
+    for (_, plan) in &plans {
+        if let Err((_, e)) = free_plan(host, plan.as_deref().unwrap_or(&[]), kind, id) {
+            return Ok(Outcome::NotYet(e));
+        }
+    }
+    if let Err((_, e)) = free_plan(host, &ram, kind, id) {
+        return Ok(Outcome::NotYet(e));
+    }
+    if !host.wait_ram(id) {
+        return Ok(Outcome::NotYet(format!("host memory did not come free for {id}")));
+    }
+    for &g in gpus {
+        if !wait_room(host, g, want(g)) {
+            return Ok(Outcome::NotYet(format!("GPU {g} has not freed {:.1} GiB for {id} yet", want(g) as f64 / 1024.0)));
+        }
+    }
+    let wants: Vec<(usize, u64)> = gpus.iter().map(|&g| (g, want(g))).collect();
+    if let Err(why) = host.reserve_span(m, x.slot, x.port, &wants) {
+        return Ok(Outcome::NotYet(why));
+    }
+    let on = gpus.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(" + ");
+    host.note(job, "loading", &format!("{id} loading on GPUs {on} (server {})", x.slot + 1));
+    if let Err((code, e)) = host.start(kind, id, x.slot, x.port, gpus[0]) {
+        if host.learn_ask(id, &e, gpus[0], want(gpus[0])) {
+            return Ok(Outcome::NotYet(format!("{id} needed more room than planned ({e}); planned again")));
         }
         return Err((code, e));
     }

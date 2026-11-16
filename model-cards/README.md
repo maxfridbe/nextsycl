@@ -21,6 +21,12 @@ gpus: '0'                       # the GPUs it loads on: '0', '1', '0,1' (one cop
                                 #   them, the whole model on the first with room, in that order - llm cards that fit one card)
 vram_gib: 29.0                  # its memory on each card when it runs, as measured (the front door keeps the card
                                 #   free for it before it has measured the model itself; else from the files' sizes)
+spans: true                     # optional, image / audio / 3D: ONE copy spans its cards (gpus '0,1'): its server starts on all
+                                #   of them (`--gpus 0,1`; an engine that splits itself - Sophon-Realtime's brain and voice), the
+                                #   front door frees room on each and never runs a second copy. Without it an image, audio or 3D
+                                #   model's cards are where its copies may go, one card a copy (a chat model spreads by gpus alone)
+vram_gib_per_card: [23.0, 5.5]  # optional, with spans: its memory on each card, in gpus' order (else vram_gib on each); vram_gib
+                                #   stays its largest card's figure for what reads one number
 ram_gib: 46                     # optional: its host memory when it runs, not counting reclaimable cache, as measured (pinned tiers, process); the
                                 #   front door checks it against MemAvailable before a load, idle models go for it, else it waits or answers no_room
 ram_cache_gib: 12.7             # optional: the reclaimable page cache it keeps warm: MemAvailable counts it, other models' loads do not

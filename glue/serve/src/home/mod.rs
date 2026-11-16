@@ -270,7 +270,11 @@ fn process(pid: u32) -> Value {
     };
     let rest = &args[i + 1..];
     let get = |k: &str| rest.iter().position(|a| a == k).and_then(|j| rest.get(j + 1)).cloned();
-    let gpus: Vec<String> = rest.iter().enumerate().filter(|(_, a)| *a == "--gpu").filter_map(|(j, _)| rest.get(j + 1).cloned()).collect();
+    // (`--gpus A,B`: a server whose one copy spans cards)
+    let mut gpus: Vec<String> = rest.iter().enumerate().filter(|(_, a)| *a == "--gpu" || *a == "--gpus").filter_map(|(j, _)| rest.get(j + 1))
+        .flat_map(|v| v.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>()).filter(|x| !x.is_empty()).collect();
+    gpus.sort();
+    gpus.dedup();
     let kinds = ["llm", "image", "video", "audio", "model3d"];
     let (kind, cmd, model) = match rest.first().map(String::as_str) {
         Some(k) if kinds.contains(&k) => {

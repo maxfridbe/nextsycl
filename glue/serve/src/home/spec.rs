@@ -181,7 +181,7 @@ const MODEL_STATE: &str = r#"{"type": "object", "properties": {"id": {"type": "s
   "drive": {"type": "string"}, "folder": {"type": "string"}, "free": {"type": "integer"},
   "pull": {"description": "not downloaded: its download under way (as system.models.pulls lists it), else null"},
   "vouch_mb": {"type": "object", "additionalProperties": {"type": "integer"}, "description": "VRAM it is counted for, by card"},
-  "spans": {"type": "boolean", "description": "a chat model spread over every card (its model card: gpus all): its cards are not a choice"},
+  "spans": {"type": "boolean", "description": "one copy over several cards: a chat model spread over every card (its model card: gpus all), or an image, audio or 3D model whose one copy spans its cards (its model card: spans) - its cards are not a choice"},
   "measured": {"type": "boolean"}, "headroom_mb": {"type": "object", "additionalProperties": {"type": "integer"}}, "headroom_given": {"type": "boolean"},
   "license": {"type": ["string", "null"], "description": "SPDX id or the licence's name (its entry's, else its model card's); null: not stated"}, "commercial": {"type": ["boolean", "null"], "description": "whether its weights may be used commercially; null: not stated"}, "license_note": {"type": ["string", "null"]},
   "annotations": {"type": ["array", "null"], "description": "what it reads inline in its text (nextcuda's schema: model-cards/README.md, Annotations) - a client's legend where the text is written; its entry's, else its model card's; null: none stated",
@@ -288,7 +288,7 @@ pub fn result(method: &str) -> Option<String> {
     "cards": {"type": "integer", "description": "cards the video daemon can make a clip on"}}},
   "slots": {"type": "array", "description": "every place work runs: image and audio servers (two each: one per card), the video daemon's cards, the chat server", "items": {"type": "object", "properties": {
     "kind": {"type": "string", "enum": ["image", "audio", "video", "llm"]}, "slot": {}, "port": {"type": "integer"}, "gpu": {"type": "integer", "nullable": true, "description": "its card (null: not running)"},
-    "gpus": {"type": "array", "items": {"type": "integer"}, "description": "llm: every card it spans"}, "model": {"type": "string", "nullable": true},
+    "gpus": {"type": "array", "items": {"type": "integer"}, "description": "llm, or a server whose one copy spans cards: every card it is on"}, "model": {"type": "string", "nullable": true},
     "up": {"type": "boolean", "description": "a server or engine holds a model there"}, "loading": {"type": "boolean"}, "busy": {"type": "boolean"}}}},
   "cards": {"type": "array", "description": "each GPU and the work on it", "items": {"type": "object", "properties": {
     "gpu": {"type": "integer"}, "name": {"type": "string"}, "vram_total_mb": {"type": "integer"}, "vram_used_mb": {"type": "integer"}, "busy_pct": {"type": "number"}, "power_w": {"type": "number"},

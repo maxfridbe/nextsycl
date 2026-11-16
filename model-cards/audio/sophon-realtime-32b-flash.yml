@@ -15,7 +15,9 @@ license_note: 'Apache-2.0 code and weights (Adventists AI); derived from Qwen3-V
 title: 'Sophon-Realtime 32B Flash (full-duplex voice conversation; Rust + SYCL)'
 about: 'A live voice conversation over /v1/realtime (OpenAI Realtime events): the 32B brain hears your speech itself, decides when you have finished (DuplexJev''s turn question) and writes a reply with sound tags ([laughter], [sigh], <strong>); a Qwen3-TTS voice speaks it as it is written; barge-in, voice cloning from a saved voice, tool calls. The brain q4 on the first card, the voice on the second'
 gpus: '0,1'
-vram_gib: 23.0                   # the brain's card (q4, 6K context); the talker's ~5.5
+spans: true                      # one copy over both cards (audio start --gpus 0,1): the brain on the first, the talker on the second
+vram_gib: 23.0                   # the brain's card (q4, 6K context)
+vram_gib_per_card: [23.0, 5.5]   # the brain's card, the talker's
 speech:
 - clone                          # a saved voice (its recording's x-vector), or a recording
 - realtime                       # a live conversation: /v1/realtime

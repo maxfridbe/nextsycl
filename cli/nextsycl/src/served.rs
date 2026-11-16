@@ -56,13 +56,16 @@ pub fn without_slot(args: &[String]) -> Vec<String> {
 }
 
 impl Served {
-    /// The container's name for `--slot N` in `args` (none or 0: the first's)
+    /// The container's name for `--slot N` in `args` (none or 0: the first's), after NS_CONTAINER_PREFIX (from the
+    /// environment: a second front door on the box - a build copy's test beside production - starts, finds and stops
+    /// its own servers, never the other's)
     pub fn name_for(&self, args: &[String]) -> Result<String, String> {
+        let prefix = std::env::var("NS_CONTAINER_PREFIX").unwrap_or_default();
         match opt(args, "--slot") {
-            None => Ok(self.name.into()),
+            None => Ok(format!("{prefix}{}", self.name)),
             Some(v) => match v.parse::<u32>() {
-                Ok(0) => Ok(self.name.into()),
-                Ok(n) => Ok(format!("{}-{n}", self.name)),
+                Ok(0) => Ok(format!("{prefix}{}", self.name)),
+                Ok(n) => Ok(format!("{prefix}{}-{n}", self.name)),
                 Err(_) => Err(format!("--slot {v}: a number")),
             },
         }

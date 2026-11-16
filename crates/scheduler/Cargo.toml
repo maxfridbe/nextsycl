@@ -1,7 +1,7 @@
 [package]
 name = "backplane-scheduler"
 description = "The backplane's scheduler: placement, room planning, pins and holds, model-card concurrency profiles, ETAs. Pure; the host supplies cards, servers, a clock and files through traits."
-version = "0.1.0+nextsycl.1"
+version = "0.1.0+nextsycl.2"
 edition = "2021"
 license = "MIT"
 

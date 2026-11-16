@@ -222,7 +222,7 @@ fn the_first_listed_card_when_asked_stopping_idle_work_there_before_going_on() {
 }
 
 fn info(id: &str, kind: &str, p: Profile) -> ModelInfo {
-    ModelInfo { id: id.into(), kind: kind.into(), enabled: true, gpus: vec![0], profile: p }
+    ModelInfo { id: id.into(), kind: kind.into(), enabled: true, gpus: vec![0], profile: p, spans: false }
 }
 
 #[test]
@@ -243,4 +243,78 @@ fn the_last_check_sees_a_load_under_way_beside_an_exclusive_model() {
     assert!(room::may_start(&card(vec![]), &models, &models["a"], 0, CARD).is_err());
     let e = room::may_start(&card(vec![Proc { model: "a".into(), kind: Some("image".into()), port: Some(8), mb: 0 }]), &models, &models["a"], 0, 4096).unwrap_err();
     assert!(e.contains("max_copies_per_card"), "{e}");
+}
+
+/// Two cards, two audio servers
+fn span_host() -> H {
+    H { f: FakeHost::new(&[CARD, CARD], &[("audio", 2)]), k: Hooks::default() }
+}
+
+/// The asking for `m` with its need on each card
+fn ask_span(h: &H, m: &ModelInfo, per: &[(usize, u64)], wait_s: u64) -> Result<(usize, u16), Fail> {
+    let need: BTreeMap<usize, u64> = per.iter().copied().collect();
+    let req = PlaceReq { model: m, job: None, need_mb: &need, asked_mb: 0 };
+    ensure(h, &req, Duration::from_secs(wait_s), None, &json!({}))
+}
+
+/// Sophon-Realtime's shares: the brain's card, the voice's
+const SOPHON: [(usize, u64); 2] = [(0, 23552), (1, 5632)];
+
+#[test]
+fn a_spanning_model_frees_idle_holders_on_each_of_its_cards_and_starts_once_on_both() {
+    let h = span_host();
+    let b = h.f.add("b", "audio", 20000, &[0], Profile::default());
+    let c = h.f.add("c", "audio", 28000, &[1], Profile::default());
+    ask_span(&h, &b, &[(0, 20000)], 90).unwrap();
+    ask_span(&h, &c, &[(1, 28000)], 90).unwrap();
+    h.f.chat("chat", 4000, 0, true);
+    let s = h.f.add_span("sophon", "audio", &SOPHON, Profile::default());
+    ask_span(&h, &s, &SOPHON, 90).unwrap();
+    let log = h.f.log();
+    // b held card 0's room and c card 1's: both idle, both go; one start on both cards
+    assert!(log.iter().any(|l| l.starts_with("stop audio slot 0")) && log.iter().any(|l| l.starts_with("stop audio slot 1")), "{log:?}");
+    assert_eq!(log.iter().filter(|l| l.starts_with("start audio sophon")).collect::<Vec<_>>(), vec!["start audio sophon slot 0 gpus 0,1"]);
+    // the room on each card taken before the start, at its own figure with the margin
+    let r = h.k.reserved.borrow().clone();
+    assert!(r.contains(&(0, 23552 + room::MARGIN_MB)) && r.contains(&(1, 5632 + room::MARGIN_MB)), "{r:?}");
+    // its memory shows on both cards; the idle chat model was not needed (card 0 had the room once b went)
+    let snap = h.snapshot();
+    for (g, mb) in SOPHON {
+        assert!(snap.cards[g].procs.iter().any(|p| p.model == "sophon" && p.mb == mb), "card {g}: {:?}", snap.cards[g].procs);
+    }
+    assert!(!log.iter().any(|l| l.contains("unload chat")), "{log:?}");
+}
+
+#[test]
+fn a_spanning_model_waits_when_one_card_is_busy_and_stops_nothing_meanwhile() {
+    let h = span_host();
+    let b = h.f.add("b", "audio", 20000, &[0], Profile::default());
+    ask_span(&h, &b, &[(0, 20000)], 90).unwrap();
+    // card 1 held by a chat model answering a request: not idle
+    h.f.chat("chat", 28000, 1, false);
+    let s = h.f.add_span("sophon", "audio", &SOPHON, Profile::default());
+    let (code, why) = ask_span(&h, &s, &SOPHON, 90).unwrap_err();
+    assert_eq!(code, 503, "{why}");
+    assert!(why.contains("GPU 1") && why.contains("chat"), "{why}");
+    // the idle model on card 0 stays until both cards can be had
+    assert_eq!(h.f.loaded("audio"), vec![Some("b".to_string()), None]);
+    assert!(!h.f.log().iter().any(|l| l.contains("sophon")), "{:?}", h.f.log());
+    // the chat model idles: it goes, b goes, sophon starts
+    h.f.chat("chat", 28000, 1, true);
+    ask_span(&h, &s, &SOPHON, 90).unwrap();
+    assert!(h.f.log().iter().any(|l| l == "unload chat chat"), "{:?}", h.f.log());
+    assert_eq!(h.f.count("start audio sophon slot"), 1);
+}
+
+#[test]
+fn a_spanning_model_never_runs_a_second_copy() {
+    let h = span_host();
+    let two = Profile::from_card(&json!({"concurrency": {"max_copies_per_card": 2, "recommended_copies": 2}})).unwrap();
+    let s = h.f.add_span("sophon", "audio", &SOPHON, two);
+    let first = ask_span(&h, &s, &SOPHON, 90).unwrap();
+    h.f.busy("sophon", 600.0, 1);
+    // its server busy, a free slot and the room for another on both cards: the request shares the copy it has
+    let again = ask_span(&h, &s, &SOPHON, 90).unwrap();
+    assert_eq!(first, again);
+    assert_eq!(h.f.count("start audio sophon"), 1, "{:?}", h.f.log());
 }

@@ -75,6 +75,7 @@ impl Catalog {
                 if let Some(c) = v.get("controls") {
                     crate::controls::check(c).map_err(|e| format!("{}: {e}", p.display()))?;
                 }
+                span_check(&v).map_err(|e| format!("{}: {e}", p.display()))?;
                 cards.push((p, v));
             }
         }
@@ -543,12 +544,35 @@ fn entry(m: &Value, paths: &BTreeMap<String, PathBuf>, local: &BTreeMap<String, 
         "files": files, "gpus": m.get("gpus").cloned().unwrap_or(json!("0")), "env": env, "enabled": true,
         "catalog": m["id"],
     });
-    for k in ["ctx", "tools", "tasks", "base", "defaults", "speech", "voices", "languages", "does", "silo", "vram_gib", "headroom_gib", "ram_gib", "ram_cache_gib", "streams", "sidecars"] {
+    for k in ["ctx", "tools", "tasks", "base", "defaults", "speech", "voices", "languages", "does", "silo", "spans", "vram_gib", "vram_gib_per_card", "headroom_gib", "ram_gib", "ram_cache_gib", "streams", "sidecars"] {
         if let Some(v) = m.get(k) {
             e[k] = v.clone();
         }
     }
     e
+}
+
+/// A card's `spans` (an image, audio or 3D model whose one copy spans its cards) and `vram_gib_per_card` (its memory on
+/// each, in its cards' order): spans only for those kinds and over two cards or more ('0,1', not a choice '0|1' or
+/// 'all'), the per-card list only with spans and one figure a card
+fn span_check(v: &Value) -> Result<(), String> {
+    let spans = match v.get("spans") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("spans: true or false".into()),
+    };
+    let gpus = v["gpus"].as_str().unwrap_or("");
+    let n = gpus.split(',').filter(|g| g.trim().parse::<usize>().is_ok()).count();
+    if spans && (!matches!(s(v, "kind").as_str(), "image" | "audio" | "model3d") || gpus.contains('|') || n < 2) {
+        return Err(format!("spans: an image, audio or 3D model over two cards or more (gpus '0,1'); this one: kind {}, gpus '{gpus}'", s(v, "kind")));
+    }
+    if let Some(per) = v.get("vram_gib_per_card") {
+        let ok = per.as_array().is_some_and(|a| a.iter().all(|x| x.as_f64().is_some_and(|g| g > 0.0)));
+        if !spans || !ok || per.as_array().map_or(0, Vec::len) != n {
+            return Err(format!("vram_gib_per_card: with spans: true, one figure (GiB) for each of its {n} cards"));
+        }
+    }
+    Ok(())
 }
 
 /// A made-locally part's path: `NS_<ROLE>` style settings in nextsycl.conf are the engine's own (the MTP layer:
@@ -755,6 +779,24 @@ mod tests {
         assert_eq!(e(json!("b"))["env"], json!({"NS_SILO_NAME": "b"}));
         assert_eq!(e(json!("none"))["env"], json!({"NS_SILO": "0"}));
         assert_eq!(e(Value::Null)["env"], json!({}));
+    }
+
+    #[test]
+    fn a_spanning_card_is_checked_and_its_entry_carries_its_shares() {
+        let card = json!({"id": "x", "kind": "audio", "arch": "a", "title": "X", "gpus": "0,1", "spans": true, "vram_gib": 23.0, "vram_gib_per_card": [23.0, 5.5]});
+        assert!(span_check(&card).is_ok());
+        let e = entry(&card, &BTreeMap::new(), &BTreeMap::new());
+        assert_eq!((e["spans"].clone(), e["vram_gib_per_card"].clone(), e["gpus"].clone()), (json!(true), json!([23.0, 5.5]), json!("0,1")));
+        let with = |k: &str, v: Value| { let mut c = card.clone(); c[k] = v; span_check(&c) };
+        assert!(with("gpus", json!("0")).is_err(), "one card is no span");
+        assert!(with("gpus", json!("0|1")).is_err(), "a choice is no span");
+        assert!(with("kind", json!("llm")).is_err(), "a chat model spreads by its gpus alone");
+        assert!(with("vram_gib_per_card", json!([23.0])).is_err(), "a figure a card");
+        assert!(with("spans", json!(false)).is_err(), "shares without spans");
+        assert!(with("spans", json!("yes")).is_err());
+        let mut plain = card.clone();
+        plain.as_object_mut().unwrap().retain(|k, _| k != "spans" && k != "vram_gib_per_card");
+        assert!(span_check(&plain).is_ok());
     }
 
     #[test]

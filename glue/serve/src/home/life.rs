@@ -12,7 +12,10 @@
 //!   request for an enabled model on the first of its cards with room, swapped when a request names another (after the
 //!   one running), ending itself when idle. A second (`--slot 1`, NS_IMAGE_PORT2 / NS_AUDIO_PORT2) holds another model,
 //!   or a second copy of a model enabled on two cards: started when a request finds its copy with work and its other
-//!   card with room; requests go to the copy without work, else the one with fewer. A start waits for the card to have the model's memory free (1.5 GiB to spare: past that the xe driver
+//!   card with room; requests go to the copy without work, else the one with fewer. A model whose ONE copy spans its
+//!   cards (its card's `spans: true`: Sophon-Realtime's brain on one card, its voice on the other) is no such choice:
+//!   it needs room on each of its cards (`vram_gib_per_card`), idle holders on any of them go for it, its server starts
+//!   with `--gpus A,B`, and it never has a second copy. A start waits for the card to have the model's memory free (1.5 GiB to spare: past that the xe driver
 //!   spills into host memory and the box can hang), and answers 503 no_room when it does not come free. Free is what
 //!   every process leaves (the root sampler's gpustat file counts other users'), less what loads started here have
 //!   yet to take.
@@ -153,10 +156,38 @@ fn free_on(c: &Value, pending: &[(u16, u64)]) -> u64 {
     free.saturating_sub(to_come)
 }
 
-/// An image, audio or 3D model, or a chat model whose cards are a choice (`gpus: '0|1'`): it loads whole on one card
-/// (the first of its cards with room)
+/// An image, audio or 3D model (its copies one card each), or a chat model whose cards are a choice (`gpus: '0|1'`): it
+/// loads whole on one card (the first of its cards with room). Not one whose one copy spans its cards (`spans: true`).
 fn one_card(m: &Value) -> bool {
-    matches!(registry::kind_of(m), "image" | "audio" | "model3d") || registry::one_of(m)
+    (matches!(registry::kind_of(m), "image" | "audio" | "model3d") && !registry::spans(m)) || registry::one_of(m)
+}
+
+/// A model's memory on each of its cards `gpus` from its model card's figures, MiB, at most `cap`: one whose one copy spans
+/// its cards takes each card's own (`vram_gib_per_card`, in its cards' order; a card past the list the last), else
+/// `vram_gib` on each; None when it states none
+fn card_figures(m: &Value, gpus: &[usize], cap: u64) -> Option<BTreeMap<usize, u64>> {
+    let mb = |g: f64| ((g * 1024.0) as u64).min(cap);
+    if let Some(per) = registry::vram_per_card(m).filter(|_| registry::spans(m)) {
+        let at = |k: usize| per.get(k).or(per.last()).copied().unwrap_or(0.0);
+        return Some(gpus.iter().enumerate().map(|(k, i)| (*i, mb(at(k)))).collect());
+    }
+    let g = m["vram_gib"].as_f64().filter(|g| *g > 0.0)?;
+    Some(gpus.iter().map(|i| (*i, mb(g))).collect())
+}
+
+/// The arguments that start an image, audio or 3D server: `<kind> start ID --gpu N --port P ...`; a model whose one copy
+/// spans its cards (`gpus`, more than one) is started on all of them with `--gpus A,B` too (`--gpu` its first, for what
+/// reads that). `idle_exit`: the seconds after which it ends itself when idle.
+fn start_args(kind: &str, id: &str, slot: usize, port: u16, gpus: &[usize], host: &str, idle_exit: Option<u64>) -> Vec<String> {
+    let mut args = vec![kind.to_string(), "start".into(), id.into(), "--gpu".into(), gpus.first().copied().unwrap_or(0).to_string()];
+    if gpus.len() > 1 {
+        args.extend(["--gpus".into(), gpus.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(",")]);
+    }
+    args.extend(["--port".into(), port.to_string(), "--host".into(), host.to_string(), "--wfe".into(), "--slot".into(), slot.to_string()]);
+    if let Some(secs) = idle_exit {
+        args.extend(["--idle-exit".into(), secs.to_string()]);
+    }
+    args
 }
 
 /// A one-of chat model's card from its cards' room plans, in its order of preference: the first it fits on now
@@ -189,6 +220,13 @@ fn card_of_port(cards: &Value, port: u16) -> Option<usize> {
     let port = port.to_string();
     cards.as_array()?.iter().find(|c| c["procs"].as_array().into_iter().flatten().any(|p| p["port"].as_str() == Some(port.as_str())))
         .and_then(|c| c["index"].as_u64()).map(|g| g as usize)
+}
+
+/// Every card the server listening on `port` holds memory on (a model whose one copy spans cards: more than one)
+fn cards_of_port(cards: &Value, port: u16) -> Vec<usize> {
+    let port = port.to_string();
+    cards.as_array().into_iter().flatten().filter(|c| c["procs"].as_array().into_iter().flatten().any(|p| p["port"].as_str() == Some(port.as_str())))
+        .filter_map(|c| c["index"].as_u64()).map(|g| g as usize).collect()
 }
 
 /// One of the kind's servers (the scheduler's type): its slot, port, model, and whether it loads or has work
@@ -463,10 +501,12 @@ impl Home {
                 return (gpus.iter().map(|g| (*g, seen[g].min(cap))).collect(), true);
             }
         }
-        if let Some(g) = m["vram_gib"].as_f64().filter(|g| *g > 0.0) {
-            return (gpus.iter().map(|i| (*i, ((g * 1024.0) as u64).min(cap))).collect(), false);
+        if let Some(v) = card_figures(m, &gpus, cap) {
+            return (v, false);
         }
         let files: u64 = registry::paths(m).iter().filter(|p| p.is_file()).filter_map(|p| std::fs::metadata(p).ok()).map(|x| x.len() >> 20).sum();
+        // (a spanning model's files are shared out over its cards, as a chat model's)
+        let files = if registry::spans(m) { files / gpus.len().max(1) as u64 } else { files };
         let per = match registry::kind_of(m) {
             "video" => card_mb.saturating_sub(4096),
             "image" => files * 105 / 100 + 4096,
@@ -492,6 +532,7 @@ impl Home {
         let paths: std::collections::BTreeSet<_> = registry::paths(m).into_iter().filter(|p| p.is_file()).collect();
         let files: u64 = paths.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|x| x.len() >> 20).sum();
         let weights = match registry::kind_of(m) {
+            _ if registry::spans(m) => files / vouch.len().max(1) as u64,
             "llm" => files / vouch.len().max(1) as u64,
             _ => files,
         };
@@ -553,8 +594,14 @@ impl Home {
                 continue;
             }
             for x in self.servers(kind) {
-                v.push(json!({"kind": kind, "slot": x.slot, "port": x.port, "gpu": card_of_port(cards, x.port),
-                              "model": x.model, "loading": x.loading, "busy": x.busy && !x.loading, "up": x.model.is_some()}));
+                let mut row = json!({"kind": kind, "slot": x.slot, "port": x.port, "gpu": card_of_port(cards, x.port),
+                                     "model": x.model, "loading": x.loading, "busy": x.busy && !x.loading, "up": x.model.is_some()});
+                // a server whose one copy spans cards: every card it holds memory on
+                let on = cards_of_port(cards, x.port);
+                if on.len() > 1 {
+                    row["gpus"] = json!(on);
+                }
+                v.push(row);
             }
         }
         if all.iter().any(|m| registry::kind_of(m) == "video" && m["enabled"] != false) {
@@ -693,7 +740,9 @@ impl Home {
             // model one) and the jobs / chat requests they take together
             let servers = if kind == "video" { gpus.len() } else { self.slots(&kind).len() };
             let chat_parallel = m["env"]["NS_PARALLEL"].as_str().or(self.o.cfg.get("NS_PARALLEL").as_deref()).and_then(|v| v.trim().parse().ok()).unwrap_or(2);
-            let (max_copies, recommended_copies, at_once) = backplane_copies(&kind, gpus.len(), servers, &prof, chat_parallel);
+            // (one copy over its cards: a card's worth of copies)
+            let copy_cards = if registry::spans(m) { 1 } else { gpus.len() };
+            let (max_copies, recommended_copies, at_once) = backplane_copies(&kind, copy_cards, servers, &prof, chat_parallel);
             let mut concurrency = concurrency;
             if let Some(o) = concurrency.as_object_mut() {
                 // the card's figures are a copy's on one card: the backplane's are below
@@ -707,7 +756,7 @@ impl Home {
                    "controls": controls(m, lc, &caps),
                    "annotations": from_card(m, lc, "annotations"), "annotations_note": from_card(m, lc, "annotations_note"),
                    "id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "gpus_one_of": registry::one_of(m), "state": state,
-                   "spans": spans_all(m, &mc),
+                   "spans": spans_all(m, &mc) || registry::spans(m),
                    "pinned": enabled && m["pinned"] == true, "held_s": holds.get(s(m, "id").as_str()).map_or(0.0, |h| h.reserved(now()).round()),
                    "capabilities": caps, "methods": methods,
                    "max_pixels": limits.map(|l| l.0), "min_side": limits.map(|l| l.1), "max_side": limits.map(|l| l.2), "grid": limits.map(|l| l.3),
@@ -790,10 +839,18 @@ impl Home {
         }
         let kind = registry::kind_of(&m).to_string();
         let mut g = g;
-        g.sort();
+        // (a spanning model's order is its shares' order: its first card takes the first share)
+        if !registry::spans(&m) {
+            g.sort();
+        }
         g.dedup();
         if g.len() < n && spans_all(&m, &self.o.cfg.cards()) {
             return Err((400, format!("{id} is spread over every card (its model card: gpus all): it does not run on fewer")));
+        }
+        // one copy over its cards: as many cards as it has shares (vram_gib_per_card), two at least
+        let shares = registry::vram_per_card(&m).map_or(2, |v| v.len().max(2));
+        if registry::spans(&m) && g.len() != shares {
+            return Err((400, format!("{id}'s one copy spans {shares} cards (its model card: spans): give it {shares}, in the order of its shares")));
         }
         let old = self.gpus_of(&m);
         if old == g {
@@ -1024,7 +1081,8 @@ impl Home {
 
     /// A registered model as the scheduler needs it
     pub(super) fn model_info(&self, m: &Value) -> ModelInfo {
-        ModelInfo { id: s(m, "id"), kind: registry::kind_of(m).to_string(), enabled: m["enabled"] != false, gpus: self.gpus_of(m), profile: self.profile_of(m) }
+        let gpus = self.gpus_of(m);
+        ModelInfo { id: s(m, "id"), kind: registry::kind_of(m).to_string(), enabled: m["enabled"] != false, spans: registry::spans(m) && gpus.len() > 1, gpus, profile: self.profile_of(m) }
     }
 
     /// A model's profile: its entry's, else its model card's (validated when the cards load), else one copy, shared
@@ -1336,15 +1394,15 @@ impl Home {
     }
 
     fn start_at_(&self, kind: &str, id: &str, slot: usize, port: u16, gpu: usize) -> Result<(), (u16, String)> {
-        let secs = (self.o.idle_minutes * 60).to_string();
         // (a pinned model's server does not end itself when idle)
-        let mut args = vec![kind.to_string(), "start".into(), id.into(), "--gpu".into(), gpu.to_string(), "--port".into(), port.to_string(),
-                            "--host".into(), self.o.serve_host.clone(), "--wfe".into(), "--slot".into(), slot.to_string()];
-        if self.o.idle_minutes > 0 && !self.pinned(id) {
-            args.extend(["--idle-exit".into(), secs]);
-        }
+        let idle_exit = (self.o.idle_minutes > 0 && !self.pinned(id)).then_some(self.o.idle_minutes * 60);
+        // a model whose one copy spans its cards: on all of them (`gpu` is its first)
+        let span = self.models().into_iter().find(|m| m["id"] == id).filter(registry::spans).map(|m| self.gpus_of(&m)).filter(|g| g.len() > 1);
+        let gpus = span.unwrap_or_else(|| vec![gpu]);
+        let args = start_args(kind, id, slot, port, &gpus, &self.o.serve_host, idle_exit);
+        let on = if gpus.len() > 1 { format!("GPUs {}", gpus.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(" + ")) } else { format!("GPU {gpu}") };
         self.loading.lock().unwrap().insert(id.to_string(), now());
-        let r = self.exec(format!("{kind} start {id} on GPU {gpu}{}", if slot > 0 { format!(" (server {})", slot + 1) } else { String::new() }), &args);
+        let r = self.exec(format!("{kind} start {id} on {on}{}", if slot > 0 { format!(" (server {})", slot + 1) } else { String::new() }), &args);
         self.loading.lock().unwrap().remove(id);
         r.map_err(|e| (502, e))?;
         self.wait_up(port, id)
@@ -1509,6 +1567,17 @@ impl Host for Sched<'_> {
         let snap = self.0.snapshot_of(&self.0.models(), false);
         room::may_start(&snap.cards, &snap.models, m, gpu, want)?;
         self.0.pending.lock().unwrap().push(super::Pending { gpu, port, mb: want.saturating_sub(MARGIN_MB), answered: None, kind: m.kind.clone(), model: m.id.clone() });
+        Ok(())
+    }
+    fn reserve_span(&self, m: &ModelInfo, _slot: usize, port: u16, wants: &[(usize, u64)]) -> Result<(), String> {
+        // every card checked, then every card's room taken, under the one lock: none of it when one card says no
+        let _a = self.0.admit.lock().unwrap();
+        let snap = self.0.snapshot_of(&self.0.models(), false);
+        for (gpu, want) in wants {
+            room::may_start(&snap.cards, &snap.models, m, *gpu, *want)?;
+        }
+        self.0.pending.lock().unwrap().extend(wants.iter().map(|(gpu, want)| super::Pending {
+            gpu: *gpu, port, mb: want.saturating_sub(MARGIN_MB), answered: None, kind: m.kind.clone(), model: m.id.clone() }));
         Ok(())
     }
     fn first_listed_card(&self) -> bool {
@@ -1761,6 +1830,60 @@ mod tests {
         assert!(!spans_all(&json!({"id": "qwen3.8-27b-q8", "kind": "llm"}), &cards), "a one-card chat model");
         assert!(!spans_all(&json!({"id": "breeze-tts-2", "kind": "audio"}), &cards), "an audio model's all is where its copies may go");
         assert!(!spans_all(&json!({"id": "my-own", "kind": "llm", "gpus": "all"}), &cards), "no model card: a choice");
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::{card_figures, cards_of_port, one_card, start_args};
+    use serde_json::json;
+
+    fn sophon() -> serde_json::Value {
+        json!({"id": "sophon-realtime-32b-flash", "kind": "audio", "gpus": "0,1", "spans": true, "vram_gib": 23.0, "vram_gib_per_card": [23.0, 5.5]})
+    }
+
+    #[test]
+    fn a_model_whose_one_copy_spans_its_cards_is_not_one_card_a_copy() {
+        assert!(!one_card(&sophon()));
+        assert!(one_card(&json!({"id": "breeze-tts-2", "kind": "audio", "gpus": "0,1"})), "an audio model's cards are where its copies go");
+        assert!(one_card(&json!({"id": "x", "kind": "llm", "gpus": "0|1"})));
+        // spans means nothing to a chat model (its gpus spread it)
+        assert!(!one_card(&json!({"id": "x", "kind": "llm", "gpus": "0,1", "spans": true})));
+        assert!(super::registry::spans(&sophon()) && !super::registry::spans(&json!({"kind": "llm", "spans": true})));
+    }
+
+    #[test]
+    fn a_spanning_model_needs_its_own_share_on_each_card() {
+        let cap = 30000;
+        let v = card_figures(&sophon(), &[0, 1], cap).unwrap();
+        assert_eq!((v[&0], v[&1]), (23552, 5632));
+        // its cards in another order take the shares in that order
+        let v = card_figures(&sophon(), &[1, 0], cap).unwrap();
+        assert_eq!((v[&1], v[&0]), (23552, 5632));
+        // without shares: vram_gib on each; a model that does not span ignores a stray list
+        let mut no_shares = sophon();
+        no_shares.as_object_mut().unwrap().remove("vram_gib_per_card");
+        assert_eq!(card_figures(&no_shares, &[0, 1], cap).unwrap()[&1], 23552);
+        let one = json!({"id": "a", "kind": "audio", "gpus": "0,1", "vram_gib": 6.0, "vram_gib_per_card": [1.0, 2.0]});
+        assert_eq!(card_figures(&one, &[0, 1], cap).unwrap()[&0], 6144);
+        assert_eq!(card_figures(&json!({"vram_gib": 40.0}), &[0], cap).unwrap()[&0], cap, "never more than a card holds");
+        assert!(card_figures(&json!({"id": "x"}), &[0], cap).is_none());
+    }
+
+    #[test]
+    fn a_spanning_server_starts_on_all_its_cards() {
+        let a = start_args("audio", "sophon-realtime-32b-flash", 0, 8087, &[0, 1], "127.0.0.1", Some(600));
+        assert_eq!(a.join(" "), "audio start sophon-realtime-32b-flash --gpu 0 --gpus 0,1 --port 8087 --host 127.0.0.1 --wfe --slot 0 --idle-exit 600");
+        // one card: as before, no --gpus; pinned: no idle exit
+        let a = start_args("image", "z", 1, 8096, &[1], "0.0.0.0", None);
+        assert_eq!(a.join(" "), "image start z --gpu 1 --port 8096 --host 0.0.0.0 --wfe --slot 1");
+    }
+
+    #[test]
+    fn a_spanning_servers_row_lists_every_card_it_holds() {
+        let cards = json!([{"index": 0, "procs": [{"port": "8087", "vram_mb": 23000}]}, {"index": 1, "procs": [{"port": "8087", "vram_mb": 5600}, {"port": "8097"}]}]);
+        assert_eq!(cards_of_port(&cards, 8087), vec![0, 1]);
+        assert_eq!(cards_of_port(&cards, 8097), vec![1]);
     }
 }
 
