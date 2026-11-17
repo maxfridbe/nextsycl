@@ -45,6 +45,8 @@ const FEATURES: &[&str] = &[
     "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars", "image.loras.request", "video.soundtrack", "video.exposure_fix",
     "backplane", "system.busy.engines", "models.profile", "system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long", "jobs.eta", "video.on_demand", "video.multi_guide",
     "image.describe", "image.describe.describer", "image.describers", "video.regen2k", "cards_taken.gpus",
+    // 2026-11-17: YuE2's instrumental covers (the `instrumental` option: a recording's lead played, not sung), as nextcuda's
+    "audio.yue2.instrumental",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults

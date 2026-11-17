@@ -125,19 +125,13 @@ fn has_notes(lines: &[&str]) -> bool {
     })
 }
 
-/// A cover's score with its tune where YuE2 sings it: SheetSage2 writes a recording's lead line into the `Vocal` voice
-/// when someone sings it and into `Ins` when an instrument plays it; YuE2 sings the `Vocal` voice (its training's
-/// scores had the sung line there - over an all-rest Vocal voice it makes an instrumental). When the Vocal voice has no
-/// note and Ins has, the two voices' lines are exchanged (bar for bar: their durations match); else the score is kept.
-/// Whether it exchanged them is the second value.
-pub fn sung_lead(abc: &str) -> (String, bool) {
-    let lines: Vec<&str> = abc.lines().collect();
-    // the body's blocks: a line "V: Vocal" or "V: Ins" alone, then the lines up to the next "V:" or "%" line
-    let mut blocks: Vec<(usize, usize, &str)> = Vec::new();
+/// The body's voice blocks: (first line, end line, voice) for each "V: Vocal" or "V: Ins" line alone, its lines up to the
+/// next "V:" or "%" line
+fn voice_blocks(lines: &[&str]) -> Vec<(usize, usize, &'static str)> {
+    let mut blocks = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        let t = lines[i].trim();
-        let voice = match t {
+        let voice = match lines[i].trim() {
             "V: Vocal" | "V:Vocal" => Some("Vocal"),
             "V: Ins" | "V:Ins" => Some("Ins"),
             _ => None,
@@ -153,31 +147,21 @@ pub fn sung_lead(abc: &str) -> (String, bool) {
             i += 1;
         }
     }
-    let of = |v: &str| -> Vec<&str> { blocks.iter().filter(|b| b.2 == v).flat_map(|b| lines[b.0..b.1].iter().copied()).collect() };
-    if has_notes(&of("Vocal")) || !has_notes(&of("Ins")) {
-        return (abc.to_string(), false);
-    }
-    // the voices' blocks pair up in order (the score writes each passage's Vocal block, then its Ins block)
-    let vocal: Vec<&(usize, usize, &str)> = blocks.iter().filter(|b| b.2 == "Vocal").collect();
-    let ins: Vec<&(usize, usize, &str)> = blocks.iter().filter(|b| b.2 == "Ins").collect();
-    if vocal.len() != ins.len() {
-        return (abc.to_string(), false);
-    }
-    let mut body: std::collections::BTreeMap<usize, (usize, Vec<&str>)> = std::collections::BTreeMap::new();
-    for (v, n) in vocal.iter().zip(&ins) {
-        body.insert(v.0, (v.1, lines[n.0..n.1].to_vec()));
-        body.insert(n.0, (n.1, lines[v.0..v.1].to_vec()));
-    }
-    let mut out = Vec::with_capacity(lines.len());
+    blocks
+}
+
+/// The score with some line ranges replaced (start -> (end, the new lines)), its final newline kept
+fn rewrite(abc: &str, lines: &[&str], body: &std::collections::BTreeMap<usize, (usize, Vec<String>)>) -> String {
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut k = 0;
     while k < lines.len() {
         match body.get(&k) {
             Some((end, repl)) => {
-                out.extend(repl.iter().copied());
+                out.extend(repl.iter().cloned());
                 k = *end;
             }
             None => {
-                out.push(lines[k]);
+                out.push(lines[k].to_string());
                 k += 1;
             }
         }
@@ -186,7 +170,144 @@ pub fn sung_lead(abc: &str) -> (String, bool) {
     if abc.ends_with('\n') {
         s.push('\n');
     }
-    (s, true)
+    s
+}
+
+/// The lead moved from voice `from` to voice `to` when `to` has no note and `from` has: the two voices' lines are
+/// exchanged (bar for bar: their durations match); else the score is kept. Whether it exchanged them is the second value.
+fn moved_lead(abc: &str, from: &str, to: &str) -> (String, bool) {
+    let lines: Vec<&str> = abc.lines().collect();
+    let blocks = voice_blocks(&lines);
+    let of = |v: &str| -> Vec<&str> { blocks.iter().filter(|b| b.2 == v).flat_map(|b| lines[b.0..b.1].iter().copied()).collect() };
+    if has_notes(&of(to)) || !has_notes(&of(from)) {
+        return (abc.to_string(), false);
+    }
+    // the voices' blocks pair up in order (the score writes each passage's Vocal block, then its Ins block)
+    let a: Vec<&(usize, usize, &str)> = blocks.iter().filter(|b| b.2 == from).collect();
+    let b: Vec<&(usize, usize, &str)> = blocks.iter().filter(|b| b.2 == to).collect();
+    if a.len() != b.len() {
+        return (abc.to_string(), false);
+    }
+    let own = |r: &[&str]| r.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+    let mut body = std::collections::BTreeMap::new();
+    for (x, y) in a.iter().zip(&b) {
+        body.insert(x.0, (x.1, own(&lines[y.0..y.1])));
+        body.insert(y.0, (y.1, own(&lines[x.0..x.1])));
+    }
+    (rewrite(abc, &lines, &body), true)
+}
+
+/// A cover's score with its tune where YuE2 sings it: SheetSage2 writes a recording's lead line into the `Vocal` voice
+/// when someone sings it and into `Ins` when an instrument plays it; YuE2 sings the `Vocal` voice (its training's
+/// scores had the sung line there - over an all-rest Vocal voice it makes an instrumental). When the Vocal voice has no
+/// note and Ins has, the two voices' lines are exchanged (bar for bar: their durations match); else the score is kept.
+/// Whether it exchanged them is the second value.
+pub fn sung_lead(abc: &str) -> (String, bool) {
+    moved_lead(abc, "Ins", "Vocal")
+}
+
+/// A line of ABC with its notes made rests of the same length: a pitch (its accidentals, letter and octave marks) or a
+/// bracketed chord of pitches becomes `z`, ties go (a rest is not tied); chord symbols ("C"), lengths, bar lines and
+/// the rest stay
+fn rested(line: &str) -> String {
+    let c: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < c.len() {
+        match c[i] {
+            '"' => {
+                // a chord symbol (or annotation), as it is
+                let j = c[i + 1..].iter().position(|&x| x == '"').map_or(c.len(), |p| i + 2 + p);
+                out.extend(&c[i..j]);
+                i = j;
+            }
+            '[' if c.get(i + 1).is_some_and(|x| matches!(x, '^' | '_' | '=' | 'A'..='G' | 'a'..='g')) => {
+                // a chord of notes: one rest
+                let j = c[i..].iter().position(|&x| x == ']').map_or(c.len(), |p| i + p + 1);
+                out.push('z');
+                i = j;
+            }
+            '^' | '_' | '=' | 'A'..='G' | 'a'..='g' => {
+                // a note: its accidentals, letter and octave marks
+                let mut j = i;
+                while j < c.len() && matches!(c[j], '^' | '_' | '=') {
+                    j += 1;
+                }
+                if j < c.len() && c[j].is_ascii_alphabetic() && matches!(c[j].to_ascii_uppercase(), 'A'..='G') {
+                    j += 1;
+                    while j < c.len() && matches!(c[j], '\'' | ',') {
+                        j += 1;
+                    }
+                    out.push('z');
+                } else {
+                    out.extend(&c[i..j]);
+                }
+                i = j.max(i + 1);
+            }
+            '-' => i += 1,
+            x => {
+                out.push(x);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// A cover's score as an instrumental: the lead where an instrument plays it (SheetSage2's `Ins` voice) and the `Vocal`
+/// voice YuE2 sings all rests - the score as SheetSage2 writes an instrumental recording, which YuE2 plays (measured on
+/// a Jingle Bells band recording: jazz, metal and synthwave with no words Whisper heard). Passage by passage (each
+/// Vocal block with the Ins block after it): a lead in Vocal alone moves to Ins, so the tune is kept where SheetSage2
+/// heard it as sung (a violin's line, 2026-11-11: some passages of a Paganini caprice); with a line in both the Vocal
+/// notes become rests of the same length.
+pub fn played_lead(abc: &str) -> String {
+    let lines: Vec<&str> = abc.lines().collect();
+    let blocks = voice_blocks(&lines);
+    let vocal: Vec<&(usize, usize, &str)> = blocks.iter().filter(|b| b.2 == "Vocal").collect();
+    let ins: Vec<&(usize, usize, &str)> = blocks.iter().filter(|b| b.2 == "Ins").collect();
+    let notes = |b: &(usize, usize, &str)| has_notes(&lines[b.0..b.1]);
+    let own = |b: &(usize, usize, &str)| lines[b.0..b.1].iter().map(|l| l.to_string()).collect::<Vec<_>>();
+    let rest = |b: &(usize, usize, &str)| lines[b.0..b.1].iter().map(|l| rested(l)).collect::<Vec<_>>();
+    let mut body = std::collections::BTreeMap::new();
+    if vocal.len() == ins.len() {
+        for (v, n) in vocal.iter().zip(&ins) {
+            if !notes(v) {
+                continue;
+            }
+            if notes(n) {
+                body.insert(v.0, (v.1, rest(v)));
+            } else {
+                // the bars match (the voices' durations are the same): the lines exchanged
+                body.insert(v.0, (v.1, own(n)));
+                body.insert(n.0, (n.1, own(v)));
+            }
+        }
+    } else {
+        // blocks that do not pair up: nothing moved, every Vocal note a rest
+        for v in vocal.iter().filter(|v| notes(v)) {
+            body.insert(v.0, (v.1, rest(v)));
+        }
+    }
+    if body.is_empty() {
+        return abc.to_string();
+    }
+    rewrite(abc, &lines, &body)
+}
+
+/// The lyrics of an instrumental cover: the score's sections (its "% intro", "% verse" ... lines, in order) as empty
+/// section tags - every passage an instrumental one, as an empty [Intro] is in a song's lyrics. No section: [Instrumental]
+pub fn bare_sections(abc: &str) -> String {
+    let tags: Vec<String> = abc.lines().filter_map(|l| l.trim().strip_prefix("% ")).map(str::trim)
+        .filter(|l| crate::sheet::tokens::STRUCTURES.contains(l) && *l != "silence")
+        .map(|l| format!("[{}]", l.split(' ').map(|w| w.split('-').map(|p| {
+            let mut c = p.chars();
+            c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
+        }).collect::<Vec<_>>().join("-")).collect::<Vec<_>>().join(" ")))
+        .collect();
+    if tags.is_empty() {
+        return "[Instrumental]\n".into();
+    }
+    tags.join("\n\n") + "\n"
 }
 
 #[cfg(test)]
@@ -211,6 +332,30 @@ mod tests {
         // a sung lead stays where it is
         let (t, again) = sung_lead(&s);
         assert!(!again && t == s);
+    }
+
+    #[test]
+    fn an_instrumental_cover_plays_its_lead() {
+        // the lead in Vocal alone moves to Ins
+        let sung = "X:1\nV: Vocal clef=treble name=\"Vocal Melody\"\nV: Ins clef=treble name=\"Ins Melody\"\nK:C\n% intro\nV: Vocal\nG4A4|c8|\nV: Ins\nZ2|\n% verse\nV: Vocal\n\"C\"e8|\nV: Ins\n\"C\"z8|\n";
+        let played = "X:1\nV: Vocal clef=treble name=\"Vocal Melody\"\nV: Ins clef=treble name=\"Ins Melody\"\nK:C\n% intro\nV: Vocal\nZ2|\nV: Ins\nG4A4|c8|\n% verse\nV: Vocal\n\"C\"z8|\nV: Ins\n\"C\"e8|\n";
+        assert_eq!(played_lead(sung), played);
+        // as transcribed (the lead in Ins already): kept
+        assert_eq!(played_lead(played), played);
+        // a line in both: the Vocal voice's notes rests of the same length, its chord symbols kept
+        let both = "K:C\n% verse\nV: Vocal\n\"Am\"^c'2-c/2 [ceg]4 _B,3/2|\nV: Ins\nE8|\n";
+        assert_eq!(played_lead(both), "K:C\n% verse\nV: Vocal\n\"Am\"z2z/2 z4 z3/2|\nV: Ins\nE8|\n");
+        // passage by passage: the lead in Ins in one, in Vocal alone in the next (moved, not lost), in both in a third
+        let mixed = "K:Dm\n% intro\nV: Vocal\nZ2|\nV: Ins\nD4F4|A8|\n% verse\nV: Vocal\nd4f4|a8|\nV: Ins\nZ2|\n% outro\nV: Vocal\nA8|\nV: Ins\nD8|\n";
+        assert_eq!(played_lead(mixed), "K:Dm\n% intro\nV: Vocal\nZ2|\nV: Ins\nD4F4|A8|\n% verse\nV: Vocal\nZ2|\nV: Ins\nd4f4|a8|\n% outro\nV: Vocal\nz8|\nV: Ins\nD8|\n");
+        assert!(!has_notes(&["\"Am\"z2z/2 z4 z3/2|"]));
+    }
+
+    #[test]
+    fn an_instrumental_cover_has_bare_sections() {
+        let abc = "K:C\n% intro\nV: Vocal\nZ2|\n% pre-chorus and chorus\nV: Vocal\nZ2|\n% ss2\n% outro\nV: Vocal\nZ|\n";
+        assert_eq!(bare_sections(abc), "[Intro]\n\n[Pre-Chorus And Chorus]\n\n[Outro]\n");
+        assert_eq!(bare_sections("K:C\nV: Vocal\nZ2|\n"), "[Instrumental]\n");
     }
 
     #[test]
