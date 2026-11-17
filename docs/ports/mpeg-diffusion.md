@@ -96,3 +96,31 @@ without H3_MPEG nothing changes for H3.
 | the base: denoiser int8 FL2VA, VAE fp16, audio VAE, text encoder | the `minimax-h3` card's files (the same files upstream names) | | |
 
 On hardac1: `/var/mnt/4TBSSD/nextsycl-models/minimax-h3-mpeg/` (downloaded 2026-11-17, checksums as above).
+
+## Parity with upstream's code (same inputs)
+
+Upstream's own Python driven by `reference/mpeg-diffusion/tt_ref.py` (its checkout imported, nothing copied; CPU,
+float32; the int8 checkpoint dequantized - W = (q s) H per 256 group - one block in memory at a time). The inputs are
+the engine's: a generate job with `"mpeg_dump"` writes what its first two-track call saw and gave (the refined text,
+both tracks' x, the sound as the network sees it, the plan, block 0's raw qkv and attention output, the region head's
+block-25 states and scores). Dump: a 22-frame 1344x768 clip (`p1`, seed 42; 7 latent frames, 1,764 half-res tokens,
+region 17.1% = 302 tokens -> 1,208 full-res rows; the two-track sequence 3,128 rows; the full-res queries over 7,212
+keys), sigma 0.75 (the first two-track step), on the B65.
+
+| Part | Ours | Upstream | Result |
+|---|---|---|---|
+| region head scores, the same block-25 features (1,764 tokens x 5,376) | `RegionHead::scores` (float64 sums) | `mixed_res.RegionHead` | rel 3.2e-7, max abs 7.6e-6 |
+| the region mask from those scores (smoothing, threshold) | `region_mask` | `mixed_res.region_mask` | identical, 0 of 1,764 cells differ (from upstream's own scores too) |
+| the token layout: full-res rows (`hr_index`), `cell_order`, `grid_source` | `mpeg::Plan` | `TwoTrackPlan` | identical (the dump, and 3 fixture cases in `cargo test`) |
+| RoPE positions of the packed sequence (3,128 rows; fixtures: 453-8,133 rows) | `Plan::positions` on `layout.rs` | `build_position_grid` of the half- and full-res layouts | identical in float32 (what the rotation reads); in float64 a quarter differ in the last bit (max 1.4e-14: the time spans summed in another order) |
+| the Level-of-Token layout the region implies (1x1 / 2x2 ring / 4x4) | `region_layout` | `mixed_res.region_layout` | identical rectangles (3 fixture cases) |
+| the K/V up-map on the same keys (block 0, the 1,462 half-res keys outside M, normalized, unrotated; 42 heads) | `UpMaps::expand_host` (D folded in float64) | `UpMaps.expand` float32 | rel 1.2e-7 (upstream's own bfloat16 path against its float32: rel 2.5e-3) |
+| block 0's dual-resolution attention on the engine's own raw qkv (3,128 rows) | the card: gather, map products in bfloat16, `nsd_attention` + `nsd_attention_qk` | `two_track_attention` float32 | cos 0.9999975, rel 2.3e-3 (half-res rows 2.3e-3, full-res rows 2.1e-3) |
+| the whole two-track network call (50 blocks, int8 GEMMs and bfloat16 activations on the card) | `Denoiser::net_two_track` | `two_track_h3.two_track_forward` float32 | half-res velocity cos 0.999934, rel 0.0115; full-res velocity inside M cos 0.999867, rel 0.0163 (per latent frame 0.99977-0.99993); outside M both exactly 0 |
+
+The whole call's 1.6% is the int8 activation quantization and bfloat16 of our H3 against float32 weights-only
+dequantization in the reference - the same size as the Regenerate-2K port's one-call check (rel 0.0157) and as our H3
+against ComfyUI. Upstream's CPU call took 290 s (+ 61 s dequantizing blocks; 8 threads).
+
+Upstream's `lot/test_lot.py` ("ok 33") is a CPU test of upstream's own code; it is not run here (it does not touch
+ours).

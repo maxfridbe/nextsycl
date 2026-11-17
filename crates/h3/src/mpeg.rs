@@ -1036,9 +1036,18 @@ pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, sigmas: &[f32], va
             }
         }
         let ck = Checkpoint::open(vae)?;
+        let mut stage = Vec::new();
+        let mut ts = Instant::now();
+        let mut mark = |what: &str, ts: &mut Instant| {
+            stage.push(format!("{what} {:.1}", ts.elapsed().as_secs_f64()));
+            *ts = Instant::now();
+        };
         let (px, frames) = {
             let dec = crate::vae::VideoDecoder::load(&dev, &ck, threads)?;
-            dec.decode(&crop, t, ch, cw, &mut || dev.wait())?
+            mark("decoder load", &mut ts);
+            let r = dec.decode(&crop, t, ch, cw, &mut || dev.wait())?;
+            mark("decode", &mut ts);
+            r
         };
         let (ph, pw) = (16 * ch, 16 * cw);
         let up = bicubic2x(&px, 3 * frames, ph, pw, 0.0, 1.0);
@@ -1052,9 +1061,12 @@ pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, sigmas: &[f32], va
             }
         }
         drop(up);
+        mark("bicubic", &mut ts);
         let enc = crate::venc::VideoEncoder::load(&dev, &ck)?;
+        mark("encoder load", &mut ts);
         let (z, zt) = enc.encode(&inter, frames, uh, uw, &mut || dev.wait())?;
         drop(enc);
+        mark("encode", &mut ts);
         if zt != t || z.len() != 24 * t * 4 * ch * cw {
             return Err(Error(format!("the switch's VAE round trip gave {zt} latent frames ({} values) for {t}", z.len())));
         }
@@ -1066,12 +1078,13 @@ pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, sigmas: &[f32], va
         }
         // the decoder's and the encoder's scratch given back before the two-track sequence
         dev.trim()?;
-        log(format!("mpeg   : switch round trip of the box {}x{} latent px x {t} frames ({frames} pixel frames) in {:.1} s", cw, ch, t1.elapsed().as_secs_f64()));
+        log(format!("mpeg   : switch round trip of the box {}x{} latent px x {t} frames ({frames} pixel frames) in {:.1} s ({})", cw, ch, t1.elapsed().as_secs_f64(),
+                    stage.join(", ")));
         report["switch_box"] = serde_json::json!([y0, y1, x0b, x1b]);
     }
     report["switch_upscale_seconds"] = serde_json::json!(t1.elapsed().as_secs_f64());
     let sw = sigmas[st.switch];
-    let (eps, _) = crate::noise::clip_noise(seed + 2, 24 * t * hh * hw, 0);
+    let eps = crate::noise::Mt19937::new(seed + 2).randn(24 * t * hh * hw);
     let mut xh: Vec<f32> = start.iter().zip(&eps).map(|(s, e)| (1.0 - sw) * s + sw * e).collect();
     drop(start);
     // 4. the two tracks
