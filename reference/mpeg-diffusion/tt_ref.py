@@ -236,6 +236,10 @@ def check(a):
                      "delta_share": float((exp32 - keys[0].unsqueeze(1)).norm() / exp32.norm())}
     print("kv map:", json.dumps(rep["kv_map"]), flush=True)
 
+    if not a.int8:
+        Path(a.report).write_text(json.dumps(rep, indent=1))
+        print(f"no --int8: the attention and the step skipped; report -> {a.report}")
+        return
     dit, ck, t_load = load_model(a.int8, a.blocks)
 
     # 4. block 0's dual-resolution attention on the engine's own qkv (raw, as its qkv linear wrote it)

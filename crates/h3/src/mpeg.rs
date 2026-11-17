@@ -1064,6 +1064,8 @@ pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, sigmas: &[f32], va
                 start[(c * hh + 2 * y0 + y) * hw + 2 * x0b..][..zw].copy_from_slice(&z[(c * zh + y) * zw..][..zw]);
             }
         }
+        // the decoder's and the encoder's scratch given back before the two-track sequence
+        dev.trim()?;
         log(format!("mpeg   : switch round trip of the box {}x{} latent px x {t} frames ({frames} pixel frames) in {:.1} s", cw, ch, t1.elapsed().as_secs_f64()));
         report["switch_box"] = serde_json::json!([y0, y1, x0b, x1b]);
     }
