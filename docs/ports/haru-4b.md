@@ -81,7 +81,8 @@ The model is one frame ahead: frame 0 comes from the prompt's last position, use
   file, or with `NS_SILO=0`, the engine's own kernels run them.
 - `glue/serve/src/realtime.rs` - `nextsycl.card`; the lockstep extension needs nothing else of the server (the engine
   makes the events); a lockstep mock test. `wfe/audio/src/converse.ts`, `components/Converse.tsx` - lockstep play-out
-  behind a 0.2 s jitter buffer, no barge-in cut, the transcript split where you spoke, the character card's fields.
+  behind a 0.2 s jitter buffer that catches up after a burst, no barge-in cut, the transcript split where you spoke,
+  the character card's fields.
 - `reference/haru/ref.py` (the dumps), `reference/haru/client.py` (a lockstep conversation over the socket).
 
 ## Checks
@@ -103,6 +104,7 @@ reference's argmax token and its head's latent from a fixed noise).
 | 12 frames teacher-forced: hidden / logits / head latent | worst rel 4.8e-3 / 3.4e-3 / 5.0e-4; argmax 13 of 13 |
 | a second dump, speak-first (`ref.py --speak-first`, words on the text stream): 17 frames | argmax 17 of 17 ("I", "'m", then PAD); hidden worst rel 2.2e-3, logits 1.6e-3; the head's latent rel 2e-4 - 4e-2 (largest on the frames right after speech, where it amplifies the hidden state's 1e-3) |
 | the head alone (from the reference's own hidden state and noise), 17 frames | worst rel 7.2e-6 |
+| a long run (`ref.py --frames 300`: a 32 s TED monologue after the default card and a 10 s voice; greedy, teacher-forced) | argmax 301 of 301; hidden worst rel 1.2e-2, logits 8.1e-3; P(PAD or EOP) at temperature 0.7 mean 0.9007 here and 0.9007 in the reference, the worst frame 3.0e-4 apart |
 
 Run: `reference/haru/ref.py` (venv `/var/mnt/2TBSSD/nextsycl-ref/venv`, `python -I`, CPU, ~6 min), dumps in
 `/var/mnt/2TBSSD/nextsycl-ref/haru/dump` (user en_chat.wav, voice a 9 s saved voice) and `dump2` (en_know.wav,
@@ -247,11 +249,70 @@ call the model's audio trails the user's by one frame (133 ms) plus 33 ms plus t
 The prompt (1.4 s with a 9 s voice) delays the first frames: the client's first ~10 frames are answered together
 once it is done.
 
+## Back-channels (2026-11-17)
+
+Does ours say "mm-hm" while you talk, as the release says the model does ("backchannels and overlapping speech",
+blog.higurashi.ai/melte/haru4b)? Three 32-36 s monologues with their natural pauses (TED-LIUM long-form, validation:
+Al Gore on the Arctic and water, Barry Schwartz on choice, Blaise Agüera y Arcas on Photosynth), each after 3 s of
+quiet and followed by 8 s; Haru's frames over -40 dBFS while the monologue runs counted, each stretch of at most 1.6 s
+written down by Whisper large-v3-turbo (the front door's), a back-channel when every word is one ("yeah", "mm",
+"mm-hmm", "oh", "okay", "I see", "wow", "really" ...). Three cards: the default ("chat", back-channels "mid"), the same
+with "high", and a listening one (female, "high", a friend on the phone telling Haru at length about something, Haru
+"mostly listens, reacts with short responses"; the default persona kept). Voices: narrator (a 10 s designed male
+voice) for the first two, keeper (6 s, a woman) for the third.
+
+| | runs | sound over the monologue (share of its frames: mean / median) | silent throughout | back-channels | runs with one |
+|---|---|---|---|---|---|
+| ours over the socket (production :8000, `reference/haru/client.py` at real time; seeds 11/22/33, 44/55) | 24 | 0.33 / 0.32 | 3 | 6 | 4 |
+| ours offline (the build copy, `/v1/audio/speech`, the same user audio; seeds 1-8) | 72 | 0.31 / 0.32 | 8 | 43 | 18 |
+| upstream's own PyTorch session on the CPU (`DuplexSession`, float32, the same user audio, card and voice) | 24 | 0.28 / 0.18 | 5 | 6 | 5 |
+
+What ours says back: "Yeah." (the most), "Mm.", "Mm-hmm.", "Oh.", "Okay.", "Wow.", "I see.", "Really?", "Sure.",
+"Aha."; the release: "Yeah." (twice), "Yes.", "Okay.", "Oh!", "Ah". A lone "No.", "I" or "Um" is not counted.
+Per card the numbers are too few to tell apart (the release: 0 / 3 / 3 for high / mid / listening; ours offline
+11 / 14 / 18). Most come over the monologue's voiced frames or its short pauses, not only at sentence ends.
+In the release's own demo video (investment-caption-en.mp4: user and Haru on separate Whisper on each) Haru says "Yeah." twice in 95 s, both in the user's 1-3 s pauses mid-turn. So: a back-channel
+in about one 30 s monologue in four or five, ours and the release's alike.
+
+Just as often it talks over the monologue, in the release as here: the default card's situation has the two "start
+by introducing themselves", so it introduces itself whenever it likes ("I'm Haru, twenty-two, a senior in college, I
+go running most mornings ..."), sometimes repeats the user's words ("the more freedom they have"), and now and then
+says the voice recording's own words ("This is how I sound when I read aloud", the narrator clip's script; "...
+wrote each name in a small blue book", the end of keeper's): 6 of our 24 socket runs - three of them the same seed
+(55, keeper, from its first frames) -, 1 of the release's 24. When the monologue ends it answers within 1.3 s in 11
+of the 12 socket runs where it was quiet at that moment (once 4.8 s); the release within 0.1-4.3 s.
+
+Same model, same sampling: the frame-by-frame check above runs 300 frames of a monologue against the release's code
+with P(silent) 3e-4 apart at worst, and the sampling is the release's line for line (DRY 0.8 / 1.75 / 1 / 1,024 on
+words only, temperature 0.7, top-k 25, top-p 1, no EOP bias, no other logit bias; the release has no back-channel or
+silence bias to miss; its PAD / EOP logits in float32 - ours are all float32). The socket and the offline path give
+the same words for the same seed (their first sentences identical, then sampling's chaos). No port difference
+found, nothing changed in the engine.
+
+Tools (reference/haru/): `client.py` (a socket session: `--say clip.wav --lead 3 --gap 8 --seed S --card c.json`),
+`upstream_session.py` (the release's session on the CPU on a socket run's user.wav: ~0.8 s a frame, 20 GB of host
+memory - one at a time), `offline_answer.py` (ours on the same audio through an audio server), `backchannels.py`
+(levels, stretches, the text by frame), `backchannel_table.py` (Whisper on the short stretches, the table above);
+`page_test.mjs` (below). The runs: hardac1 `~/src/harubc-work` (runs/, off/, up/, summary-all.json, compare.json).
+
+## The conversation page with a microphone (2026-11-17)
+
+Tested headless: Chrome for Testing 153 with a fake microphone (`--use-fake-device-for-media-stream
+--use-file-for-fake-audio-capture=<the TED clip>`), the page driven over DevTools, its WebSocket and every
+`AudioBufferSourceNode.start` recorded (`reference/haru/page_test.mjs`: `node page_test.mjs URL WAV SECONDS OUT
+[VOICE]`). Against production over https://127.0.0.1:8443/open/haru-4b/:
+the microphone at 48 kHz with echo cancellation, noise suppression and AGC, `input_sample_rate: 48000`, 45 s sent in
+562 appends, 338 frames back, every one played, no gap between them - but queued 450 ms ahead (median; 200 at the
+first): the frames answered together when the prompt finished stayed queued, so everything Haru said came 0.25 s
+late for the whole call. Fixed: past 0.35 s queued a quiet frame (under -40 dBFS) is dropped, past 1 s any (the
+release's client drops its oldest audio too); the AudioContext is made in the click, before the permission prompt,
+and resumed if a browser started it suspended. After the fix, against the build copy's server (B65, the page from
+disk): 45 s - 338 frames, 3 quiet ones dropped, queued 205 ms median (p95 243), no gaps; 30 s - 225 frames, none
+dropped, 211 ms. Haru heard the fake microphone and answered it ("wait, what are you, a libertarian?").
+
 ## Open
 
-- **Back-channels**: none heard in these tests (it listens silently, then answers); interruptions it handles when
-  addressed ("sorry to cut you off" - "go ahead"), not when talked over by a reading. Worth a session with a person
-  on a headset in the wfe.
+- **Back-channels**: occasional, as in the release (above); not yet heard by a person on a headset.
 - **Speed**: a frame is not tuned (the silo has only the prompt's wide passes). It is bound by a few hundred small
   launches and host round trips, not bandwidth; the codec encoder's first stages (3,200 rows) are its largest part.
   Graphs or fused launches would cut the 23-25 ms further; nothing needs it for real time.
@@ -260,6 +321,5 @@ once it is done.
 - **One conversation per voice and card change**: a session.update that changes them starts over (the prompt again,
   0.5-0.7 s, or the cache's 13 ms), as the release does.
 - **The start** was measured on the B70 only; the B65 not yet.
-- **The wfe panel** was checked by its smoke test against the Haru server (the page and its 27 modules load, the
-  app renders) and the protocol by the lockstep mock test and the client - not yet by a person with a microphone.
-- Not deployed (no card registered on the front door).
+- **The wfe panel**: checked headless with a fake microphone (above); not yet by a person with a real one.
+- Served on hardac1's front door (:8000, :8443; the page /open/haru-4b/).
