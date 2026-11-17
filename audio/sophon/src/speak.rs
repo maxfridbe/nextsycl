@@ -137,6 +137,15 @@ pub struct Spoken {
     pub seconds: f64,
 }
 
+/// What a check catches on the way (check.rs's talker stage): the prompt's rows, the first codebook's logits after
+/// it, every frame's codes
+#[derive(Default)]
+pub struct Probe {
+    pub prefill: Vec<f32>,
+    pub logits0: Vec<f32>,
+    pub codes: Vec<Vec<i32>>,
+}
+
 pub struct Talk {
     pub ops: Ops,
     pub nsd: Nsd,
@@ -205,6 +214,13 @@ impl Talk {
     #[allow(clippy::too_many_arguments)]
     pub fn speak(&self, xvec: &[f32], lang: &str, draw: Draw, seed: u64, next: &mut dyn FnMut(usize) -> Feed, out: &mut dyn FnMut(&[f32]) -> Result<()>,
                  stop: &dyn Fn() -> bool) -> Result<Spoken> {
+        self.speak_probed(xvec, lang, draw, seed, next, out, stop, None)
+    }
+
+    /// `speak`, `probe` catching the prompt, the first logits and the codes
+    #[allow(clippy::too_many_arguments)]
+    pub fn speak_probed(&self, xvec: &[f32], lang: &str, draw: Draw, seed: u64, next: &mut dyn FnMut(usize) -> Feed,
+                        out: &mut dyn FnMut(&[f32]) -> Result<()>, stop: &dyn Fn() -> bool, mut probe: Option<&mut Probe>) -> Result<Spoken> {
         let t0 = Instant::now();
         let (ops, nsd, t, c) = (&self.ops, &self.nsd, &self.talker, &self.conf);
         let h = t.lm.hidden;
@@ -249,6 +265,10 @@ impl Talk {
         rows.extend(first.iter().zip(&bos).map(|(a, b)| a + b));
         let l = rows.len() / h;
         t.prefill(ops, nsd, &ss, &rows)?;
+        if let Some(p) = probe.as_deref_mut() {
+            p.prefill = rows.clone();
+            p.logits0 = t.logits0(ops, &ss)?;
+        }
         // the text rows fed a frame each, on the card: [tokens + eos, then pad]
         let feed_buf = DevBuf::f32(&ops.gpu, (max_tokens + 2) * h)?;
         let pad_at = max_tokens + 1;
@@ -345,6 +365,9 @@ impl Talk {
             out(&wav)?;
         }
         spoken.frames = codes.len();
+        if let Some(p) = probe {
+            p.codes = codes;
+        }
         spoken.seconds = t0.elapsed().as_secs_f64();
         Ok(spoken)
     }

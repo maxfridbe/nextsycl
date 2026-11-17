@@ -277,15 +277,27 @@ impl Inner {
 
     /// Speakable text's ids: the reply as the talker reads it, tokenized (the thinker's tokenizer)
     pub fn speakable_ids(&self, text: &str, last: bool) -> Vec<u32> {
-        let s = text::tag_clean(&text::cut_tool(text, last), last);
-        // the talker reads sound tags aloud in this port: out of its text unless NS_SOPHON_TAGS=1 (text::without_tags)
-        let s = if std::env::var("NS_SOPHON_TAGS").is_ok_and(|v| v.trim() == "1") { s } else { text::without_tags(&s) };
-        let s = s.trim_start();
-        if s.is_empty() {
-            return Vec::new();
-        }
-        self.tok.encode(s)
+        speakable_ids(&self.tok, text, last, tags_spoken())
     }
+}
+
+/// Whether the talker is handed the sound tags, as upstream hands them (NS_SOPHON_TAGS; 0: taken out, see
+/// `speakable_ids`). Flash's own talker performs them; Qwen3-TTS-12Hz-1.7B-Base - the checkpoint pull once linked in
+/// its place, the same name and size - reads them aloud
+pub fn tags_spoken() -> bool {
+    std::env::var("NS_SOPHON_TAGS").map_or(true, |v| v.trim() != "0")
+}
+
+/// Speakable text's ids (proc.py's thinker2talker_async_chunk): the text before a tool call, tag_clean (the sound
+/// tags kept), the thinker's tokenizer without special tokens; `tags` false: the tags taken out too (text::without_tags)
+pub fn speakable_ids(tok: &Tokenizer, text: &str, last: bool, tags: bool) -> Vec<u32> {
+    let s = text::tag_clean(&text::cut_tool(text, last), last);
+    let s = if tags { s } else { text::without_tags(&s) };
+    let s = s.trim_start();
+    if s.is_empty() {
+        return Vec::new();
+    }
+    tok.encode(s)
 }
 
 impl AudioEngine for Sophon {

@@ -75,6 +75,7 @@ one used with permission, be cloned.
 | `glue/serve/src/audio.rs`, `http.rs`, `home/{api,mod}.rs` | `/v1/realtime` on the audio server; the front door's splice (`/v1/realtime?model=`, `/open/<id>/v1/realtime`) |
 | `wfe/audio/src/converse.ts`, `components/Converse.tsx` | the page's live conversation: microphone (AudioWorklet), playback, barge-in truncation, transcript |
 | `reference/sophon/ref.py`, `client.py` | the reference dumps; a standard-library /v1/realtime client for checks |
+| `reference/sophon/talker_ref.py` | the talker as upstream feeds it (proc.py's tag_clean, the thinker's tokenizer, talker.py's prompt through qwen-tts on the CPU) for `audio check --stages talker`; `--stages speak` speaks lines.json's lines x seeds with the talker alone |
 | `model-cards/audio/sophon-realtime-32b-flash.yml`, `guides/sophon-realtime.md`, `docs/api/realtime.md` | the card, its guide, the protocol |
 
 ## Parity
@@ -124,7 +125,39 @@ The answers' audio, written down by the box's Whisper (`nextsycl audio transcrib
     for `<laughter>` and "strong blue" for `<strong>blue</strong>` (21 of 21 takes) - and `<strong>` stressed
     nothing (the word +0.3 dB on average against the line, +2.1 without the tags). The speech text pass keeps the
     tags as written (the server's markup); the talker gets them as plain text tokens (`speakable_ids`: tag_clean, then
-    the thinker's tokenizer). Not looked into further; the card and guide say not to send them to audio.speak.
+    the thinker's tokenizer).
+  - **The cause (found 2026-11-16): the wrong talker.** The registry's `talker` was
+    `/var/mnt/2TBSSD/qwen3tts/models/qwen3-tts/base/model.safetensors` - Qwen3-TTS-12Hz-1.7B-Base, which reads tags
+    as text. `models pull --from` had linked it for the card's `talker/model.safetensors` because a copy is found
+    by name and size, and a fine-tune keeps its base model's size to the byte (3,857,413,744; SHA-256 38fc7fc5...
+    against the card's b1d57164...); only copies under 256 MiB were hashed. The first check above ran `--dir` on the
+    release, with Flash's own talker - hence performed then, read aloud through the registry. Our input path was
+    already upstream's: proc.py feeds the talker the thinker tokenizer's plain ids of tag_clean's text (no special
+    tokens, no tag table: `[laughter]` is " [", "laughter", "]"), and talker.py builds Qwen3-TTS's streaming
+    x-vector prompt - nothing else carries the tags. Fixed: pull hashes every name-and-size copy before linking it
+    (glue/models catalog.rs), and the talker gets the tags again by default (`NS_SOPHON_TAGS=0` takes them out).
+  - **Parity with upstream's talker path** (`reference/sophon/talker_ref.py`: upstream's tag_clean and cut_tool from
+    the repository's own files, the thinker's tokenizer in transformers, the prompt talker.py builds run through the
+    qwen-tts package in float32 on the CPU, greedy; then `nextsycl audio check DIR --stages talker --gpu 1`, the
+    talker alone on the B65), "They would be bagels! [laughter] Oh, that is a classic.", voice chelsie: the 16
+    speakable ids identical; the 10 prompt rows rel 4.8e-8 (cos 1.000000); the first logits rel 3.9e-4 (cos
+    1.000000), the same first code (1221); greedy 71 frames in both, all 1,136 codes identical.
+  - **Heard with Flash's talker** (`--stages speak`, voice chelsie, seeds 1-3, the sampled defaults; Whisper
+    large-v3-turbo; the gap: Whisper's word before the tag to the word after, its 10 ms frames above -40 dBFS, against
+    the same line without the tag):
+
+    | tag | tag word written | gap, s (sound, s) | without the tag |
+    |---|---|---|---|
+    | `[laughter]` "bagels! [laughter] Oh" | 0 of 3 | 1.20 (0.81) / 1.34 (0.43) / 1.22 (0.48) | 0.28 (0.08) / 0.48 (0.10) / 0.58 (0.11) |
+    | `[sigh]` "over. [sigh] Fine" | 0 of 3 | 1.48 (0.70) / 1.18 (0.32) / 0.96 (0.36) | 0.50 (0.06) / 0.62 (0.07) / 0.34 (0.08) |
+    | `[cough]` "me, [cough] as" | 0 of 3 | 0.32 (0.03) / 0.28 (0.02) / 0.76 (0.15) | 0.16 (0.05) / 0.14 (0.06) / 0.22 (0.08) |
+    | `[breath]` "go. [breath] Let" | 0 of 3 | 1.72 (0.29) / 1.54 (0.54) / 0.88 (0.42) | 0.24 (0.04) / 0.26 (0.01) / 0.68 (0.04) |
+    | `[quick_breath]` (same line) | 1 of 3 ("Quick breath.") | - / 0.78 (0.10) / 1.84 (0.12) | as above |
+    | `<laughter>...</laughter>`, "person.</laughter> Well" | 0 of 3 | 0.84 (0.13) / 1.18 (0.30) / 0.74 (0.21) | 0.58 (0.10) / 0.36 (0.06) / 0.50 (0.06) |
+    | `<strong>blue</strong>` | 0 of 3 | "blue" -1.9 / +4.1 / +0.8 dB against the line | -0.7 / +1.0 / +0.9 dB |
+
+    `[cough]` is weak in English (upstream: 50%), `<strong>` weak (upstream says so). Upstream's own greedy take of
+    the bagels line: "they would be bagels. Oh, that is a classic.", 2.1 s between with short bursts of sound.
 - a two-turn conversation over /v1/realtime (en_know, then en_chat "how are you"): "because sunlight is made up of
   different colors and blue light scatters more in the atmosphere than other colors, making the sky appear blue to
   us." / "I'm doing well thank you for asking, how about you?" - each the text the brain wrote.

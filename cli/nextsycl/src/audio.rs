@@ -35,7 +35,7 @@ nextsycl audio voice enroll NAME [--gpu N] [--steps 2000] [--replace] [--direct]
 nextsycl audio voice rm NAME            (addvoice / clonevoice NAME ... = voice add; designvoice = voice design)
 nextsycl audio transcribe FILE [--model ID | --dir DIR] [--language L] [--translate] [--no-words] [--prompt TEXT] [--opt-NAME VALUE]...
                    [--json] [--gpu N]   (speech to text: a recogniser, whisper-large-v3-turbo; any rate, WAV, MP3, FLAC, Ogg, M4A)
-nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | mel,encoder,logits,transcribe | prompt,lm,head,codec,run | prompt,frames,flow,codec | mel,ear,lm,check,write | prompt,encode,pass,run,codec,post | codec,prompt,frames,speed | prompt,lm,forced,decoder,speaker,encoder,stream,align,edit] [--gpu N | --gpus A,B]
+nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | mel,encoder,logits,transcribe | prompt,lm,head,codec,run | prompt,frames,flow,codec | mel,ear,lm,check,write | talker,speak | prompt,encode,pass,run,codec,post | codec,prompt,frames,speed | prompt,lm,forced,decoder,speaker,encoder,stream,align,edit] [--gpu N | --gpus A,B]
 nextsycl audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
@@ -445,9 +445,14 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         nextsycl_audio_acestep::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
     } else if m["arch"] == nextsycl_audio_sophon::ARCH {
         let stages: Vec<String> = opt(args, "--stages").map(|s| s.split(',').map(str::to_string).collect()).unwrap_or_default();
-        // the brain and its ear alone (the talker is checked by speaking: audio generate)
-        let e = nextsycl_audio_sophon::Sophon::load_with(&files, &gpus(args)?, &options(&m, args)?, false, &mut log).map_err(|e| e.0)?;
-        nextsycl_audio_sophon::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+        if !stages.is_empty() && stages.iter().all(|s| nextsycl_audio_sophon::check::TALKER_STAGES.contains(&s.as_str())) {
+            // the talker alone, on its own card (--gpu N): no brain loaded
+            nextsycl_audio_sophon::check::talker(&files, &g, dir, &stages, &mut log).map_err(|e| e.0)?
+        } else {
+            // the brain and its ear alone
+            let e = nextsycl_audio_sophon::Sophon::load_with(&files, &gpus(args)?, &options(&m, args)?, false, &mut log).map_err(|e| e.0)?;
+            nextsycl_audio_sophon::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+        }
     } else if m["arch"] == nextsycl_audio_haru::ARCH {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("codec,prompt,frames").split(',').collect();
         let e = nextsycl_audio_haru::Haru::load(&files, &gpus(args)?, &options(&m, args)?, &mut log).map_err(|e| e.0)?;

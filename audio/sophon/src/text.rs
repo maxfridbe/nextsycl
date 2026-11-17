@@ -259,14 +259,10 @@ fn close_of(c: char) -> Option<char> {
     }
 }
 
-/// The reply as the talker reads it (proc.py's tag_clean): the sound tags it performs kept ([laughter], [breath],
-/// [sigh], [cough], [quick_breath], <laughter>...</laughter>, <strong>...</strong>, a strong span closed at the next
-/// punctuation), other bracketed asides and markdown marks dropped, arrows and comparisons said; `last`: the reply
-/// is whole (an unclosed bracket's text spoken, open spans closed) - else a bracket that may still close is held back
-/// The sound tags taken out of what the talker reads (POINT's tags gone, SPAN's tags gone and their words kept), for
-/// as long as this port's talker reads them aloud ("Laughter." - heard 21 of 21 times, 2026-11-16; upstream's Flash
-/// performs them, so the cause is ours and open). NS_SOPHON_TAGS=1 hands them to the talker as before. The reply's
-/// text - the transcript the client shows - keeps them
+/// The sound tags taken out of what the talker reads (POINT's tags gone, SPAN's tags gone and their words kept):
+/// NS_SOPHON_TAGS=0, an opt-out. By default the talker gets them, as upstream's does (Flash's talker performs them;
+/// they were read aloud on 2026-11-16 only because the registry's talker was Qwen3-TTS-12Hz-1.7B-Base's file). The
+/// reply's text - the transcript the client shows - keeps them either way
 pub fn without_tags(s: &str) -> String {
     let mut v = s.to_string();
     for t in POINT {
@@ -289,6 +285,10 @@ pub fn without_tags(s: &str) -> String {
     out
 }
 
+/// The reply as the talker reads it (proc.py's tag_clean): the sound tags it performs kept ([laughter], [breath],
+/// [sigh], [cough], [quick_breath], <laughter>...</laughter>, <strong>...</strong>, a strong span closed at the next
+/// punctuation), other bracketed asides and markdown marks dropped, arrows and comparisons said; `last`: the reply
+/// is whole (an unclosed bracket's text spoken, open spans closed) - else a bracket that may still close is held back
 pub fn tag_clean(s: &str, last: bool) -> String {
     let mut out = String::new();
     let mut open: Vec<&'static str> = Vec::new();
@@ -393,9 +393,9 @@ pub fn plain(s: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The talker is not handed a sound tag (it reads it aloud): the words of a span are kept
+    /// NS_SOPHON_TAGS=0: the talker is not handed a sound tag; the words of a span are kept
     #[test]
-    fn the_talker_gets_no_sound_tags() {
+    fn without_tags_keeps_the_words() {
         assert_eq!(super::without_tags("Ha [laughter] that's great"), "Ha that's great");
         assert_eq!(super::without_tags("They'd be bagels! [laughter] Oh, a classic [sigh]."), "They'd be bagels! Oh, a classic.");
         assert_eq!(super::without_tags("I <strong>really</strong> mean it, <laughter>so funny</laughter>!"), "I really mean it, so funny!");
