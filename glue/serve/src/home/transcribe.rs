@@ -1,7 +1,7 @@
 //! Saved voices heard once: a voice saved without what it says (a recording added with no text: the film app's,
 //! the audio page's, `nextsycl audio voice add`), or with a text but never heard, is transcribed by the enabled
-//! recogniser (Whisper large-v3-turbo, word times on) and the transcript kept with it (`voices::Library::transcribed`)
-//! - so a model that clones in context (Sophon-Realtime's Base talker) has a transcript, and the words' times to cut
+//! recogniser (Whisper large-v3-turbo, word times on) and the transcript kept with it (`voices::Library::transcribed`),
+//! so a model that clones in context (Sophon-Realtime's Base talker) has a transcript, and the words' times to cut
 //! the recording by, done once.
 //!
 //! ```text
