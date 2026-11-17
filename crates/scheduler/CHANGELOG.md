@@ -2,6 +2,16 @@
 
 Bump `VERSION` in `src/lib.rs` and `version` in `Cargo.toml` with each entry.
 
+## 0.1.0+nextsycl.4 - 2026-11-17
+
+- nextcuda cf2debd's refusal half, for a model whose one copy spans its cards: `place::refused_card` reads the card a server's
+  "needs about X GiB on <card>; ..." names (also "... on <card> (and 1.5 GiB kept free); ...", Sophon's), and `place::short_of_room`
+  learns the ask for THAT card (`Host::learn_ask` takes `rest`: a spanning model's card past its first, kept apart and planned as
+  `PlaceReq::asked_rest_mb` by `span_want`) and makes the try `NotYet` - the request waits for the room there and ends in 503 no_room
+  at its limit; only a need past that card's whole memory fails at once. Before, a refusal on the second card was learned for the
+  first (its free memory, not the refusing card's) and went back at once. The same for a one-card model and a second copy.
+  `FakeHost::hide` (memory no snapshot shows, the way another program grows between a sample and a start); `FakeHost::learn_ask` logs.
+
 ## 0.1.0+nextsycl.3 - 2026-11-16
 
 - `place::hot` + `Host::lock_hot`: `ensure` places a request on a server of its model that is up and idle (on a card no other work

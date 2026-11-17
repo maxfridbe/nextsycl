@@ -40,9 +40,10 @@ pub fn engines() -> Vec<nextsycl_image::ImageKind> {
          nextsycl_image_vldescribe::kind(), nextsycl_image_example::kind()]
 }
 
-/// `--gpu 0` or `--gpu 0,1` (an engine that splits over two cards takes the second too)
+/// `--gpu 0` or `--gpu 0,1` (an engine that splits over two cards takes the second too); `--gpus A,B` wins (what the
+/// front door starts a model whose one copy spans its cards with: `--gpu A --gpus A,B`)
 fn gpus(args: &[String]) -> Result<Vec<std::sync::Arc<nextsycl_core::Gpu>>, String> {
-    let list = opt(args, "--gpu").unwrap_or("0");
+    let list = opt(args, "--gpus").or_else(|| opt(args, "--gpu")).unwrap_or("0");
     let mut v = Vec::new();
     for i in list.split(',').filter(|x| !x.trim().is_empty()) {
         let i: usize = i.trim().parse().map_err(|_| format!("--gpu {list}: card numbers, comma separated"))?;
@@ -825,8 +826,9 @@ fn serve_here(cfg: &Config, m: &Value, files: ModelFiles, args: &[String], out: 
     let arch = m["arch"].as_str().unwrap_or("").to_string();
     let ks = engines();
     let load_fn = nextsycl_image::kind_for(&ks, &arch)?.load;
-    let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let gpu = nextsycl_core::Gpu::open(i).map_err(|e| e.0)?;
+    // every card it loads on (a model whose one copy spans its cards: `--gpus A,B`); the first is the server's own
+    let gs = gpus(args)?;
+    let gpu = gs[0].clone();
     let first = options(cfg, m, args)?;
     let loras = loras_for(cfg, m)?;
     let known: Vec<KnownLora> = loras.iter().filter_map(|l| Some(KnownLora {
@@ -849,7 +851,7 @@ fn serve_here(cfg: &Config, m: &Value, files: ModelFiles, args: &[String], out: 
             }
         }
     }
-    let g = gpu.clone();
+    let g = gs;
     let loader: nextsycl_serve::image::Loader = Box::new(move |use_: &[LoraUse], log: &mut dyn FnMut(String)| {
         let mut o = base.clone();
         o.merge_loras = use_.to_vec();
@@ -858,7 +860,7 @@ fn serve_here(cfg: &Config, m: &Value, files: ModelFiles, args: &[String], out: 
                 o.settings.extend(env.iter().cloned());
             }
         }
-        load_fn(&files, std::slice::from_ref(&g), &o, log).map_err(|e| e.0)
+        load_fn(&files, &g, &o, log).map_err(|e| e.0)
     });
     let wfe = args.iter().any(|a| a == "--wfe").then(|| cfg.dist.join("wfe"));
     let cors: Vec<String> = opt(args, "--cors").or(cfg.get("NS_CORS").as_deref()).map(|c| c.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default();

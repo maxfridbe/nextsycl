@@ -24,7 +24,7 @@ pub mod rsvp;
 pub mod shape;
 
 /// The crate's version: bump it with a line in CHANGELOG.md when behaviour changes
-pub const VERSION: &str = "0.1.0+nextsycl.3";
+pub const VERSION: &str = "0.1.0+nextsycl.4";
 
 /// What a failed step answers: an HTTP-like status (kept for the host's error body) and the words
 pub type Fail = (u16, String);

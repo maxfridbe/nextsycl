@@ -34,6 +34,9 @@ struct State {
     vram_mb: BTreeMap<String, u64>,
     /// a model whose one copy spans cards: its MiB on each
     span_mb: BTreeMap<String, BTreeMap<usize, u64>>,
+    /// memory taken on a card that no snapshot shows, until a time on the clock: (card, MiB, until) - another program
+    /// that grew between the sample and a start
+    hidden: Vec<(usize, u64, f64)>,
     pinned: BTreeSet<String>,
     holds: BTreeMap<String, Hold>,
     cancelled: BTreeSet<String>,
@@ -65,7 +68,7 @@ impl FakeHost {
             }
         }
         FakeHost { st: Mutex::new(State {
-            now: 1000.0, cards: cards_mb.to_vec(), servers: v, models: BTreeMap::new(), vram_mb: BTreeMap::new(), span_mb: BTreeMap::new(), pinned: BTreeSet::new(), holds: BTreeMap::new(),
+            now: 1000.0, cards: cards_mb.to_vec(), servers: v, models: BTreeMap::new(), vram_mb: BTreeMap::new(), span_mb: BTreeMap::new(), hidden: Vec::new(), pinned: BTreeSet::new(), holds: BTreeMap::new(),
             cancelled: BTreeSet::new(), video_idle: true, chat: None, chat_idle: true, locked: BTreeSet::new(), load_s: 10.0, log: Vec::new(), notes: Vec::new(),
         }) }
     }
@@ -174,6 +177,18 @@ impl FakeHost {
         }
     }
 
+    /// `mb` taken on card `g` for `secs` that no snapshot shows (a start there finds it)
+    pub fn hide(&self, g: usize, mb: u64, secs: f64) {
+        let mut st = self.st.lock().unwrap();
+        let until = st.now + secs;
+        st.hidden.push((g, mb, until));
+    }
+
+    /// What a start on card `g` finds taken: what a snapshot shows and the hidden memory not run out
+    fn used_really(st: &State, g: usize) -> u64 {
+        FakeHost::used(st, g) + st.hidden.iter().filter(|h| h.0 == g && h.2 > st.now).map(|h| h.1).sum::<u64>()
+    }
+
     fn used(st: &State, g: usize) -> u64 {
         BASE_USED_MB
             + st.servers.iter().filter_map(|s| FakeHost::on_card(st, s, g)).sum::<u64>()
@@ -246,8 +261,9 @@ impl Host for FakeHost {
             None => vec![(gpu, st.vram_mb.get(id).copied().unwrap_or(0))],
         };
         for (g, need) in &needs {
-            let free = st.cards[*g].saturating_sub(FakeHost::used(&st, *g));
+            let free = st.cards[*g].saturating_sub(FakeHost::used_really(&st, *g));
             if free < *need {
+                st.log.push(format!("refused {kind} {id}: short on card {g}"));
                 return Err((502, format!("{id} needs about {:.1} GiB on card {g}; {:.1} GiB are free", *need as f64 / 1024.0, free as f64 / 1024.0)));
             }
         }
@@ -308,7 +324,8 @@ impl Host for FakeHost {
         self.st.lock().unwrap().cancelled.contains(job)
     }
 
-    fn learn_ask(&self, _id: &str, _err: &str, _gpu: usize, _want: u64) -> bool {
+    fn learn_ask(&self, id: &str, _err: &str, gpu: usize, _want: u64, rest: bool) -> bool {
+        self.st.lock().unwrap().log.push(format!("learn {id} gpu {gpu}{}", if rest { " (rest)" } else { "" }));
         false
     }
 }

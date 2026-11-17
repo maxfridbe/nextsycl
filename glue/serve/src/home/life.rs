@@ -25,8 +25,11 @@
 //!   it is held no model loads - requests are refused with `cards_taken` (503, retryable), jobs wait, the video queue
 //!   pauses (mod.rs video_hold); what is loaded keeps answering. A run that named its cards (the side file
 //!   `<lock>.cards`) takes only those: nothing loads there, the other cards serve (taken_for, Host::barred_on).
-//! - A server that refuses to load for want of room (its `no room: ...` / "needs about X GiB ...; Y GiB are free") is
-//!   503 no_room with what it said (load_failed); a server that ends for another reason stays 502.
+//! - A server that refuses to load for want of room (its `no room: ...` / "needs about X GiB on <card>; Y GiB are free")
+//!   has its ask learned for the card it names (a spanning model's card past its first kept apart, `<id>@rest`) and
+//!   the request waits for that room (scheduler place::short_of_room), ending in 503 no_room at its limit; a need past
+//!   the card's whole memory is 503 no_room at once with what it said (load_failed); a server that ends for another
+//!   reason stays 502.
 //! - video: the daemon (`nextsycl video start`) with the enabled video models as its engines, on their GPUs; its
 //!   workers load per clip and let the card go when idle. No video model enabled: the daemon is stopped. A worker waiting for its card's memory (any card, shared or
 //!   not) has the same room rule applied for it (video_room_loop): idle holders there go, a chat model kept or answering stays, and the worker gives up after VIDEO_ROOM_WAIT_S.
@@ -1068,8 +1071,12 @@ impl Home {
         let info = self.model_info(&m);
         let card_mb = self.cards.lock().unwrap().get(info.gpus[0]).and_then(|c| c["vram_total_mb"].as_u64()).unwrap_or(32768);
         let (need_mb, _) = self.vouched_mb(&m, card_mb);
-        let asked_mb = self.asked.lock().unwrap().get(id).copied().unwrap_or(0);
-        let req = PlaceReq { model: &info, job, need_mb: &need_mb, asked_mb };
+        // what its server once refused for: on its first card, and (one whose one copy spans its cards) on the others
+        let (asked_mb, asked_rest_mb) = {
+            let a = self.asked.lock().unwrap();
+            (a.get(id).copied().unwrap_or(0), a.get(&format!("{id}@rest")).copied().unwrap_or(0))
+        };
+        let req = PlaceReq { model: &info, job, need_mb: &need_mb, asked_mb, asked_rest_mb };
         // the scheduler's driver is the only wait: cancel, files moving, cards taken, the limit, room
         let (_, port) = place::ensure(&Sched(self), &req, default, None, &Value::Null)?;
         self.request_on(id);
@@ -1605,14 +1612,17 @@ impl Host for Sched<'_> {
     fn cancelled(&self, job: &str) -> bool {
         self.0.job_cancelled(job)
     }
-    fn learn_ask(&self, id: &str, err: &str, gpu: usize, want: u64) -> bool {
+    fn learn_ask(&self, id: &str, err: &str, gpu: usize, want: u64, rest: bool) -> bool {
         let Some((need, had)) = place::asked_mb(err) else { return false };
+        // (`gpu` is the card the refusal named: its free memory, not the first card's)
         let ask = place::ask_mb(need, had, self.free_mb(gpu));
         eprintln!("{id}: its server asked {need} MiB with {had} MiB free on GPU {gpu}; planned {want} MiB, from now {ask}");
+        // a spanning model's card past its first: kept apart (PlaceReq::asked_rest_mb)
+        let key = if rest { format!("{id}@rest") } else { id.to_string() };
         let mut a = self.0.asked.lock().unwrap();
-        let more = ask > want && a.get(id).is_none_or(|x| ask > *x);
+        let more = ask > want && a.get(&key).is_none_or(|x| ask > *x);
         if more {
-            a.insert(id.to_string(), ask);
+            a.insert(key, ask);
         }
         more
     }

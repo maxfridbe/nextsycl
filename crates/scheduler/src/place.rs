@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 
 use crate::host::Host;
-use crate::room::{card_free, card_of_port, extra_copy_allowed, no_room, pick_card, pick_first, room_plan, Free, Holder, ModelInfo, Server, Snapshot, JOB_ROOM_WAIT_S,
-                  MARGIN_MB};
+use crate::room::{card_free, card_of_port, extra_copy_allowed, no_room, pick_card, pick_first, room_plan, Card, Free, Holder, ModelInfo, Server, Snapshot,
+                  JOB_ROOM_WAIT_S, MARGIN_MB};
 use crate::Fail;
 
 /// What to place
@@ -17,6 +17,9 @@ pub struct PlaceReq<'a> {
     pub need_mb: &'a BTreeMap<usize, u64>,
     /// MiB a server once refused for (learned): at least this is planned for
     pub asked_mb: u64,
+    /// MiB the server of a model whose one copy spans its cards once refused for on one of its cards past the first
+    /// (learned, `Host::learn_ask` with `rest`): at least this is planned for on each of them
+    pub asked_rest_mb: u64,
 }
 
 /// The answer of one try
@@ -157,7 +160,7 @@ fn start_copy(host: &dyn Host, req: &PlaceReq, snap: &Snapshot, mine: &[&Server]
         host.reserve(m, x.slot, x.port, gpu, want(gpu)).map_err(|e| (503, e))?;
         host.note(job, "loading", &format!("a second copy of {id} loading on GPU {gpu} (server {})", x.slot + 1));
         host.start(kind, id, x.slot, x.port, gpu).inspect_err(|(_, e)| {
-            host.learn_ask(id, e, gpu, want(gpu));
+            short_of_room(host, &snap.cards, m, gpu, e, &[(gpu, want(gpu))]);
         })
     });
     match started {
@@ -290,20 +293,54 @@ pub fn place(host: &dyn Host, req: &PlaceReq) -> Result<Outcome, Fail> {
     }
     host.note(job, "loading", &format!("{id} loading on GPU {gpu} (server {})", x.slot + 1));
     if let Err((code, e)) = host.start(kind, id, x.slot, x.port, gpu) {
-        // the server asked more than was planned for: the next try plans for that (stopping idle work for it)
-        if host.learn_ask(id, &e, gpu, want(gpu)) {
-            return Ok(Outcome::NotYet(format!("{id} needed more room on GPU {gpu} than planned ({e}); planned again")));
+        // a refusal for memory is a wait, not a failure: what it asked is learned and the next try plans for it
+        if let Some(why) = short_of_room(host, &snap.cards, m, gpu, &e, &[(gpu, want(gpu))]) {
+            return Ok(Outcome::NotYet(why));
         }
         return Err((code, e));
     }
     Ok(Outcome::Placed { slot: x.slot, port: x.port })
 }
 
-/// What a model whose one copy spans its cards plans for on card `g`, MiB: its share there and the margin; a refusal
-/// learned (`asked_mb`, which names no card) raises its first card's - the largest share - never another's
+/// What a model whose one copy spans its cards plans for on card `g`, MiB: its share there and the margin, at least a
+/// refusal learned for that card - its first card's `asked_mb`, the others' `asked_rest_mb` (learned for the card the
+/// refusal named: [`short_of_room`])
 pub fn span_want(req: &PlaceReq, g: usize) -> u64 {
     let w = req.need_mb.get(&g).copied().unwrap_or(0) + MARGIN_MB;
-    if req.model.gpus.first() == Some(&g) { w.max(req.asked_mb) } else { w }
+    if req.model.gpus.first() == Some(&g) { w.max(req.asked_mb) } else { w.max(req.asked_rest_mb) }
+}
+
+/// The card a refusal for memory names ("needs about X GiB on <card name>; ..." or "... on <card name> (and 1.5 GiB
+/// kept free); ..."), of the cards `among` (the ones the start took): by its name, the one with the least free when
+/// two share it. None: no card named, or none of them.
+pub fn refused_card(cards: &[Card], e: &str, among: &[usize]) -> Option<usize> {
+    let name = e.split(" GiB on ").nth(1)?.split(';').next()?.split(" (").next()?.trim();
+    cards.iter().filter(|c| among.contains(&c.index) && c.name == name).min_by_key(|c| c.free()).map(|c| c.index)
+}
+
+/// A start of `m` on `gpu` that failed (`e`), when it was a refusal for memory on one of the cards it took (`wants`: each
+/// with what was planned there): the ask learned for the card the refusal names (the host's `learn_ask`; `rest`: not
+/// the first card of a model whose one copy spans its cards) and why the request waits - the next try plans for the
+/// ask, so it waits for busy work there or stops idle work, and the wait ends in 503 no_room. None: another failure,
+/// or a need past that card's whole memory (it would never load there).
+/// (nextcuda cf2debd: MiniMax Music 3 int8's starts were refused 36 times on its flow stage's card, the refusals learned
+/// for the other card and sent back as failures)
+pub fn short_of_room(host: &dyn Host, cards: &[Card], m: &ModelInfo, gpu: usize, e: &str, wants: &[(usize, u64)]) -> Option<String> {
+    let (need, _) = asked_mb(e)?;
+    let taken: Vec<usize> = wants.iter().map(|w| w.0).collect();
+    let card = refused_card(cards, e, &taken).unwrap_or(gpu);
+    let planned = wants.iter().find(|w| w.0 == card).map_or(0, |w| w.1);
+    let rest = m.spans && m.gpus.first() != Some(&card);
+    let more = host.learn_ask(&m.id, e, card, planned, rest);
+    let total = cards.iter().find(|c| c.index == card).map_or(u64::MAX, |c| c.total_mb);
+    if need > total {
+        return None;
+    }
+    Some(if more {
+        format!("{} needed more room on GPU {card} than planned ({e}); planned again", m.id)
+    } else {
+        format!("GPU {card} was short of the room {} asked ({e}); it waits for the room there", m.id)
+    })
 }
 
 /// [`place`] for a model not loaded whose one copy spans its cards ([`ModelInfo::spans`]): the room on EACH of its cards
@@ -377,8 +414,9 @@ fn place_span(host: &dyn Host, req: &PlaceReq, snap: &Snapshot) -> Result<Outcom
     let on = gpus.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(" + ");
     host.note(job, "loading", &format!("{id} loading on GPUs {on} (server {})", x.slot + 1));
     if let Err((code, e)) = host.start(kind, id, x.slot, x.port, gpus[0]) {
-        if host.learn_ask(id, &e, gpus[0], want(gpus[0])) {
-            return Ok(Outcome::NotYet(format!("{id} needed more room than planned ({e}); planned again")));
+        // a refusal for memory on any of its cards is a wait: learned for the card it names, planned for next try
+        if let Some(why) = short_of_room(host, &snap.cards, m, gpus[0], &e, &wants) {
+            return Ok(Outcome::NotYet(why));
         }
         return Err((code, e));
     }
@@ -489,6 +527,22 @@ pub fn ask_mb(need: u64, had: u64, front_free: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_names_its_card() {
+        let card = |index: usize, name: &str, used_mb: u64| Card { index, name: name.into(), total_mb: 32768, used_mb, procs: Vec::new() };
+        let cards = [card(0, "Intel(R) Graphics [0xe223]", 1000), card(1, "Intel(R) Graphics [0xe222]", 9000)];
+        // Sophon's own words (its talker's card named, with the kept margin in brackets)
+        let e = "audio start sophon on GPUs 0 + 1: sophon needs about 6.2 GiB on Intel(R) Graphics [0xe222] (and 1.5 GiB kept free); 4.1 GiB are free";
+        assert_eq!(refused_card(&cards, e, &[0, 1]), Some(1));
+        assert_eq!(refused_card(&cards, "x needs about 2.0 GiB on Intel(R) Graphics [0xe223]; 1.0 GiB are free", &[0, 1]), Some(0));
+        // not among the cards the start took, or no card named
+        assert_eq!(refused_card(&cards, e, &[0]), None);
+        assert_eq!(refused_card(&cards, "device out of memory", &[0, 1]), None);
+        // two cards of one name: the one with less free
+        let same = [card(0, "B", 1000), card(1, "B", 9000)];
+        assert_eq!(refused_card(&same, "x needs about 2.0 GiB on B; 1.0 GiB are free", &[0, 1]), Some(1));
+    }
 
     #[test]
     fn a_refusal_for_memory_is_read_and_planned_for() {
