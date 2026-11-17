@@ -8,6 +8,8 @@
 
 pub use nextsycl_h3::*;
 
+mod silo;
+
 // ---- the engine behind the video contract -----------------------------------------------------------------------
 
 use std::path::{Path, PathBuf};
@@ -22,19 +24,21 @@ pub const ARCH: &str = "minimax-h3";
 
 /// The files it takes, by role (the denoiser at load; the others go into each job, where a job does not name its own)
 pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "vae", "audio-vae", "vision", "controlnet", "ic-lora", "hyperflow", "adaln", "sharp-lora",
-                             "silence"];
+                             "silence", "fast-vae"];
 
 /// A role and the job key it fills
 const ROLE_KEYS: &[(&str, &str)] = &[("text-encoder", "te"), ("tokenizer", "tokenizer"), ("vae", "vae"), ("audio-vae", "audio_vae"),
                                      ("upscaler", "upscaler"), ("pixel-upscaler", "pixel_upscaler"), ("vision", "te_visual"), ("controlnet", "controlnet"),
                                      // Open-H3-Regenerate-2K-IC's parts (the regen2k job)
-                                     ("ic-lora", "ic_lora"), ("hyperflow", "hyperflow"), ("adaln", "adaln"), ("sharp-lora", "sharp_lora"), ("silence", "silence")];
+                                     ("ic-lora", "ic_lora"), ("hyperflow", "hyperflow"), ("adaln", "adaln"), ("sharp-lora", "sharp_lora"), ("silence", "silence"),
+                                     ("fast-vae", "regen_fast_vae")];
 
 /// The options it takes (`--opt-NAME`): at load the variables they set; per request the generate job's own keys
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "threads", env: "H3_THREADS", value: "N", help: "threads reading the checkpoint at load (default 8)", at: At::Load },
     EngineOption { name: "resident-blocks", env: "H3_RESIDENT_BLOCKS", value: "N", help: "keep only the first N denoiser blocks on the card and stream the rest from the int8 file as they run (the card for the activations: Open-H3-Regenerate-2K's 2560x1440 sequences; default all)", at: At::Load },
     EngineOption { name: "te-pin", env: "H3_TE_PIN", value: "0|1", help: "keep the text encoder in pinned host memory between clips (default 1)", at: At::Load },
+    EngineOption { name: "regen-vae", env: "H3_REGEN_VAE", value: "fast|standard", help: "regen2k's decoder: Open-H3-Regenerate-2K's fast decoder (the card's fast-vae file; the H3 video silo's kernels) or the H3 video decoder (default standard)", at: At::Load },
     EngineOption { name: "vae-attn-per-tile", env: "H3_VAE_ATTN_PER_TILE", value: "0|1", help: "the video decoder's attention a tile at a time", at: At::Load },
     EngineOption { name: "attn", env: "NSD_ATTN", value: "sage|onednn", help: "long sequences' attention: SageAttention (int8 q, k) or oneDNN's", at: At::Load },
     EngineOption { name: "sage-min-s", env: "NSD_SAGE_MIN_S", value: "TOKENS", help: "the shortest sequence Sage takes (default 8192)", at: At::Load },
@@ -70,6 +74,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "regen_sampler", env: "", value: "up3|up4|hf8", help: "with regen2k: 3 or 4 steps from the upscaled draft, or 8 from noise (default up3)", at: At::Request },
     EngineOption { name: "regen_resolution", env: "", value: "2k|1080p", help: "with regen2k: 2560x1440 (default) or 1920x1080", at: At::Request },
     EngineOption { name: "sharp", env: "", value: "X", help: "with regen2k: LMS Sharp's strength (default 1; 0 off)", at: At::Request },
+    EngineOption { name: "regen_vae", env: "", value: "fast|standard", help: "with regen2k: the decoder for this clip (default the model's H3_REGEN_VAE)", at: At::Request },
 ];
 
 /// This engine's registry entry
@@ -87,7 +92,16 @@ fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn Fn
     let dev = device::Device::open_index(gpu).map_err(ve)?;
     let resident = o.setting("H3_RESIDENT_BLOCKS").and_then(|v| v.parse().ok());
     let e = jobs::Engine::load_resident(dev, denoiser, None, resident, threads, log).map_err(ve)?;
-    Ok(Box::new(H3 { e, files: files.clone(), load_s: t0.elapsed().as_secs_f64() }))
+    // regen2k's decoder (the card's H3_REGEN_VAE): the fast one needs its file and this engine's silo
+    let regen_vae = o.setting("H3_REGEN_VAE").filter(|v| !v.is_empty());
+    if files.contains_key("fast-vae") || regen_vae.as_deref() == Some("fast") {
+        match silo::install() {
+            Ok(Some(p)) => log(format!("silo   : {} (the fast decoder's kernels)", p.display())),
+            Ok(None) => log("silo   : none - regen2k decodes with the H3 video decoder".to_string()),
+            Err(e) => log(format!("silo   : {e} - regen2k decodes with the H3 video decoder")),
+        }
+    }
+    Ok(Box::new(H3 { e, files: files.clone(), load_s: t0.elapsed().as_secs_f64(), regen_vae }))
 }
 
 fn ve(e: Error) -> nextsycl_video::Error {
@@ -98,6 +112,8 @@ pub struct H3 {
     pub e: jobs::Engine,
     files: ModelFiles,
     load_s: f64,
+    /// regen2k's decoder when a request does not say (H3_REGEN_VAE: fast | standard)
+    regen_vae: Option<String>,
 }
 
 impl H3 {
@@ -111,6 +127,9 @@ impl H3 {
                     let p = if *role == "tokenizer" && p.is_file() { p.parent().map(Path::to_path_buf).unwrap_or_else(|| p.clone()) } else { p.clone() };
                     m.insert((*key).into(), json!(p));
                 }
+            }
+            if let (None, Some(v)) = (m.get("regen_vae"), &self.regen_vae) {
+                m.insert("regen_vae".into(), json!(v));
             }
             // the effect embeddings (roles embedding-NAME): `embedding:NAME` in a prompt finds them in their directory
             if !m.contains_key("embeddings") {
@@ -178,6 +197,9 @@ impl VideoEngine for H3 {
                           "resolution": req.extra.get("regen_resolution").map_or("2k", String::as_str)});
             if let Some(x) = req.extra.get("sharp").and_then(|v| v.parse::<f64>().ok()) {
                 spec["sharp"] = json!(x);
+            }
+            if let Some(x) = req.extra.get("regen_vae") {
+                spec["regen_vae"] = json!(x);
             }
         }
         let flag = AtomicBool::new(false);

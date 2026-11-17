@@ -14,6 +14,7 @@ pub mod dit;
 pub mod dtype;
 pub mod esrgan;
 pub mod exposure;
+pub mod fastvae;
 pub mod jobs;
 pub mod kquant;
 pub mod media;

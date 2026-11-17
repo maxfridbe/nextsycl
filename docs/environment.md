@@ -321,6 +321,8 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 | `H3_TE_PIN_LOCK` | /tmp/h3-te-pin.lock | the lock file that lets one worker a host hold the pinned text-encoder copy | video h3 |
 | `H3_THREADS` | 8 | threads reading the checkpoint at load (--opt-threads) | video h3 |
 | `H3_VAE_ATTN_PER_TILE` | off | 1: the video decoder's attention a tile at a time (--opt-vae-attn-per-tile) | video h3 |
+| `H3_REGEN_VAE` | standard | regen2k's decoder: `fast` - Open-H3-Regenerate-2K's fast decoder (the card's fast-vae file, crates/h3/src/fastvae.rs; needs the H3 video silo, dist/silo/libnextsycl-h3.so, and falls back to the video decoder without it or without the room) - or `standard`, the H3 video decoder; a request's `regen_vae` overrides (--opt-regen-vae; the minimax-h3-regen2k-ic card) | video h3 |
+| `H3_DECODE_FRAMES` | unset | a path: the decode job also writes its frames there as a check dump (`images` [F, H, W, 3], float32 in [0, 1]) - for comparing one decoder with another through the decode job's `check` | video h3 |
 | `H3_VAE_FLOAT32` | off | 1: every tile of the fp16 video decoder in float32 (~8x slower; for checks). Without it, only a tile that comes out non-finite in half precision is decoded again in float32, and the job log names it | video h3 |
 | `NS_VIDEO_CHARACTERS` | docs/video/characters.example.json | characters for the speech tool | cli (video tools) |
 | `NS_VIDEO_DOOR` | 127.0.0.1:8000 | the front door the studio asks which cards a pin or hold has and the host's free memory (`--door` wins; off: none) | studio |

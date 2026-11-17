@@ -118,7 +118,7 @@ impl Device {
         if ptr.is_null() {
             return Err(Error(self.api.error()));
         }
-        Ok(Buf { dev: self.clone(), ptr, bytes })
+        Ok(Buf { dev: self.clone(), ptr, bytes, owned: true })
     }
 
     /// Waits until everything queued has run.
@@ -175,6 +175,8 @@ pub struct Buf {
     dev: Arc<Device>,
     ptr: *mut c_void,
     bytes: usize,
+    /// false for a view into another buffer (`Tensor::rows_view`): the owner frees the memory
+    owned: bool,
 }
 
 // SAFETY: a device pointer is only dereferenced by the library, on the queue.
@@ -222,8 +224,10 @@ impl Buf {
 
 impl Drop for Buf {
     fn drop(&mut self) {
-        // SAFETY: allocated by this device; freed once.
-        unsafe { (self.dev.api.free)(self.dev.ctx, self.ptr) }
+        if self.owned {
+            // SAFETY: allocated by this device; freed once.
+            unsafe { (self.dev.api.free)(self.dev.ctx, self.ptr) }
+        }
     }
 }
 
@@ -330,6 +334,23 @@ impl Tensor {
             (dev.api.copy)(dev.ctx, self.buf.ptr().cast::<u8>().add(dst_row * rb).cast(), src.buf.ptr().cast::<u8>().add(src_row * rb).cast_const().cast(), (rows * rb) as u64)
         };
         dev.check(rc)
+    }
+
+    /// Rows `[row0, row0 + rows)` of this tensor as a tensor of their own, sharing its memory (nothing is copied; the
+    /// view frees nothing): a stage that works on part of a long buffer in place (the fast decoder's temporal windows).
+    ///
+    /// # Safety
+    /// The view must not outlive `self` (its memory is `self`'s).
+    pub unsafe fn rows_view(&self, row0: usize, rows: usize) -> Result<Tensor> {
+        let rb = self.row_bytes();
+        if (row0 + rows) * rb > self.buf.len() || self.shape.is_empty() {
+            return Err(Error(format!("rows_view: rows {row0}+{rows} of {:?}", self.shape)));
+        }
+        let mut shape = self.shape.clone();
+        shape[0] = rows;
+        // SAFETY: in bounds, checked above.
+        let ptr = unsafe { self.buf.ptr.cast::<u8>().add(row0 * rb).cast() };
+        Ok(Tensor { buf: Buf { dev: self.buf.dev.clone(), ptr, bytes: rows * rb, owned: false }, dtype: self.dtype, shape })
     }
 
     /// The tensor's bytes, read back from the device.

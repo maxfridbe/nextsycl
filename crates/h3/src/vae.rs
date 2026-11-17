@@ -648,7 +648,7 @@ impl VideoDecoder {
 }
 
 /// raw decoder output -> [0, 1]: undo the ImageNet normalization, clamp
-fn finalize(mut px: Vec<f32>, frames: usize, plane: usize) -> Vec<f32> {
+pub(crate) fn finalize(mut px: Vec<f32>, frames: usize, plane: usize) -> Vec<f32> {
     for c in 0..OUT_C {
         for v in &mut px[c * frames * plane..(c + 1) * frames * plane] {
             *v = (*v * IMAGENET_STD[c] + IMAGENET_MEAN[c]).clamp(0.0, 1.0);

@@ -80,6 +80,8 @@ pub struct RegenSpec<'a> {
     /// LMS Sharp and its strength (0: off)
     pub sharp: Option<(&'a Path, f32)>,
     pub silence: &'a Path,
+    /// Open-H3-Regenerate-2K's fast decoder (fastvae.rs), or None: the H3 video decoder
+    pub fast_vae: Option<&'a Path>,
     /// MLP rows at a time
     pub mlp_rows: usize,
     /// a parity dump: the net's inputs and its output at the first level, then stop
@@ -415,14 +417,17 @@ pub fn regen2k(e: &Engine, s: &RegenSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         ("samples.video".to_string(), (vec![1, 24, lt, uh, uw], joined.clone())),
     ]), &BTreeMap::new())?;
 
-    // 3. the frames, the draft's length and sound
+    // 3. the frames, the draft's length and sound (the sampling's kernel scratch given back first: the fast decoder runs in
+    // a context of its own and needs the room)
+    dev.trim()?;
     let rep = jobs::decode_latents(dev, e.threads, Latents { video: joined, t: lt, h: uh, w: uw, audio: None },
-                                   &Vaes { video: s.vae, audio: None, upscale: None, pixel: None }, Some(out), None, ctl)?;
+                                   &Vaes { video: s.vae, audio: None, upscale: None, pixel: None, fast: s.fast_vae }, Some(out), None, ctl)?;
     note_peak(dev);
     finish(out, s.draft, real, frames, (tw, th), s.keep_h, ctl)?;
     let total = t_all.elapsed().as_secs_f64();
     for (k, v) in [("encode_seconds", json!(encode_s)), ("upscale_seconds", json!(upscale_s)), ("text_encoder_seconds", json!(te_s)),
                    ("sample_seconds", json!(sample_s)), ("decode_seconds", rep.get("seconds").cloned().unwrap_or(json!(null))),
+                   ("vae", rep.get("vae").cloned().unwrap_or(json!(null))),
                    ("total_seconds", json!(total)), ("real_frames", json!(real)), ("peak_gib", json!(jobs::gib(peak))),
                    ("sampler", json!(s.sampler)), ("sigmas", json!(sigmas)), ("width", json!(tw)), ("height", json!(s.keep_h)), ("out", json!(out))] {
         report[k] = v;
