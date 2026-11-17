@@ -740,6 +740,12 @@ GPU work the front door does not manage (a test, a benchmark, a build) holds the
   work for them waits forever). Under the lock, a helper yields (exit 75) when a job waits with `stage: cards_taken`
   or, for a run that named no cards, whenever the box is busy.
 
+
+Since 2026-11-17 a run on some cards holds each card's own lock beside the box's, `/tmp/ds2run.gpuN.lock`
+(`gpulock::card_file`; gpu-lock.sh takes them in card order on fds 20+N): the front door takes exactly those cards, and two
+runs on two cards go side by side. The box's lock (a run that names no card, or an old flock-only runner) still takes
+every card, and a run on some cards waits for it.
+
 ## What stays shared on purpose
 
 - **One kernel library a kind**, not one an engine: one toolchain run builds them all, and an engine's code reaches
