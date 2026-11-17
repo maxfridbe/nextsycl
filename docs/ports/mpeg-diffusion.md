@@ -122,5 +122,5 @@ The whole call's 1.6% is the int8 activation quantization and bfloat16 of our H3
 dequantization in the reference - the same size as the Regenerate-2K port's one-call check (rel 0.0157) and as our H3
 against ComfyUI. Upstream's CPU call took 290 s (+ 61 s dequantizing blocks; 8 threads).
 
-Upstream's `lot/test_lot.py` ("ok 33") is a CPU test of upstream's own code; it is not run here (it does not touch
-ours).
+Upstream's own CPU test `lot/test_lot.py` passes in the reference's environment ("ok 33", torch 2.15 CPU): the code
+the checks drove is upstream's as it tests it.
