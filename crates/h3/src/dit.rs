@@ -182,6 +182,11 @@ impl Block {
         })
     }
 
+    /// The per-head key norm's weight (float32 [head_dim])
+    pub fn k_norm(&self) -> &Tensor {
+        &self.k_norm
+    }
+
     /// The four block matrices, in product order: qkv, out, fc1, fc2
     pub fn linears(&self) -> [&Weight; 4] {
         [&self.qkv, &self.out_proj, &self.fc1, &self.fc2]

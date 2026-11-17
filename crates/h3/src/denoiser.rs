@@ -399,7 +399,7 @@ pub struct Denoiser<'a> {
     pub shape: Shape,
     pub layout: Layout,
     pub schedule: Schedule,
-    text: Tensor,
+    pub(crate) text: Tensor,
     text_tags: Option<Vec<i32>>,
     x: Tensor,
     scratch: Scratch,
@@ -418,7 +418,13 @@ pub struct Denoiser<'a> {
     /// (block, states): the next `net` call reads the video rows' stream after that block into the vector as float32
     /// [video rows, hidden] (MPEG-Diffusion's region head reads block 25's)
     pub capture: Option<(usize, Vec<f32>)>,
+    /// (block, taps): the next two-track call (`net_two_track`) keeps that block's raw qkv and attention output as
+    /// float32 ("qkv" [rows, 3 H D], "att" [rows, H D]) - the reference checks of docs/ports/mpeg-diffusion.md
+    pub taps: Option<(usize, Taps)>,
 }
+
+/// Named float32 copies of a block's buffers (`Denoiser::taps`)
+pub type Taps = Vec<(String, Vec<f32>)>;
 
 /// The final layer on `n` rows of the stream `x` from row `start`: norm, the timestep's shift and scale (`t_rows`:
 /// each row's timestep index into the tables), the output linear; float32 [n, outputs], in chunks of rows
@@ -558,6 +564,7 @@ impl<'a> Denoiser<'a> {
             control: None,
             hyperflow: None,
             capture: None,
+            taps: None,
         })
     }
 
@@ -808,7 +815,21 @@ impl<'a> Denoiser<'a> {
                 _ => None,
             };
             let lora = staged.as_ref().or_else(|| self.lora.and_then(|l| l.blocks.get(i)));
-            self.blocks.block_split(i, x, &step, &tt.scratch, lora, None, Some(tt))?;
+            if self.taps.as_ref().is_some_and(|(b, _)| *b == i) {
+                let mut got = Vec::new();
+                let mut keep = |name: &str, t: &Tensor| -> Result<()> {
+                    if name == "qkv" || name == "att" {
+                        got.push((name.to_string(), t.to_f32()?));
+                    }
+                    Ok(())
+                };
+                self.blocks.block_split(i, x, &step, &tt.scratch, lora, Some(&mut keep), Some(tt))?;
+                if let Some((_, v)) = self.taps.as_mut() {
+                    v.extend(got);
+                }
+            } else {
+                self.blocks.block_split(i, x, &step, &tt.scratch, lora, None, Some(tt))?;
+            }
         }
         let (shift, scale) = o.final_tables(&cfg, &t_emb);
         let r = ts.values.len();

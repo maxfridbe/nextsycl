@@ -861,6 +861,67 @@ impl SplitAttention for TwoTrack<'_> {
     }
 }
 
+/// The reference checks' dump (reference/mpeg-diffusion/tt_ref.py): one two-track network call on the run's own
+/// inputs - the refined text, both tracks' x, the sound as the network sees it, the plan and its positions - with its
+/// outputs, block 0's raw qkv and attention output, the region head's input and output, and block 0's maps applied on
+/// the host to the half-res keys outside M (normalized, before rotation)
+#[allow(clippy::too_many_arguments)]
+fn dump(d: &mut crate::denoiser::Denoiser, tt: &TwoTrack, maps: &UpMaps, path: &Path, (xv, xh, xa): (&[f32], &[f32], &[f32]), sigma: f32,
+        (states, scores): (&[f32], &[f32]), log: &mut dyn FnMut(String)) -> Result<()> {
+    use std::collections::BTreeMap;
+    let cfg = d.blocks.cfg;
+    let sh = d.shape;
+    let sc = d.schedule;
+    let sigma_a = crate::layout::time_shift_sigma(sigma.max(1e-6) as f64, sc.shift_video as f64, sc.shift_audio as f64) as f32;
+    let audio_in: Vec<f32> = xa.iter().map(|x| x * sigma_a / sigma.max(1e-6)).collect();
+    d.taps = Some((0, Vec::new()));
+    let (v, vh, va) = d.net_two_track(tt, xv, xh, &audio_in, sigma, &mut |_| Ok(()))?;
+    let taps = d.taps.take().map(|t| t.1).unwrap_or_default();
+    let w = cfg.heads * cfg.head_dim;
+    let mut m: BTreeMap<String, (Vec<usize>, Vec<f32>)> = BTreeMap::new();
+    let text = d.text.to_f32()?;
+    let tl = text.len() / cfg.hidden;
+    m.insert("text".into(), (vec![tl, cfg.hidden], text));
+    m.insert("lr".into(), (vec![24, sh.t, sh.h, sh.w], xv.to_vec()));
+    m.insert("hr".into(), (vec![24, sh.t, 2 * sh.h, 2 * sh.w], xh.to_vec()));
+    m.insert("audio".into(), (vec![32, 2, sh.audio_t], audio_in));
+    m.insert("v_lr".into(), (vec![24, sh.t, sh.h, sh.w], v));
+    m.insert("v_hr".into(), (vec![24, sh.t, 2 * sh.h, 2 * sh.w], vh));
+    m.insert("v_audio".into(), (vec![32, 2, sh.audio_t], va));
+    let p = &tt.plan;
+    m.insert("mask".into(), (vec![p.t, p.h, p.w], p.mask.iter().map(|b| *b as u8 as f32).collect()));
+    m.insert("hr_index".into(), (vec![p.hr_count()], p.hr_index.iter().map(|i| *i as f32).collect()));
+    m.insert("positions".into(), (vec![tt.tokens, 3], tt.positions.iter().map(|x| *x as f32).collect()));
+    m.insert("states".into(), (vec![p.lr_count(), cfg.hidden], states.to_vec()));
+    m.insert("scores".into(), (vec![p.t, p.h, p.w], scores.to_vec()));
+    for (name, t) in &taps {
+        let cols = if name == "qkv" { 3 * w } else { w };
+        m.insert(format!("{name}0"), (vec![t.len() / cols, cols], t.clone()));
+    }
+    // block 0's maps on the host: the half-res keys outside M, normalized (k_norm, eps 1e-5) before rotation
+    if let Some((_, qkv)) = taps.iter().find(|(n, _)| n == "qkv") {
+        let kw = d.blocks.blocks[0].k_norm().to_f32()?;
+        let mut keys = Vec::with_capacity(p.lr_out.len() * w);
+        for lr in &p.lr_out {
+            let row = &qkv[(tt.prefix + lr) * 3 * w + w..][..w];
+            for hd in 0..cfg.heads {
+                let x = &row[hd * cfg.head_dim..][..cfg.head_dim];
+                let ms = x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / cfg.head_dim as f64;
+                let r = 1.0 / (ms + cfg.qk_eps as f64).sqrt();
+                keys.extend(x.iter().zip(&kw).map(|(v, g)| (*v as f64 * r) as f32 * g));
+            }
+        }
+        let n = p.lr_out.len();
+        m.insert("expanded_k0".into(), (vec![n, 4, cfg.heads, HEAD_DIM], maps.expand_host(0, 0, &keys, cfg.heads)));
+        m.insert("knorm0".into(), (vec![n, cfg.heads, HEAD_DIM], keys));
+    }
+    let meta = BTreeMap::from([("sigma".to_string(), format!("{sigma:.9}")), ("prefix".to_string(), tt.prefix.to_string()),
+                               ("text_len".to_string(), tl.to_string()), ("audio_t".to_string(), sh.audio_t.to_string())]);
+    crate::safetensors::write_f32(path, &m, &meta)?;
+    log(format!("mpeg   : the reference dump (one two-track call at sigma {sigma}) written to {}", path.display()));
+    Ok(())
+}
+
 // ---- the sampler ---------------------------------------------------------------------------------------------
 
 /// A clip's two-track run: the model card's files and settings
@@ -868,6 +929,8 @@ pub struct Spec<'a> {
     pub maps: &'a Path,
     pub head: &'a Path,
     pub settings: Settings,
+    /// write what the first two-track call saw and gave here (the reference checks: reference/mpeg-diffusion)
+    pub dump: Option<&'a Path>,
 }
 
 /// What a two-track run gives the decode
@@ -934,6 +997,7 @@ pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, sigmas: &[f32], va
     report["half_res_seconds"] = serde_json::json!(t0.elapsed().as_secs_f64());
     // 2. the region
     let states = d.capture.take().map(|c| c.1).filter(|v| !v.is_empty()).ok_or("the region head's block states were not captured")?;
+    let states_kept = if spec.dump.is_some() { states.clone() } else { Vec::new() };
     let scores = head.scores(&states);
     let mask = region_mask(&scores, t, th, tw, st.alpha, st.floor);
     let plan = Plan::new(mask, t, th, tw)?;
@@ -1019,6 +1083,9 @@ pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, sigmas: &[f32], va
     let t2 = Instant::now();
     for k in 0..tail.len() - 1 {
         let i = st.switch + k;
+        if k == 0 && spec.dump.is_some() {
+            dump(d, &tt, &maps, spec.dump.unwrap_or(Path::new("")), (&xv, &xh, &xa), tail[0], (&states_kept, &scores), log)?;
+        }
         let (dv, dh, da) = d.denoised_two_track(&tt, &xv, &xh, &xa, tail[k], &mut |b| between(i, b))?;
         euler(&mut xv, &dv, tail[k], tail[k + 1]);
         euler(&mut xh, &dh, tail[k], tail[k + 1]);
@@ -1042,6 +1109,46 @@ pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, sigmas: &[f32], va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream's own functions on fixed inputs (reference/mpeg-diffusion/tt_ref.py fixtures): the region mask from
+    /// scores, the plan's index lists, the packed sequence's positions, the Level-of-Token layout, the tail's sigmas
+    #[test]
+    fn the_plan_positions_and_layout_are_upstreams() {
+        let raw = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/mpeg_fixture.json")).unwrap();
+        let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let us = |v: &serde_json::Value| -> Vec<usize> { v.as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as usize).collect() };
+        for c in fx["cases"].as_array().unwrap() {
+            let name = c["name"].as_str().unwrap();
+            let n = |k: &str| c[k].as_u64().unwrap() as usize;
+            let (t, lh, lw) = (n("latent_t"), n("lat_h"), n("lat_w"));
+            let (th, tw) = (lh / 2, lw / 2);
+            let scores: Vec<f32> = c["scores"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
+            let mask = region_mask(&scores, t, th, tw, 0.5, None);
+            let want: Vec<bool> = us(&c["mask"]).iter().map(|v| *v == 1).collect();
+            assert_eq!(mask, want, "{name}: the mask");
+            let p = Plan::new(mask, t, th, tw).unwrap();
+            assert_eq!(p.hr_index, us(&c["hr_index"]), "{name}: hr_index");
+            assert_eq!(p.cell_order(), us(&c["cell_order"]), "{name}: cell_order");
+            assert_eq!(p.grid_source(), us(&c["grid_source"]), "{name}: grid_source");
+            let lr = crate::layout::Layout::new(n("text_len"), t, lh, lw, n("audio_t"), &[], &[]).unwrap();
+            let hr = crate::layout::Layout::new(n("text_len"), t, 2 * lh, 2 * lw, n("audio_t"), &[], &[]).unwrap();
+            let pos = p.positions(&lr, &hr).unwrap();
+            let want: Vec<f64> = c["positions"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+            assert_eq!(pos.len(), want.len(), "{name}: rows");
+            let worst = pos.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            assert!(worst < 1e-12, "{name}: positions differ by {worst}");
+            // (float64: the last bit of a quarter of them differs - the sums run in another order); in float32, as the
+            // rotation reads them: the same numbers
+            assert!(pos.iter().zip(&want).all(|(a, b)| *a as f32 == *b as f32), "{name}: positions in float32");
+            let full: Vec<bool> = (0..t * lh * lw).map(|i| p.mask[((i / (lh * lw)) * th + (i / lw) % lh / 2) * tw + (i % lw) / 2]).collect();
+            let lot: Vec<Vec<usize>> = region_layout(&full, t, lh, lw).iter().map(|r| vec![r.t, r.u, r.v, r.eh, r.ew]).collect();
+            let want: Vec<Vec<usize>> = c["lot"].as_array().unwrap().iter().map(us).collect();
+            assert_eq!(lot, want, "{name}: the Level-of-Token layout");
+        }
+        let tail = Settings::default().tail(&crate::denoiser::sigmas(20, 12.0));
+        let want: Vec<f32> = fx["tail_16_6"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
+        assert_eq!(tail, want);
+    }
 
     #[test]
     fn the_tail_is_linear_in_sigma() {

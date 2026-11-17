@@ -1955,6 +1955,7 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     true => Some(crate::mpeg::Spec {
                         maps: Path::new(s("mpeg_maps").ok_or("mpeg needs \"mpeg_maps\": the fitted K/V maps (up_maps_tt.safetensors)")?),
                         head: Path::new(s("region_head").ok_or("mpeg needs \"region_head\": the region head (region_head_tt.safetensors)")?),
+                        dump: s("mpeg_dump").map(Path::new),
                         settings: crate::mpeg::Settings::from_env(&|k: &str| {
                             // a job's own key (mpeg_switch ...) over the variable (H3_MPEG_SWITCH ...)
                             let key = k.trim_start_matches("H3_").to_lowercase();
