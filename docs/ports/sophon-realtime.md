@@ -220,8 +220,66 @@ through the qwen3-tts engine, with each talker's weights:
 - **With Flash's talker it fails.** Speech ends early (WER 0.26-0.74; Skippy1 "Thank you." in 3 of 9 takes), though Keeper's "[laughter]" was performed and not read.
 
 So no measured path gives both a faithful clone and performed tags. The fine-tune learned the x-vector prompt alone.
-ICL with Base is a candidate for the plain entry (the saved voices keep their transcripts). It is not ported: speak.rs
-builds upstream's x-vector prompt only.
+ICL with Base is now the plain entry's way (next section).
+
+## In-context clones (2026-11-17): the plain entry's default
+
+`NS_SOPHON_CLONE=icl` (sophon-realtime-32b-flash's card; -tags keeps `xvector`): a cloned voice whose transcript is
+known speaks through Qwen3-TTS's own ICL prompt (qwen-tts `generate_icl_prompt`, streaming), built in speak.rs:
+- the codec rows as before (x-vector included), then `proj(ref text ++ reply ++ tts_eos)` beside codec
+  `[bos, the recording's frames]` (the 12 Hz codec's encoder, crates/codec12hz); a shorter text is padded with
+  tts_pad, a longer one fed a token a frame after the prompt;
+- the codec decodes the new frames after the recording's (their context), as qwen-tts does;
+- the transcript's ids are qwen-tts's `ref_ids[3:-2]` (the reference template, NFC, the thinker's tokenizer).
+
+**Where the transcript comes from.** A request's `ref_text`, or a saved voice's record. The front door hears every
+saved voice once with Whisper (glue/serve home/transcribe.rs, `NS_VOICE_TRANSCRIBE`): `text` filled when empty,
+`words` (their times) and `transcribed` kept. With word times the engine cuts the recording between two words (after
+the last sentence ending in the second half of its first `NS_SOPHON_ICL_MAX_S`, 16 s) and takes that part's
+transcript from the words. No transcript: the x-vector; over the limit with no word times: the x-vector.
+
+Why the words, not the stored text: Skippy1's stored transcript is "Heidi, hold their monkeys. Tis eye, ...", Whisper
+hears "Hidey-ho there, monkeys. Tis I, ...", and the 15.9 s recording ends on a clipped "Since...". With the stored
+text the talker ran on past a 30-token line (to the frame guard, 28-34 s) in 5 of 8 seeds - and so does the
+qwen3-tts engine with the same inputs (4 of 8 to its 60 s cap): the model, not the port. With Whisper's words: 0 of 8
+whole, 0 of 8 cut at 15.2 s, 0 of 8 cut at 5.9 s. Meeseeks: 0 of 8 either way.
+
+**Caching.** `Talk::icl` keeps the last 16 prepared recordings (x-vector, frames, codec rows, the transcript's
+projected rows) by a fingerprint of the samples kept and the text: 0.4-0.9 s to make (B65), then nothing; a
+/v1/realtime session makes it at session.update. The prompt itself (~210 rows for 15 s) is prefilled each reply.
+
+**Exactness** (`reference/sophon/talker_ref.py --ref-wav --ref-text`: qwen-tts's ICL path on the CPU in float32,
+Base, Skippy1's 15.9 s at 24 kHz; `audio check --stages talker`, B65): the transcript's 48 ids identical; the x-vector
+rel 9.2e-7; the recording's codes 3177 of 3184 (every first codebook); prompt rows rel 2.4e-2 from our frames (those
+7 codes), rel 7.2e-5 from the reference's; first logits rel 3.1e-4, the same first code; forced through the
+reference's 122 greedy frames, 0 first-code misses and 8 of 1830 other codes. Free-running greedy parts after 3
+frames on a predictor near-tie (as the qwen3-tts engine's ICL check found).
+
+**Quality** (the A/B's method: `audio check --stages speak`, Base on the B65, two lines x seeds 1-3, T 0.9; ZONOS3
+similarity to the recording, Whisper large-v3-turbo WER; mean of 6 takes):
+
+| voice | x-vector | qwen3-tts engine ICL | Sophon ICL, stored text | Sophon ICL, Whisper words, 16 s (default) | 10 s | WER (default) |
+|---|---|---|---|---|---|---|
+| Skippy1 | 0.606 | 0.696 | 0.684 (1 run-on, WER 0.14) | 0.714 (cut 15.2 s) | 0.601 (5.9 s) | 0 |
+| Meeseeks | 0.553 | 0.707 | 0.753 | 0.699 (cut 11.0 s) | 0.681 (5.6 s) | 0 |
+| mission | 0.659 | 0.773 | 0.764 | 0.746 (9.4 s) | 0.746 | 0 |
+| keeper | 0.835 | 0.834 | 0.850 | 0.872 (6.2 s) | 0.872 | 0 |
+
+**/v1/realtime, first audio** (reply start to its first audio, `reference/sophon/client.py --options`, a build copy
+serving both cards, saved voice Skippy1 with Whisper's words; two sessions each; the brain at tg ~20 tok/s):
+
+| question (reply) | x-vector | in context, 16 s (default) | in context, `icl-max-s` 10 |
+|---|---|---|---|
+| en_know (30 tokens, 7.9 s spoken) | 0.82 / 1.05 s | 2.22 / 2.75 s | 2.04 / 2.06 s |
+| en_chat (13 tokens, 3.3 s spoken) | 1.48 / 1.50 s | 1.61 / 1.81 s | 1.43 / 1.44 s |
+
+In upstream's layout the reply's text sits beside the recording's frames, so the talker starts when the reply covers
+them (190 frames here: never) or is whole - a reply's whole writing time, +1.2-1.7 s on a 30-token answer, little
+on a short one. No run-on in these sessions (7.84 s spoken, as the x-vector's 7.86); before the words cut the stored
+transcript's prompt ran on to 33.7 s in all three sessions.
+
+`NS_SOPHON_ICL_LIVE=stream` (the reference's text over its frames, the reply fed as written) fails: WER 1.0 in all 24
+takes ("Thank you.", "Hmm"). It stays an option for experiments only.
 
 Files: hardac1 `~/src/talkerab-out` (ab/<config>/*.wav, transcripts.json, scores.json; emb/), scripts
 `~/src/talkerab-scripts`.

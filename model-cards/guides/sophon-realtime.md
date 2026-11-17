@@ -37,9 +37,14 @@ nothing for a tag (below).
 ## Which entry: the voice or the tags
 Two entries run the same brain and differ only in the voice that speaks:
 - `sophon-realtime-32b-flash`: the voice is Qwen3-TTS-12Hz-1.7B-Base. Choose it for a character with a saved, cloned
-  voice. It sounds closest to the recording: 0.55-0.84 speaker similarity to it, against 0.47-0.74 with the tags
-  entry's talker (four saved voices, measured 2026-11-17). It cannot perform the sound tags. The brain still writes
-  them in its text, but they are taken out of what the voice reads, so they are silent.
+  voice. It clones in context: the saved voice's recording and what it says go into the voice's prompt (the front
+  door has Whisper hear each saved voice once for that; a voice not heard yet, or a recording sent without
+  `ref_text`, is cloned from its timbre alone). That sounds closest to the recording: 0.70-0.87 speaker similarity
+  to it, against 0.55-0.84 by timbre and 0.47-0.74 with the tags entry's talker (four saved voices, measured
+  2026-11-17). The price is a later first word in a conversation: the voice starts once the reply is written (about
+  2.2 s after the reply starts for a 30-word answer, against 0.8 s; little on a short one). Set
+  `nextsycl.options: {"clone": "xvector"}` in the session for the quick start. It cannot perform the sound tags. The
+  brain still writes them in its text, but they are taken out of what the voice reads, so they are silent.
 - `sophon-realtime-32b-flash-tags`: the voice is the release's own talker, a fine-tune of Base. Choose it for a
   built-in voice (`chelsie`, `brand`) or when the laughs and sighs matter more than the likeness. It performs the
   tags, as listed above. A cloned voice keeps its words and its manner, but it drifts towards a generic voice: the
