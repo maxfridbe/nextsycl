@@ -384,7 +384,40 @@ impl Durations {
         }
         (est as usize).max(1)
     }
+
+    /// The target's frames as the engine sets them: upstream's estimate (`target_frames`) with two departures, each
+    /// off at 0 (2026-11-16: lines with `[sigh]` that came out without their words - docs/ports/omnivoice.md):
+    /// - `sigh_s`: each `[sigh]` takes this long, added after the short-line boost, instead of its six letters (about
+    ///   0.35 s at the default pace, then shrunk by the boost's cube root: "Oh well [sigh] maybe next time." got 0.14 s
+    ///   more than the line without it, and a sigh takes 0.5-1 s, so the words were squeezed out);
+    /// - `floor_s`: without a recording, the words at least this long, the sighs' time on top (a one-word line is
+    ///   boosted to about 1.1 s, and in under about 2 s the model often makes a hum or silence instead of the word -
+    ///   upstream's code as often as ours).
+    ///
+    /// The silences these leave at the ends are trimmed by the post-processing.
+    pub fn frames(&self, text: &str, ref_text: Option<&str>, ref_frames: Option<usize>, speed: f64, sigh_s: f64, floor_s: f64) -> usize {
+        let sighs = if sigh_s > 0.0 { text.matches("[sigh]").count() } else { 0 };
+        if sighs == 0 && floor_s <= 0.0 {
+            return self.target_frames(text, ref_text, ref_frames, speed);
+        }
+        let words = if sighs > 0 { text.replace("[sigh]", "") } else { text.to_string() };
+        let (rt, rf) = match (ref_text.filter(|r| !r.is_empty()), ref_frames) {
+            (Some(r), Some(f)) => (r, f as f64),
+            _ => ("Nice to meet you.", 25.0),
+        };
+        let pace = if speed > 0.0 && speed != 1.0 { speed } else { 1.0 };
+        let mut est = self.estimate(&words, rt, rf) / pace;
+        let recording = ref_text.is_some_and(|r| !r.is_empty()) && ref_frames.is_some();
+        if !recording && floor_s > 0.0 {
+            est = est.max(floor_s * FRAMES_PER_S);
+        }
+        est += sighs as f64 * sigh_s * FRAMES_PER_S / pace;
+        (est as usize).max(1)
+    }
 }
+
+/// The codec's frames a second (24,000 / 960)
+const FRAMES_PER_S: f64 = 25.0;
 
 impl Default for Durations {
     fn default() -> Self {
@@ -497,6 +530,36 @@ mod tests {
         assert_eq!(d.target_frames(&t, None, None, 1.0), (100.0 / (14.1 / 25.0)) as usize);
         // a short one boosted toward 50
         assert!(d.target_frames("Hi.", None, None, 1.0) > 20);
+    }
+
+    /// The [sigh] lines that lost their words (2026-11-16): the sigh gets its own time after the short-line boost, a
+    /// line without a recording at least the floor; both off is upstream's estimate exactly
+    #[test]
+    fn a_sigh_gets_its_time_and_short_lines_a_floor() {
+        let d = Durations::new();
+        let lines = ["Oh well [sigh] maybe next time.", "[sigh] Fine.", "No [sigh]", "Fine.", "That is the funniest thing I have heard all week [laughter] you have to tell me again."];
+        for t in lines {
+            assert_eq!(d.frames(t, None, None, 1.0, 0.0, 0.0), d.target_frames(t, None, None, 1.0), "{t}: off is upstream's");
+            assert_eq!(d.frames(t, Some("Hello there."), Some(40), 1.2, 0.0, 0.0), d.target_frames(t, Some("Hello there."), Some(40), 1.2));
+        }
+        // upstream's: the sigh adds 3.5 frames (0.14 s) to this line, after the boost; here 0.8 s (20 frames)
+        let (with, without) = (d.target_frames(lines[0], None, None, 1.0), d.target_frames("Oh well  maybe next time.", None, None, 1.0));
+        assert_eq!((with, without), (48, 44));
+        assert_eq!(d.frames(lines[0], None, None, 1.0, 0.8, 0.0), (d.estimate("Oh well  maybe next time.", "Nice to meet you.", 25.0) + 20.0) as usize);
+        // with the floor: the words 2 s, the sigh on top (2.8 s; the words kept in 16 of 16 seeds against 12 of 24)
+        assert_eq!(d.frames(lines[0], None, None, 1.0, 0.8, 2.0), 70);
+        assert_eq!(d.frames("[sigh] Fine.", None, None, 1.0, 0.8, 2.0), 70);
+        assert_eq!(d.frames("[sigh] Fine.", None, None, 2.0, 0.8, 2.0), 60, "speed: the words' estimate and the sigh, not the floor");
+        // two sighs, two sighs' time; a line that is only a sigh
+        assert_eq!(d.frames("[sigh] Well. [sigh]", None, None, 1.0, 0.8, 0.0), (d.estimate(" Well. ", "Nice to meet you.", 25.0) + 40.0) as usize);
+        assert_eq!(d.frames("[sigh]", None, None, 1.0, 0.8, 0.0), 20);
+        // the floor: a one-word line 2 s without a recording (upstream's 27 frames), a clone's as upstream's
+        assert_eq!(d.target_frames("Fine.", None, None, 1.0), 27);
+        assert_eq!(d.frames("Fine.", None, None, 1.0, 0.8, 2.0), 50);
+        assert_eq!(d.frames("Fine.", Some("Hello there."), Some(40), 1.0, 0.8, 2.0), d.target_frames("Fine.", Some("Hello there."), Some(40), 1.0));
+        // a long line is untouched by the floor
+        let long = lines[4];
+        assert_eq!(d.frames(long, None, None, 1.0, 0.8, 2.0), d.target_frames(long, None, None, 1.0));
     }
 
     /// The spans the server keeps are the card's annotations[].keep, each tag kept by one of them

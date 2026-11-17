@@ -198,7 +198,8 @@ pub fn run(e: &OmniVoice, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
         Some(i) => crate::text::resolve_instruct(i, &rq.text)?,
         None => None,
     };
-    let g = Gen { steps: rq.steps, position_temperature: 0.0, duration: rq.duration, ..Gen::default() };
+    // upstream's length estimate (no sigh time, no floor), as the reference set T
+    let g = Gen { steps: rq.steps, position_temperature: 0.0, duration: rq.duration, sigh_s: 0.0, floor_s: 0.0, ..Gen::default() };
     // a bench needs only request.json (text, language, instruct, a recording): the stages against a dump need its ids
     let dumped = dir.join("ids.npy").exists();
     let stages: Vec<&str> = stages.iter().copied().filter(|s| dumped || *s == "bench").collect();

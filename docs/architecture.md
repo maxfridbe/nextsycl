@@ -557,7 +557,7 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   attention, GELU and Snake are the shared diffusion kernels, the convolutions the MiniMax Music engine's on oneDNN
   (float32). The unmasking (layer penalty, Gumbel noise on the positions, the schedule), the quantizer's nearest codes
   and upstream's pydub silence trimming run on the host. Per-request options: `NS_OV_SPEED`, `NS_OV_DURATION`,
-  `NS_OV_T_SHIFT`, `NS_OV_LAYER_PENALTY`, `NS_OV_POSITION_TEMPERATURE`, `NS_OV_DENOISE`, `NS_OV_POSTPROCESS`.
+  `NS_OV_SIGH_SECONDS`, `NS_OV_MIN_SECONDS`, `NS_OV_T_SHIFT`, `NS_OV_LAYER_PENALTY`, `NS_OV_POSITION_TEMPERATURE`, `NS_OV_DENOISE`, `NS_OV_POSTPROCESS`.
 - **zonos3** - ZONOS3-Mini from Zyphra's own GGUFs (card zonos3-mini: the backbone with its Q4_0 experts kept in their
   blocks and read by the engine's expert products, the rest float32 on oneMKL; the keep2 decoder resident, the full one
   loaded on first use; the reference encoder, its SSL teacher and FuseAlign loaded for an encode / an edit and freed).

@@ -46,7 +46,10 @@ The length is set before the speech is made, from the text at the recording's pa
 said in chunks of about 15 s, split at sentence ends, cross-faded. `steps` (32; 16 is about twice as fast, a little
 worse), `cfg` (guidance, 2.0), `seed`. Other `options`: `position-temperature` (5.0; 0: deterministic),
 `layer-penalty` (5.0), `t-shift` (0.1), `denoise` (1: with a recording, ask for clean speech), `postprocess` (1:
-silences over 0.5 s shortened). Short texts (1-2 s) without a recording can come out unreliable: give a recording.
+silences over 0.5 s shortened), `sigh-seconds` (0.8: the time each `[sigh]` gets in the estimate), `min-seconds` (2.0:
+the shortest length without a recording - the trailing silence is trimmed). Without these two (0: upstream's estimate)
+short lines often came out as a hum or silence instead of their words. A tag with a single word and no recording
+(`No [sigh]`) can still lose the word: give a recording or a few more words.
 
 ## License
 The weights - and omnivoice.cpp's GGUF conversion of them - are **CC BY-NC 4.0: no commercial use** (the training

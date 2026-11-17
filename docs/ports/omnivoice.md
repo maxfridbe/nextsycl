@@ -222,3 +222,55 @@ steps).
   saw came with the load failure above (no server: every request 502).
 - **Annotations**: the card states the 13 tags, the pronunciations and the instructions' attributes in nextcuda's
   schema (`annotations`, `annotations_note`; model-cards/README.md), and system.models rows carry them.
+
+## The `[sigh]` lines that lost their words (2026-11-16)
+
+A line with `[sigh]` came out without its words (one take was heard only as "You"). Reproduced through the front door
+(B65; design, clone and the model's own voice; the tag first, in the middle, last; seeds 1-24) and against upstream's
+own code (CPU float32, its default config: position temperature 5, torch seeds), each take written down by Whisper
+large-v3-turbo:
+
+- **What a failed take is.** Not the tag's word, not a truncation: the whole target is a low hum (spectral centroid
+  ~130 Hz, Whisper's "you" / "Thank you.") or a negative DC offset (-0.05 to -0.15) over near silence, sometimes only
+  breath. The prompt tokens, the tag's ids (`[s` `igh` `]`, 11880 1090 60, tokenized on its own) and T are upstream's,
+  and upstream's code fails the same lines at the same rates, so it is the model, not the port:
+
+  | line (no recording unless said) | T | words kept: ours | upstream's code |
+  |---|---|---|---|
+  | `Oh well [sigh] maybe next time.` (male, young adult) | 48 | 12 / 24 | 12 / 24 |
+  | the same without the tag | 44 | 8 / 8 | 8 / 8 |
+  | `[sigh] Fine.` (own voice) | 35 | 7 / 16 | 4 / 8 |
+  | `Fine.` (own voice) | 27 | 5 / 16 | 2 / 8 |
+  | `[sigh] Okay.` (male, young adult) | 35 | 3 / 8 | 4 / 8 |
+  | `No [sigh]` (male, young adult) | 31 | 1 / 8 | 1 / 8 |
+  | longer lines with the tag first or last | - | 7-8 / 8 | 8 / 8 |
+  | clones of every line above | - | 7-8 / 8 | - |
+
+- **The cause: the length.** Upstream's estimate gives a tag its letters' weight; `[sigh]` has the shortest name of
+  the 13 (5.0, about 0.35 s at the default pace, where `[laughter]` gets 9 and the interjections 11-20), and under
+  50 frames the cube-root boost shrinks it further: the sigh line above got 4 frames (0.14 s) more than the line
+  without it, while a sigh takes 0.5-1 s. Fixed lengths (`duration`) show it: that line kept its words in 8 / 8 at
+  2.5 s against 3 / 8 at its estimate (1.92 s); `Fine.` 12 / 12 at 2 s against 4 / 12 at its 1.08 s (5 / 12 at
+  0.6 s, 3 / 12 at 1.4 s). Without a recording, in under about 2 s the model often makes no words at all.
+- **The fix** (`text::Durations::frames`, two departures from upstream's estimate, each off at 0): every `[sigh]` gets
+  0.8 s of its own, added after the boost instead of its letters (`sigh-seconds`); without a recording the words get
+  at least 2 s (`min-seconds`), the sighs on top. Silence left at the ends is trimmed by the post-processing as
+  before. The other 12 tags' lengths are untouched (their lines in the card, seed 7: each heard as the same sound as before, "Ye" now written "Yee"),
+  and `audio check` compares T with upstream's estimate (both off), as before. Measured with the build (B65, the same
+  requests through its own `audio serve`):
+
+  | line | before | after |
+  |---|---|---|
+  | `Oh well [sigh] maybe next time.` | 12 / 24 | 16 / 16 |
+  | `[sigh] Okay.` / `[sigh] Yes.` | 3 / 8, 5 / 8 | 16 / 16, 16 / 16 |
+  | `Fine.` / `Okay.` | 5 / 16, 3 / 8 | 16 / 16, 15 / 16 |
+  | longer lines, first / last / mid | 8 / 8, 8 / 8, 15 / 16 | 8 / 8, 7 / 8, 7 / 8 |
+  | clones (`[sigh] Okay.`, the mid line, `No [sigh]`) | 8 / 8 | 8 / 8, 8 / 8, 7 / 8 |
+  | `[sigh] Fine.` (own voice) / `No [sigh]` | 7 / 16, 1 / 8 | 5 / 16, 4 / 16 |
+
+  The sigh is performed: 0.4-1.3 s more sound above -40 dBFS than the line without it (`[sigh] Okay.` +0.39 s on
+  average, the mid line +0.46 s, `[sigh] I suppose ...` +1.08 s), +0.64 s in the card's long line (seed 7).
+- **Left open.** A sigh with one word and no recording is still a coin toss for some words (`[sigh] Fine.` in the
+  model's own voice, `No [sigh]`; upstream's code too), and lengths do not help monotonically (`[sigh] Okay.` 16 / 16
+  at 2.4-2.8 s, 5 / 16 at 3 s): the guide says to give such lines a recording or a few more words. A failed take
+  could be caught (a DC offset or a hum over the whole target) and remade with another seed; not done.

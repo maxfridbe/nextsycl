@@ -59,12 +59,21 @@ const MAX_REFERENCE_S: f32 = 30.0;
 /// card's vram_gib 2.6, then the peak it measures); the load must not ask more than that plan, or a start the front
 /// door placed would end while loading (2026-11-16: it asked weights + 2 GiB and refused on a B70 with 2.9 GiB free)
 const LOAD_MARGIN: u64 = 1 << 28;
+/// a `[sigh]`'s time in the length estimate (seconds), and the shortest answer without a recording: the two departures
+/// from upstream's estimate that keep short lines' words (text::Durations::frames; measured 2026-11-16, see
+/// docs/ports/omnivoice.md)
+pub const SIGH_S: f64 = 0.8;
+pub const FLOOR_S: f64 = 2.0;
 
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "speed", env: "NS_OV_SPEED", value: "1.0", help: "how fast it speaks: the estimated length divided by this (upstream's speed)",
                    at: At::Request },
     EngineOption { name: "duration", env: "NS_OV_DURATION", value: "seconds", help: "a fixed length in seconds instead of the estimate (upstream's duration)",
                    at: At::Request },
+    EngineOption { name: "sigh-seconds", env: "NS_OV_SIGH_SECONDS", value: "0.8",
+                   help: "the time a [sigh] gets in the length estimate (0: upstream's, its letters - short lines then lose their words)", at: At::Request },
+    EngineOption { name: "min-seconds", env: "NS_OV_MIN_SECONDS", value: "2.0",
+                   help: "the shortest answer without a recording (0: upstream's - one-word lines then often come out as a hum)", at: At::Request },
     EngineOption { name: "t-shift", env: "NS_OV_T_SHIFT", value: "0.1", help: "the unmasking schedule's shift (smaller: more codes set late)", at: At::Request },
     EngineOption { name: "layer-penalty", env: "NS_OV_LAYER_PENALTY", value: "5.0", help: "how much later codebooks wait to be unmasked", at: At::Request },
     EngineOption { name: "position-temperature", env: "NS_OV_POSITION_TEMPERATURE", value: "5.0",
@@ -99,11 +108,16 @@ pub struct Gen {
     pub postprocess: bool,
     pub speed: f64,
     pub duration: Option<f32>,
+    /// a `[sigh]`'s own time in the length estimate (seconds; 0: upstream's, its letters) - text::Durations::frames
+    pub sigh_s: f64,
+    /// the shortest target without a recording (seconds; 0: upstream's, no floor) - text::Durations::frames
+    pub floor_s: f64,
 }
 
 impl Default for Gen {
     fn default() -> Gen {
-        Gen { steps: 32, guidance: 2.0, t_shift: 0.1, layer_penalty: 5.0, position_temperature: 5.0, denoise: true, postprocess: true, speed: 1.0, duration: None }
+        Gen { steps: 32, guidance: 2.0, t_shift: 0.1, layer_penalty: 5.0, position_temperature: 5.0, denoise: true, postprocess: true, speed: 1.0, duration: None,
+              sigh_s: SIGH_S, floor_s: FLOOR_S }
     }
 }
 
@@ -437,6 +451,18 @@ impl OmniVoice {
             }
             g.duration = Some(v as f32);
         }
+        if let Some(v) = num("sigh-seconds")? {
+            if !(0.0..=5.0).contains(&v) {
+                return Err(Error(format!("sigh-seconds {v}: 0 to 5")));
+            }
+            g.sigh_s = v;
+        }
+        if let Some(v) = num("min-seconds")? {
+            if !(0.0..=10.0).contains(&v) {
+                return Err(Error(format!("min-seconds {v}: 0 to 10")));
+            }
+            g.floor_s = v;
+        }
         if let Some(v) = num("t-shift")? {
             if !(v > 0.0 && v <= 1.0) {
                 return Err(Error(format!("t-shift {v}: in (0, 1]")));
@@ -469,7 +495,7 @@ impl OmniVoice {
     fn frames_for(&self, text: &str, voice: Option<&Voice>, g: &Gen, cap: Option<f32>) -> usize {
         let mut t = match g.duration {
             Some(d) => ((d * FPS) as usize).max(1),
-            None => self.durs.target_frames(text, voice.map(|v| v.text.as_str()), voice.map(|v| v.frames), g.speed),
+            None => self.durs.frames(text, voice.map(|v| v.text.as_str()), voice.map(|v| v.frames), g.speed, g.sigh_s, g.floor_s),
         };
         if let Some(c) = cap {
             t = t.min(((c * FPS) as usize).max(1));
