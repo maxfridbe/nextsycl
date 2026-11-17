@@ -232,6 +232,21 @@ pub fn stretches(text: &str, max: usize) -> Vec<String> {
     out
 }
 
+/// The complete frames of delayed rows (`np` prefill rows first; frame f's codebook c on row f + c) before the take's
+/// end: its aligned end frame `eos` (counted from the first generated row) and any end of audio drawn in a row
+pub fn frames_before_end(buffer: &[[u32; 10]], ncb: usize, eoa: u32, eos: Option<usize>, np: usize) -> usize {
+    let mut target = buffer.len().saturating_sub(ncb - 1);
+    if let Some(e) = eos {
+        target = target.min(e + np);
+    }
+    for (i, r) in buffer.iter().enumerate() {
+        if let Some(mc) = (0..ncb).rev().find(|cb| r[*cb] == eoa) {
+            target = target.min(i.saturating_sub(mc));
+        }
+    }
+    target
+}
+
 /// The output stage: the decoder's headroom as gain, then the soft limiter above -1 dBFS
 pub fn output(pcm: &mut [f32], headroom_db: f32) {
     let g = 10f32.powf(-headroom_db / 20.0);
@@ -747,17 +762,7 @@ impl Zonos3 {
 
     /// The final frame count of a take's buffer (prefill + rows): complete frames, before its end and any end of audio
     fn target_frames(&self, buffer: &[[u32; 10]], eos: Option<usize>, np: usize) -> usize {
-        let c = &self.lm.c;
-        let mut target = buffer.len().saturating_sub(c.ncb - 1);
-        if let Some(e) = eos {
-            target = target.min(e + np);
-        }
-        for (i, r) in buffer.iter().enumerate() {
-            if let Some(mc) = (0..c.ncb).rev().find(|cb| r[*cb] == c.eoa) {
-                target = target.min(i.saturating_sub(mc));
-            }
-        }
-        target
+        frames_before_end(buffer, self.lm.c.ncb, self.lm.c.eoa, eos, np)
     }
 
     /// A take's rows to PCM: undelayed (frame f's codebook c on row f + c), the complete frames before the end, the
@@ -902,13 +907,23 @@ impl Zonos3 {
         let max_tokens = ((max_span * ed::FRAME_RATE) as usize + c.ncb + 1).min(MAX_FRAMES);
         let s = Sampling { temperature: num(&AudioRequest { extra: req.extra.clone(), ..Default::default() }, "temperature")?.unwrap_or(0.75), ..Sampling::default() };
         let spec = markup::Spec::read(&c.spec);
+        let ereq = AudioRequest { extra: req.extra.clone(), ..Default::default() };
+        let normalize = match given(&ereq, "normalize") {
+            None | Some("on") | Some("1") | Some("true") => true,
+            Some("off") | Some("0") | Some("false") => false,
+            Some(v) => return Err(Error(format!("normalize {v:?}: on or off"))),
+        };
+        let lang = markup::grammar_language(req.language.as_deref(), target);
         let mut fills: Vec<Vec<[u32; 10]>> = vec![Vec::new(); spans.len()];
         let mut ended = vec![false; spans.len()];
         let voice = Voice::Embedding(emb);
         for w in &windows {
             let wcodes = &codes[w.start..w.end];
             let rel: Vec<ed::Span> = w.regions.iter().map(|k| (spans[*k].0 - w.start, spans[*k].1)).collect();
-            let ids = markup::text_ids(&self.tok, c, &spec, &w.text)?;
+            // the window's text normalized in the request's language, as Zyphra's EditEngine.fill does
+            // (text_normalization, default on; option normalize off: as written)
+            let wtext = markup::normalize(&w.text, if normalize { &lang } else { "none" });
+            let ids = markup::text_ids(&self.tok, c, &spec, &wtext)?;
             let p = prompt::build(c, &ids, &voice, &[], 0)?;
             let cond = Cond { speaker: p.speaker.as_ref().map(|(r, v)| Ok::<_, Error>((*r, self.lm.project_speaker(v)?))).transpose()?, buckets: p.buckets.clone(),
                               deltas: Vec::new() };
@@ -930,7 +945,8 @@ impl Zonos3 {
                         _ => (-1, Vec::new()),
                     };
                     let j = serde_json::json!({"condition_buckets": p.buckets.iter().map(|b| b.1).collect::<Vec<_>>(), "condition_row": p.buckets.first().map_or(0, |b| b.0),
-                                               "prefill_frames": 0, "speaker_embedding": semb, "speaker_row": srow});
+                                               "prefill_frames": 0, "speaker_embedding": semb, "speaker_row": srow,
+                                               "speaker_rows": i64::from(srow >= 0)});
                     std::fs::write(d.join("ids.cond.json"), j.to_string()).map_err(|x| Error(x.to_string()))?;
                 }
                 let mut seq = self.lm.seq_edit(&self.ops, rows + max_tokens + 2, rows)?;
@@ -965,6 +981,19 @@ impl Zonos3 {
                     }
                     let next: Vec<u32> = r[..c.ncb].iter().copied().chain(std::iter::once(c.text_vocab)).collect();
                     self.lm.forward(&self.ops, &mut seq, &next, &Cond::default(), false)?;
+                }
+                // NS_Z3_EDIT_DUMP: the first region's generated rows as fed back (rows.npy, for `check --stages forced`
+                // with the file `edit` there) and the window it was made from (codes.npy, edit.json)
+                if let (Ok(d), true) = (std::env::var("NS_Z3_EDIT_DUMP"), *region == 0) {
+                    let d = std::path::Path::new(&d);
+                    let f: Vec<f32> = gen.iter().flat_map(|r| r.iter().map(|x| *x as f32).chain(std::iter::once(c.text_vocab as f32))).collect();
+                    check::npy(&d.join("rows.npy"), &[gen.len(), c.row_width()], &f)?;
+                    let f: Vec<f32> = wcodes.iter().flat_map(|r| r.iter().map(|x| *x as f32)).collect();
+                    check::npy(&d.join("codes.npy"), &[wcodes.len(), c.ncb], &f)?;
+                    let j = serde_json::json!({"text": w.text, "spans": rel, "min_frames": min_frames[*region], "eos_frame": eos, "seed": req.seed,
+                                               "max_tokens": max_tokens});
+                    std::fs::write(d.join("edit.json"), j.to_string()).map_err(|x| Error(x.to_string()))?;
+                    std::fs::write(d.join("edit"), b"").map_err(|x| Error(x.to_string()))?;
                 }
                 gen.pop();
                 let (fill, end) = ed::extract_fill(&gen, eos, c.ncb, c.codebook as u32);
@@ -1152,7 +1181,10 @@ impl Zonos3 {
             let mut on_rows = |rows: &[[u32; 10]], end: Option<usize>| -> Result<()> {
                 let Some(o) = out_stream.as_mut() else { return Ok(()) };
                 let buffer: Vec<[u32; 10]> = silence_rows.iter().chain(rows).copied().collect();
-                let complete = buffer.len().saturating_sub(c.ncb - 1);
+                // complete frames, but none past an end of audio already drawn (Zyphra's PrefixDecoder.ready: the rows
+                // of the delay countdown after it are not speech - a frame past the end used as the right context of the
+                // last one made the stream's last frame differ from the whole take's, up to 266 of 32768 at seed 11)
+                let complete = self.target_frames(&buffer, None, silence_rows.len());
                 let last = end.map(|e| self.target_frames(&buffer, Some(e), silence_rows.len()));
                 if let Some((from, emitted, to, end)) = prefix.due(complete, last) {
                     let pcm = dec.decode(&self.ops, &self.undelay(&buffer, from, end))?;
@@ -1200,6 +1232,21 @@ impl Zonos3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_decodes_no_frame_past_an_end_of_audio_drawn() {
+        // 3 prefill rows, then rows whose codebook 4 draws the end of audio at row 20 (frame 16): before the take
+        // finishes (the delay countdown) the rows after it must not count as complete frames
+        let (eoa, pad) = (4096u32, 4097u32);
+        let mut rows: Vec<[u32; 10]> = (0..25).map(|i| [i as u32 % 4096; 10]).collect();
+        rows[20][4] = eoa;
+        for r in rows.iter_mut().skip(21) {
+            r[4] = pad;
+        }
+        assert_eq!(frames_before_end(&rows[..20], 10, eoa, None, 3), 11, "no end yet: every complete frame");
+        assert_eq!(frames_before_end(&rows, 10, eoa, None, 3), 16, "the end drawn: frames before it only");
+        assert_eq!(frames_before_end(&rows, 10, eoa, Some(12), 3), 15, "the aligned end frame wins when earlier");
+    }
 
     #[test]
     fn long_texts_are_said_in_sentences() {

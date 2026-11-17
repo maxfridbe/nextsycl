@@ -9,6 +9,17 @@ languages (no language tag needed: the text decides), many times faster than rea
 - A long text is said a stretch of whole sentences at a time (up to ~400 characters each, a quarter second between),
   in the same voice; `seconds` caps the whole (600 s at most).
 
+## Markup
+- `[pause]`, `[pause 0.25|0.5|1|2]`: a pause after a word (the model says long ones shorter, a 2 s one as about half a
+  second); `[start]` (first): speech from the first frame.
+- `[ipa ...]`: a word said as written in IPA (one of the model's 136 phone symbols each; stress marks, syllable dots and
+  spaces are dropped). Write it **in the notation the model was trained on**, Zyphra's pronunciation lexicon: for
+  English that is American, CMUdict-style IPA - no length marks (`ː`), `ɝ` / `ɚ` for r-coloured vowels, no flaps or
+  glottal stops - e.g. `[ipa təmeɪtoʊ]`, `[ipa ɛləfənt]`, `[ipa kəmpjutɚ]`. Spelled that way the word comes out as
+  written (18 of 18 takes of those three words); other notations are not reliable (British `[ipa təmɑːtoʊ]` was heard
+  as "tomato" in 2 of 6 takes, and in 1 of 6 in Zyphra's own reference runtime: the model's, not this port's).
+- `[steer ID=DOSE, ...]words[/steer]`: steering over those words alone (the controls below).
+
 ## Voices
 - **Preset** (`voice`): `savannah` (American, female; the default), `wyatt` (American, male), `rupert`, `imogen`
   (British), `cillian` (Irish, male), `jett` (energetic, male), `morgana` (a witch), `sakura` (anime, female),

@@ -44,7 +44,8 @@ nextcuda's numbers (RTX 5070, the same comparisons) in brackets.
 | reference encoder, Rupert's 13 s, 198 frames (`encoder` vs `zac-encoder-cli`) | codes the same in 97.0 / 95.5 / 87.9 / 87.4 / 82.3 / 76.3 / 72.7 / 72.2 / 74.2 / 71.2 % by codebook [97.5 / 95.5 / 89 / 85 / 86 / 80 / 79 / 78 / 76 / 77]; against Zyphra's shipped codes ours 96.0 / 91.9 / 87.4 / 83.3 / 77.3 / 75.3 / 67.7 / 66.7 / 64.6 / 68.2, the reference's own 98.0 / 95.5 / 88.9 / 87.9 / 81.3 / 81.8 / 78.3 / 75.3 / 75.8 / 76.8 |
 | FuseAlign, Zyphra's Cillian recording (9.6 s, 22 words; `align` vs `fusealign-cli` on the CPU) | every start and end within 1 ms, presence and placement equal [the same] |
 | streaming, the same take whole and streamed (`stream`, option level off) | rel 1.9e-6, max 5.5e-6 [rel 1.2e-6] |
-| the edit LM (the adapter on) | not compared numerically here (nextcuda patched zonos3-cli to take the adapter; its LoRA kernels are ported one to one and the base LM above is checked); the edit itself heard word for word, below |
+| the edit prompt (`edit`, Cillian's 9.7 s; three targets: "weaker hardware" -> "older laptops" at the end, "cloning" -> "voice" mid-sentence, "... 2 old laptops at 50% power" with numbers) | identical, row for row (215 / 220 / 223 rows): the text rows from `zonos3-cli --request --build-prompt` (Zyphra's fill: the window text normalized, the clip's speaker row, unknown condition buckets, no silence), the layout from Zyphra's `tts/edit.py` `edit_prompt_tokens` over our window codes and spans (`reference/zonos3/edit_ref.sh`) |
+| the edit LM teacher-forced over our take's rows (`forced` with the edit adapter, 24 / 19 / 40 steps, against `zonos3-cli --validate` patched to apply the adapter) | first logits cos 0.99990 / 0.99993 / 0.99970 (rel 1.5e-2 / 1.2e-2 / 2.5e-2); all steps cos 0.99993 / 0.99993 / 0.99989 mean, 0.99990 / 0.99981 / 0.99970 worst, rel 1.2e-2 / 1.2e-2 / 1.5e-2, argmax 89.6 / 90.0 / 89.8 %; our drawn codes in the reference's top-80 100 % (nextcuda 0.99987, 93 %). Without the adapter on the reference side: cos 0.59 / 0.49 / 0.57 at the first step - the adapter is what is being compared |
 
 The first codebooks (the semantic one, 97 %) match as closely as nextcuda's; the later residual codebooks drift a few
 points more. The encoder runs the reference's BF16 recipe, where a tiny float difference flips a rounding and then a
@@ -63,7 +64,7 @@ named; seed 7; the level of every take measured over its active 50 ms frames (ta
 | raw-reference clone of Cillian's recording (speaker-mode reference), then a second text from the cached codes | word for word, both | -19.0 / -18.8 |
 | a saved voice (`voice: cp-imogen`, the library's recording) | word for word but "Intel R-card" | -19.1 |
 | `One.[pause 2] Two.[pause 2] Three, and four.` (8 seeds) | "One, two, three and four."; the two longest pauses 0.55 s on average, 0.30 s without the markers (nextcuda 0.53 / 0.30; Zyphra's runtime 0.52 / 0.28) | -19.0 |
-| `I would like a [ipa təmɑːtoʊ], please.` (seeds 1-4) | "tomato" once; "liken Matto", "a no, toe", "to motto" (the ids are Zyphra's exactly) | - |
+| `[ipa ...]`, Rupert's embedding, normalize off, seeds 1-6, against Zyphra's PyTorch reference (CPU, the release LM `lm/zonos3_mini` + its text rows, decoded by `zac-cli`; `reference/zonos3/ipa_ref.py`) | ids identical to the reference's for all four lines (its phoneme ids + 3: the edit backbone's three marker rows come first; those rows equal to F16). Lexicon notation said as written: `I would like a [ipa təmeɪtoʊ], please.` 6/6 here, 6/6 reference; `Look at the [ipa ɛləfənt] over there.` 6/6, 6/6; `My new [ipa kəmpjutɚ] is very fast.` 6/6, 6/6 (here once "a nigh tomato", once "over there" twice). British `[ipa təmɑːtoʊ]`: 2/6 here, 1/6 reference ("to motto", "Itamoto", "a notto") - the English training notation (CMUdict-style, no length marks) is what the model reads, in both | - |
 | `[steer delivery.whisper=4]This part is whispered,[/steer] and this part is not.` | the words alone, no tag read | -18.9 |
 | short texts "Yes" (seeds 1-3) and "Hello" | short-text auto: "Yes" 3 of 3, "Hello"; off: "Yes" 2 of 3 ("Yes, and four." once) | -18.5 .. -19.0 |
 | controls `delivery.tempo=2,emotions.happy=4` | word for word, 5.5 s against 7.0 s unsteered | -19.0 |
@@ -76,10 +77,18 @@ named; seed 7; the level of every take measured over its active 50 ms frames (ta
 | a 1,013-character story, wyatt (four stretches 0.25 s apart) | 62.7 s of sound | -19.2 |
 | streamed against whole (rupert, seed 11) | the same words; same samples with level off (above); with level on the causal leveler | see below |
 | speech edit: Cillian's 9.7 s, Whisper's transcript, "on weaker hardware." -> "on weaker laptops." | the target word for word; one region 8.93-9.60 s -> 8.93-9.47 s | -21.0 |
+| speech edits 2026-11-17 (B65, seed 7): "older laptops", "voice quality", "2 old laptops at 50% power" | each word for word ("two old laptops at 50% power") | - |
 
 Markup through the server: `(laugh)` and `[laugh]` are read ("laugh") and `<laugh/>` is said as "less than laugh slash
 greater than" - the server's speech text pass makes brackets into pauses and symbols into words for every speech model;
 only the card's annotations' spans (pause, start, ipa, steer) pass as they are.
+
+Streamed and whole takes with level off were the same to rel 1.9e-6 at seed 7, but at seed 11 (Rupert's codes) 1,231
+samples (28 ms) differed by up to 266 of 32768, all in the last frame: in the rows of the delay countdown after the
+end of audio was drawn, a chunk was decoded with the frame past the end (its late codebooks out of range, decoded as 0)
+as the right context of the last one. A stream now counts no frame past an end of audio already drawn as complete (as
+Zyphra's PrefixDecoder.ready; test `a_stream_decodes_no_frame_past_an_end_of_audio_drawn`): seed 11 rel 2.2e-5, at
+most 1 of 32768 (seed 7 the same), B65 through the audio server.
 
 The streamed take's leveling is causal (a gain from the last 3 s). nextcuda's leveler set its first gain from the first
 active frame and then moved at 0.5 s: a quiet onset left the next second up to 17 dB too loud (clipped by the limiter).
@@ -126,14 +135,14 @@ grown card).
 - `audio.edit` (RPC, a job like audio.speak; the audio server's `POST /v1/audio/edit`): `{audio (base64, data: URL or
   upload:<name>; <= 30 s), original_text, target_text, model?, seed?, language?, options?, response_format (url |
   wav)}` -> `{created, data: [{url, ...}], regions: [{original: [s, e], edited: [s, e], old_words}], nextsycl: {took,
-  seconds, seed}}`. Capability `speech_edit` (with method `audio.edit`) for a card whose `speech` lists `edit`.
+  seconds, seed}}`. Capability `speech_edit` (with method `audio.edit`) for a card whose `speech` lists `edit`. The
+  regions' text is normalized in `language` before it is read (as Zyphra's fill; `options.normalize: off` keeps it as
+  written).
 - Markup in the text (kept as written through the server's speech text pass: the engine's `AudioEngine::markup`, the same patterns as the card's `annotations[].keep` - test `the_kept_spans_are_the_cards`):
   `[pause]`, `[pause 0.25|0.5|1|2]`, `[start]`, `[ipa ...]`, `[steer ID=DOSE,...]words[/steer]`.
 
 ## Open
 
-- The edit LM with its adapter is not compared with Zyphra's runtime numerically (nextcuda's check needed a patched
-  zonos3-cli); `nextsycl audio check DIR --stages forced` with a file `edit` in DIR runs ours.
 - The reference encoder's later codebooks sit 3-6 points further from the reference than nextcuda's (above); its
   convolutions run on the shared diffusion library's plain-loop `nsd_conv1d` (the encode is ~4.7 s of a 13 s
   recording's 7-9 s). A GEMM-based convolution in a silo (`kernels/audio/zonos3/silo`) would speed both; not started.
