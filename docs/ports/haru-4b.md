@@ -74,7 +74,11 @@ The model is one frame ahead: frame 0 comes from the prompt's last position, use
   DeltaNet's convolution, recurrence and gated norm, attention's q / k norm + partial RoPE + half cache store, the
   attention split over pieces of the keys and its gated merge. The products, norms and codec blocks are the VibeVoice
   engine's (vv.h: bfloat16 weights read as they are), the add MiniMax Music's, SiLU Qwen3-TTS's - shared, called,
-  not changed. No silo: nothing was tuned (it keeps up with real time on the shared products).
+  not changed. A frame runs on these alone (it keeps up with real time on the shared products).
+- `cache.rs` - the voices' cache: a call's prompt (the state after it) kept on the host, restored by a repeat call.
+- `kernels/audio/haru/silo/hs.{h,cpp}` - the silo (`dist/silo/libnextsycl-haru.so`): the prompt's wide passes' gated
+  delta rule (the state held in registers across the rows) and attention (a sub-group a row, no pieces). Without the
+  file, or with `NS_SILO=0`, the engine's own kernels run them.
 - `glue/serve/src/realtime.rs` - `nextsycl.card`; the lockstep extension needs nothing else of the server (the engine
   makes the events); a lockstep mock test. `wfe/audio/src/converse.ts`, `components/Converse.tsx` - lockstep play-out
   behind a 0.2 s jitter buffer, no barge-in cut, the transcript split where you spoke, the character card's fields.
@@ -116,14 +120,81 @@ sampling, the head, decode):
 | B65 (GPU 1) | 25.0 ms (median 25.2, worst 25.3) | 5.3x | 0.9 s |
 
 Over the socket (the audio server on the B65, `reference/haru/client.py` streaming at real time): each frame's answer
-comes back 33 ms (median) after the frame was sent. The prompt with a 9 s voice (336 positions, 68 frames encoded)
-takes 1.4 s; the frames that came meanwhile are then answered at once (the client's first 10 frames wait up to 1.4 s).
+comes back 33 ms (median) after the frame was sent. The prompt delays the first frames (below: "The start of a
+call"); the frames that came meanwhile are then answered at once.
 
 Where a frame goes (`NS_HARU_PROFILE=1`, the B65, each operation waited for - so slower than the 25 ms): the codec's
 encoder is the largest share (its first stages run 3,200 rows of 32-128 channels through the tiled product), the
 language model's MLPs next, then attention, the DeltaNet layers, the logits (248,320 x 2,560 bfloat16) and the head.
 Both cards land within 7% of each other: a frame is a few hundred small launches and host round trips (token ids,
-latents, logits and the head's 64 values cross each frame), not the 10 GiB of weights it reads. Not tuned: no silo.
+latents, logits and the head's 64 values cross each frame), not the 10 GiB of weights it reads. Not tuned (the silo
+has only the prompt's kernels).
+
+## The start of a call
+
+A Talk call sends a saved voice's recording (up to 60 s; a 39 s one measured) and the platform measured 1.77 s from
+the session's ready to the first audio, against 0.41 s on nextcuda (its port of this engine: the reference encoded 16
+frames a pass, the prompt on its qwen35 engine's wide prefill). Measured here on the B70 (GPU 0) with two saved voices
+from the voice library - 38.8 s (291 frames, 559 positions with the default card) and 60.0 s (450 frames, 718
+positions) - by `nextsycl audio check DIR --stages start` (voice*.wav, card.txt, user.wav in DIR: each path timed three
+times, then the old path's frames against the new one's) and over the socket (`reference/haru/client.py`, a server
+of the build copy, each call's session.update then 3 s of quiet).
+
+**Where the 2 s went** (the old path, the 39 s voice; `NS_HARU_PROFILE=1` for the split, each operation waited for):
+
+| part | time | |
+|---|---|---|
+| the reference through the codec's encoder | 697 ms | a frame at a time (291 x 2.4 ms: a few hundred small launches each) |
+| the prompt's 559 positions through the language model | 1,347 ms | 35 passes of 16 rows on the small-batch product: MLPs 672, attention layers 237, DeltaNet layers 446 |
+| frame 0 (logits, sampling, head, decoder) | 6 ms | |
+| the conversation's state (28,672 positions) allocated | 24 ms | once a call |
+| total, `start` | 2,050 ms | the 60 s voice: 2,860 (encode 1,075, prefill 1,780) |
+
+**What changed** (each measured alone; time to frame 0, 39 s / 60 s voice):
+
+| path | 39 s voice | 60 s voice |
+|---|---|---|
+| old: the encoder a frame at a time, positions 16 a pass | 2,050 ms | 2,860 ms |
+| the reference 8 frames a pass through the encoder (a wide stream of its own) | 1,548 (encode 697 -> 195) | 2,086 (1,075 -> 301) |
+| the positions 128 a pass on the matrix engines (vv.h's tiled product, input split in two bfloat16 halves) | 1,261 (prefill 1,347 -> 557) | 1,846 (1,779 -> 763) |
+| both | 760 | 1,070 |
+| + the silo's gated delta rule (state in registers; DeltaNet layers 240 -> 113 ms) | 627 | 898 |
+| + the silo's attention (a sub-group a row; attention layers ~154 -> ~40 ms) | **515** (encode 194, prefill 313) | **718** (301, 409) |
+| a repeat call: the voices' cache (state restored: 5-6 ms, frame 0: 6 ms) | **13** | **13** |
+
+A larger attention piece for the wide passes without the silo (256 keys and more) changed nothing (755 vs 760 ms).
+16 frames a pass through the encoder would cut ~60 ms more for another 0.12 GiB on the card; not taken.
+
+**The prompt ahead**: the conversation now runs the prompt as soon as a session names its voice (session.update), not
+at the first audio, so a client that waits after its update finds it done; and a session that names no seed draws the
+reference's latent noise from a fixed seed (the frames still from the session's own), so its prompt is the same call
+after call - the cache's key. A seeded session keeps one stream from its seed, as before.
+
+**Over the socket** (time from session.updated to the first audio; the client sends audio at once):
+
+| | before | after, first call (cold) | after, repeat call (cache) |
+|---|---|---|---|
+| 39 s voice | 2.09 s | 0.58 s | 0.06 s |
+| 60 s voice | 2.90 s | 0.77 s | 0.06 s |
+
+The frames that queued meanwhile: the first call's worst turnaround 2.11 s -> 0.59 s (39 s voice), the repeat call's
+74 ms, its median 30.8 ms either way. A frame alone did not change: 23.5 ms (median 23.5) on the B70 by the speed
+stage, 23.4 before.
+
+**Exactness** (`--stages start`): the new path against the old over 41 frames (frame 0 and 40 user frames: user.wav,
+then silence), seed 41, the new session teacher-forced (each frame given the old one's token and latent), with and
+without speak-first, both voices: the logits' argmax 41 of 41 every time, silent (PAD) vs speaking 41 of 41, the
+sampled tokens 41 of 41, audible vs quiet audio 41 of 41; the audio's relative difference median 3e-5 - 7e-5, worst
+5e-4 - 1.5e-3. What they said: "Yeah" / "Wow" (39 s voice), "I'm doing well" / "I'm Haru twenty two a senior in
+college I go running every morning" (60 s), the same words on both paths. A cache hit against the cold start: the
+same tokens and argmax 41 of 41 and the same audio, bit for bit (max difference 0), all four runs.
+
+**Memory**: on the card +0.18 GiB (9.88 -> 10.06 GiB loaded: the encoder's wide stream 0.12, the wide passes' work
+buffers); with a conversation of 28,672 positions 11.13 GiB on the B70, under the card's 11.5. The cache is host
+memory: 71 MB a prompt with the 39 s voice, 76 MB with the 60 s one (the DeltaNet states ~50 MB whatever the voice,
+keys and values 32 KB a position), bounded by `NS_HARU_VOICE_CACHE` (MiB, default 1024: about a dozen voice and card
+pairs; the least recently used leaves first; 0: none), plus the encoded references of the last 64 voices (256 bytes a
+frame) so a new card on a known voice skips the encoder. It goes with the model when it unloads.
 
 ## Memory
 
@@ -181,13 +252,14 @@ once it is done.
 - **Back-channels**: none heard in these tests (it listens silently, then answers); interruptions it handles when
   addressed ("sorry to cut you off" - "go ahead"), not when talked over by a reading. Worth a session with a person
   on a headset in the wfe.
-- **Speed**: not tuned (no silo). The frame is bound by a few hundred small launches and host round trips, not
-  bandwidth; the codec encoder's first stages (3,200 rows) are its largest part. Graphs or fused launches would cut
-  the 23-25 ms further; nothing needs it for real time.
+- **Speed**: a frame is not tuned (the silo has only the prompt's wide passes). It is bound by a few hundred small
+  launches and host round trips, not bandwidth; the codec encoder's first stages (3,200 rows) are its largest part.
+  Graphs or fused launches would cut the 23-25 ms further; nothing needs it for real time.
 - **The GGUF** (sakasegawa/Haru-4B-GGUF) is not read: bfloat16 already keeps up; a Q8_0 path (vv.h's gemv reads Q8_0)
   would halve the weights' memory if a card needs the room.
 - **One conversation per voice and card change**: a session.update that changes them starts over (the prompt again,
-  1-2 s), as the release does.
+  0.5-0.7 s, or the cache's 13 ms), as the release does.
+- **The start** was measured on the B70 only; the B65 not yet.
 - **The wfe panel** was checked by its smoke test against the Haru server (the page and its 27 modules load, the
   app renders) and the protocol by the lockstep mock test and the client - not yet by a person with a microphone.
 - Not deployed (no card registered on the front door).

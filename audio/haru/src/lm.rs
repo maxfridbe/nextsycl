@@ -5,19 +5,25 @@
 //! output gate, k, v; per-head RMS norm and RoPE on the first quarter of each head; grouped-query attention over the
 //! half cache; the gate's sigmoid). Every layer: zero-centred RMS norms (1 + w), a SwiGLU MLP, residuals.
 //!
-//! Rows go through in groups of up to `ROWS` (a frame: one; a prompt: 16 at a time). The products read the
-//! checkpoint's bfloat16 matrices (vv.h's gemv), everything else is float32 on the device; a conversation's state (each
-//! DeltaNet layer's convolution rows and recurrence, each attention layer's keys and values) lives in its `State`.
+//! Rows go through in groups: a frame one, a prompt up to `WIDE` at a time. The products read the checkpoint's
+//! bfloat16 matrices - up to `ROWS` rows on the small-batch product (vv.h's gemv: the weights read once a row group),
+//! more on the matrix engines' tiled one (vv.h's gemm, its input split into two bfloat16 halves, so a float32 product);
+//! everything else is float32 on the device; a conversation's state (each DeltaNet layer's convolution rows and
+//! recurrence, each attention layer's keys and values) lives in its `State`, which a voice's cache copies out and back
+//! (`snapshot` / `restore`).
 
 use nextsycl_audio::{Error, Result};
 use nextsycl_core::DevBuf;
 
-use crate::ops::{fp, Epi, Mat, Ops};
+use crate::ops::{fp, split_len, Epi, Mat, Ops, Split};
 use crate::weights::{Config, Weights};
 
-/// The rows one pass takes at most (the products' small-batch form takes 20)
+/// The rows the small-batch product takes in a pass (it takes 20 at most); a prompt went 16 rows a pass before the
+/// wide passes (`Model::prefill_rows`: a check's old path)
 pub const ROWS: usize = 16;
-/// Attention's keys are split into at most this many pieces
+/// The rows a wide pass (a prompt's) takes at most: past `ROWS` the products run on the matrix engines
+pub const WIDE: usize = 128;
+/// Attention's keys are split into at most this many pieces (a pass of r rows: PIECES * ROWS / r, the scratch's room)
 const PIECES: usize = 64;
 
 enum Mixer {
@@ -63,6 +69,65 @@ impl State {
     pub fn bytes(&self) -> usize {
         self.conv.iter().chain(&self.ssm).chain(&self.kc).chain(&self.vc).map(|b| b.len).sum()
     }
+
+    /// Its first `pos` positions on the host (each DeltaNet layer's convolution rows and recurrence, each attention
+    /// layer's keys and values of those positions, a head at a time): what `restore` puts back. A position of a layer
+    /// is `kv_heads` x `head_dim` halves
+    pub fn snapshot(&self, kv_heads: usize, head_dim: usize) -> Result<Snapshot> {
+        let mut recur = Vec::with_capacity(self.conv.len() + self.ssm.len());
+        for b in self.conv.iter().chain(&self.ssm) {
+            let mut v = vec![0u8; b.len];
+            b.read(0, &mut v)?;
+            recur.push(v);
+        }
+        let row = head_dim * 2;
+        let mut kv = Vec::with_capacity(self.kc.len() * 2);
+        for b in self.kc.iter().chain(&self.vc) {
+            let mut v = vec![0u8; kv_heads * self.pos * row];
+            for h in 0..kv_heads {
+                b.read(h * self.ctx * row, &mut v[h * self.pos * row..(h + 1) * self.pos * row])?;
+            }
+            kv.push(v);
+        }
+        Ok(Snapshot { recur, kv, pos: self.pos, kv_heads, row })
+    }
+
+    /// A snapshot's positions back (into a state of at least as many positions)
+    pub fn restore(&mut self, s: &Snapshot) -> Result<()> {
+        if s.pos > self.ctx || s.recur.len() != self.conv.len() + self.ssm.len() || s.kv.len() != self.kc.len() + self.vc.len() {
+            return Err(Error(format!("a snapshot of {} positions into a state of {}", s.pos, self.ctx)));
+        }
+        for (b, v) in self.conv.iter().chain(&self.ssm).zip(&s.recur) {
+            b.write(0, v)?;
+        }
+        for (b, v) in self.kc.iter().chain(&self.vc).zip(&s.kv) {
+            for h in 0..s.kv_heads {
+                b.write(h * self.ctx * s.row, &v[h * s.pos * s.row..(h + 1) * s.pos * s.row])?;
+            }
+        }
+        self.pos = s.pos;
+        Ok(())
+    }
+}
+
+/// A state's first positions on the host (State::snapshot)
+pub struct Snapshot {
+    recur: Vec<Vec<u8>>,
+    kv: Vec<Vec<u8>>,
+    pub pos: usize,
+    kv_heads: usize,
+    row: usize,
+}
+
+impl Snapshot {
+    /// No positions (a test's)
+    pub fn empty() -> Snapshot {
+        Snapshot { recur: Vec::new(), kv: Vec::new(), pos: 0, kv_heads: 0, row: 0 }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.recur.iter().chain(&self.kv).map(|v| v.len()).sum()
+    }
 }
 
 /// The work buffers of a pass
@@ -75,6 +140,10 @@ struct Work {
     y2: DevBuf,
     q: DevBuf,
     f: DevBuf,
+    /// a wide pass's gate / up pairs [r, 2 ffn] (the tiled product has no SwiGLU epilogue)
+    gu: DevBuf,
+    /// a wide pass's input split for the matrix engines, and their K pieces' scratch
+    split: Split,
     part: DevBuf,
     ids: DevBuf,
     lat: DevBuf,
@@ -165,20 +234,27 @@ impl Lm {
         let g = &ops.gpu;
         let qkv_n = c.heads * 2 * c.head_dim + 2 * c.kv_heads * c.head_dim;
         let proj_n = c.conv_dim() + vd + 2 * c.lin_v_heads;
+        let qd = c.heads * c.head_dim;
+        // a wide pass's products (n, k): the split input's room and the K pieces' scratch for the largest
+        let prods = [(proj_n, h), (h, vd), (qkv_n, h), (h, qd), (2 * c.ffn, h), (h, c.ffn), (h, c.latent), (h, h)];
+        let sp = prods.iter().map(|(_, k)| split_len(WIDE, *k, *k)).max().unwrap_or(0);
+        let pt = prods.iter().map(|(n, k)| ops.gemm_scratch(WIDE, *n, *k)).max().unwrap_or(0);
         let w = Work {
-            x: DevBuf::f32(g, ROWS * h)?,
-            h: DevBuf::f32(g, ROWS * h)?,
-            proj: DevBuf::f32(g, ROWS * proj_n.max(qkv_n))?,
-            conv: DevBuf::f32(g, ROWS * c.conv_dim())?,
-            y: DevBuf::f32(g, ROWS * vd.max(c.heads * c.head_dim))?,
-            y2: DevBuf::f32(g, ROWS * vd.max(c.heads * c.head_dim))?,
-            q: DevBuf::f32(g, ROWS * c.heads * c.head_dim)?,
-            f: DevBuf::f32(g, ROWS * c.ffn)?,
+            x: DevBuf::f32(g, WIDE * h)?,
+            h: DevBuf::f32(g, WIDE * h)?,
+            proj: DevBuf::f32(g, WIDE * proj_n.max(qkv_n))?,
+            conv: DevBuf::f32(g, WIDE * c.conv_dim())?,
+            y: DevBuf::f32(g, WIDE * vd.max(qd))?,
+            y2: DevBuf::f32(g, WIDE * vd.max(qd))?,
+            q: DevBuf::f32(g, WIDE * qd)?,
+            f: DevBuf::f32(g, WIDE * c.ffn)?,
+            gu: DevBuf::f32(g, WIDE * 2 * c.ffn)?,
+            split: Split { hi: DevBuf::new(g, sp * 2)?, lo: DevBuf::new(g, sp * 2)?, part: DevBuf::f32(g, pt.max(4))? },
             part: DevBuf::f32(g, ROWS * c.heads * PIECES * (c.head_dim + 2))?,
-            ids: DevBuf::new(g, ROWS * 4)?,
-            lat: DevBuf::f32(g, ROWS * c.latent)?,
-            t1: DevBuf::f32(g, ROWS * h)?,
-            t2: DevBuf::f32(g, ROWS * h)?,
+            ids: DevBuf::new(g, WIDE * 4)?,
+            lat: DevBuf::f32(g, WIDE * c.latent)?,
+            t1: DevBuf::f32(g, WIDE * h)?,
+            t2: DevBuf::f32(g, WIDE * h)?,
         };
         Ok(Lm {
             cfg: c.clone(),
@@ -242,8 +318,8 @@ impl Lm {
     /// (first row, scaled latents [n, latent]) - the latents already in the model's space, (raw + bias) * scale)
     pub fn embed_rows(&self, ops: &Ops, ids: &[u32], model: Option<(usize, &[f32])>, user: Option<(usize, &[f32])>) -> Result<()> {
         let r = ids.len();
-        if r == 0 || r > ROWS {
-            return Err(Error(format!("{r} rows (1 to {ROWS} a pass)")));
+        if r == 0 || r > WIDE {
+            return Err(Error(format!("{r} rows (1 to {WIDE} a pass)")));
         }
         let c = &self.cfg;
         let ib: Vec<u8> = ids.iter().flat_map(|i| (*i as i32).to_le_bytes()).collect();
@@ -259,11 +335,26 @@ impl Lm {
                 return Err(Error(format!("audio rows {r0}..{} of {r}", r0 + n)));
             }
             self.w.lat.write(0, &crate::weights::bytes(lat))?;
-            ops.gemv(self.w.lat.fp(), n, c.latent, &p.fc1, self.w.t1.fp(), c.hidden, Epi::Store, None)?;
+            self.mm(ops, self.w.lat.fp(), n, c.latent, &p.fc1, self.w.t1.fp(), c.hidden, Epi::Store)?;
             ops.rms_norm(self.w.t1.fp(), n, c.hidden, Some(&p.norm), 1e-6, None, self.w.t2.fp())?;
-            ops.gemv(self.w.t2.fp(), n, c.hidden, &p.fc2, fp(&self.w.x, r0 * c.hidden), c.hidden, Epi::Acc, None)?;
+            self.mm(ops, self.w.t2.fp(), n, c.hidden, &p.fc2, fp(&self.w.x, r0 * c.hidden), c.hidden, Epi::Acc)?;
         }
         Ok(())
+    }
+
+    /// A product over r rows: up to ROWS on the small-batch product (a frame's, and the prompt's old 16-row passes,
+    /// as before), more on the matrix engines (the input split in two bfloat16 halves, float32 sums). SwiGLU there is
+    /// the gate / up pairs stored, then their product (`swiglu_pairs`): `out` gets [r, w.n / 2]
+    #[allow(clippy::too_many_arguments)]
+    fn mm(&self, ops: &Ops, x: *const f32, r: usize, ldx: usize, w: &Mat, out: *mut f32, ldo: usize, epi: Epi) -> Result<()> {
+        if r <= ROWS {
+            return ops.gemv(x, r, ldx, w, out, ldo, epi, None);
+        }
+        if epi == Epi::Swiglu {
+            ops.prod(x, r, ldx, w, self.w.gu.fp(), w.n, Epi::Store, None, Some(&self.w.split))?;
+            return ops.swiglu_pairs(self.w.gu.fp(), r, w.n / 2, out);
+        }
+        ops.prod(x, r, ldx, w, out, ldo, epi, None, Some(&self.w.split))
     }
 
     /// The input rows as given (`x` [r, hidden] float32 on the host: a check's own embeddings)
@@ -284,6 +375,9 @@ impl Lm {
         if s.pos + r > s.ctx {
             return Err(Error(format!("the conversation is full ({} positions)", s.ctx)));
         }
+        if r == 0 || r > WIDE || (all && r > ROWS) {
+            return Err(Error(format!("a pass of {r} rows (1 to {WIDE}; every row's hidden state: up to {ROWS})")));
+        }
         let w = &self.w;
         let (mut di, mut ai) = (0, 0);
         for (li, l) in self.layers.iter().enumerate() {
@@ -293,32 +387,34 @@ impl Lm {
                     let pn = proj.n;
                     let cd = c.conv_dim();
                     let vd = c.lin_v_heads * c.lin_v_dim;
-                    ops.gemv(w.h.fp(), r, hd, proj, w.proj.fp(), pn, Epi::Store, None)?;
+                    self.mm(ops, w.h.fp(), r, hd, proj, w.proj.fp(), pn, Epi::Store)?;
                     ops.gdn_conv(w.proj.fp(), pn, r, cd, c.conv_k, conv_w, &s.conv[di], w.conv.fp())?;
                     ops.gdn_rule(w.conv.fp(), cd, fp(&w.proj, cd + vd), pn, a_log, dt_bias, &s.ssm[di], r, c.lin_k_heads, c.lin_v_heads, c.lin_k_dim, c.lin_v_dim,
-                                 w.y.fp())?;
+                                 w.y.fp(), r > ROWS)?;
                     ops.gated_norm(w.y.fp(), fp(&w.proj, cd), pn, norm, c.eps, r, c.lin_v_heads, c.lin_v_dim, w.y2.fp())?;
-                    ops.gemv(w.y2.fp(), r, vd, out, w.x.fp(), hd, Epi::Acc, None)?;
+                    self.mm(ops, w.y2.fp(), r, vd, out, w.x.fp(), hd, Epi::Acc)?;
                     di += 1;
                 }
                 Mixer::Attn { qkv, qn, kn, o } => {
                     let qn_ = qkv.n;
                     let qd = c.heads * c.head_dim;
-                    ops.gemv(w.h.fp(), r, hd, qkv, w.proj.fp(), qn_, Epi::Store, None)?;
+                    self.mm(ops, w.h.fp(), r, hd, qkv, w.proj.fp(), qn_, Epi::Store)?;
                     ops.attn_prep(w.proj.fp(), qn_, r, c.heads, c.kv_heads, c.head_dim, c.rot, qn, kn, c.eps, &self.inv_freq, s.pos, w.q.fp(), &s.kc[ai],
                                   &s.vc[ai], s.ctx)?;
+                    // the keys in at most PIECES pieces; fewer for a wide pass without the silo (the scratch holds ROWS x
+                    // PIECES); the silo's wide attention takes no pieces
                     let n = s.pos + r;
-                    let chunk = n.div_ceil(PIECES).max(64);
+                    let chunk = n.div_ceil((PIECES * ROWS / r).clamp(1, PIECES)).max(64);
                     ops.attn(w.q.fp(), &s.kc[ai], &s.vc[ai], r, c.heads, c.kv_heads, c.head_dim, s.ctx, s.pos, chunk, &w.part, fp(&w.proj, c.head_dim), qn_,
-                             2 * c.head_dim, w.y.fp())?;
-                    ops.gemv(w.y.fp(), r, qd, o, w.x.fp(), hd, Epi::Acc, None)?;
+                             2 * c.head_dim, w.y.fp(), r > ROWS)?;
+                    self.mm(ops, w.y.fp(), r, qd, o, w.x.fp(), hd, Epi::Acc)?;
                     ai += 1;
                 }
             }
             ops.mark(|| format!("layer {} {}", li % 4, if c.full[li] { "attention" } else { "deltanet" }))?;
             ops.rms_norm(w.x.fp(), r, hd, Some(&l.post_norm), c.eps, None, w.h.fp())?;
-            ops.gemv(w.h.fp(), r, hd, &l.gate_up, w.f.fp(), c.ffn, Epi::Swiglu, None)?;
-            ops.gemv(w.f.fp(), r, c.ffn, &l.down, w.x.fp(), hd, Epi::Acc, None)?;
+            self.mm(ops, w.h.fp(), r, hd, &l.gate_up, w.f.fp(), c.ffn, Epi::Swiglu)?;
+            self.mm(ops, w.f.fp(), r, c.ffn, &l.down, w.x.fp(), hd, Epi::Acc)?;
             ops.mark(|| "mlp".into())?;
             tap(li, &w.x)?;
         }

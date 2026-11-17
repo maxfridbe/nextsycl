@@ -11,15 +11,21 @@
 //!   model:     -               reference latents      the model's audio
 //!   user:      -               -                      the user's audio
 //! ```
+//!
+//! The prompt is most of a call's start (a voice of 39 s: 293 frames encoded, ~560 positions), so it is made fast
+//! three ways (`StartPath`; each can be turned off for a check against the old path): the reference encoded
+//! `ENC_FRAMES` frames a pass instead of one, the positions run `WIDE` a pass on the matrix engines instead of 16 on
+//! the small-batch product, and the result kept per voice (`cache.rs`: a repeat call restores it instead).
 
 use std::time::Instant;
 
 use nextsycl_audio::{Error, Result};
 
+use crate::cache::{self, Entry, PromptKey};
 use crate::codec::Stream;
-use crate::lm::{State, ROWS};
+use crate::lm::{State, ROWS, WIDE};
 use crate::sample::{self, Detok, Dry, DryState, Rng};
-use crate::Model;
+use crate::{Model, ENC_FRAMES};
 
 /// A session's settings (haru/session.py's DuplexConfig)
 #[derive(Clone, Debug)]
@@ -35,13 +41,35 @@ pub struct Settings {
     /// the model opens the conversation
     pub speak_first: bool,
     pub seed: u64,
+    /// the seed of the voice reference's latent noise, apart from `seed` (which then seeds the frames alone): a
+    /// session that names no seed draws the reference's noise from a fixed one, so its prompt is the same call after
+    /// call and the voice's cache serves it. None: one stream from `seed` for both (the release's; a seeded session)
+    pub voice_seed: Option<u64>,
     /// the codec's latent noise drawn (the release's); false: the means (a check)
     pub latent_noise: bool,
 }
 
+/// How a session's prompt runs: the fast paths, each of which a check can turn off (all off: the path before them)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StartPath {
+    /// the reference through the encoder ENC_FRAMES frames a pass (else one, as a live frame)
+    pub batch_encode: bool,
+    /// the positions WIDE a pass on the matrix engines (else ROWS on the small-batch product)
+    pub wide: bool,
+    /// the voice's cache: a prompt made once is restored after (and the reference's encoding kept)
+    pub cache: bool,
+}
+
+impl Default for StartPath {
+    fn default() -> StartPath {
+        StartPath { batch_encode: true, wide: true, cache: true }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { guidance: 1.5, temperature: 0.7, top_k: 25, top_p: 1.0, dry: true, eop_bias: 0.0, speak_first: false, seed: 0, latent_noise: true }
+        Settings { guidance: 1.5, temperature: 0.7, top_k: 25, top_p: 1.0, dry: true, eop_bias: 0.0, speak_first: false, seed: 0, voice_seed: None,
+                   latent_noise: true }
     }
 }
 
@@ -53,6 +81,8 @@ pub struct Frame {
     pub text: String,
     pub index: usize,
     pub seconds: f64,
+    /// the logits' argmax before any sampling (a check's)
+    pub argmax: u32,
 }
 
 /// The prompt's three streams (haru/prompt.py's build_prompt): latents raw (the codec's scale)
@@ -77,6 +107,36 @@ pub struct Session {
     detok: Detok,
     pub index: usize,
     pub prompt_len: usize,
+    /// the prompt this session's state holds, not yet moved on from (`prime`): `start` then only makes frame 0
+    primed: Option<PromptKey>,
+    /// the prompt's last hidden state (normed): the model's `hidden` is shared by every session, so frame 0 reads
+    /// this copy
+    hidden: Vec<f32>,
+}
+
+impl Session {
+    /// The model's last frame's raw latent
+    pub fn latent(&self) -> &[f32] {
+        &self.latent
+    }
+}
+
+/// Where a start's time went (seconds; Model::start_timed)
+#[derive(Clone, Debug, Default)]
+pub struct StartTimes {
+    /// the reference through the codec's encoder (0 on a cache hit)
+    pub encode: f64,
+    /// the prompt's positions through the language model (or, on a hit, the state restored)
+    pub prefill: f64,
+    /// a hit: the cache's state put back
+    pub restore: f64,
+    /// a miss: the state copied into the cache
+    pub store: f64,
+    /// frame 0: the logits, the sampling, the head and the decoder
+    pub frame0: f64,
+    pub total: f64,
+    pub hit: bool,
+    pub positions: usize,
 }
 
 /// Mono samples at 24 kHz: silence trimmed (below -45 dBFS in 20 ms windows, 0.2 s kept around the voice), the last
@@ -99,6 +159,35 @@ pub fn prepare_reference(x: &[f32], max_s: f32) -> Vec<f32> {
 }
 
 impl Model {
+    /// The codec encoder's latent means of a voice reference (whole frames of 24 kHz audio, from a fresh stream):
+    /// ENC_FRAMES frames a pass through the model's wide stream (StartPath::batch_encode), else a frame at a time
+    pub fn encode_reference(&self, pcm: &[f32]) -> Result<Vec<f32>> {
+        let f = self.cfg.frame;
+        if !self.path.batch_encode {
+            let s = self.enc.stream(&self.ops, f)?;
+            return self.encode_frames(&s, pcm);
+        }
+        if !pcm.len().is_multiple_of(f) {
+            return Err(Error(format!("{} samples: whole frames of {f}", pcm.len())));
+        }
+        let s = &self.enc_wide;
+        self.enc.reset(s)?;
+        let mut out = Vec::with_capacity(pcm.len() / f * self.cfg.latent);
+        let (buf, at) = self.enc.input(s);
+        for chunk in pcm.chunks(ENC_FRAMES * f) {
+            buf.write(at * 4, &crate::weights::bytes(chunk))?;
+            let (o, rows) = self.enc.push(&self.ops, s, None, chunk.len())?;
+            if rows != chunk.len() / f {
+                return Err(Error(format!("the encoder made {rows} latents of {} frames", chunk.len() / f)));
+            }
+            let mut v = vec![0u8; rows * self.cfg.latent * 4];
+            o.read(0, &mut v)?;
+            out.extend(v.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+        }
+        self.ops.mark(|| "codec encode (reference)".into())?;
+        Ok(out)
+    }
+
     /// The codec encoder's latent means of whole frames of 24 kHz audio, a frame at a time through `s` (from its
     /// current state)
     pub fn encode_frames(&self, s: &Stream, pcm: &[f32]) -> Result<Vec<f32>> {
@@ -153,10 +242,19 @@ impl Model {
         let mut n_ref = 0;
         if let Some(r) = reference.filter(|r| !r.is_empty()) {
             let frames = r.len().div_ceil(c.frame);
-            let mut pcm = r.to_vec();
-            pcm.resize(frames * c.frame, 0.0);
-            let s = self.enc.stream(&self.ops, c.frame)?;
-            let means = self.encode_frames(&s, &pcm)?;
+            let fp = cache::fingerprint(r);
+            let means = match self.path.cache.then(|| self.cache.means(fp)).flatten() {
+                Some(m) => m,
+                None => {
+                    let mut pcm = r.to_vec();
+                    pcm.resize(frames * c.frame, 0.0);
+                    let m = self.encode_reference(&pcm)?;
+                    if self.path.cache {
+                        self.cache.keep_means(fp, &m);
+                    }
+                    m
+                }
+            };
             // the quietest whole frame's latent: the speaker's room tone
             let whole = r.len() / c.frame;
             if whole > 0 {
@@ -201,13 +299,19 @@ impl Model {
         Ok(Prompt { model: (ids.len(), model), user: (tokens.len() - grid.len(), user), tokens })
     }
 
-    /// The prompt's rows through the language model, ROWS at a time; the last row's hidden state in `lm.hidden`
+    /// The prompt's rows through the language model, WIDE at a time (StartPath::wide; else ROWS); the last row's
+    /// hidden state in `lm.hidden`
     pub fn prefill(&self, st: &mut State, p: &Prompt) -> Result<()> {
+        self.prefill_rows(st, p, if self.path.wide { WIDE } else { ROWS })
+    }
+
+    /// The prompt's rows through the language model, `rows` a pass
+    pub fn prefill_rows(&self, st: &mut State, p: &Prompt, rows: usize) -> Result<()> {
         let c = &self.cfg;
         let n = p.tokens.len();
         let mut s = 0;
         while s < n {
-            let e = (s + ROWS).min(n);
+            let e = (s + rows).min(n);
             let span = |(r0, v): &(usize, Vec<f32>)| -> Option<(usize, Vec<f32>)> {
                 let rows = v.len() / c.latent;
                 let (a, b) = ((*r0).max(s), (r0 + rows).min(e));
@@ -240,25 +344,90 @@ impl Model {
             detok: Detok::new(silent),
             index: 0,
             prompt_len: 0,
+            primed: None,
+            hidden: Vec::new(),
         })
     }
 
     /// Run the prompt (card + voice reference: mono 24 kHz) and make frame 0
     pub fn start(&self, s: &mut Session, card: &str, reference: Option<&[f32]>) -> Result<Frame> {
+        Ok(self.start_timed(s, card, reference)?.0)
+    }
+
+    /// `start`, and where its time went
+    pub fn start_timed(&self, s: &mut Session, card: &str, reference: Option<&[f32]>) -> Result<(Frame, StartTimes)> {
         let t0 = Instant::now();
-        self.lm.reset(&s.state)?;
-        s.state.pos = 0;
+        let mut t = self.prime(s, card, reference)?;
+        s.primed = None;
+        s.force_text = if s.cfg.speak_first { 1 } else { 0 };
+        s.index = 0;
+        self.lm.hidden.write(0, &crate::weights::bytes(&s.hidden))?;
+        let t1 = Instant::now();
+        let f = self.emit(s, t0)?;
+        t.frame0 = t1.elapsed().as_secs_f64();
+        t.total = t0.elapsed().as_secs_f64();
+        Ok((f, t))
+    }
+
+    /// The prompt into the session's state, ready for `start` (which then only makes frame 0): from the voice's
+    /// cache when it holds this prompt, else run (and kept there). A session already primed with it does nothing.
+    /// The session's random numbers start over from its seed (a seeded session gives the same call each time).
+    pub fn prime(&self, s: &mut Session, card: &str, reference: Option<&[f32]>) -> Result<StartTimes> {
+        let mut t = StartTimes::default();
+        let key = PromptKey { voice: reference.filter(|r| !r.is_empty()).map(cache::fingerprint), card: card.to_string(), speak_first: s.cfg.speak_first,
+                              noise: s.cfg.latent_noise, seed: s.cfg.voice_seed.unwrap_or(s.cfg.seed), path: (self.path.batch_encode, self.path.wide) };
+        if s.primed.as_ref() == Some(&key) {
+            t.hit = true;
+            t.positions = s.prompt_len;
+            return Ok(t);
+        }
+        s.primed = None;
         self.enc.reset(&s.enc)?;
         self.dec.reset(&s.dec)?;
-        let p = self.prompt(card, reference, s.cfg.speak_first, s.cfg.latent_noise.then_some(&mut s.rng))?;
-        if p.tokens.len() + 16 > s.state.ctx {
-            return Err(Error(format!("a prompt of {} positions in a context of {} (a shorter voice reference)", p.tokens.len(), s.state.ctx)));
-        }
-        self.prefill(&mut s.state, &p)?;
-        s.force_text = if s.cfg.speak_first { 1 } else { 0 };
-        s.prompt_len = p.tokens.len();
-        s.index = 0;
-        self.emit(s, t0)
+        let hit = if self.path.cache { self.cache.get(&key) } else { None };
+        let rng = match hit {
+            Some(e) => {
+                let t1 = Instant::now();
+                if e.snapshot.pos + 16 > s.state.ctx {
+                    return Err(Error(format!("a prompt of {} positions in a context of {} (a shorter voice reference)", e.snapshot.pos, s.state.ctx)));
+                }
+                s.state.restore(&e.snapshot)?;
+                s.hidden = e.hidden.clone();
+                s.prompt_len = e.snapshot.pos;
+                t.restore = t1.elapsed().as_secs_f64();
+                t.hit = true;
+                e.rng.clone()
+            }
+            None => {
+                self.lm.reset(&s.state)?;
+                s.state.pos = 0;
+                let mut rng = Rng::new(key.seed);
+                let t1 = Instant::now();
+                let p = self.prompt(card, reference, s.cfg.speak_first, s.cfg.latent_noise.then_some(&mut rng))?;
+                self.ops.gpu.sync()?;
+                t.encode = t1.elapsed().as_secs_f64();
+                if p.tokens.len() + 16 > s.state.ctx {
+                    return Err(Error(format!("a prompt of {} positions in a context of {} (a shorter voice reference)", p.tokens.len(), s.state.ctx)));
+                }
+                let t2 = Instant::now();
+                self.prefill(&mut s.state, &p)?;
+                s.hidden = self.lm.hidden.to_f32()?[..self.cfg.hidden].to_vec();
+                t.prefill = t2.elapsed().as_secs_f64();
+                s.prompt_len = p.tokens.len();
+                if self.path.cache {
+                    let t3 = Instant::now();
+                    let e = Entry { snapshot: s.state.snapshot(self.cfg.kv_heads, self.cfg.head_dim)?, hidden: s.hidden.clone(), rng: rng.clone() };
+                    self.cache.put(key.clone(), e);
+                    t.store = t3.elapsed().as_secs_f64();
+                }
+                rng
+            }
+        };
+        // the frames' random numbers: the prompt's stream on (one seed), or their own seed (a voice seed apart)
+        s.rng = if s.cfg.voice_seed.is_some() { Rng::new(s.cfg.seed) } else { rng };
+        t.positions = s.prompt_len;
+        s.primed = Some(key);
+        Ok(t)
     }
 
     /// One user frame (frame samples at 24 kHz) in; the model's next frame out
@@ -275,6 +444,7 @@ impl Model {
 
     /// The position of (token, the model's raw latent, the user's raw latent) through the model
     pub fn advance(&self, s: &mut Session, token: u32, model: &[f32], user: &[f32]) -> Result<()> {
+        s.primed = None;
         let (m, u) = (self.scale(model), self.scale(user));
         self.lm.embed_rows(&self.ops, &[token], Some((0, &m)), Some((0, &u)))?;
         self.ops.mark(|| "embed".into())?;
@@ -285,6 +455,7 @@ impl Model {
     pub fn emit(&self, s: &mut Session, t0: Instant) -> Result<Frame> {
         let c = &self.cfg;
         let mut logits = self.lm.logits(&self.ops, 0)?;
+        let argmax = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32);
         if let Some(d) = &s.dry {
             d.apply(&mut logits);
         }
@@ -310,9 +481,16 @@ impl Model {
             d.update(token);
         }
         let text = s.detok.push(&self.tok, token);
-        let f = Frame { audio, token, text, index: s.index, seconds: t0.elapsed().as_secs_f64() };
+        let f = Frame { audio, token, text, index: s.index, seconds: t0.elapsed().as_secs_f64(), argmax };
         s.index += 1;
         Ok(f)
+    }
+
+    /// The model's last frame taken as `token` and the raw latent `latent` instead of its own (a check's teacher
+    /// forcing: the next position reads them)
+    pub fn force(&self, s: &mut Session, token: u32, latent: &[f32]) {
+        s.token = token;
+        s.latent = latent.to_vec();
     }
 
     /// The model's next frame held silent (a cancel): PAD on its text stream, its room tone's latent on its audio -

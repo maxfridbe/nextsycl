@@ -603,14 +603,15 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   `Conversation` and `/v1/realtime` with the lockstep extension (one long response, an audio delta a frame in; the
   character card as `nextsycl.card`). A position is the sum of the model's text token, its last audio latent and the
   user's, each latent through its projector; Qwen3.5-4B's text layers (`lm.rs`: 24 Gated DeltaNet layers - causal conv,
-  the gated delta rule's [128 x 128] state a head, gated norm - and 8 gated attention layers over a half cache, rows in
-  groups of 16) give the hidden state; its tied embedding the next text token (DRY, top-k 25, 0.7), the MeanFlow head
+  the gated delta rule's [128 x 128] state a head, gated norm - and 8 gated attention layers over a half cache; a frame
+  one row, a prompt 128 a pass on vv.h's tiled product) give the hidden state; its tied embedding the next text token (DRY, top-k 25, 0.7), the MeanFlow head
   (`head.rs`, one step) the next latent, the streaming codec (`codec.rs`: the VibeVoice engine's tokenizer code on its
   vv.h kernels) the frame's audio. Its kernels (`kernels/audio/haru`): the DeltaNet's convolution, recurrence and
   gated norm, attention's q / k norm with partial RoPE and cache store, the split attention and its gated merge; the
   products are vv.h's bfloat16 ones (the checkpoint's values). The safetensors are read as they are; 10.9 GiB on one
   card with an hour's context. Settings: `NS_HARU_CTX`, `NS_HARU_GUIDANCE`, `NS_HARU_TOP_K`, `NS_HARU_EOP_BIAS`,
-  `NS_HARU_SPEAK_FIRST`, `NS_HARU_DRY`, `NS_HARU_PROFILE`.
+  `NS_HARU_SPEAK_FIRST`, `NS_HARU_DRY`, `NS_HARU_PROFILE`, `NS_HARU_VOICE_CACHE` (`cache.rs`: a call's prompt - card and
+  saved voice - kept on the host, so a repeat call starts at once).
 
 ## The 3D engines
 

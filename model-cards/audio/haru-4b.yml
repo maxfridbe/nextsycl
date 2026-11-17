@@ -13,7 +13,8 @@ license_note: 'Apache-2.0 code and weights (higurashi.ai); a pretrained base mod
 title: 'Haru-4B (full-duplex voice conversation in lockstep; Rust + SYCL)'
 about: 'A live voice conversation over /v1/realtime in lockstep: every 133 ms one frame of your audio in, one frame of its own out (silence included), so it listens while it speaks - back-channels, interruptions and overlaps are its own. A character card (persona, names, relationship, situation; nine languages) sets who it is, a saved voice (3 s - 3 min of one speaker) how it sounds. One card'
 gpus: '0|1'
-vram_gib: 11.5                   # measured on the B65: 9.9 GiB loaded, 10.9 with a conversation of an hour (28,672 positions)
+vram_gib: 11.5                   # measured on the B65: 9.9 GiB loaded, 10.9 with a conversation of an hour (28,672 positions);
+                                 #   the fast start's buffers add 0.18 (B70 2026-11-16: 10.06 loaded, 11.13 with a conversation)
 speech:
 - realtime                       # a live conversation: /v1/realtime (lockstep below; a saved voice's recording is its voice). It
                                  #   does not read text aloud: no clone / voices here, so speech requests never come to it

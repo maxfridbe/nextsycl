@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use nextsycl_tok::Tokenizer;
 
 /// splitmix64 for the seed, xoshiro256** for the stream; normals by Box-Muller
+#[derive(Clone)]
 pub struct Rng {
     s: [u64; 4],
     spare: Option<f32>,

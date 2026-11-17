@@ -68,13 +68,15 @@ type OpTimes = (Instant, BTreeMap<String, (f64, u32)>);
 pub struct Ops {
     pub gpu: Arc<Gpu>,
     k: &'static ffi::Api,
+    /// the silo (hs.h): the prompt's wide passes' tuned kernels; None without one (or NS_SILO=0)
+    silo: Option<&'static ffi::Silo>,
     /// NS_HARU_PROFILE=1: the frame's operations timed one by one (the GPU waited for after each), by label
     prof: Option<Mutex<OpTimes>>,
 }
 
 impl Ops {
     pub fn new(gpu: &Arc<Gpu>, profile: bool) -> Result<Ops> {
-        Ok(Ops { gpu: gpu.clone(), k: ffi::api()?, prof: profile.then(|| Mutex::new((Instant::now(), BTreeMap::new()))) })
+        Ok(Ops { gpu: gpu.clone(), k: ffi::api()?, silo: ffi::silo()?, prof: profile.then(|| Mutex::new((Instant::now(), BTreeMap::new()))) })
     }
 
     pub fn profiling(&self) -> bool {
@@ -186,6 +188,13 @@ impl Ops {
         ffi::check(unsafe { (self.k.shift)(self.g(), buf, p as i64, l as i64, c as i64) }, "shift")
     }
 
+    /// x [m, 2c] of interleaved gate / up pairs -> out [m, c] = silu(gate) * up (a wide pass's SwiGLU, after its
+    /// product stored the pairs)
+    pub fn swiglu_pairs(&self, x: *const f32, m: usize, c: usize, out: *mut f32) -> Result<()> {
+        // SAFETY: x m * 2c floats, out m * c (the caller's).
+        ffi::check(unsafe { (self.k.swiglu_pairs)(self.g(), x, m as i64, c as i64, out) }, "swiglu")
+    }
+
     /// x += y (n floats)
     pub fn add(&self, x: *mut f32, y: *const f32, n: usize) -> Result<()> {
         // SAFETY: n floats each.
@@ -213,11 +222,23 @@ impl Ops {
         ffi::check(unsafe { (self.k.gdn_conv)(self.g(), x, ldx as i64, r as i64, c as i64, k as i64, w.fp(), state.fp(), out) }, "gdn conv")
     }
 
-    /// The gated delta rule over r rows (haru.h)
+    /// Whether the silo is open
+    pub fn has_silo(&self) -> bool {
+        self.silo.is_some()
+    }
+
+    /// The gated delta rule over r rows (haru.h); `wide` (a prompt's pass): the silo's kernel when it takes these
+    /// heads (the state held in registers across the rows)
     pub fn gdn_rule(&self, qkv: *const f32, ldq: usize, ba: *const f32, ldb: usize, a_log: &DevBuf, dt_bias: &DevBuf, state: &DevBuf, r: usize, hk: usize,
-                    hv: usize, dk: usize, dv: usize, out: *mut f32) -> Result<()> {
+                    hv: usize, dk: usize, dv: usize, out: *mut f32, wide: bool) -> Result<()> {
         if state.len < hv * dk * dv * 4 {
             return Err(Error(format!("gdn rule: a state of {} bytes for {hv} heads of {dk} x {dv}", state.len)));
+        }
+        // SAFETY: arithmetic only.
+        if let Some(s) = self.silo.filter(|s| wide && unsafe { (s.gdn_supported)(hk as i64, hv as i64, dk as i64, dv as i64) } == 1) {
+            // SAFETY: as the shared kernel's call below.
+            return ffi::check(unsafe { (s.gdn_rule)(self.g(), qkv, ldq as i64, ba, ldb as i64, a_log.fp(), dt_bias.fp(), state.fp(), r as i64, hk as i64,
+                                                    hv as i64, dk as i64, dv as i64, out) }, "gdn rule (silo)");
         }
         // SAFETY: the rows as the caller names them; the state checked above.
         ffi::check(unsafe { (self.k.gdn_rule)(self.g(), qkv, ldq as i64, ba, ldb as i64, a_log.fp(), dt_bias.fp(), state.fp(), r as i64, hk as i64, hv as i64,
@@ -241,9 +262,19 @@ impl Ops {
                                                p0 as i64, q, kc.ptr(), vc.ptr(), t as i64) }, "attention prep")
     }
 
-    /// The split attention and its gated merge: out [r, hq * d]; `part` holds r * hq * pieces * (d + 2) floats
+    /// The split attention and its gated merge: out [r, hq * d]; `part` holds r * hq * pieces * (d + 2) floats. `wide`
+    /// (a prompt's pass): the silo's one-pass kernel when it takes these heads (no pieces)
     pub fn attn(&self, q: *const f32, kc: &DevBuf, vc: &DevBuf, r: usize, hq: usize, hkv: usize, d: usize, t: usize, p0: usize, chunk: usize, part: &DevBuf,
-                gate: *const f32, ldg: usize, hs: usize, out: *mut f32) -> Result<()> {
+                gate: *const f32, ldg: usize, hs: usize, out: *mut f32, wide: bool) -> Result<()> {
+        // SAFETY: arithmetic only.
+        if let Some(s) = self.silo.filter(|s| wide && unsafe { (s.attn_supported)(hq as i64, hkv as i64, d as i64) } == 1) {
+            if kc.len.min(vc.len) < hkv * t * d * 2 || p0 + r > t {
+                return Err(Error(format!("attention: a cache of {} bytes for {t} positions, rows to {}", kc.len.min(vc.len), p0 + r)));
+            }
+            // SAFETY: the cache checked above; q, gate and out the caller's rows.
+            return ffi::check(unsafe { (s.attn)(self.g(), q, kc.ptr(), vc.ptr(), r as i64, hq as i64, hkv as i64, d as i64, t as i64, p0 as i64, gate, ldg as i64,
+                                                hs as i64, out) }, "attention (silo)");
+        }
         let pieces = (p0 + r).div_ceil(chunk);
         if part.len < r * hq * pieces * (d + 2) * 4 {
             return Err(Error(format!("attention: scratch of {} bytes for {r} rows in {pieces} pieces", part.len)));

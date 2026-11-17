@@ -109,6 +109,13 @@ pub struct Stream {
 // SAFETY: a stream is used by one thread at a time (the engine's lock); the cells are its own bookkeeping.
 unsafe impl Sync for Stream {}
 
+impl Stream {
+    /// Its device memory (bytes)
+    pub fn bytes(&self) -> usize {
+        self.cin.iter().chain(self.hist.iter().flatten()).chain([&self.h, &self.f, &self.out, &self.split.hi, &self.split.lo, &self.split.part]).map(|b| b.len).sum()
+    }
+}
+
 impl Coder {
     /// The encoder (`codec.encoder.`: stem, down.N, stages.N.M, head; strides the ratios reversed) or the decoder
     /// (`codec.decoder.`: stem, up.N transposed, stages, head; strides the ratios)

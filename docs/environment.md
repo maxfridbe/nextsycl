@@ -480,6 +480,7 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 | `NS_HARU_DRY` | 1 | 0: no DRY repetition penalty on Haru-4B's words; also a session's option dry (--opt-dry) | audio haru |
 | `NS_HARU_STEREO` | - | a request's option only (stereo=1): an offline answer to a recording as two channels, the user left, the model right | audio haru |
 | `NS_HARU_PROFILE` | 0 | 1: each Haru-4B frame's operations timed one by one (the GPU waited for after each: slower), the table on stderr after a check or an offline answer (--opt-profile) | audio haru |
+| `NS_HARU_VOICE_CACHE` | 1024 | MiB of host memory for Haru-4B's voices' cache: a call's prompt (card + saved voice) kept after it ran, so a repeat call with the same voice and card restores it instead (~75 MB a 39 s voice, ~85 MB a 60 s one; the least recently used leaves first); 0: none (--opt-voice-cache) | audio haru |
 | `NS_SOPHON_LOG` | 0 | Debug: 1 logs each turn check's P(finished) and each reply's prompt / speeds / text on stderr | audio sophon |
 | `NS_SOPHON_PROFILE` | 0 | Debug: 1 times the talker's frame stages (synchronised: slower) | audio sophon |
 | `NS_WH_*` | - | every NS_WH_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |

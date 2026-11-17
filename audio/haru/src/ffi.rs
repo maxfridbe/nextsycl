@@ -31,6 +31,7 @@ pub struct Api {
     pub norm_hist: unsafe extern "C" fn(G, *const f32, i64, *const f32, i64, i64, i64, *const f32, f32, *mut f32) -> c_int,
     pub block_mix: unsafe extern "C" fn(G, *const f32, *mut f32, i64, i64, i64, *const f32, *const f32, *const f32, *const f32, f32, *mut f32) -> c_int,
     pub shift: unsafe extern "C" fn(G, *mut f32, i64, i64, i64) -> c_int,
+    pub swiglu_pairs: unsafe extern "C" fn(G, *const f32, i64, i64, *mut f32) -> c_int,
     // mm3.h, q3t.h
     pub add: unsafe extern "C" fn(G, *mut f32, *const f32, i64) -> c_int,
     pub silu: unsafe extern "C" fn(G, *mut f32, i64) -> c_int,
@@ -73,6 +74,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             norm_hist: sym!("ns_audio_vv_norm_hist"),
             block_mix: sym!("ns_audio_vv_block_mix"),
             shift: sym!("ns_audio_vv_shift"),
+            swiglu_pairs: sym!("ns_audio_vv_swiglu_pairs"),
             add: sym!("ns_audio_mm3_add"),
             silu: sym!("ns_audio_q3t_silu"),
         })
@@ -88,4 +90,43 @@ pub fn check(rc: c_int, what: &str) -> nextsycl_core::Result<()> {
     }
     let why = nextsycl_core::api().map(|a| a.error()).unwrap_or_default();
     Err(nextsycl_core::Error(format!("{what}: {why}")))
+}
+
+/// Haru's silo (kernels/audio/haru/silo/hs.h, dist/silo/libnextsycl-haru.so): the prompt's wide passes' tuned kernels
+#[allow(clippy::type_complexity)]
+pub struct Silo {
+    pub gdn_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
+    pub gdn_rule: unsafe extern "C" fn(G, *const f32, i64, *const f32, i64, *const f32, *const f32, *mut f32, i64, i64, i64, i64, i64, *mut f32) -> c_int,
+    pub attn_supported: unsafe extern "C" fn(i64, i64, i64) -> c_int,
+    pub attn: unsafe extern "C" fn(G, *const f32, P, P, i64, i64, i64, i64, i64, i64, *const f32, i64, i64, *mut f32) -> c_int,
+}
+
+// SAFETY: function pointers into the silo library, which stays loaded for the process.
+unsafe impl Send for Silo {}
+unsafe impl Sync for Silo {}
+
+/// The silo (None: none built, or NS_SILO=0 - the engine's own kernels for everything)
+pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
+    static SILO: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
+    SILO.get_or_init(|| {
+        let Some(lib) = nextsycl_core::silo(crate::ARCH).map_err(|e| e.0)? else { return Ok(None) };
+        macro_rules! sym {
+            ($name:literal) => {{
+                let p = lib.symbol($name);
+                if p.is_null() {
+                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
+                }
+                // SAFETY: the symbol is declared in hs.h with the field's signature.
+                #[allow(clippy::missing_transmute_annotations)]
+                unsafe {
+                    std::mem::transmute::<*mut c_void, _>(p)
+                }
+            }};
+        }
+        Ok(Some(Silo { gdn_supported: sym!("ns_haru_silo_gdn_supported"), gdn_rule: sym!("ns_haru_silo_gdn_rule"),
+                       attn_supported: sym!("ns_haru_silo_attn_supported"), attn: sym!("ns_haru_silo_attn") }))
+    })
+    .as_ref()
+    .map(|s| s.as_ref())
+    .map_err(|e| nextsycl_core::Error(e.clone()))
 }

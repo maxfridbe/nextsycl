@@ -10,6 +10,9 @@
 //!   frames   f_tok / f_model / f_user (teacher-forced) -> f_hidden.npy, f_logits.npy (argmax agreement), and the
 //!            head from f_noise.npy -> f_latent.npy
 //!   speed    frames of a live session (the prompt: the card), timed: ms a frame against real time (133)
+//!   start    voice*.wav (saved voices' recordings), card.txt, user.wav -> a call's start on each voice: the old path
+//!            (a frame at a time through the encoder, 16 positions a pass) and the fast ones (StartPath), timed; then
+//!            the old path's frames against the new one's, cold and from the voices' cache (session.rs)
 //! ```
 
 use std::path::Path;
@@ -17,8 +20,8 @@ use std::time::Instant;
 
 use nextsycl_audio::{Error, Result};
 
-use crate::session::{Prompt, Settings};
-use crate::{Haru, Model};
+use crate::session::{Prompt, Settings, StartPath};
+use crate::{Haru, Model, RATE};
 
 /// A little-endian .npy of float32, float64, int32 or int64: (shape, values as f64)
 pub fn read_npy(path: &Path) -> Result<(Vec<usize>, Vec<f64>)> {
@@ -98,7 +101,7 @@ fn run_of(v: &[f32], mask: &[u32], d: usize) -> (usize, Vec<f32>) {
 pub fn run(e: &Haru, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)) -> Result<f64> {
     let want = |s: &str| stages.is_empty() || stages.contains(&s);
     let mut worst = 0f64;
-    let m = e.inner.model.lock().map_err(|_| Error("the model's lock".into()))?;
+    let mut m = e.inner.model.lock().map_err(|_| Error("the model's lock".into()))?;
     let c = m.cfg.clone();
     let d = c.latent;
     if want("codec") {
@@ -191,6 +194,11 @@ pub fn run(e: &Haru, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)) -
     if want("speed") && !stages.is_empty() {
         speed(&m, e.inner.ctx, dir, log)?;
     }
+    if want("start") && !stages.is_empty() {
+        let r = start(&mut m, e.inner.ctx, dir, log);
+        m.path = StartPath::default();
+        worst = worst.max(r?);
+    }
     Ok(worst)
 }
 
@@ -258,4 +266,124 @@ fn speed(m: &Model, ctx: usize, dir: &Path, log: &mut dyn FnMut(String)) -> Resu
                 times[frames / 2] * 1e3, times[frames * 95 / 100] * 1e3, times[frames - 1] * 1e3, 0.13333 / mean, m.ops.gpu.name));
     log(format!("speed: it said {:?}", text.split_whitespace().collect::<Vec<_>>().join(" ")));
     Ok(())
+}
+
+/// A WAV file's samples, mono at 24 kHz
+fn wav24(path: &Path) -> Result<Vec<f32>> {
+    let b = std::fs::read(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+    let (x, rate) = nextsycl_audio::decode_wav(&b).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+    Ok(crate::resample::resample(&x, rate, RATE))
+}
+
+/// The start's paths compared: the old one, each fast one alone, both, both with the voices' cache
+const PATHS: [(&str, StartPath); 5] = [
+    ("old: 1 frame / 16 positions a pass", StartPath { batch_encode: false, wide: false, cache: false }),
+    ("encoder 8 frames a pass", StartPath { batch_encode: true, wide: false, cache: false }),
+    ("positions 128 a pass", StartPath { batch_encode: false, wide: true, cache: false }),
+    ("both", StartPath { batch_encode: true, wide: true, cache: false }),
+    ("both + the voices' cache", StartPath { batch_encode: true, wide: true, cache: true }),
+];
+
+/// Frames compared after a start: the old path's, the new path's cold and from the cache
+const FRAMES: usize = 40;
+
+fn rms(v: &[f32]) -> f32 {
+    (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt()
+}
+
+/// A call's start on each voice (voice*.wav in `dir`) with the card (card.txt): timed on each path, then the old
+/// path's first frames against the new one's (teacher-forced: the new sessions take the old one's token and latent
+/// each frame, so a difference does not carry), cold and from the cache. The user's side: user.wav, then silence.
+fn start(m: &mut Model, ctx: usize, dir: &Path, log: &mut dyn FnMut(String)) -> Result<f64> {
+    let card = std::fs::read_to_string(dir.join("card.txt")).map_err(|e| Error(format!("card.txt: {e}")))?;
+    let user = wav24(&dir.join("user.wav"))?;
+    let mut voices: Vec<std::path::PathBuf> = std::fs::read_dir(dir).map_err(|e| Error(e.to_string()))?.filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("voice") && n.ends_with(".wav"))).collect();
+    voices.sort();
+    if voices.is_empty() {
+        return Err(Error(format!("{}: no voice*.wav", dir.display())));
+    }
+    let fs = m.cfg.frame;
+    let pad = m.cfg.pad;
+    let mut worst = 0f64;
+    log(format!("start: the silo (libnextsycl-haru.so) {}", if m.ops.has_silo() { "open: its kernels in the wide passes" } else { "not open: the engine's own kernels" }));
+    for vp in &voices {
+        let name = vp.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+        let r = crate::session::prepare_reference(&wav24(vp)?, 180.0);
+        let frames = r.len().div_ceil(fs);
+        log(format!("start: {name}: {:.1} s of voice (trimmed), {frames} frames to encode", r.len() as f64 / RATE as f64));
+        let t = Instant::now();
+        let mut s = m.session(Settings { seed: 41, ..Default::default() }, ctx)?;
+        m.ops.gpu.sync()?;
+        log(format!("start: {name}: a conversation's state ({ctx} positions) made in {:.0} ms", t.elapsed().as_secs_f64() * 1e3));
+        for (what, path) in PATHS {
+            m.path = path;
+            m.cache.clear();
+            for run in 0..3 {
+                let (_, t) = m.start_timed(&mut s, &card, Some(&r))?;
+                log(format!("start: {name}: {what:<36} run {run}: frame 0 after {:>5.0} ms ({} positions; encode {:.0} ms, prefill {:.0} ms, restore {:.0} ms, \
+                             store {:.0} ms, frame 0 {:.0} ms){}", 1e3 * t.total, t.positions, 1e3 * t.encode, 1e3 * t.prefill, 1e3 * t.restore,
+                            1e3 * t.store, 1e3 * t.frame0, if t.hit { " - from the cache" } else { "" }));
+            }
+            if m.ops.profiling() {
+                log(format!("start: {name}: {what}: the operations of a start (NS_HARU_PROFILE: each waited for), per start:"));
+                m.ops.report(3);
+            }
+        }
+        log(format!("start: {name}: the cache holds {:.1} MB for this voice and card", m.cache.stats().1 as f64 / 1e6));
+        drop(s);
+        for speak_first in [false, true] {
+            let set = Settings { seed: 41, speak_first, ..Default::default() };
+            let cctx = frames + 1024 + FRAMES;
+            m.path = PATHS[0].1;
+            m.cache.clear();
+            let (mut a, mut b, mut h) = (m.session(set.clone(), cctx)?, m.session(set.clone(), cctx)?, m.session(set.clone(), cctx)?);
+            let mut fa = m.start(&mut a, &card, Some(&r))?;
+            m.path = StartPath::default();
+            let mut fb = m.start(&mut b, &card, Some(&r))?;
+            let mut fh = m.start(&mut h, &card, Some(&r))?;
+            let (mut arg, mut cls, mut tok, mut aud, mut hit_tok, mut hit_max) = (0, 0, 0, 0, 0, 0f32);
+            let mut rels = Vec::new();
+            let mut said = (String::new(), String::new());
+            for k in 0..=FRAMES {
+                arg += (fa.argmax == fb.argmax) as usize;
+                cls += ((fa.argmax == pad) == (fb.argmax == pad)) as usize;
+                tok += (fa.token == fb.token) as usize;
+                aud += ((rms(&fa.audio) > 1e-3) == (rms(&fb.audio) > 1e-3)) as usize;
+                rels.push(compare(&fb.audio, &fa.audio).0);
+                hit_tok += (fh.token == fb.token && fh.argmax == fb.argmax) as usize;
+                hit_max = fh.audio.iter().zip(&fb.audio).map(|(x, y)| (x - y).abs()).fold(hit_max, f32::max);
+                said.0.push_str(&fa.text);
+                said.1.push_str(&fb.text);
+                if k == FRAMES {
+                    break;
+                }
+                let la = a.latent().to_vec();
+                m.force(&mut b, fa.token, &la);
+                m.force(&mut h, fa.token, &la);
+                let pcm: Vec<f32> = (0..fs).map(|i| user.get(k * fs + i).copied().unwrap_or(0.0)).collect();
+                fa = m.step(&mut a, &pcm)?;
+                fb = m.step(&mut b, &pcm)?;
+                fh = m.step(&mut h, &pcm)?;
+            }
+            let n = FRAMES + 1;
+            let mut sorted = rels.clone();
+            sorted.sort_by(f64::total_cmp);
+            log(format!("start: {name}, speak first {speak_first}: the new path against the old over {n} frames (teacher-forced): argmax {arg} of {n}, \
+                         silent-vs-speak {cls} of {n}, sampled tokens {tok} of {n}, audible-vs-quiet audio {aud} of {n}; audio rel median {:.2e}, worst {:.2e}",
+                        sorted[n / 2], sorted[n - 1]));
+            log(format!("start: {name}, speak first {speak_first}: old said {:?}; new said {:?}", said.0.split_whitespace().collect::<Vec<_>>().join(" "),
+                        said.1.split_whitespace().collect::<Vec<_>>().join(" ")));
+            log(format!("start: {name}, speak first {speak_first}: a cache hit against the cold start: tokens and argmax {hit_tok} of {n} the same, audio max \
+                         difference {hit_max:.1e}"));
+            if hit_tok != n || hit_max != 0.0 {
+                worst = f64::INFINITY;
+            }
+            if arg != n || cls != n {
+                worst = worst.max(1.0);
+            }
+        }
+    }
+    m.cache.clear();
+    Ok(worst)
 }

@@ -17,6 +17,7 @@
 //! Realtime's events with the lockstep extension: duplex.rs); `generate` answers a recording offline (the release's
 //! haru-inference: the model's track as long as the user's).
 
+pub mod cache;
 pub mod card;
 pub mod check;
 pub mod codec;
@@ -39,11 +40,12 @@ use nextsycl_audio::{At, Audio, AudioEngine, AudioKind, AudioRequest, Conversati
 use nextsycl_core::Gpu;
 use nextsycl_tok::Tokenizer;
 
-use crate::codec::Coder;
+use crate::cache::VoiceCache;
+use crate::codec::{Coder, Stream};
 use crate::head::Head;
 use crate::lm::Lm;
 use crate::ops::Ops;
-use crate::session::Settings;
+use crate::session::{Settings, StartPath};
 use crate::weights::{Config, Weights};
 
 pub const ARCH: &str = "haru";
@@ -55,6 +57,12 @@ const GIB: f64 = (1u64 << 30) as f64;
 /// what every card keeps free (the xe driver spills to host memory past it)
 const KEEP_FREE: u64 = 3 << 29;
 pub const RATE: u32 = 24000;
+/// The frames a pass of a voice reference through the encoder (its wide stream: ~110 MB on the card)
+pub const ENC_FRAMES: usize = 8;
+/// The voices' cache by default (MiB of host memory; cache.rs)
+pub const VOICE_CACHE_MIB: usize = 1024;
+/// The reference's noise's seed for a session that names none (Settings::voice_seed)
+pub const VOICE_SEED: u64 = 0x4841_5255_5f56_4f49;
 
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "ctx", env: "NS_HARU_CTX", value: "28672", help: "positions a conversation holds (7.5 a second, plus the prompt: 28672 is about an hour)",
@@ -69,6 +77,9 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "stereo", env: "NS_HARU_STEREO", value: "0|1", help: "offline (a source recording): the user on the left channel, the model on the right",
                    at: At::Request },
     EngineOption { name: "profile", env: "NS_HARU_PROFILE", value: "0|1", help: "each frame's operations timed one by one (slower), the table on stderr", at: At::Load },
+    EngineOption { name: "voice-cache", env: "NS_HARU_VOICE_CACHE", value: "1024",
+                   help: "MiB of host memory for the voices' prompts kept (a repeat call with the same voice and card starts at once; ~75 MB a 39 s voice); 0: none",
+                   at: At::Load },
 ];
 
 pub fn kind() -> AudioKind {
@@ -88,6 +99,12 @@ pub struct Model {
     pub head: Head,
     pub enc: Coder,
     pub dec: Coder,
+    /// the encoder's stream for a voice reference, ENC_FRAMES frames a pass
+    pub enc_wide: Stream,
+    /// how a prompt runs (a check turns the fast paths off for the old one)
+    pub path: StartPath,
+    /// the voices' prompts kept (cache.rs)
+    pub cache: VoiceCache,
     pub tok: Tokenizer,
     pub latent_scale: f32,
     pub latent_bias: f32,
@@ -149,6 +166,7 @@ impl Haru {
         let gpu = gpus.first().ok_or_else(|| Error("no GPU".into()))?.clone();
         let ctx: usize = num(o.setting("NS_HARU_CTX"), "ctx", CTX)?.max(512);
         let profile = o.setting("NS_HARU_PROFILE").is_some_and(|v| v == "1");
+        let cache_mib: usize = num(o.setting("NS_HARU_VOICE_CACHE"), "voice-cache", VOICE_CACHE_MIB)?;
         let cfg = Config::read(&role(files, "config")?)?;
         let model_path = role(files, "model")?;
         let f = Weights::open(&model_path)?;
@@ -180,7 +198,11 @@ impl Haru {
         gpu.sync()?;
         log(format!("{ARCH}: language model {:.2} GiB, head {:.2} GiB, codec {:.2} + {:.2} GiB on {}", lm.bytes() as f64 / GIB, head.bytes() as f64 / GIB,
                     enc.bytes() as f64 / GIB, dec.bytes() as f64 / GIB, gpu.name));
-        let mut model = Model { cfg: cfg.clone(), ops, lm, head, enc, dec, tok, latent_scale, latent_bias, silence: Vec::new() };
+        let enc_wide = enc.stream(&ops, ENC_FRAMES * cfg.frame)?;
+        log(format!("{ARCH}: the reference's encoder stream ({ENC_FRAMES} frames a pass) {:.2} GiB; the voices' cache up to {cache_mib} MiB of host memory",
+                    enc_wide.bytes() as f64 / GIB));
+        let mut model = Model { cfg: cfg.clone(), ops, lm, head, enc, dec, enc_wide, path: StartPath::default(), cache: VoiceCache::new(cache_mib << 20), tok,
+                                latent_scale, latent_bias, silence: Vec::new() };
         // digital silence's latent: the last of 16 frames of zeros
         let s = model.enc.stream(&model.ops, cfg.frame)?;
         let means = model.encode_frames(&s, &vec![0.0; 16 * cfg.frame])?;
@@ -294,6 +316,10 @@ impl AudioEngine for Haru {
     }
     fn report(&self) -> Vec<String> {
         let mut r = self.report.clone();
+        if let Ok(m) = self.inner.model.lock() {
+            let (n, b, hits, misses) = m.cache.stats();
+            r.push(format!("  voices' cache: {n} prompts, {:.0} MiB of {} (hits {hits}, misses {misses})", b as f64 / (1u64 << 20) as f64, m.cache.limit >> 20));
+        }
         r.push(format!("  loaded {:.0} s ago", self.loaded.elapsed().as_secs_f64()));
         r
     }

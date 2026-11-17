@@ -14,6 +14,10 @@
 //!   display; the model does not need them): a frame above max(0.01, 3 x the noise floor) starts, 4 quiet frames end.
 //! - **Cancel**: response.cancel ends the response (cancelled) and silences the model: its text held at PAD and its
 //!   own audio stream at the room tone while it keeps listening; nothing goes out until a response.create.
+//! - **The prompt early**: once a session names its voice, the worker runs the prompt into the conversation's state
+//!   (`Model::prime`) while the client is still getting ready, so the first audio needs only frame 0; a repeat voice
+//!   comes from the voices' cache (cache.rs). A session without a seed draws the reference's noise from a fixed one
+//!   (Settings::voice_seed), so its prompt is the same each call.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +28,7 @@ use nextsycl_audio::{Conversation, Error, RealtimeEvent, RealtimeSession, Result
 
 use crate::resample;
 use crate::session::{prepare_reference, Session, Settings};
-use crate::{card, settings, Inner, RATE};
+use crate::{card, settings, Inner, RATE, VOICE_SEED};
 
 /// What makes the prompt: when it changes, the conversation starts over
 #[derive(Clone, PartialEq)]
@@ -46,6 +50,8 @@ struct St {
     key: Key,
     /// the key the running session was started with
     running: Option<Key>,
+    /// the key the session's state was primed with (the prompt run ahead of the first audio)
+    primed: Option<Key>,
     want_start: bool,
     /// the client's rate and its resampler to 24 kHz
     rs: Option<resample::Stream>,
@@ -109,6 +115,7 @@ fn conf(eng: &Inner, c: &RealtimeSession) -> Result<Conf> {
         s.temperature = t.clamp(0.0, 2.0);
     }
     s.seed = if c.seed != 0 { c.seed } else { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64) };
+    s.voice_seed = (c.seed == 0).then_some(VOICE_SEED);
     let key = Key { card: text.clone(), voice: voice.as_ref().map(|v| (v.len(), hash(v))), guidance: s.guidance.to_bits(), temperature: s.temperature.to_bits(),
                     top_k: s.top_k, eop_bias: s.eop_bias.to_bits(), speak_first: s.speak_first, dry: s.dry };
     Ok((text, voice, s, key))
@@ -117,7 +124,7 @@ fn conf(eng: &Inner, c: &RealtimeSession) -> Result<Conf> {
 impl Duplex {
     pub fn start(eng: Arc<Inner>, c: &RealtimeSession) -> Result<Duplex> {
         let (card, voice, settings, key) = conf(&eng, c)?;
-        let st = St { card, voice, settings, key, running: None, want_start: false, rs: None, input: VecDeque::new(), frames_in: 0, muted: false, response: None,
+        let st = St { card, voice, settings, key, running: None, primed: None, want_start: false, rs: None, input: VecDeque::new(), frames_in: 0, muted: false, response: None,
                       resp_n: 0, text: String::new(), sent: 0, noise: 0.003, speaking: false, quiet: 0, full: false,
                       told: false };
         let s = Arc::new(Shared { eng, st: Mutex::new(st), wake: Condvar::new(), events: Mutex::new(VecDeque::new()), ev: Condvar::new(),
@@ -239,6 +246,8 @@ impl Conversation for Duplex {
 /// What the worker does next
 enum Work {
     Start(String, Option<Arc<Vec<f32>>>, Settings, Key),
+    /// the prompt ahead of the start (a voice named, no audio yet)
+    Prime(String, Option<Arc<Vec<f32>>>, Settings, Key),
     Frame(Vec<f32>),
 }
 
@@ -270,27 +279,51 @@ fn run(s: Arc<Shared>) {
                     let f: Vec<f32> = st.input.drain(..fs).collect();
                     break Work::Frame(f);
                 }
+                if !st.want_start && st.voice.is_some() && st.running.as_ref() != Some(&st.key) && st.primed.as_ref() != Some(&st.key) && !st.full {
+                    let k = st.key.clone();
+                    st.primed = Some(k.clone());
+                    break Work::Prime(st.card.clone(), st.voice.clone(), st.settings.clone(), k);
+                }
                 st = s.wake.wait_timeout(st, Duration::from_millis(200)).map(|(g, _)| g).unwrap_or_else(|e| e.into_inner().0);
             }
         };
         match work {
-            Work::Start(cardt, voice, set, key) => {
-                let t0 = Instant::now();
-                let r = (|| -> Result<crate::session::Frame> {
+            Work::Prime(cardt, voice, set, _key) => {
+                let r = (|| -> Result<crate::session::StartTimes> {
                     let m = lock(&s.eng.model);
                     if ses.is_none() {
                         ses = Some(m.session(set.clone(), s.eng.ctx)?);
                     }
                     let se = ses.as_mut().ok_or_else(|| Error("no session".into()))?;
                     se.cfg = set.clone();
-                    m.start(se, &cardt, voice.as_deref().map(|v| v.as_slice()))
+                    m.prime(se, &cardt, voice.as_deref().map(|v| v.as_slice()))
+                })();
+                match r {
+                    Ok(t) => eprintln!("haru: the prompt ahead: {} positions in {:.2} s ({})", t.positions, t.encode + t.prefill + t.restore + t.store,
+                                       if t.hit { "the voice's cache" } else { "encoded and run" }),
+                    // the start runs it again and reports what fails
+                    Err(e) => eprintln!("haru: the prompt ahead: {}", e.0),
+                }
+            }
+            Work::Start(cardt, voice, set, key) => {
+                let t0 = Instant::now();
+                let r = (|| -> Result<(crate::session::Frame, crate::session::StartTimes)> {
+                    let m = lock(&s.eng.model);
+                    if ses.is_none() {
+                        ses = Some(m.session(set.clone(), s.eng.ctx)?);
+                    }
+                    let se = ses.as_mut().ok_or_else(|| Error("no session".into()))?;
+                    se.cfg = set.clone();
+                    m.start_timed(se, &cardt, voice.as_deref().map(|v| v.as_slice()))
                 })();
                 let mut st = lock(&s.st);
                 s.finish(&mut st, "completed");
                 match r {
-                    Ok(f) => {
-                        eprintln!("haru: a conversation started: prompt of {} positions in {:.2} s", ses.as_ref().map_or(0, |x| x.prompt_len),
-                                  t0.elapsed().as_secs_f64());
+                    Ok((f, t)) => {
+                        eprintln!("haru: a conversation started: prompt of {} positions in {:.2} s ({}; encode {:.0} ms, prefill {:.0} ms, restore {:.0} ms, \
+                                   store {:.0} ms, frame 0 {:.0} ms)", t.positions, t0.elapsed().as_secs_f64(),
+                                  if t.encode + t.prefill + t.restore == 0.0 { "primed ahead" } else if t.hit { "the voice's cache" } else { "cold" },
+                                  1e3 * t.encode, 1e3 * t.prefill, 1e3 * t.restore, 1e3 * t.store, 1e3 * t.frame0);
                         st.running = Some(key);
                         s.begin(&mut st);
                         out(&s, &mut st, f, &mut ses);

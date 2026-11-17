@@ -21,6 +21,8 @@ microphone, and talk. Wired headphones help: it hears whatever the microphone pi
 - `voice`: a saved voice by name - its recording is the voice it speaks with (3 s to 3 minutes of one speaker,
   clean). It is needed: without a voice the model stays silent (the release's own server refuses such a session), so
   the conversation does not start and an `error` says so. Only clone your own voice or one you have permission to use.
+  The voice and card are read as soon as the session names them (the start then needs only the first frame), and kept:
+  the next call with the same voice and card starts at once.
 - `nextsycl.language`: the card's language - `en` (default), `ja`, `zh`, `ko`, `es`, `fr`, `de`, `pt`, `ru`. It
   answers in the language you speak.
 - `nextsycl.options`: `guidance` (1-2, default 1.5: higher keeps the voice closer to the recording), `eop-bias`
