@@ -12,13 +12,29 @@
 //!
 //! Text ids are the thinker's tokenizer's (the same BPE as the talker's). A voice is an x-vector: a voices/<name>.pt
 //! of the release (2,048 floats), or a recording's (speaker.rs: the checkpoint's ECAPA encoder). 24 kHz out.
+//!
+//! A recording with its transcript can be cloned in context instead (Qwen3-TTS's own ICL clone, qwen-tts
+//! generate_icl_prompt, streaming): its x-vector as above, and after the codec rows its transcript's and the reply's
+//! text beside codec bos and the recording's own frames (the 12 Hz codec's encoder), the reply spoken as their
+//! continuation; the codec decodes the new frames after the recording's (their context, as qwen-tts decodes them).
+//!
+//! ```text
+//!   IclIclLayout::Prompt (upstream's):  proj(ref text ++ reply ++ tts_eos)[..F+1] + codec [bos, ref frames x F]
+//!                                 the rest of the text fed a frame each, then tts_pad (shorter text: tts_pad in the prompt)
+//!                                 - a live reply waits until its text covers the frames (or it is whole)
+//!   IclIclLayout::Stream (live):        proj(ref text) then tts_pad      + codec [bos, ref frames x F]
+//!                                 the reply's text fed a frame each as written, then tts_eos, then tts_pad
+//! ```
+//!
+//! A prepared recording (`Icl`: its x-vector, frames, codec rows and its transcript's projected rows) is kept for the
+//! last few recordings (`Talk::icl`), so a voice's next request or session skips the encoders.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use nextsycl_audio::{Error, Result};
-use nextsycl_codec12hz::{Codec, Weights as CodecWeights};
+use nextsycl_codec12hz::{Codec, Encoder, Weights as CodecWeights};
 use nextsycl_core::{DevBuf, Gpu};
 use nextsycl_diffusion::kernels::Nsd;
 
@@ -121,6 +137,81 @@ pub fn read_pt_xvector(p: &Path) -> Result<Vec<f32>> {
     Err(Error(format!("{}: no tensor storage (data/0) in it", p.display())))
 }
 
+/// Prepared recordings kept (`Talk::icl`)
+const ICL_KEEP: usize = 16;
+
+/// A recording made ready for an in-context clone
+pub struct Icl {
+    pub xvec: Vec<f32>,
+    /// its frames' codes [F][16] (the codec's encoder)
+    pub codes: Vec<Vec<i32>>,
+    /// its transcript, and the transcript's ids (qwen-tts's ref_ids[3:-2]: the role and <|im_end|>\n off)
+    pub text: String,
+    pub ids: Vec<u32>,
+    /// seconds of it kept
+    pub seconds: f64,
+    /// codec [bos, frames] rows [F+1, hidden], the transcript's projected rows [ids, hidden]
+    pub codec_rows: Vec<f32>,
+    pub text_rows: Vec<f32>,
+    /// how long making it took (s)
+    pub made_s: f64,
+}
+
+/// Whose voice the talker speaks in
+#[derive(Clone)]
+pub enum Voice {
+    /// an x-vector (a release voice, or a recording's)
+    XVector(Vec<f32>),
+    /// a recording and its transcript, in context
+    InContext(Arc<Icl>),
+}
+
+impl Voice {
+    pub fn xvec(&self) -> &[f32] {
+        match self {
+            Voice::XVector(x) => x,
+            Voice::InContext(i) => &i.xvec,
+        }
+    }
+    pub fn in_context(&self) -> bool {
+        matches!(self, Voice::InContext(_))
+    }
+}
+
+/// Where an in-context clone's reply text goes (module doc)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IclLayout {
+    Prompt,
+    Stream,
+}
+
+impl IclLayout {
+    pub fn parse(v: &str) -> Result<IclLayout> {
+        match v.trim() {
+            "prompt" => Ok(IclLayout::Prompt),
+            "stream" => Ok(IclLayout::Stream),
+            _ => Err(Error(format!("icl layout {v:?}: prompt or stream"))),
+        }
+    }
+}
+
+/// A recording's fingerprint: FNV-1a over its rate, length, samples' bits and transcript
+pub fn fingerprint(x: &[f32], rate: u32, text: &str) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    let mut eat = |b: &[u8]| {
+        for v in b {
+            h = (h ^ *v as u64).wrapping_mul(0x100000001b3);
+        }
+    };
+    eat(&rate.to_le_bytes());
+    eat(&(x.len() as u64).to_le_bytes());
+    for v in x {
+        eat(&v.to_bits().to_le_bytes());
+    }
+    eat(text.as_bytes());
+    h
+}
+
 /// What the brain hands the talker: the reply's speakable text ids so far, and whether it is whole
 pub struct Feed {
     pub ids: Vec<u32>,
@@ -144,6 +235,10 @@ pub struct Probe {
     pub prefill: Vec<f32>,
     pub logits0: Vec<f32>,
     pub codes: Vec<Vec<i32>>,
+    /// a forced run: these codes taken each frame (the reference's), not drawn; `misses`: the frames whose first code
+    /// / the other codes' draws greedy would not have taken
+    pub force: Option<Vec<Vec<i32>>>,
+    pub misses: [usize; 2],
 }
 
 pub struct Talk {
@@ -155,6 +250,11 @@ pub struct Talk {
     pub speaker: Option<Speaker>,
     weights: Shards,
     pub voices: PathBuf,
+    /// the codec's encoder (an in-context clone's frames), loaded at its first use
+    encoder: OnceLock<Encoder>,
+    codec_file: PathBuf,
+    /// prepared recordings, the last used last
+    icl: Mutex<Vec<(u64, Arc<Icl>)>>,
 }
 
 impl Talk {
@@ -166,11 +266,80 @@ impl Talk {
         let weights = Shards::open(&[model.to_path_buf()])?;
         let talker = Talker::load(&ops, &weights, int8, log)?;
         let speaker = if weights.has("speaker_encoder.fc.weight") { Some(Speaker::load(&weights)?) } else { None };
+        let codec_file = codec.to_path_buf();
         let codec = Codec::load(gpu, &CodecWeights::open(codec)?)?;
         codec.decode_bucketed(&nsd, &[vec![0; 16]])?;
         gpu.sync()?;
         log(format!("talker (Qwen3-TTS 12 Hz, {}) and codec on {} in {:.0} s", if int8 { "int8" } else { "half" }, gpu.name, t0.elapsed().as_secs_f64()));
-        Ok(Talk { ops, nsd, talker, codec, conf, speaker, weights, voices: voices.to_path_buf() })
+        Ok(Talk { ops, nsd, talker, codec, conf, speaker, weights, voices: voices.to_path_buf(), encoder: OnceLock::new(), codec_file,
+                  icl: Mutex::new(Vec::new()) })
+    }
+
+    /// The codec's encoder, loaded now if it is not yet (the talker's lock held: one loader)
+    pub fn encoder(&self) -> Result<&Encoder> {
+        if let Some(e) = self.encoder.get() {
+            return Ok(e);
+        }
+        let t = Instant::now();
+        let e = Encoder::load(&self.ops.gpu, &CodecWeights::open(&self.codec_file)?)?;
+        let _ = self.encoder.set(e);
+        eprintln!("sophon-realtime: the codec's encoder (in-context clones) loaded in {:.1} s", t.elapsed().as_secs_f64());
+        self.encoder.get().ok_or_else(|| Error("the codec's encoder".into()))
+    }
+
+    /// A recording (`samples` at `rate`, already cut to what is kept) and its transcript (`ids`: the transcript's
+    /// text ids) made ready for an in-context clone - or the one made before for the same recording and text
+    pub fn icl(&self, samples: &[f32], rate: u32, text: &str, ids: &[u32]) -> Result<Arc<Icl>> {
+        self.icl_with(samples, rate, text, ids, None)
+    }
+
+    /// `icl`; `codes`: the recording's frames given (a check's: the reference's own), not encoded here (nor kept)
+    pub fn icl_with(&self, samples: &[f32], rate: u32, text: &str, ids: &[u32], codes: Option<Vec<Vec<i32>>>) -> Result<Arc<Icl>> {
+        let key = fingerprint(samples, rate, text);
+        let given = codes.is_some();
+        {
+            let mut c = self.icl.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(i) = c.iter().position(|(k, _)| *k == key && !given) {
+                let e = c.remove(i);
+                let v = e.1.clone();
+                c.push(e);
+                return Ok(v);
+            }
+        }
+        let t0 = Instant::now();
+        let sp = self.speaker.as_ref().ok_or_else(|| Error("the talker has no speaker encoder (no clones)".into()))?;
+        if ids.is_empty() {
+            return Err(Error("the reference's transcript made no tokens".into()));
+        }
+        let wav = crate::speaker::resample(samples, rate);
+        let xvec = sp.embed(&wav)?;
+        let codes = match codes {
+            Some(c) => c,
+            None => self.encoder()?.encode(&self.nsd, &wav)?,
+        };
+        let (ops, t) = (&self.ops, &self.talker);
+        let ss = t.session(ops, ids.len().max(codes.len() + 1).max(16), 1)?;
+        let mut codec_rows = t.codec_sum(ops, &ss, &[self.conf.bos])?;
+        for fr in &codes {
+            let idx: Vec<i32> = fr.iter().enumerate().map(|(g, x)| t.index(g, *x)).collect();
+            codec_rows.extend(t.codec_sum(ops, &ss, &idx)?);
+        }
+        let mut rows = Vec::with_capacity(ids.len() * t.fc1.k);
+        for &i in ids {
+            rows.extend(self.weights.rows_f32("talker.model.text_embedding.weight", i as usize, i as usize + 1)?);
+        }
+        let text_rows = t.project_text(ops, &self.nsd, &ss, &rows)?;
+        let icl = Arc::new(Icl { xvec, codes, text: text.to_string(), ids: ids.to_vec(), seconds: samples.len() as f64 / rate.max(1) as f64, codec_rows,
+                                 text_rows, made_s: t0.elapsed().as_secs_f64() });
+        if given {
+            return Ok(icl);
+        }
+        let mut c = self.icl.lock().unwrap_or_else(|e| e.into_inner());
+        c.push((key, icl.clone()));
+        if c.len() > ICL_KEEP {
+            c.remove(0);
+        }
+        Ok(icl)
     }
 
     /// The x-vector of a release voice: voices/<name>_<lang>.pt, else voices/<name>.pt (talker.py's lookup)
@@ -212,18 +381,23 @@ impl Talk {
     /// Speak the text `next` hands out as it comes (it blocks until there is more, or the end), in `xvec`'s voice:
     /// samples to `out` as they are made; `stop` asked between frames (a cancel: true ends it)
     #[allow(clippy::too_many_arguments)]
-    pub fn speak(&self, xvec: &[f32], lang: &str, draw: Draw, seed: u64, next: &mut dyn FnMut(usize) -> Feed, out: &mut dyn FnMut(&[f32]) -> Result<()>,
-                 stop: &dyn Fn() -> bool) -> Result<Spoken> {
-        self.speak_probed(xvec, lang, draw, seed, next, out, stop, None)
+    pub fn speak(&self, voice: &Voice, layout: IclLayout, lang: &str, draw: Draw, seed: u64, next: &mut dyn FnMut(usize) -> Feed,
+                 out: &mut dyn FnMut(&[f32]) -> Result<()>, stop: &dyn Fn() -> bool) -> Result<Spoken> {
+        self.speak_probed(voice, layout, lang, draw, seed, next, out, stop, None)
     }
 
     /// `speak`, `probe` catching the prompt, the first logits and the codes
     #[allow(clippy::too_many_arguments)]
-    pub fn speak_probed(&self, xvec: &[f32], lang: &str, draw: Draw, seed: u64, next: &mut dyn FnMut(usize) -> Feed,
+    pub fn speak_probed(&self, voice: &Voice, layout: IclLayout, lang: &str, draw: Draw, seed: u64, next: &mut dyn FnMut(usize) -> Feed,
                         out: &mut dyn FnMut(&[f32]) -> Result<()>, stop: &dyn Fn() -> bool, mut probe: Option<&mut Probe>) -> Result<Spoken> {
         let t0 = Instant::now();
         let (ops, nsd, t, c) = (&self.ops, &self.nsd, &self.talker, &self.conf);
         let h = t.lm.hidden;
+        let xvec = voice.xvec();
+        let icl = match voice {
+            Voice::InContext(i) => Some(i.as_ref()),
+            Voice::XVector(_) => None,
+        };
         if xvec.len() != h {
             return Err(Error(format!("a voice of {} values; the talker takes {h}", xvec.len())));
         }
@@ -238,8 +412,19 @@ impl Talk {
         if feed.ids.is_empty() {
             return Ok(Spoken::default());
         }
+        // upstream's in-context layout: the reply's text that falls beside the recording's frames is in the prompt,
+        // so a reply still being written is waited for until it covers them (or is whole)
+        let cl = icl.map_or(0, |i| i.codes.len() + 1);
+        if let (Some(i), IclLayout::Prompt) = (icl, layout) {
+            while !feed.done && i.ids.len() + feed.ids.len() < cl {
+                if stop() {
+                    return Ok(Spoken::default());
+                }
+                feed = next(cl - i.ids.len());
+            }
+        }
         let (max_tokens, max_frames) = (1024, 2400);
-        let ss = t.session(ops, 16, max_frames)?;
+        let ss = t.session(ops, 16 + cl, max_frames)?;
         let proj = |ids: &[u32]| -> Result<Vec<f32>> {
             let mut rows = Vec::with_capacity(ids.len() * self.talker.fc1.k);
             for &i in ids {
@@ -261,8 +446,45 @@ impl Talk {
             let base = if i + 1 < n { &tts_pad } else { &tts_bos };
             rows.extend(base.iter().zip(cr).map(|(a, b)| a + b));
         }
-        let first = proj(&feed.ids[..1])?;
-        rows.extend(first.iter().zip(&bos).map(|(a, b)| a + b));
+        // the text rows fed a frame each after the prompt (ahead of the ids still to come), the ids in them so far,
+        // and whether tts_eos is in already
+        let mut lead_rows: Vec<f32> = Vec::new();
+        let mut fed = 1usize;
+        let mut eos_in = false;
+        match (icl, layout) {
+            (None, _) => {
+                let first = proj(&feed.ids[..1])?;
+                rows.extend(first.iter().zip(&bos).map(|(a, b)| a + b));
+            }
+            (Some(i), IclLayout::Prompt) => {
+                // proj(ref text ++ reply [++ tts_eos once whole]) against codec [bos, frames]: its first cl rows in
+                // the prompt (tts_pad after a shorter text), the rest fed a frame each
+                let mut te = i.text_rows.clone();
+                te.extend(proj(&feed.ids)?);
+                fed = feed.ids.len();
+                if feed.done {
+                    te.extend_from_slice(&tts_eos);
+                    eos_in = true;
+                }
+                let tl = te.len() / h;
+                if tl < cl {
+                    te.extend((tl..cl).flat_map(|_| tts_pad.iter().copied()));
+                }
+                rows.extend(te[..cl * h].iter().zip(&i.codec_rows).map(|(a, b)| a + b));
+                lead_rows = te[cl * h..].to_vec();
+            }
+            (Some(i), IclLayout::Stream) => {
+                // proj(ref text) then tts_pad against codec [bos, frames]; the reply fed from the first frame
+                let mut te = i.text_rows.clone();
+                let tl = te.len() / h;
+                if tl < cl {
+                    te.extend((tl..cl).flat_map(|_| tts_pad.iter().copied()));
+                }
+                rows.extend(te[..cl * h].iter().zip(&i.codec_rows).map(|(a, b)| a + b));
+                lead_rows = te[cl * h..].to_vec();
+                fed = 0;
+            }
+        }
         let l = rows.len() / h;
         t.prefill(ops, nsd, &ss, &rows)?;
         if let Some(p) = probe.as_deref_mut() {
@@ -270,12 +492,15 @@ impl Talk {
             p.logits0 = t.logits0(ops, &ss)?;
         }
         // the text rows fed a frame each, on the card: [tokens + eos, then pad]
+        let lead_n = lead_rows.len() / h;
+        let max_tokens = max_tokens + lead_n;
         let feed_buf = DevBuf::f32(&ops.gpu, (max_tokens + 2) * h)?;
         let pad_at = max_tokens + 1;
         feed_buf.write(pad_at * h * 4, &crate::f32_bytes(&tts_pad))?;
-        let mut fed = 1usize; // text ids projected so far (the first is in the prompt)
-        let mut rows_in = 0usize; // rows in feed_buf
-        let mut eos_in = false;
+        if lead_n > 0 {
+            feed_buf.write(0, &crate::f32_bytes(&lead_rows))?;
+        }
+        let mut rows_in = lead_n; // rows in feed_buf
         let mut done = feed.done;
         let mut total_ids = feed.ids.len();
         let add = |ids: &[u32], from: usize, rows_in: &mut usize| -> Result<()> {
@@ -288,8 +513,10 @@ impl Talk {
             Ok(())
         };
         add(&feed.ids, fed, &mut rows_in)?;
-        fed = feed.ids.len();
+        fed = feed.ids.len().max(fed);
         let mut rng = Rng::new(seed);
+        // an in-context clone's frames go through the codec ahead of the new ones (their samples left out)
+        let rc: &[Vec<i32>] = icl.map_or(&[], |i| i.codes.as_slice());
         let mut codes: Vec<Vec<i32>> = Vec::new();
         let mut seen = Vec::new();
         let mut sent = 0;
@@ -331,12 +558,14 @@ impl Talk {
                 min_frames: if eos_in { 2 } else { usize::MAX },
             };
             let guard = FRAMES_PER_TOKEN * total_ids.max(1) + 60;
-            let fr = if eos_in && f > guard { None } else { t.frame(ops, nsd, &ss, l + f, fp(&feed_buf, at * h), &d, &seen, &mut rng, None)? };
+            // a check's forced run ends where its codes do
+            let forced = probe.as_deref().and_then(|p| p.force.as_ref()).map(|fc| fc.get(f).cloned().unwrap_or_else(|| vec![c.eos; t.groups]));
+            let fr = if eos_in && f > guard { None } else { t.frame(ops, nsd, &ss, l + f, fp(&feed_buf, at * h), &d, &seen, &mut rng, forced.as_deref())? };
             let Some(cd) = fr else { break };
             seen.push(cd[0]);
             codes.push(cd);
             if Codec::stream_due(codes.len(), sent, STREAM_FIRST) {
-                let mut wav = self.codec.decode_from(nsd, &codes, sent)?;
+                let mut wav = self.decode(&codes, rc, sent)?;
                 sent = codes.len();
                 if lead {
                     // the talker starts a reply with a little silence: dropped (talker.py's LEAD_TRIM, up to 1 s)
@@ -357,7 +586,7 @@ impl Talk {
             }
         }
         if !stop() && sent < codes.len() {
-            let wav = self.codec.decode_from(nsd, &codes, sent)?;
+            let wav = self.decode(&codes, rc, sent)?;
             if spoken.first_audio == 0.0 && !wav.is_empty() {
                 spoken.first_audio = t0.elapsed().as_secs_f64();
             }
@@ -367,9 +596,19 @@ impl Talk {
         spoken.frames = codes.len();
         if let Some(p) = probe {
             p.codes = codes;
+            p.misses = ss.misses.get();
         }
         spoken.seconds = t0.elapsed().as_secs_f64();
         Ok(spoken)
+    }
+
+    /// The samples of `codes[from..]`, an in-context clone's recording's frames `rc` ahead of them (the codec's context)
+    fn decode(&self, codes: &[Vec<i32>], rc: &[Vec<i32>], from: usize) -> Result<Vec<f32>> {
+        if rc.is_empty() {
+            return self.codec.decode_from(&self.nsd, codes, from);
+        }
+        let all: Vec<Vec<i32>> = rc.iter().chain(codes).cloned().collect();
+        self.codec.decode_from(&self.nsd, &all, rc.len() + from)
     }
 }
 

@@ -15,6 +15,13 @@
 //!
 //! The conversation runs through the audio contract's `Conversation` (the front door's /v1/realtime WebSocket, OpenAI
 //! Realtime's events); `generate` speaks a text in a Sophon voice (the talker alone).
+//!
+//! A cloned voice (a saved voice's recording, a request's reference) is its x-vector (upstream's talker.py way), or
+//! with NS_SOPHON_CLONE=icl - when its transcript is known - Qwen3-TTS's in-context clone (speak.rs): the recording
+//! (its first NS_SOPHON_ICL_MAX_S, cut between two words by the saved voice's word times) and what it says in the
+//! talker's prompt. The plain entry's Base talker clones closest that way; the -tags entry's fine-tuned talker ends
+//! its speech early with it, so it keeps the x-vector. /v1/audio/speech takes upstream's ICL layout; a live reply
+//! NS_SOPHON_ICL_LIVE's (stream: the reply fed a token a frame as it is written, the recording's prompt ahead).
 
 pub mod brain;
 pub mod check;
@@ -42,7 +49,7 @@ use crate::brain::{Brain, Layout, Slot};
 use crate::ear::Ear;
 use crate::ops::Shards;
 use crate::sample::Draw;
-use crate::speak::Talk;
+use crate::speak::{IclLayout, Talk, Voice};
 
 pub const ARCH: &str = "sophon-realtime";
 /// thinker-1..N: the thinker's shards; voice-1..N: the release's voices/<name>.pt
@@ -71,7 +78,67 @@ pub const OPTIONS: &[EngineOption] = &[
                    help: "the pauses (s) at which the brain is asked whether the user has finished", at: At::Both },
     EngineOption { name: "turn-thresholds", env: "NS_SOPHON_TURN_THRESHOLDS", value: "0.95,0.85,0.7,0.5,0.35,0.25",
                    help: "P(finished) that answers at each of those pauses", at: At::Both },
+    EngineOption { name: "clone", env: "NS_SOPHON_CLONE", value: "xvector|icl",
+                   help: "a cloned voice: its x-vector, or in context (its recording's frames and transcript in the prompt; x-vector when no transcript is known)",
+                   at: At::Both },
+    EngineOption { name: "icl-max-s", env: "NS_SOPHON_ICL_MAX_S", value: "16",
+                   help: "an in-context clone's recording at most this long (s): a longer one cut between two words (its word times), else its x-vector", at: At::Both },
+    EngineOption { name: "icl-live", env: "NS_SOPHON_ICL_LIVE", value: "prompt|stream",
+                   help: "a live reply's in-context layout: prompt (upstream's: the talker waits until the reply covers the recording or is whole) or stream (the reply fed as written: experimental, ends early or runs on)",
+                   at: At::Both },
 ];
+
+/// An in-context clone's longest recording (s) by default (Qwen3-TTS: a few seconds to about 15)
+pub const ICL_MAX_S: f64 = 16.0;
+/// and its shortest after a cut
+const ICL_MIN_S: f64 = 3.0;
+
+/// The part of a reference an in-context clone takes, and what it says. With the recogniser's word times (a saved
+/// voice Whisper has heard): cut between two words - after the last sentence that ends in the second half of the first
+/// `max_s` (of the recording), else after the last whole word there - the words before the cut its transcript, so a
+/// recording clipped mid-word (a 15 s or 60 s cut of a longer clip) or a transcript that does not match it exactly
+/// is not handed over as it is. Without them: the whole recording and its transcript, when it is at most `max_s`.
+/// None: no transcript, too long with no word times to cut by, or under 3 s of words
+pub fn icl_part(r: &nextsycl_audio::Reference, max_s: f64) -> Option<(usize, String)> {
+    let text = r.text.as_deref().map(str::trim).filter(|t| !t.is_empty())?;
+    let rate = r.rate.max(1) as f64;
+    let secs = r.samples.len() as f64 / rate;
+    let w: Vec<&nextsycl_audio::Timed> = r.words.iter().filter(|w| !w.text.trim().is_empty() && w.end > w.start).collect();
+    if w.is_empty() {
+        return (secs <= max_s).then(|| (r.samples.len(), text.to_string()));
+    }
+    let limit = max_s.min(secs);
+    let fits: Vec<usize> = (0..w.len()).filter(|&k| w[k].end <= limit).collect();
+    let last = *fits.last()?;
+    let sentence_end = |t: &str| {
+        let t = t.trim_end().trim_end_matches(['"', '\'', '”', '’', ')']);
+        !t.ends_with("...") && !t.ends_with('…') && t.ends_with(['.', '!', '?', '。', '！', '？'])
+    };
+    let sentence = fits.iter().rev().copied().find(|&k| w[k].end >= (limit * 0.5).max(ICL_MIN_S) && sentence_end(&w[k].text));
+    let k = sentence.unwrap_or(last);
+    // halfway into the gap after the word (at most 0.25 s past it), never past the limit
+    let gap_end = w.get(k + 1).map_or(w[k].end + 0.25, |n| n.start);
+    let cut = (w[k].end + ((gap_end - w[k].end) / 2.0).clamp(0.0, 0.25)).min(limit);
+    if cut < ICL_MIN_S {
+        return None;
+    }
+    // whisper's words carry their leading space, or come bare (joined by one, but before a "-ho" or "'s")
+    let spaced = w[1..=k].iter().any(|x| x.text.starts_with(char::is_whitespace));
+    let said = if spaced {
+        w[..=k].iter().map(|x| x.text.as_str()).collect::<String>()
+    } else {
+        let mut s = String::new();
+        for (i, x) in w[..=k].iter().enumerate() {
+            let t = x.text.trim();
+            if i > 0 && !t.starts_with(['-', '\'', '’', ',', '.', '!', '?']) {
+                s.push(' ');
+            }
+            s.push_str(t);
+        }
+        s
+    };
+    Some((((cut * rate) as usize).min(r.samples.len()), said.trim().to_string()))
+}
 
 pub fn kind() -> AudioKind {
     AudioKind { archs: &[ARCH], name: "Sophon-Realtime Flash (full-duplex voice conversation: a 32B brain that listens and a Qwen3-TTS voice; /v1/realtime)",
@@ -101,6 +168,10 @@ pub struct Inner {
     pub turn_thresholds: Vec<f32>,
     /// voices: name -> its x-vector file
     pub voices: Vec<(String, PathBuf)>,
+    /// a cloned voice in context (NS_SOPHON_CLONE=icl), its recording at most this long, a live reply's layout
+    pub clone_icl: bool,
+    pub icl_max_s: f64,
+    pub icl_live: IclLayout,
 }
 
 pub struct Sophon {
@@ -112,6 +183,23 @@ pub struct Sophon {
 
 fn role(files: &ModelFiles, r: &str) -> Result<PathBuf> {
     files.get(r).cloned().ok_or_else(|| Error(format!("{ARCH}: no {r} file")))
+}
+
+/// NS_SOPHON_CLONE / the clone option: whether a cloned voice is in context (default: its x-vector)
+fn clone_mode(v: Option<&str>) -> Result<bool> {
+    match v.map(str::trim) {
+        None | Some("" | "xvector") => Ok(false),
+        Some("icl") => Ok(true),
+        Some(x) => Err(Error(format!("clone {x:?}: xvector or icl"))),
+    }
+}
+
+/// NS_SOPHON_ICL_MAX_S / the icl-max-s option
+fn icl_max(v: Option<&str>) -> Result<f64> {
+    match v.map(str::trim).filter(|x| !x.is_empty()) {
+        None => Ok(ICL_MAX_S),
+        Some(x) => x.parse::<f64>().ok().filter(|s| *s >= ICL_MIN_S && *s <= 60.0).ok_or_else(|| Error(format!("icl-max-s {x:?}: seconds, 3 to 60"))),
+    }
 }
 
 fn floats(s: &str) -> Result<Vec<f32>> {
@@ -220,15 +308,28 @@ impl Sophon {
         let greedy = o.setting("NS_SOPHON_GREEDY").is_some_and(|v| v == "1");
         let turn_checks = floats(&o.setting("NS_SOPHON_TURN_CHECKS").unwrap_or_else(|| "0.2,0.35,0.5,0.8,1.3,2.0".into()))?;
         let turn_thresholds = floats(&o.setting("NS_SOPHON_TURN_THRESHOLDS").unwrap_or_else(|| "0.95,0.85,0.7,0.5,0.35,0.25".into()))?;
+        let clone_icl = clone_mode(o.setting("NS_SOPHON_CLONE").as_deref())?;
+        let icl_max_s = icl_max(o.setting("NS_SOPHON_ICL_MAX_S").as_deref())?;
+        let icl_live = IclLayout::parse(&o.setting("NS_SOPHON_ICL_LIVE").unwrap_or_else(|| "prompt".into()))?;
+        // the codec's encoder now (an in-context clone's frames), not at the first cloned voice
+        if let (true, Some(t)) = (clone_icl, &talk) {
+            t.encoder()?;
+        }
         let mut report = vec![format!("{ARCH} brain {} on {}, talker on {}", layout.name(),
-                                      brain.devs.iter().map(|d| d.ops.gpu.name.clone()).collect::<Vec<_>>().join(" + "), talker_gpu.name)];
+                                      brain.devs.iter().map(|d| d.ops.gpu.name.clone()).collect::<Vec<_>>().join(" + "), talker_gpu.name),
+                              format!("  a cloned voice {}", if clone_icl {
+                                  format!("in context (its recording up to {icl_max_s} s and transcript; live replies {icl_live:?})")
+                              } else {
+                                  "by its x-vector".to_string()
+                              })];
         for (g, b) in &need {
             report.push(format!("  planned {:.1} GiB on {}", *b as f64 / GIB, g.name));
         }
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("{ARCH}: ready in {load_s:.0} s"));
         Ok(Sophon {
-            inner: Arc::new(Inner { mind: Mutex::new(Mind { ear, brain, reply, check }), talk: Mutex::new(talk), tok, greedy, turn_checks, turn_thresholds, voices }),
+            inner: Arc::new(Inner { mind: Mutex::new(Mind { ear, brain, reply, check }), talk: Mutex::new(talk), tok, greedy, turn_checks, turn_thresholds, voices,
+                                    clone_icl, icl_max_s, icl_live }),
             load_s,
             loaded: Instant::now(),
             report,
@@ -248,6 +349,48 @@ impl Inner {
             Some(p) => speak::read_pt_xvector(&p),
             None => Err(Error(format!("voice {want:?}: one of {} (or a saved voice's recording)", self.voice_names().join(", ")))),
         }
+    }
+
+    /// The voice a request or session speaks in: a release voice by name (its x-vector); a reference recording in
+    /// context when that is asked for (`extra`'s clone, else NS_SOPHON_CLONE) and its transcript is known, else its
+    /// x-vector. The talker's lock held by the caller
+    pub fn speaker(&self, talk: &Talk, reference: Option<&nextsycl_audio::Reference>, name: Option<&str>, lang: &str, extra: &nextsycl_audio::Given)
+                   -> Result<Voice> {
+        let Some(r) = reference else {
+            return Ok(Voice::XVector(self.voice(name, lang)?));
+        };
+        let icl = match given(extra, "clone") {
+            Some(v) => clone_mode(Some(v))?,
+            None => self.clone_icl,
+        };
+        let max_s = match given(extra, "icl-max-s") {
+            Some(v) => icl_max(Some(v))?,
+            None => self.icl_max_s,
+        };
+        if icl {
+            match icl_part(r, max_s) {
+                Some((n, text)) => {
+                    let ids = icl_ids(&self.tok, &text);
+                    let t = Instant::now();
+                    let i = talk.icl(&r.samples[..n], r.rate, &text, &ids)?;
+                    eprintln!("{ARCH}: an in-context clone of {:.1} s ({} frames, {} transcript tokens{}): {:?}", i.seconds, i.codes.len(), i.ids.len(),
+                              if t.elapsed().as_secs_f64() < i.made_s / 2.0 { ", kept from before".to_string() } else { format!(", made in {:.2} s", i.made_s) },
+                              text.chars().take(60).collect::<String>());
+                    return Ok(Voice::InContext(i));
+                }
+                None => eprintln!("{ARCH}: a clone by its x-vector ({})", if r.text.as_deref().is_none_or(|t| t.trim().is_empty()) {
+                    "no transcript known".to_string()
+                } else {
+                    format!("{:.1} s, over {max_s} s, and no word times to cut it by", r.samples.len() as f64 / r.rate.max(1) as f64)
+                }),
+            }
+        }
+        Ok(Voice::XVector(talk.clone_voice(&r.samples, r.rate)?))
+    }
+
+    /// A live reply's in-context layout (`extra`'s icl-live, else NS_SOPHON_ICL_LIVE)
+    pub fn live_layout(&self, extra: &nextsycl_audio::Given) -> Result<IclLayout> {
+        given(extra, "icl-live").map_or(Ok(self.icl_live), IclLayout::parse)
     }
 
     pub fn voice_names(&self) -> Vec<String> {
@@ -288,6 +431,18 @@ pub fn tags_spoken() -> bool {
     std::env::var("NS_SOPHON_TAGS").map_or(true, |v| v.trim() != "0")
 }
 
+/// An in-context clone's transcript as the talker reads it: qwen-tts's ref_ids - the reference template
+/// "<|im_start|>assistant\n{text}<|im_end|>\n" (NFC) tokenized, the role's three ids and the last two off
+pub fn icl_ids(tok: &Tokenizer, text: &str) -> Vec<u32> {
+    use unicode_normalization::UnicodeNormalization;
+    let t = format!("<|im_start|>assistant\n{}<|im_end|>\n", text.trim()).nfc().collect::<String>();
+    let ids = tok.encode(&t);
+    if ids.len() < 6 {
+        return Vec::new();
+    }
+    ids[3..ids.len() - 2].to_vec()
+}
+
 /// Speakable text's ids (proc.py's thinker2talker_async_chunk): the text before a tool call, tag_clean (the sound
 /// tags kept), the thinker's tokenizer without special tokens; `tags` false: the tags taken out too (text::without_tags)
 pub fn speakable_ids(tok: &Tokenizer, text: &str, last: bool, tags: bool) -> Vec<u32> {
@@ -315,7 +470,8 @@ impl AudioEngine for Sophon {
             design: false,
             clone: true,
             clone_needs_text: false,
-            clone_takes_text: false,
+            // in context (NS_SOPHON_CLONE=icl) a transcript makes the closer clone
+            clone_takes_text: self.inner.clone_icl,
             direction: false,
             // none when the talker is not handed them (NS_SOPHON_TAGS=0: the plain entry's Base talker, which reads them)
             events: if tags_spoken() {
@@ -387,10 +543,7 @@ impl Sophon {
         let lang = &lang[..2.min(lang.len())];
         let guard = self.inner.talk.lock().unwrap_or_else(|e| e.into_inner());
         let talk = guard.as_ref().ok_or_else(|| Error("loaded without its talker".into()))?;
-        let xvec = match &req.reference {
-            Some(r) => talk.clone_voice(&r.samples, r.rate)?,
-            None => self.inner.voice(req.voice.as_deref(), lang)?,
-        };
+        let voice = self.inner.speaker(talk, req.reference.as_ref(), req.voice.as_deref(), lang, &req.extra)?;
         let ids = self.inner.speakable_ids(&req.prompt, true);
         if ids.is_empty() {
             return Err(Error("the text has nothing to say".into()));
@@ -398,10 +551,11 @@ impl Sophon {
         progress(Step { phase: "tokens", at: 0, of: 1, seconds: 0.0 })?;
         let draw = self.inner.talker_draw(&req.extra);
         let mut next = |_: usize| speak::Feed { ids: ids.clone(), done: true };
-        let sp = talk.speak(&xvec, lang, draw, req.seed, &mut next, out, &|| false)?;
+        // the whole text in hand: upstream's in-context layout
+        let sp = talk.speak(&voice, IclLayout::Prompt, lang, draw, req.seed, &mut next, out, &|| false)?;
         progress(Step { phase: "tokens", at: 1, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
-        eprintln!("{ARCH}: {} frames ({:.1} s of speech) in {:.2} s, first audio {:.2} s", sp.frames, sp.samples as f64 / speak::RATE as f64, sp.seconds,
-                  sp.first_audio);
+        eprintln!("{ARCH}: {} frames ({:.1} s of speech) in {:.2} s, first audio {:.2} s{}", sp.frames, sp.samples as f64 / speak::RATE as f64, sp.seconds,
+                  sp.first_audio, if voice.in_context() { " (in context)" } else { "" });
         Ok(())
     }
 }
@@ -440,4 +594,53 @@ pub fn files_in(dir: &Path) -> Result<ModelFiles> {
         f.insert(format!("voice-{}", i + 1), p);
     }
     Ok(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nextsycl_audio::{Reference, Timed};
+
+    fn w(start: f64, end: f64, text: &str) -> Timed {
+        Timed { start, end, text: text.into(), probability: None }
+    }
+
+    #[test]
+    fn an_in_context_clone_takes_a_cut_between_words() {
+        let rate = 1000;
+        let r = |secs: f64, text: Option<&str>, words: Vec<Timed>| Reference { samples: vec![0.0; (secs * rate as f64) as usize], rate,
+                                                                              text: text.map(str::to_string), words };
+        // short enough and no word times: all of it, its text
+        assert_eq!(icl_part(&r(10.0, Some(" Hello there. "), vec![]), 16.0), Some((10_000, "Hello there.".into())));
+        // short enough with word times: the clipped last word left off, an ellipsis is no sentence's end, the words' text
+        let clipped = vec![w(0.5, 2.0, "Hidey"), w(2.0, 2.3, "-ho"), w(2.3, 4.0, "there."), w(4.2, 6.0, "As"), w(6.1, 7.0, "I..."), w(7.2, 9.0, "it."),
+                           w(9.5, 9.95, "Since...")];
+        assert_eq!(icl_part(&r(10.0, Some("Heidi, hold there."), clipped.clone()), 16.0), Some((9_250, "Hidey-ho there. As I... it.".into())));
+        assert_eq!(icl_part(&r(10.0, Some("x"), clipped), 6.5), Some((4_100, "Hidey-ho there.".into())));
+        // no transcript: none (its x-vector)
+        assert_eq!(icl_part(&r(10.0, None, vec![]), 16.0), None);
+        assert_eq!(icl_part(&r(10.0, Some("  "), vec![]), 16.0), None);
+        // too long and no word times: none
+        assert_eq!(icl_part(&r(40.0, Some("Long."), vec![]), 16.0), None);
+        // too long: cut after the last sentence that ends in the second half, halfway into the gap after it
+        let words = vec![w(0.5, 2.0, " One"), w(2.1, 9.0, " two."), w(9.4, 12.0, " Three"), w(12.1, 15.8, " four"), w(15.9, 17.0, " five.")];
+        assert_eq!(icl_part(&r(40.0, Some("One two. Three four five. Six."), words.clone()), 16.0), Some((9_200, "One two.".into())));
+        // no sentence end late enough: after the last word that fits
+        assert_eq!(icl_part(&r(40.0, Some("x"), words), 10.0), Some((9_200, "One two.".into())));
+        let plain = vec![w(0.5, 4.0, "alpha"), w(4.2, 8.0, "beta"), w(8.2, 12.0, "gamma")];
+        assert_eq!(icl_part(&r(40.0, Some("x"), plain), 10.0), Some((8_100, "alpha beta".into())));
+        // under 3 s of words before the limit: none
+        assert_eq!(icl_part(&r(40.0, Some("x"), vec![w(0.2, 2.0, " Hi."), w(2.5, 30.0, " long")]), 16.0), None);
+    }
+
+    #[test]
+    fn clone_settings() {
+        assert!(!clone_mode(None).unwrap() && !clone_mode(Some("xvector")).unwrap() && clone_mode(Some("icl")).unwrap());
+        assert!(clone_mode(Some("both")).is_err());
+        assert_eq!(icl_max(None).unwrap(), ICL_MAX_S);
+        assert_eq!(icl_max(Some("12")).unwrap(), 12.0);
+        assert!(icl_max(Some("1")).is_err() && icl_max(Some("x")).is_err());
+        assert_eq!(IclLayout::parse("stream").unwrap(), IclLayout::Stream);
+        assert!(IclLayout::parse("x").is_err());
+    }
 }

@@ -19,9 +19,13 @@
 //!   talker  request.json's text          -> the speakable ids against ids.npy, the prompt's rows against prefill.npy,
 //!                                           the first logits against logits0.npy, greedy codes against codes.npy;
 //!           (its "reference": a recording) -> the clone's x-vector against xvec.npy (talker_ref.py --ref-wav), ns_xvec.npy
+//!           (and "ref_text": in context)  -> the transcript's ids against ref_ids.npy, the recording's frames against
+//!                                           ref_codes.npy (talker_ref.py --ref-text: qwen-tts's ICL prompt)
 //!   speak   lines.json (lines x seeds)   -> <name>-s<seed>.wav here, sampled as served (NS_SOPHON_TAGS applies);
-//!           (its "voices": [{name, reference?}]) -> <voice>-<name>-s<seed>.wav and <voice>.xvec.npy, each voice a
-//!           release voice by name or a recording's clone; "temperature" draws the talker and its predictor at it
+//!           (its "voices": [{name, reference?, text?, words?}]) -> <voice>-<name>-s<seed>.wav and <voice>.xvec.npy,
+//!           each voice a release voice by name or a recording's clone; "temperature" draws the talker and its
+//!           predictor at it; "clone": "icl" clones a voice with a text in context ("layout": prompt | stream,
+//!           "icl_max_s": its longest recording, cut by "words")
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -34,8 +38,8 @@ use nextsycl_tok::Tokenizer;
 
 use crate::brain::{argmax, Rows};
 use crate::sample::Draw;
-use crate::speak::{Feed, Probe, Talk};
-use crate::{ear, Sophon};
+use crate::speak::{Feed, IclLayout, Probe, Talk, Voice};
+use crate::{ear, icl_ids, icl_part, Sophon};
 
 /// The stages the talker alone answers (`talker`)
 pub const TALKER_STAGES: &[&str] = &["talker", "speak"];
@@ -82,16 +86,48 @@ fn write_npy(path: &Path, v: &[f32]) -> Result<()> {
     std::fs::write(path, b).map_err(|e| Error(format!("{}: {e}", path.display())))
 }
 
-/// A voice for a check: a recording's clone (`reference`: a WAV's path) or a release voice by name
-fn check_voice(talk: &Talk, v: &serde_json::Value, lang: &str) -> Result<Vec<f32>> {
+/// A voice for a check: a recording's clone (`reference`: a WAV's path; with `icl` and its `ref_text` - or `text` -
+/// in context, `words` its word times) or a release voice by name
+fn check_voice(talk: &Talk, tok: &Tokenizer, v: &serde_json::Value, lang: &str, icl: bool, max_s: f64, log: &mut dyn FnMut(String)) -> Result<Voice> {
     match v["reference"].as_str() {
         Some(p) => {
             let b = std::fs::read(p).map_err(|e| Error(format!("{p}: {e}")))?;
             let (samples, rate) = nextsycl_audio::decode_wav(&b).map_err(|e| Error(format!("{p}: {e}")))?;
-            talk.clone_voice(&samples, rate)
+            let text = v["ref_text"].as_str().or_else(|| v["text"].as_str()).map(str::to_string);
+            let words = v["words"].as_array().into_iter().flatten().filter_map(|w| {
+                Some(nextsycl_audio::Timed { start: w["start"].as_f64()?, end: w["end"].as_f64()?, text: w["text"].as_str()?.to_string(), probability: None })
+            }).collect();
+            let r = nextsycl_audio::Reference { samples, rate, text, words };
+            if icl {
+                match icl_part(&r, max_s) {
+                    Some((n, t)) => {
+                        let i = talk.icl(&r.samples[..n], rate, &t, &icl_ids(tok, &t))?;
+                        log(format!("voice {p}: in context, {:.2} s kept ({} frames, {} transcript tokens, made in {:.2} s): {t:?}", i.seconds, i.codes.len(),
+                                    i.ids.len(), i.made_s));
+                        return Ok(Voice::InContext(i));
+                    }
+                    None => log(format!("voice {p}: no transcript to clone in context by (or too long without word times): its x-vector")),
+                }
+            }
+            Ok(Voice::XVector(talk.clone_voice(&r.samples, r.rate)?))
         }
-        None => talk.voice(v["voice"].as_str().or_else(|| v["name"].as_str()).unwrap_or("chelsie"), lang),
+        None => Ok(Voice::XVector(talk.voice(v["voice"].as_str().or_else(|| v["name"].as_str()).unwrap_or("chelsie"), lang)?)),
     }
+}
+
+/// A .npy of int32 rows ([n] or [n, w])
+fn write_npy_i32(path: &Path, v: &[i32], w: usize) -> Result<()> {
+    let shape = if w > 1 { format!("({}, {w})", v.len() / w) } else { format!("({},)", v.len()) };
+    let mut head = format!("{{'descr': '<i4', 'fortran_order': False, 'shape': {shape}, }}");
+    while (10 + head.len() + 1) % 64 != 0 {
+        head.push(' ');
+    }
+    head.push('\n');
+    let mut b = b"\x93NUMPY\x01\x00".to_vec();
+    b.extend_from_slice(&(head.len() as u16).to_le_bytes());
+    b.extend_from_slice(head.as_bytes());
+    b.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+    std::fs::write(path, b).map_err(|e| Error(format!("{}: {e}", path.display())))
 }
 
 fn f32s(path: &Path) -> Result<Vec<f32>> {
@@ -250,12 +286,29 @@ pub fn talker(files: &ModelFiles, gpu: &Arc<Gpu>, dir: &Path, stages: &[String],
         let req = json(&dir.join("request.json"))?;
         let text = req["text"].as_str().unwrap_or_default();
         let lang = req["lang"].as_str().unwrap_or("en");
-        let xvec = check_voice(&talk, &req, lang)?;
+        // in context when the dump is of qwen-tts's ICL prompt (talker_ref.py --ref-text), the recording kept whole
+        let icl = req["ref_text"].is_string();
+        let voice = check_voice(&talk, &tok, &req, lang, icl, f64::MAX, log)?;
         if req["reference"].is_string() {
-            write_npy(&dir.join("ns_xvec.npy"), &xvec)?;
+            write_npy(&dir.join("ns_xvec.npy"), voice.xvec())?;
             if dir.join("xvec.npy").exists() {
-                report(log, &mut worst, "talker: the clone's x-vector", &xvec, &f32s(&dir.join("xvec.npy"))?);
+                report(log, &mut worst, "talker: the clone's x-vector", voice.xvec(), &f32s(&dir.join("xvec.npy"))?);
             }
+        }
+        if let Voice::InContext(i) = &voice {
+            let ids_ref: Vec<u32> = read_npy(&dir.join("ref_ids.npy"))?.1.iter().map(|x| *x as u32).collect();
+            log(format!("talker: the transcript's ids {} (reference: {}): {:?}", if i.ids == ids_ref { "the same" } else { "DIFFER" }, ids_ref.len(), i.ids));
+            if i.ids != ids_ref {
+                log(format!("talker: the reference's {ids_ref:?}"));
+                worst = f64::INFINITY;
+            }
+            write_npy_i32(&dir.join("ns_ref_codes.npy"), &i.codes.concat(), 16)?;
+            let (shape, c) = read_npy(&dir.join("ref_codes.npy"))?;
+            let rc: Vec<Vec<i32>> = c.chunks(shape.get(1).copied().unwrap_or(16)).map(|r| r.iter().map(|x| *x as i32).collect()).collect();
+            let same: usize = i.codes.iter().zip(&rc).map(|(a, b)| a.iter().zip(b).filter(|(x, y)| x == y).count()).sum();
+            let first: usize = i.codes.iter().zip(&rc).filter(|(a, b)| a[0] == b[0]).count();
+            log(format!("talker: the recording's frames {} here, {} in the reference; codes agree on {same} of {} (first codebook {first} of {})", i.codes.len(),
+                        rc.len(), i.codes.len().min(rc.len()) * 16, i.codes.len().min(rc.len())));
         }
         // the tags handed over whatever NS_SOPHON_TAGS says: the reference is upstream's path (a dump made with tags)
         let ids = crate::speakable_ids(&tok, text, true, true);
@@ -265,38 +318,63 @@ pub fn talker(files: &ModelFiles, gpu: &Arc<Gpu>, dir: &Path, stages: &[String],
             log(format!("talker: the reference's {ids_ref:?}"));
             worst = f64::INFINITY;
         }
-        let mut probe = Probe::default();
-        let mut next = |_: usize| Feed { ids: ids.clone(), done: true };
-        talk.speak_probed(&xvec, lang, Draw::GREEDY, 0, &mut next, &mut sink, &|| false, Some(&mut probe))?;
-        report(log, &mut worst, "talker: prompt rows", &probe.prefill, &f32s(&dir.join("prefill.npy"))?);
-        let l0 = f32s(&dir.join("logits0.npy"))?;
-        report(log, &mut worst, "talker: first logits", &probe.logits0, &l0);
-        log(format!("talker: first code here {} (reference {})", argmax(&probe.logits0), argmax(&l0)));
-        let (shape, c) = read_npy(&dir.join("codes.npy"))?;
-        let g = shape.get(1).copied().unwrap_or(16);
-        let codes_ref: Vec<Vec<i32>> = c.chunks(g).map(|r| r.iter().map(|x| *x as i32).collect()).collect();
-        let n = probe.codes.len().min(codes_ref.len());
-        let same_frames = probe.codes.iter().zip(&codes_ref).take_while(|(a, b)| a == b).count();
-        let c0 = probe.codes.iter().zip(&codes_ref).filter(|(a, b)| a[0] == b[0]).count();
-        let all: usize = probe.codes.iter().zip(&codes_ref).map(|(a, b)| a.iter().zip(b.iter()).filter(|(x, y)| x == y).count()).sum();
-        log(format!("talker: greedy frames {} here, {} in the reference; the first {same_frames} identical; of the {n} in both, first codes agree on {c0}, \
-                     all codes on {all} of {}", probe.codes.len(), codes_ref.len(), n * g));
-        log(format!("talker: the first frames here {:?}", &probe.codes[..probe.codes.len().min(3)]));
-        log(format!("talker: the reference's       {:?}", &codes_ref[..codes_ref.len().min(3)]));
+        // in context: the prompt made from the reference's own frames too (the encoder's few differing codes apart)
+        let mut runs = vec![("", voice.clone())];
+        if let Voice::InContext(i) = &voice {
+            let (shape, c) = read_npy(&dir.join("ref_codes.npy"))?;
+            let rc: Vec<Vec<i32>> = c.chunks(shape.get(1).copied().unwrap_or(16)).map(|r| r.iter().map(|x| *x as i32).collect()).collect();
+            let p = req["reference"].as_str().unwrap_or_default();
+            let (samples, rate) = nextsycl_audio::decode_wav(&std::fs::read(p).map_err(|e| Error(format!("{p}: {e}")))?).map_err(Error)?;
+            runs.push((" (the reference's frames)", Voice::InContext(talk.icl_with(&samples, rate, &i.text, &i.ids, Some(rc))?)));
+        }
+        for (what, voice) in runs {
+            let mut probe = Probe::default();
+            let mut next = |_: usize| Feed { ids: ids.clone(), done: true };
+            talk.speak_probed(&voice, IclLayout::Prompt, lang, Draw::GREEDY, 0, &mut next, &mut sink, &|| false, Some(&mut probe))?;
+            log(format!("talker: the run{what}"));
+            report(log, &mut worst, "talker: prompt rows", &probe.prefill, &f32s(&dir.join("prefill.npy"))?);
+            let l0 = f32s(&dir.join("logits0.npy"))?;
+            report(log, &mut worst, "talker: first logits", &probe.logits0, &l0);
+            log(format!("talker: first code here {} (reference {})", argmax(&probe.logits0), argmax(&l0)));
+            let (shape, c) = read_npy(&dir.join("codes.npy"))?;
+            let g = shape.get(1).copied().unwrap_or(16);
+            let codes_ref: Vec<Vec<i32>> = c.chunks(g).map(|r| r.iter().map(|x| *x as i32).collect()).collect();
+            let n = probe.codes.len().min(codes_ref.len());
+            let same_frames = probe.codes.iter().zip(&codes_ref).take_while(|(a, b)| a == b).count();
+            let c0 = probe.codes.iter().zip(&codes_ref).filter(|(a, b)| a[0] == b[0]).count();
+            let all: usize = probe.codes.iter().zip(&codes_ref).map(|(a, b)| a.iter().zip(b.iter()).filter(|(x, y)| x == y).count()).sum();
+            log(format!("talker: greedy frames {} here, {} in the reference; the first {same_frames} identical; of the {n} in both, first codes agree on {c0}, \
+                         all codes on {all} of {}", probe.codes.len(), codes_ref.len(), n * g));
+            log(format!("talker: the first frames here {:?}", &probe.codes[..probe.codes.len().min(3)]));
+            log(format!("talker: the reference's       {:?}", &codes_ref[..codes_ref.len().min(3)]));
+            // the reference's codes forced frame by frame: where greedy here would have taken another code
+            let mut forced = Probe { force: Some(codes_ref.clone()), ..Probe::default() };
+            let mut next = |_: usize| Feed { ids: ids.clone(), done: true };
+            talk.speak_probed(&voice, IclLayout::Prompt, lang, Draw::GREEDY, 0, &mut next, &mut sink, &|| false, Some(&mut forced))?;
+            log(format!("talker: forced through the reference's {} frames: first code misses {}, other codes' misses {} of {}", forced.codes.len(),
+                        forced.misses[0], forced.misses[1], forced.codes.len() * (g - 1)));
+        }
     }
     if want("speak") {
         let lj = json(&dir.join("lines.json"))?;
         let lang = lj["lang"].as_str().unwrap_or("en");
         // one voice (lines.json's "voice": the files <line>-s<seed>.wav), or several (its "voices": <voice>-<line>-s<seed>.wav)
-        let voices: Vec<(String, Vec<f32>)> = match lj["voices"].as_array() {
-            Some(vs) => vs.iter().map(|v| {
-                let name = v["name"].as_str().unwrap_or("voice").to_string();
-                let x = check_voice(&talk, v, lang)?;
-                write_npy(&dir.join(format!("{name}.xvec.npy")), &x)?;
-                Ok((format!("{name}-"), x))
-            }).collect::<Result<_>>()?,
-            None => vec![(String::new(), check_voice(&talk, &lj, lang)?)],
-        };
+        let icl = lj["clone"].as_str() == Some("icl");
+        let layout = IclLayout::parse(lj["layout"].as_str().unwrap_or("prompt"))?;
+        let max_s = lj["icl_max_s"].as_f64().unwrap_or(crate::ICL_MAX_S);
+        let mut voices: Vec<(String, Voice)> = Vec::new();
+        match lj["voices"].as_array() {
+            Some(vs) => {
+                for v in vs {
+                    let name = v["name"].as_str().unwrap_or("voice").to_string();
+                    let x = check_voice(&talk, &tok, v, lang, icl, max_s, log)?;
+                    write_npy(&dir.join(format!("{name}.xvec.npy")), x.xvec())?;
+                    voices.push((format!("{name}-"), x));
+                }
+            }
+            None => voices.push((String::new(), check_voice(&talk, &tok, &lj, lang, icl, max_s, log)?)),
+        }
+        log(format!("speak: clones {} ({layout:?} layout)", if icl { "in context where a transcript is given" } else { "by their x-vectors" }));
         let seeds: Vec<u64> = lj["seeds"].as_array().into_iter().flatten().filter_map(|v| v.as_u64()).collect();
         let draw = match lj["temperature"].as_f64() {
             Some(t) => Draw { temperature: t as f32, ..Draw::DEFAULT },
@@ -316,10 +394,11 @@ pub fn talker(files: &ModelFiles, gpu: &Arc<Gpu>, dir: &Path, stages: &[String],
                         Ok(())
                     };
                     let t = Instant::now();
-                    let sp = talk.speak(xvec, lang, draw, seed, &mut next, &mut keep, &|| false)?;
+                    let sp = talk.speak(xvec, layout, lang, draw, seed, &mut next, &mut keep, &|| false)?;
                     let path = dir.join(format!("{voice}{name}-s{seed}.wav"));
                     Audio { rate: crate::speak::RATE, channels: 1, samples: wav }.write_wav(&path, &[("ICMT", text)]).map_err(Error)?;
-                    log(format!("speak: {} ({} frames) in {:.1} s: {text:?}", path.display(), sp.frames, t.elapsed().as_secs_f64()));
+                    log(format!("speak: {} ({} frames) in {:.1} s, first audio {:.2} s: {text:?}", path.display(), sp.frames, t.elapsed().as_secs_f64(),
+                                sp.first_audio));
                 }
             }
         }
