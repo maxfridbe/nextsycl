@@ -48,6 +48,8 @@ image/                     IMAGES
                                  attention over a KV ring, the LQ projection, the tiny conditional decoder), stage checks
   zimage     nextsycl-image-zimage  Z-Image-Turbo: the 6B single-stream DiT (Ming-Image's transformer) on Qwen3-4B's
                                  states, Flux.1's VAE, 8 steps without guidance; a silo of fused passes, stage checks
+  depthanything nextsycl-image-depthanything  Depth Anything V2 Small: relative depth (DINOv2-S/14 + DPT), float32 -
+                                 video.control's depth control videos
   example    nextsycl-image-example  a template
 
 video/                     VIDEO
@@ -474,6 +476,23 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   float32 (the shared vision im2col and oneDNN's GEMM, its own ceil-mode pool, half-pixel upsampling, bias + ReLU and
   sigmoid in `kernels/image/rembg`), rembg's Lanczos preparation and min-max mask. `post_process_mask` (either model)
   is rembg's opening, 5 x 5 Gaussian and threshold, written to OpenCV's 8-bit fixed point.
+- **depthanything** (`image/depthanything`, arch `depth-anything-v2`) - Depth Anything V2 Small (transformers'
+  DepthAnythingForDepthEstimation, Apache-2.0; Base and Large are CC-BY-NC-4.0 and not served): a picture's relative
+  inverse depth (`ImageEngine::depth`), what video.control's depth control videos are made of (nextcuda's API and
+  shapes). DINOv2 ViT-S/14 (the taps after layers 3, 6, 9, 12 through its final norm) and the DPT head in float32: the
+  shared diffusion linear (oneDNN) for every product, the vision im2col and align-corners resize, its own kernels
+  (`kernels/image/depthanything`: embeddings, layer norm, bias / GELU / ReLU, LayerScale residual, the transposed
+  convolutions' pixel shuffle, a half-pixel resize) and its silo's attention as products (`silo/gemm_attn.cpp` lays the
+  heads out, takes the scaled softmax and merges them; q k^T and p v on the shared linear - the per-query kernel took
+  46 ms a layer at 2,550 tokens on a B65, the products a few). DPTImageProcessor's preparation (the side nearest 518 on
+  the 14 grid keeping the aspect, Pillow's bicubic, ImageNet's normalization), the depth back at the picture's size
+  bilinearly (half-pixel). Checked against transformers on the CPU (reference/depthanything/ref.py, `image depth
+  --check`): six frames of two H3 clips (2560 x 1440, 864 x 480, and a 896 x 512 control canvas) - every stage
+  within 3e-6 relative, the depth within 2.2e-4 absolute (4e-5 of its 0-7.6 range), the 8-bit map equal on 99.993 %
+  of pixels and never more than 1 apart. B65: ~0.10 s a picture at 924 x 518 into the network (the backbone ~58 ms,
+  neck and head ~42 ms, synced by section). The clip path is the glue's (video/studio/control.rs `make_depth`, as
+  nextcuda's): every frame's depth kept in 16 bits, then one range for the clip (the 0.5th-99.5th percentile), grey,
+  near bright. `NS_PROFILE=1` prints a pass by op class.
 
 ## The audio engines
 

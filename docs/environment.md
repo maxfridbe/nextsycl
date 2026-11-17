@@ -103,7 +103,7 @@ The llm kind's common options (`nextsycl_llm::COMMON_OPTIONS`); what each engine
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
-| `NS_PROFILE` | off | Time the passes by section (1: GPU synced at each boundary; gpu: device timestamps, no syncs; deepseek2: 1 its decode passes, prompt its prompt passes) (--opt-profile) | llm glm5next, llm qwen35 (NS_Q35_PROFILE needs gpu), llm deepseek2, llm minimaxm3, kernels:ns (gpu: profiling queues) |
+| `NS_PROFILE` | off | Time the passes by section (1: GPU synced at each boundary; gpu: device timestamps, no syncs; deepseek2: 1 its decode passes, prompt its prompt passes) (--opt-profile) | llm glm5next, llm qwen35 (NS_Q35_PROFILE needs gpu), llm deepseek2, llm minimaxm3, image depthanything (1: each op class of a pass), kernels:ns (gpu: profiling queues) |
 | `NS_SPLIT` | even by layer count (glm5next); planned by free VRAM (qwen4exp, qwen35) | Layers per GPU. glm5next: A,B,... layer counts of each GPU but the last; qwen4exp, qwen35: the first layer of each GPU after the first (same for two GPUs) (--opt-split) | llm glm5next, llm qwen4exp, llm qwen35 |
 | `NS_VRAM_GUARD_GIB` | glm5next: off; qwen4exp: 1.5 | VRAM (GiB) to keep free. glm5next: a prompt read stops with an error once a GPU has less free after a chunk; qwen4exp: the load plan's margin a GPU (--opt-vram-guard-gib) | llm glm5next, llm qwen4exp; cli (passes it to the container) |
 

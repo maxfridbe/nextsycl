@@ -333,6 +333,8 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
         "image" if arch == "flashvsr" => (vec!["upscale", "upscale_video", "temporal", "stream"], vec!["image.upscale", "video.upscale"]),
         "image" if arch == "starvector" => (vec!["vectorize", "svg"], vec!["image.vectorize"]),
         "image" if arch == "birefnet" || arch == "isnet" => (vec!["remove_background", "mask", "rgba"], vec!["image.remove_background"]),
+        // a depth estimator: video.control's depth control video
+        "image" if arch == "depth-anything-v2" => (vec!["depth"], vec!["video.control"]),
         "image" => {
             let mut c = vec!["generate", "edit", "compose", "img2img", "loras"];
             // a few-step preset: Qwen-Image's sigmas, or MiniMax-H3-Image's step count of 4 or fewer (the pDMD 2-step card)

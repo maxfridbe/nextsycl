@@ -39,7 +39,12 @@ impl Store for Mem {
         self.dir.join("models.json")
     }
     fn get(&self, name: &str) -> Option<String> {
-        (name == "NS_API_TOKEN").then(|| TOKEN.to_string())
+        match name {
+            "NS_API_TOKEN" => Some(TOKEN.to_string()),
+            // the clips beside the test's own files (video.control reads its source there)
+            "NS_VIDEO_OUT" => Some(self.dir.join("clips").to_string_lossy().into_owned()),
+            _ => None,
+        }
     }
     fn in_env(&self, _name: &str) -> bool {
         false
@@ -414,6 +419,62 @@ fn a_background_goes_to_a_remover_and_a_model_that_draws_is_refused_in_the_platf
     let v = ok(&a, "system.version", json!({}));
     assert!(v["methods"].as_array().unwrap().iter().any(|m| m == "image.remove_background"));
     assert!(v["features"].as_array().unwrap().iter().any(|m| m == "image.remove_background"));
+}
+
+#[test]
+fn video_control_depth_needs_a_depth_model_and_is_an_image_job() {
+    // (nextcuda's fixture test aff685a / b315f61, over HTTP) a clip in the clips directory; skipped where there is no ffmpeg
+    let mut drawer = entry("qwen-image-2.1-q8", "image", &[], true);
+    drawer["arch"] = json!("qwenimage21");
+    // (a video model enabled: video.control is a video method, as on nextcuda)
+    let video = entry("minimax-h3", "video", &[], true);
+    let a = door("control-depth", vec![video.clone(), drawer], vec![]);
+    let clips = std::env::temp_dir().join(format!("nextsycl-front-door-{}-control-depth", std::process::id())).join("clips");
+    std::fs::create_dir_all(&clips).unwrap();
+    let made = std::process::Command::new("ffmpeg").args(["-y", "-v", "error", "-f", "lavfi", "-i", "color=c=gray:s=320x240:r=24:d=1.2", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(clips.join("take.mp4")).status().is_ok_and(|s| s.success());
+    if !made {
+        return;
+    }
+    let ask = json!({"file": "take", "control": "depth", "width": 320, "height": 256, "frames": 22, "wait": false});
+    // no depth model enabled: refused when submitted, nothing queued
+    let e = err(&a, "video.control", ask.clone());
+    assert_eq!(e["status"], 409, "{e}");
+    assert!(e["message"].as_str().is_some_and(|m| m.contains("no depth model is enabled")), "{e}");
+    // system.version does not offer depth control videos (canny and gray it does)
+    let has = |f: &str| ok(&a, "system.version", json!({}))["features"].as_array().unwrap().iter().any(|x| x == f);
+    assert!(has("video.control") && has("video.control.canny") && has("video.control.gray") && !has("video.control.depth"));
+    // a model named that does not estimate depth: 400
+    let mut named = ask.clone();
+    named["model"] = json!("qwen-image-2.1-q8");
+    let e = err(&a, "video.control", named);
+    assert_eq!(e["status"], 400, "{e}");
+    assert!(e["message"].as_str().is_some_and(|m| m.contains("does not estimate depth")), "{e}");
+    // the source and settings are checked first, as the studio checks them for canny
+    for (k, v, st) in [("width", json!(300), 400), ("frames", json!(40), 400), ("file", json!("nothing-here"), 404)] {
+        let mut bad = ask.clone();
+        bad[k] = v;
+        let e = err(&a, "video.control", bad);
+        assert_eq!(e["status"], st, "{k}: {e}");
+    }
+    let a = door("control-depth2", vec![video, {
+        let mut d = entry("depth-anything-v2-small", "image", &[], true);
+        d["arch"] = json!("depth-anything-v2");
+        d
+    }], vec![]);
+    let clips2 = std::env::temp_dir().join(format!("nextsycl-front-door-{}-control-depth2", std::process::id())).join("clips");
+    std::fs::create_dir_all(&clips2).unwrap();
+    std::fs::copy(clips.join("take.mp4"), clips2.join("take.mp4")).unwrap();
+    // with a depth model: depth offered, a job of the image queue (wait false answers with it)
+    let v = ok(&a, "system.version", json!({}));
+    assert!(v["features"].as_array().unwrap().iter().any(|x| x == "video.control.depth"), "{v}");
+    let job = ok(&a, "video.control", ask.clone());
+    assert_eq!((job["kind"].as_str(), job["method"].as_str()), (Some("image"), Some("video.control")), "{job}");
+    // the depth model's methods: video.control alone; it draws nothing
+    let all = ok(&a, "system.models", json!({}));
+    let list: Vec<Value> = all.as_array().cloned().or_else(|| all["models"].as_array().cloned()).unwrap_or_default();
+    let m = list.iter().find(|m| m["id"] == "depth-anything-v2-small").unwrap_or_else(|| panic!("not listed in {all}"));
+    assert_eq!((m["capabilities"].clone(), m["methods"].clone()), (json!(["depth"]), json!(["video.control"])), "{m}");
 }
 
 #[test]

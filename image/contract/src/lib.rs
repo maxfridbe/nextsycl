@@ -357,6 +357,15 @@ pub trait ImageEngine: Send + Sync {
     fn remove_background(&self, _pic: &Picture, _post_process: bool) -> Result<(Picture, Picture)> {
         Err(Error(format!("{} does not remove backgrounds (birefnet, isnet-general-use do)", self.arch())))
     }
+    /// whether it estimates depth (`depth`: Depth Anything V2); video.control's depth control video is made with it
+    fn estimates_depth(&self) -> bool {
+        false
+    }
+    /// the picture's relative inverse depth (near = large; its scale is the model's own, not metres), one value a pixel
+    /// at the picture's size, rows top to bottom (a clip's frames are scaled by the clip's range by the caller)
+    fn depth(&self, _pic: &Picture) -> Result<Vec<f32>> {
+        Err(Error(format!("{} does not estimate depth (depth-anything-v2 does)", self.arch())))
+    }
 }
 
 /// How an engine loads: its files, its GPUs, the options, a log
@@ -382,4 +391,27 @@ pub fn kind_for<'k>(kinds: &'k [ImageKind], arch: &str) -> std::result::Result<&
         let known: Vec<&str> = kinds.iter().flat_map(|k| k.archs.iter().copied()).collect();
         format!("image architecture {arch:?} has no engine here (known: {})", known.join(", "))
     })
+}
+
+/// Depth maps scaled together to 8 bits: (d - min) / (max - min) * 255 over all of them, truncated (a flat set is 0)
+pub fn depth8(maps: &[&[f32]]) -> Vec<Vec<u8>> {
+    let (mi, ma) = maps.iter().flat_map(|m| m.iter()).fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+    let d = ma - mi;
+    maps.iter().map(|m| m.iter().map(|&v| if d > 0.0 { (((v - mi) / d) * 255.0).clamp(0.0, 255.0) as u8 } else { 0 }).collect()).collect()
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::depth8;
+
+    #[test]
+    fn depth8_scales_by_the_common_range_and_truncates() {
+        let a = [0.0f32, 1.0, 2.0];
+        let b = [2.0f32, 4.0, 3.0];
+        let o = depth8(&[&a, &b]);
+        assert_eq!(o[0], vec![0, 63, 127]);
+        assert_eq!(o[1], vec![127, 255, 191]);
+        // a flat set has no range
+        assert_eq!(depth8(&[&[3.0, 3.0]])[0], vec![0, 0]);
+    }
 }

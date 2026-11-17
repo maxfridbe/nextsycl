@@ -31,12 +31,17 @@ pub const METHODS: [&str; 14] = ["image.generate", "image.edit", "image.upscale"
     "audio.edit", "audio.voices.enroll", "model3d.generate", "model3d.rig"];
 
 /// The queue a method's jobs wait in: its prefix, but video.upscale runs on the image servers (an upscaler there) and
-/// so waits with the image jobs (image.status / image.cancel read it)
+/// so waits with the image jobs (image.status / image.cancel read it), as does video.control's depth (a depth model's)
 pub fn kind_of_method(name: &str) -> &str {
-    if name == "video.upscale" {
+    if matches!(name, "video.upscale" | "video.control") {
         return "image";
     }
     name.split_once('.').map(|(k, _)| k).unwrap_or(name)
+}
+
+/// Whether a request runs as a job: its method's always (METHODS), video.control when a model makes its control
+pub fn runs_as_job(name: &str, b: &Value) -> bool {
+    METHODS.contains(&name) || super::control::by_model(name, b)
 }
 
 /// The kinds whose requests run as jobs here

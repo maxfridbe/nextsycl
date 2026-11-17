@@ -363,6 +363,16 @@ impl ImageServer {
                     Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
                 }
             }
+            ("POST", "/v1/videos/depth") => {
+                let body: Value = match serde_json::from_slice(&req.body) {
+                    Ok(v) => v,
+                    Err(e) => return http::respond_with(&mut s, 400, &err(format!("the body is not JSON: {e}")), &cors),
+                };
+                match self.depth_video(&body) {
+                    Ok(v) => http::respond_with(&mut s, 200, &v, &cors),
+                    Err((code, m)) => http::respond_with(&mut s, code, &err(m), &cors),
+                }
+            }
             ("POST", "/v1/ocr") => {
                 let body: Value = match serde_json::from_slice(&req.body) {
                     Ok(v) => v,
@@ -842,6 +852,89 @@ impl ImageServer {
     /// variant, scale, noise, tile, crf} - every frame through the upscaler (ffmpeg decodes and encodes, the audio
     /// copied as it was; an engine that takes a clip whole - SeedVR2 - reads and hands back the frames itself), an MP4
     /// back as a link (the server keeps it) or base64
+    /// POST /v1/videos/depth: {path (a clip on this machine: the clips directory's), name (the control video's,
+    /// ref_<unix>_<stem>-depth.mp4), width, height, frames, start_s, model, request_id} - the front door's video.control
+    /// with control depth (nextcuda's route). The clip read as the studio reads a control video's source, every frame's
+    /// depth from the engine, the clip scaled by one range (video/studio/control.rs make_depth). This server sees the
+    /// clips directory read-only: the video is written into its own output directory, the answer's `path`, and the
+    /// front door moves it beside the clips
+    fn depth_video(&self, b: &Value) -> Result<Value, (u16, String)> {
+        use crate::video::studio::control;
+        let bad = |m: String| (400u16, m);
+        if let Some(m) = b["model"].as_str().filter(|m| !m.is_empty() && *m != self.model) {
+            return Err((404, format!("model {m} is not served here (this server: {})", self.model)));
+        }
+        let dir = self.out_dir.clone().ok_or_else(|| bad("video.control needs a server that keeps files (start it with an output directory)".into()))?;
+        let src = PathBuf::from(b["path"].as_str().unwrap_or(""));
+        if !src.is_file() {
+            return Err((404, format!("path {}: no such clip", src.display())));
+        }
+        // the result by a control video's name: nothing else is written
+        let name = b["name"].as_str().unwrap_or("");
+        if crate::files::plain(name) != Some(name) || !name.starts_with("ref_") || !name.ends_with("-depth.mp4") {
+            return Err(bad(format!("name {name:?}: a control video's name (ref_<unix>_<stem>-depth.mp4)")));
+        }
+        let dst = dir.join(name);
+        claim(&dst)?;
+        let fail = |e: (u16, String)| {
+            let _ = std::fs::remove_file(&dst);
+            e
+        };
+        let (w, h, seconds) = control::probe(&src).ok_or_else(|| fail(bad(format!("{}: not a clip ffprobe reads (no video stream)", src.display()))))?;
+        let mut p = b.clone();
+        p["control"] = json!("depth");
+        let s = control::settings(&p, (w, h, seconds)).map_err(|e| fail((e.http, e.message)))?;
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let g = self.engine.lock().unwrap_or_else(|p| p.into_inner());
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        let (engine, _) = match g.as_ref() {
+            None => return Err(fail((503, "the engine is not loaded".into()))),
+            Some((e, _)) if !e.estimates_depth() => return Err(fail(bad(format!("{} does not estimate depth (depth-anything-v2-small does)", self.model)))),
+            Some(x) => x,
+        };
+        let Some(_running) = self.cancel.begin(b["request_id"].as_str()) else {
+            return Err(fail((499, "cancelled".into())));
+        };
+        let t0 = Instant::now();
+        let j0 = self.tele.joules();
+        let prog = &self.progress;
+        let what = format!("depth of a clip {}x{}", s.width, s.height);
+        let mut net_s = 0.0;
+        // (claimed above as an empty file: make_depth writes a .part beside it and renames it over)
+        let r = control::make_depth(&src, &dst, &s, &mut |rgb| {
+            let t = Instant::now();
+            let pic = nextsycl_image::Picture { width: s.width, height: s.height, channels: 3, data: rgb.to_vec() };
+            let d = engine.depth(&pic).map_err(|e| e.0);
+            net_s += t.elapsed().as_secs_f64();
+            d
+        }, &mut |n| {
+            *prog.lock().unwrap() = json!({"busy": true, "prompt": what, "at": n, "of": s.frames, "phase": "frames", "seconds": t0.elapsed().as_secs_f64()});
+            if self.cancel.stopping() {
+                return Err("cancelled".into());
+            }
+            Ok(())
+        });
+        *prog.lock().unwrap() = json!({"busy": false});
+        let (made, range) = r.map_err(|e| {
+            if e == "cancelled" || self.cancel.stopping() {
+                fail((499, "cancelled".to_string()))
+            } else {
+                fail(crate::engine_status(nextsycl_core::Error(e), 500))
+            }
+        })?;
+        let secs = t0.elapsed().as_secs_f64();
+        let wh = match (j0, self.tele.joules()) {
+            (Some(a), Some(b)) if b >= a => Some((b - a) / 3600.0),
+            _ => None,
+        };
+        let mut hist = self.history.lock().unwrap();
+        hist.push_front(json!({"kind": "depth-video", "url": format!("/v1/images/files/{name}"), "prompt": format!("{name}: {made} frames"), "width": s.width,
+                               "height": s.height, "seconds": secs, "wh": wh, "created": now()}));
+        hist.truncate(200);
+        Ok(json!({"name": name, "path": dst.to_string_lossy(), "frames": made, "range": [range.0, range.1], "seconds": secs,
+                  "frame_seconds": net_s / made.max(1) as f64, "model": self.model, "wh": wh}))
+    }
+
     fn upscale_video(&self, b: &Value, base: &str) -> Result<Value, (u16, String)> {
         use std::io::{Read, Write};
         use std::process::{Command, Stdio};

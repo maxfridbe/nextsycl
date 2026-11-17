@@ -131,6 +131,7 @@ impl Home {
         queue_fields(b)?;
         match name {
             "image.generate" | "image.edit" => self.precheck_image(name == "image.edit", b, all),
+            "video.control" if super::control::by_model(name, b) => self.precheck_control(b, all),
             // a model that is not a remover, refused at submit (wait: false too) in the platform's words
             "image.remove_background" => match b["model"].as_str().and_then(|id| super::api::not_a_remover(id, all)) {
                 Some(why) => Err(bad(why)),

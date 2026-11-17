@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-image-depthanything"
+description = "Depth Anything V2 Small on the GPU (DINOv2-small ViT + DPT head): relative depth of a picture, the control video's depth; Rust and SYCL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-image.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true

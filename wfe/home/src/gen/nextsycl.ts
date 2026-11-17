@@ -623,6 +623,9 @@ export interface AudioVoicesRemoveReq {
 /** How a clip carries on from the last: video | png | latent | none */
 export type ChainMode = "video" | "png" | "latent" | "none";
 
+/** A control signal H3's Fun ControlNet-Union steers by */
+export type ControlKind = "canny" | "gray" | "depth" | "pose";
+
 /** How long a prompt image.describe writes: short | medium | long */
 export type DescribeDetail = "short" | "medium" | "long";
 
@@ -2018,6 +2021,118 @@ export interface VideoCanvasesListReq {
   [key: string]: unknown;
 }
 
+/** What video.control takes. */
+export interface VideoControlReq {
+  /**
+   * depth: hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * depth: the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
+  /**
+   * depth only (a job of the image queue): a group inside the project
+   * @maxLength 60
+   */
+  batch?: string | null;
+  /**
+   * depth only: queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch
+   * @default false
+   */
+  held?: boolean | null;
+  /**
+   * depth only: names the job for image.status and image.cancel (default: its id)
+   * @maxLength 120
+   */
+  label?: string | null;
+  /**
+   * depth only: what people call this job: free text, 120 characters, never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
+  /**
+   * depth only: a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)
+   * @minimum -9
+   * @maximum 9
+   * @default 0
+   */
+  priority?: number | null;
+  /**
+   * depth only: a group of jobs held or released together (<kind>.queue.pause / resume), listed with <kind>.jobs {project}
+   * @maxLength 60
+   */
+  project?: string | null;
+  /**
+   * depth only: false: refused at once (409 busy, retryable) when the job would not start now - a server free and no runnable job waiting before it; true (default): it waits its turn
+   * @default true
+   */
+  queue?: boolean | null;
+  /**
+   * depth only: idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)
+   * @maxLength 200
+   */
+  reentrant_id?: string | null;
+  /**
+   * depth only: true: answer when it ends (the job goes on if the call drops); false: answer at once with the job. Canny and gray answer while the call waits
+   * @default true
+   */
+  wait?: boolean | null;
+  /** the clip to read: a file in the clips directory (video.upload it - MP4, WebM, MOV, MKV - or a finished clip's name) */
+  file: string;
+  /** what to make of it (default canny); the ones this box makes are its features video.control.<control> - the rest are refused (400). depth needs a depth model enabled (409 otherwise) */
+  control?: ControlKind | null;
+  /** depth: the depth model's id; none: the loaded one, else the first enabled (capability depth) */
+  model?: string | null;
+  /**
+   * the canvas the clip will be made at (the source is scaled to cover it and cut in the middle, as video.generate does with a control video); none: the source's aspect at about 768 x 576
+   * @minimum 256
+   * @maximum 1344
+   */
+  width?: number | null;
+  /**
+   *
+   * @minimum 256
+   * @maximum 1344
+   */
+  height?: number | null;
+  /**
+   * the clip's length in frames at 24 fps (17k + 5, 22-362); none: the most the source has from start_s. A shorter source holds its last frame
+   * @minimum 22
+   * @maximum 362
+   */
+  frames?: number | null;
+  /**
+   * seconds into the source to start from
+   * @minimum 0
+   * @default 0
+   */
+  start_s?: number | null;
+  /**
+   * canny: the lower threshold on the gradient's size (cv2.Canny's, 0-255 pictures): weaker edges are dropped unless joined to a strong one
+   * @minimum 0
+   * @maximum 1000
+   * @default 100
+   */
+  low?: number | null;
+  /**
+   * canny: the upper threshold: stronger edges are always kept
+   * @minimum 0
+   * @maximum 1000
+   * @default 200
+   */
+  high?: number | null;
+  /**
+   * canny: stretch the clip's brightness (its 1st to 99th percentile) to the full range first, so a dim room's edges pass the thresholds
+   * @default true
+   */
+  normalize?: boolean | null;
+  /** other keys */
+  [key: string]: unknown;
+}
+
 /** What video.describePromptGuideMD takes. */
 export interface VideoDescribePromptGuideMdReq {
   /** the model's registry id (system.models) */
@@ -3162,6 +3277,12 @@ export interface Methods {
    */
   "video.upload": { req: VideoUploadReq; resp: any };
   /**
+   * A clip turned into a ControlNet control video for video.generate's control_video: canny edges or its brightness (gray), made on the CPU while the call waits (seconds), or its depth (near bright; the clip scaled by one range), a depth model's job in the image queue (image.status / image.cancel; wait false answers with the job) - at the clip's canvas and length (24 fps, scaled to cover, a short source's last frame held). The answer names the file beside the clips (control_video takes the name; system.files.delete removes it) and links it
+   * @tags video
+   * @example {"control":"canny","file":"ref_1792400000_take.webm","frames":124,"height":576,"width":768}
+   */
+  "video.control": { req: VideoControlReq; resp: any };
+  /**
    * How to prompt the model, as Markdown
    * @tags video
    * @example {"model":"minimax-h3"}
@@ -3817,6 +3938,12 @@ export function client(post: Post, raw?: PostRaw) {
      * @example {"data":"iVBORw0KGgo...","name":"fox.png"}
      */
     "video.upload": (req: VideoUploadReq): Promise<any> => post("video.upload", req),
+    /**
+     * A clip turned into a ControlNet control video for video.generate's control_video: canny edges or its brightness (gray), made on the CPU while the call waits (seconds), or its depth (near bright; the clip scaled by one range), a depth model's job in the image queue (image.status / image.cancel; wait false answers with the job) - at the clip's canvas and length (24 fps, scaled to cover, a short source's last frame held). The answer names the file beside the clips (control_video takes the name; system.files.delete removes it) and links it
+     * @tags video
+     * @example {"control":"canny","file":"ref_1792400000_take.webm","frames":124,"height":576,"width":768}
+     */
+    "video.control": (req: VideoControlReq): Promise<any> => post("video.control", req),
     /**
      * How to prompt the model, as Markdown
      * @tags video

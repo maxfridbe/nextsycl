@@ -25,6 +25,7 @@
 mod api;
 mod backplane;
 mod config;
+mod control;
 mod describe_page;
 mod disks;
 mod enroll;

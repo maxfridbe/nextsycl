@@ -537,6 +537,8 @@ impl Studio {
         // the ControlNet: a control video, a mask over a source; files beside the clips
         for k in ["control_video", "control_mask", "control_source"] {
             let v = p.get(k).and_then(|v| v.as_str()).map(basename).filter(|v| !v.is_empty());
+            // a clip named without its extension (video.control's `file`, a video.generate clip's name) is its .mp4
+            let v = v.map(|f| with_mp4(&f, |n| self.here_or_coming(n)));
             if let Some(f) = &v {
                 if !self.here_or_coming(f) {
                     return Err(RpcError::not_found(&format!("{k} {f} not found in out/")));
@@ -631,6 +633,15 @@ pub fn regen_windows(frames: usize) -> usize {
 /// A request's reentrant_id (reentrantid is read too)
 pub fn reentrant(p: &Value) -> Option<String> {
     ["reentrant_id", "reentrantid"].iter().find_map(|k| p.get(*k).and_then(|v| v.as_str())).map(str::trim).filter(|r| !r.is_empty()).map(|r| r.chars().take(200).collect())
+}
+
+/// `f`, or `f.mp4` when `f` has no extension, is not a file and the .mp4 is (`exists` asks)
+pub fn with_mp4(f: &str, exists: impl Fn(&str) -> bool) -> String {
+    if !f.contains('.') && !exists(f) && exists(&format!("{f}.mp4")) {
+        format!("{f}.mp4")
+    } else {
+        f.to_string()
+    }
 }
 
 pub fn basename(p: &str) -> String {
@@ -775,6 +786,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_control_clip_may_be_named_without_its_extension() {
+        let have = |n: &str| ["ctl_1_depth.mp4", "plain", "clip.webm"].contains(&n);
+        assert_eq!(with_mp4("ctl_1_depth", have), "ctl_1_depth.mp4");
+        assert_eq!(with_mp4("ctl_1_depth.mp4", have), "ctl_1_depth.mp4");
+        // a file that is there as named, an extension of another kind, or nothing there: as it came
+        assert_eq!(with_mp4("plain", have), "plain");
+        assert_eq!(with_mp4("clip.webm", have), "clip.webm");
+        assert_eq!(with_mp4("gone", have), "gone");
+    }
 
     #[test]
     fn a_title_is_one_line_of_120_at_most_and_none_is_null() {
