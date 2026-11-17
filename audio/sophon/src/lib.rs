@@ -278,6 +278,8 @@ impl Inner {
     /// Speakable text's ids: the reply as the talker reads it, tokenized (the thinker's tokenizer)
     pub fn speakable_ids(&self, text: &str, last: bool) -> Vec<u32> {
         let s = text::tag_clean(&text::cut_tool(text, last), last);
+        // the talker reads sound tags aloud in this port: out of its text unless NS_SOPHON_TAGS=1 (text::without_tags)
+        let s = if std::env::var("NS_SOPHON_TAGS").is_ok_and(|v| v.trim() == "1") { s } else { text::without_tags(&s) };
         let s = s.trim_start();
         if s.is_empty() {
             return Vec::new();

@@ -263,6 +263,32 @@ fn close_of(c: char) -> Option<char> {
 /// [sigh], [cough], [quick_breath], <laughter>...</laughter>, <strong>...</strong>, a strong span closed at the next
 /// punctuation), other bracketed asides and markdown marks dropped, arrows and comparisons said; `last`: the reply
 /// is whole (an unclosed bracket's text spoken, open spans closed) - else a bracket that may still close is held back
+/// The sound tags taken out of what the talker reads (POINT's tags gone, SPAN's tags gone and their words kept), for
+/// as long as this port's talker reads them aloud ("Laughter." - heard 21 of 21 times, 2026-11-16; upstream's Flash
+/// performs them, so the cause is ours and open). NS_SOPHON_TAGS=1 hands them to the talker as before. The reply's
+/// text - the transcript the client shows - keeps them
+pub fn without_tags(s: &str) -> String {
+    let mut v = s.to_string();
+    for t in POINT {
+        v = v.replace(t, " ");
+    }
+    for t in SPAN {
+        v = v.replace(&format!("<{t}>"), "").replace(&format!("</{t}>"), "");
+    }
+    // the spaces a tag leaves: one, and none before punctuation
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        if c == ' ' && out.ends_with(' ') {
+            continue;
+        }
+        if ",.!?;:，。！？；：".contains(c) && out.ends_with(' ') {
+            out.pop();
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub fn tag_clean(s: &str, last: bool) -> String {
     let mut out = String::new();
     let mut open: Vec<&'static str> = Vec::new();
@@ -366,6 +392,14 @@ pub fn plain(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The talker is not handed a sound tag (it reads it aloud): the words of a span are kept
+    #[test]
+    fn the_talker_gets_no_sound_tags() {
+        assert_eq!(super::without_tags("Ha [laughter] that's great"), "Ha that's great");
+        assert_eq!(super::without_tags("They'd be bagels! [laughter] Oh, a classic [sigh]."), "They'd be bagels! Oh, a classic.");
+        assert_eq!(super::without_tags("I <strong>really</strong> mean it, <laughter>so funny</laughter>!"), "I really mean it, so funny!");
+    }
 
     #[test]
     fn tags_are_kept_and_asides_dropped() {
