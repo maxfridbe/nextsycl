@@ -17,16 +17,16 @@ speech:
 - direction                     # a clone (or the model's voice) steered by instructions: an inline tag
 - events                        # inline tags in the text
 - transcript                    # a clone needs what the recording says (saved voices without it go elsewhere)
-annotations_note: 'Free-form bracketed directions and speaker turns, kept as written (the engine''s markup()): any short description in brackets up to 60 characters is a direction, so square brackets are never read aloud. Direction can also go in instructions.'
+annotations_note: 'Free-form bracketed directions and speaker turns, kept as written (the engine''s markup()): any short description in brackets up to 60 characters is a direction, so square brackets are never read aloud. Direction can also go in instructions. Heard 2026-11-16 (a clone of LibriSpeech 1272, seeds 1-3, each against the same line and seed without the tag; Whisper large-v3-turbo): no tag''s word was ever read, but the effects are weak - [whisper] makes the words after it about 2.5 dB quieter and lower, still voiced (not a whisper), [laughing] and [sigh] add a longer pause with a faint sound, [pause] and [excited tone] made no measurable difference, and <|speaker:N|> changed the voice in one take of three.'
 annotations:
 - syntax: '[whisper] / [laughing] / [pause] / [excited tone] ...'
   keep: '\[[^\[\]\n]{1,60}\]'
-  does: 'a free-form direction for what follows (S2 Pro reads any short description)'
-  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+  does: 'a free-form direction for what follows (S2 Pro reads any short description); heard on a clone the effects are weak (see tested)'
+  tested: 'verified 2026-11-16 (/v1/audio/speech, a clone of LibriSpeech 1272, seeds 1-3, each line against itself without the tag): never read aloud. [whisper] ("Listen carefully. [whisper] The treasure ..."): the words after it -0.7 / -3.9 / -1.0 dB against the line''s start (without: +2.9 / +0.4 / -1.6), f0 90-111 Hz (without: 107-119), but voiced as much as without (62-68 % of their frames against 69-73 %): quieter and lower, not a whisper. [laughing] ("... all week. [laughing] You have ..."): the stretch between the sentences 0.6 / 1.8 / 2.2 s (without: 0.26-0.58) with 0.12 / 0.19 / 0.53 s of sound at -35 to -39 dBFS: a longer pause with a faint laugh or breath. [sigh]: 1.06-1.44 s (without: 0.32-0.74) with 0 / 0.19 / 0.21 s of sound at -41 to -50 dBFS: a pause, at most a faint breath. [pause] ("Wait for it. [pause] Now we can go."): no longer gap between the words (0.16 / 0.74 / 0 s against 0.2 / 0.4 / 0.18): not performed measurably. [excited tone] at the start: words a second 2.67-2.99 (without: 2.64-2.85), f0 117-164 Hz (without: 132-217), level -20 to -23 dBFS (without: -19 to -23): no measurable change'
 - syntax: '<|speaker:N|>'
   keep: '<\|speaker:\d+\|>'
-  does: 'the next turn is speaker N'
-  tested: 'unverified (kept by the text pass since 2026-11-16: glue/serve audio tests; the model''s performance not yet heard)'
+  does: 'the next turn is speaker N (with a clone, speaker 0 is the recording); heard, the voice changed in one take of three'
+  tested: 'verified 2026-11-16 (/v1/audio/speech, a clone of LibriSpeech 1272, seeds 1-3, "<|speaker:0|>Did you hear that noise outside? <|speaker:1|>Hear what? ..." against the line without the markers): never read aloud; the second turn''s median f0 against the first: 156 -> 138, 110 -> 105, 134 -> 196 Hz (without the markers: 111 -> 115, 134 -> 101, 127 -> 116): a different voice only in seed 3, otherwise the clone''s voice goes on'
 defaults:
   seconds: 60.0
 env: {}

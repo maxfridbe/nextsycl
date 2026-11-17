@@ -35,7 +35,8 @@ while keeping the speaker: `Speak slowly with a restrained, serious tone.` / `�
 (4 by default) against the plain clone.
 
 ## Vocal events
-Put them in the text where they happen:
+Put them in the text where they happen (heard 2026-11-16: the sigh, cough and throat-clear come out as short, quiet
+sounds; the laughs mostly as a pause with at most a faint chuckle):
 
 - English, in parentheses: `(laugh)`, `(sigh)`, `(cough)`, `(clears throat)` - `(sigh) It is good to hear your voice again.`
 - Chinese, in square brackets: `[笑]`, `[叹气]`, `[咳嗽]`, `[清嗓子]` - `[叹气] 没想到过了这么久，你还记得我的声音。`

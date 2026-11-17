@@ -27,5 +27,6 @@ Its text keeps the sound tags it performs: `[laughter]`, `[breath]`, `[sigh]`, `
 `<laughter>...</laughter>` (laughing while speaking) and `<strong>...</strong>` (emphasis). Strip them for display.
 
 ## Speaking a text
-`audio.speak` / `/v1/audio/speech` with this model speaks `input` in its voice (the talker alone, no brain): the same
-tags are performed.
+`audio.speak` / `/v1/audio/speech` with this model speaks `input` in its voice (the talker alone, no brain). **Leave
+the sound tags out here**: heard 2026-11-16, the talker reads them aloud ("Laughter.", "Sigh.", "Quick breath.",
+"strong blue") instead of performing them.

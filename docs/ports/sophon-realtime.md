@@ -119,6 +119,12 @@ The answers' audio, written down by the box's Whisper (`nextsycl audio transcrib
 
 - the talker alone, "Oh, that is wonderful news! [laughter] I am so happy for you. Tell me, how did it happen?" ->
   "Oh, that is wonderful news. I am so happy for you. Tell me, how did it happen?" (the tag performed, not read)
+  - 2026-11-16, through the front door's `/v1/audio/speech` (voice chelsie, seeds 1-3, each of the 7 tags in a line):
+    every tag was read aloud - "Laughter.", "Breath,", "Sigh.", "Cough.", "Quick breath.", "less than ... laughter"
+    for `<laughter>` and "strong blue" for `<strong>blue</strong>` (21 of 21 takes) - and `<strong>` stressed
+    nothing (the word +0.3 dB on average against the line, +2.1 without the tags). The speech text pass keeps the
+    tags as written (the server's markup); the talker gets them as plain text tokens (`speakable_ids`: tag_clean, then
+    the thinker's tokenizer). Not looked into further; the card and guide say not to send them to audio.speak.
 - a two-turn conversation over /v1/realtime (en_know, then en_chat "how are you"): "because sunlight is made up of
   different colors and blue light scatters more in the atmosphere than other colors, making the sky appear blue to
   us." / "I'm doing well thank you for asking, how about you?" - each the text the brain wrote.

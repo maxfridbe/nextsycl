@@ -17,7 +17,9 @@ voice]` steers the delivery, not a reliable timbre), and there are no named voic
 
 ## Inline tags (S2 Pro's control)
 Free-form words in square brackets, anywhere in the text, apply from where they are: S2 Pro was trained on
-15,000+ different tags, so plain descriptions work, not only a fixed list.
+15,000+ different tags, so plain descriptions work, not only a fixed list. Expect subtle effects: heard on a clone
+(2026-11-16), no tag was read aloud, but `[whisper]` made the words quieter and lower rather than whispered,
+`[laughing]` / `[sigh]` mostly a longer pause with a faint sound, and `[pause]` / `[excited tone]` no measurable change.
 
 - Emotion and tone: `[excited]`, `[excited tone]`, `[sad]`, `[angry]`, `[surprised]`, `[shocked]`, `[delight]`,
   `[laughing tone]`, `[professional broadcast tone]`
