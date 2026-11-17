@@ -874,6 +874,7 @@ Inputs of the checks and unit tests that need files outside the repository (unse
 | `NS_TEST_WHISPER_CONFIG` | test skipped | whisper-large-v3-turbo's config.json for its sizes' test | audio whisper (cargo test) |
 | `NS_TEST_WHISPER_GENERATION` | test skipped | whisper-large-v3-turbo's generation_config.json (with NS_TEST_WHISPER_TOKENIZER) for the vocabulary, rules and alignment tests | audio whisper (cargo test) |
 | `NS_TEST_WHISPER_REF` | test skipped | a folder of reference/whisper/ref.py dumps (short/, long/, song/): the mel, greedy-rule, alignment and placement tests against openai-whisper | audio whisper (cargo test) |
+| `CHROME` | ~/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome | the browser reference/haru/page_test.mjs drives headless (the wfe Conversation page with a fake microphone; not checked: JavaScript) | reference/haru (page_test.mjs) |
 | `NS_TEST_WHISPER_TOKENIZER` | test skipped | whisper-large-v3-turbo's tokenizer.json for the byte-level tokenizer test and the vocabulary tests | tests (crates/tok), audio whisper (cargo test) |
 | `NS_TEST_QWEN_TOKENIZER` | test skipped | a Qwen3-VL tokenizer.json for the tokenizer test (with NS_TEST_QWEN_TOKENS) | tests (crates/tok) |
 | `NS_TEST_QWEN_TOKENS` | test skipped | the reference pipeline's tokens.json the tokenizer test compares against | tests (crates/tok) |

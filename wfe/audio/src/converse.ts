@@ -5,8 +5,9 @@
  *
  *  A lockstep model (info.realtime.frame_ms > 0: Haru-4B) answers every 133 ms frame of the microphone with one of its
  *  own, silence included, in one long response: nothing is stopped when the user speaks (the model hears it and stops
- *  itself), its audio plays behind a short jitter buffer, and its text is split into lines where the user spoke. Its
- *  character is a card (nextsycl.card). */
+ *  itself), its audio plays behind a short jitter buffer that catches up after a burst (quiet frames dropped past
+ *  0.35 s queued, any past 1 s), and its text is split into lines where the user spoke. Its character is a card
+ *  (nextsycl.card). */
 import { render, state } from "./state.js";
 
 export interface Line {
@@ -55,6 +56,9 @@ let stoppedAt = 0;
 const OUT_RATE = 24000;
 /** a lockstep model's audio plays this far behind (s): its frames come every 133 ms, give or take the network */
 const JITTER = 0.2;
+/** lockstep: queued further ahead than this (s), its quiet frames are dropped; further than BACKLOG, any frame */
+const CATCHUP = JITTER + 0.15;
+const BACKLOG = 1.0;
 /** lockstep: the user spoke since the model's last text (its next text starts a new line), and the lines made */
 let splitNext = false;
 let part = 0;
@@ -128,7 +132,17 @@ function play(id: string, delta: string): void {
   if (pcm.length === 0) return;
   const buf = ctx.createBuffer(1, pcm.length, OUT_RATE);
   const ch = buf.getChannelData(0);
-  pcm.forEach((x, i) => { ch[i] = x / 32768; });
+  let e = 0;
+  pcm.forEach((x, i) => { ch[i] = x / 32768; e += ch[i] * ch[i]; });
+  // lockstep: the queue stays near the jitter buffer. Frames that came in a burst (the prompt's start, a stall on the
+  // network or the server) would otherwise stay queued and delay everything it says afterwards by as much: past
+  // CATCHUP a quiet frame is dropped, past BACKLOG any frame (as the release's client drops its oldest audio)
+  if (lockstep() && playhead > 0) {
+    const ahead = playhead - ctx.currentTime;
+    // quiet: under -40 dBFS
+    const quiet = Math.sqrt(e / pcm.length) < 0.01;
+    if (ahead > BACKLOG || (ahead > CATCHUP && quiet)) return;
+  }
   const src = ctx.createBufferSource();
   src.buffer = buf;
   src.connect(ctx.destination);
@@ -282,8 +296,11 @@ export async function start(): Promise<void> {
   talk.connecting = true;
   render();
   try {
-    mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+    // the context first, inside the click (a browser starts one made later, after the permission prompt, suspended)
     ctx = new AudioContext();
+    mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+    if (!ctx) throw new Error("stopped");
+    if (ctx.state !== "running") await ctx.resume();
     const mod = URL.createObjectURL(new Blob([CAPTURE], { type: "text/javascript" }));
     await ctx.audioWorklet.addModule(mod);
     URL.revokeObjectURL(mod);
