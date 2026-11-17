@@ -320,6 +320,12 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 | `H3_TE_PIN` | 1 | 0: no pinned host copy of the text encoder between clips (two pinned layer slots instead) (--opt-te-pin) | video h3 |
 | `H3_TE_PIN_LOCK` | /tmp/h3-te-pin.lock | the lock file that lets one worker a host hold the pinned text-encoder copy | video h3 |
 | `H3_THREADS` | 8 | threads reading the checkpoint at load (--opt-threads) | video h3 |
+| `H3_MPEG` | 0 | 1: MPEG-Diffusion - every generate job from text alone runs the two-track sampler (half resolution, then full-resolution tokens on the region the region head picks; crates/h3/src/mpeg.rs, docs/ports/mpeg-diffusion.md); needs the card's mpeg-maps and region-head files and opens the H3 silo (its gather) on the core's queue; a request's `"mpeg": false` runs it at full resolution (the minimax-h3-mpeg card; --opt-mpeg) | video h3 |
+| `H3_MPEG_SWITCH` | 16 | with H3_MPEG: half-resolution steps before the region joins, of the schedule's (20 by default) (--opt-mpeg-switch; job key mpeg_switch) | video h3 |
+| `H3_MPEG_HR_STEPS` | 6 | with H3_MPEG: two-track steps after the switch, linear in sigma to 0 (0: the schedule's rest) (--opt-mpeg-hr-steps; mpeg_hr_steps) | video h3 |
+| `H3_MPEG_ALPHA` | 0.5 | with H3_MPEG: the region's threshold m + alpha (p - m) over the smoothed head scores (higher: a smaller region) (--opt-mpeg-alpha; mpeg_alpha) | video h3 |
+| `H3_MPEG_FLOOR` | none | with H3_MPEG: a clip whose 99th-percentile smoothed score is under this stays half resolution (--opt-mpeg-floor; mpeg_floor) | video h3 |
+| `H3_MPEG_FEATHER` | 4 | with H3_MPEG: the paste's ramp inside the region's edge, in full-res latent pixels (--opt-mpeg-feather; mpeg_feather) | video h3 |
 | `H3_VAE_ATTN_PER_TILE` | off | 1: the video decoder's attention a tile at a time (--opt-vae-attn-per-tile) | video h3 |
 | `H3_VAE_FLOAT32` | off | 1: every tile of the fp16 video decoder in float32 (~8x slower; for checks). Without it, only a tile that comes out non-finite in half precision is decoded again in float32, and the job log names it | video h3 |
 | `NS_VIDEO_CHARACTERS` | docs/video/characters.example.json | characters for the speech tool | cli (video tools) |

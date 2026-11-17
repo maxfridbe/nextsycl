@@ -8,6 +8,8 @@
 
 pub use nextsycl_h3::*;
 
+pub mod ffi;
+
 // ---- the engine behind the video contract -----------------------------------------------------------------------
 
 use std::path::{Path, PathBuf};
@@ -22,13 +24,19 @@ pub const ARCH: &str = "minimax-h3";
 
 /// The files it takes, by role (the denoiser at load; the others go into each job, where a job does not name its own)
 pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "vae", "audio-vae", "vision", "controlnet", "ic-lora", "hyperflow", "adaln", "sharp-lora",
-                             "silence"];
+                             "silence", "mpeg-maps", "region-head"];
 
 /// A role and the job key it fills
 const ROLE_KEYS: &[(&str, &str)] = &[("text-encoder", "te"), ("tokenizer", "tokenizer"), ("vae", "vae"), ("audio-vae", "audio_vae"),
                                      ("upscaler", "upscaler"), ("pixel-upscaler", "pixel_upscaler"), ("vision", "te_visual"), ("controlnet", "controlnet"),
                                      // Open-H3-Regenerate-2K-IC's parts (the regen2k job)
-                                     ("ic-lora", "ic_lora"), ("hyperflow", "hyperflow"), ("adaln", "adaln"), ("sharp-lora", "sharp_lora"), ("silence", "silence")];
+                                     ("ic-lora", "ic_lora"), ("hyperflow", "hyperflow"), ("adaln", "adaln"), ("sharp-lora", "sharp_lora"), ("silence", "silence"),
+                                     // MPEG-Diffusion's (the generate job's two-track sampler, crates/h3/src/mpeg.rs)
+                                     ("mpeg-maps", "mpeg_maps"), ("region-head", "region_head")];
+
+/// MPEG-Diffusion's settings a model card may set (H3_MPEG=1 turns it on): the variable and the generate job's key
+const MPEG_SETTINGS: &[(&str, &str)] = &[("H3_MPEG_SWITCH", "mpeg_switch"), ("H3_MPEG_HR_STEPS", "mpeg_hr_steps"), ("H3_MPEG_ALPHA", "mpeg_alpha"),
+                                         ("H3_MPEG_FLOOR", "mpeg_floor"), ("H3_MPEG_FEATHER", "mpeg_feather")];
 
 /// The options it takes (`--opt-NAME`): at load the variables they set; per request the generate job's own keys
 pub const OPTIONS: &[EngineOption] = &[
@@ -41,6 +49,12 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "attn-rows", env: "NSD_ATTN_ROWS", value: "N", help: "query rows a fused attention call takes", at: At::Load },
     EngineOption { name: "mem-fraction", env: "NSD_MEM_FRACTION", value: "F", help: "the share of the card the kernels may hold (default 0.94)", at: At::Load },
     EngineOption { name: "profile", env: "NSD_PROFILE", value: "", help: "the kernels' and decoders' times by part, on stderr", at: At::Load },
+    EngineOption { name: "mpeg", env: "H3_MPEG", value: "0|1", help: "MPEG-Diffusion: every clip from text alone made on two tracks - half resolution, then full-resolution tokens on a region the model picks (needs the mpeg-maps and region-head files; the minimax-h3-mpeg card)", at: At::Load },
+    EngineOption { name: "mpeg-switch", env: "H3_MPEG_SWITCH", value: "N", help: "with mpeg: half-resolution steps before the region joins (default 16, of 20)", at: At::Load },
+    EngineOption { name: "mpeg-hr-steps", env: "H3_MPEG_HR_STEPS", value: "N", help: "with mpeg: two-track steps after the switch, linear in sigma (default 6; 0: the schedule's rest)", at: At::Load },
+    EngineOption { name: "mpeg-alpha", env: "H3_MPEG_ALPHA", value: "X", help: "with mpeg: the region's threshold m + alpha (p - m) (default 0.5; higher: a smaller region)", at: At::Load },
+    EngineOption { name: "mpeg-floor", env: "H3_MPEG_FLOOR", value: "X", help: "with mpeg: a clip whose 99th-percentile score is under this stays half-resolution (default none)", at: At::Load },
+    EngineOption { name: "mpeg-feather", env: "H3_MPEG_FEATHER", value: "N", help: "with mpeg: the paste's ramp inside the region's edge, full-res latent pixels (default 4)", at: At::Load },
     EngineOption { name: "first_frame", env: "", value: "PNG", help: "the clip starts on this picture (a clip: its last frame, a still - no motion; guide_clip carries motion)", at: At::Request },
     EngineOption { name: "last_frame", env: "", value: "PNG", help: "the clip ends on this picture", at: At::Request },
     EngineOption { name: "first_frame_ref", env: "", value: "PNG", help: "exposure match: the first and last frame pictures rescaled to this picture's luminance (a chain's drift; clip 1's frame)", at: At::Request },
@@ -83,11 +97,33 @@ fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn Fn
     let gpu = gpus.first().map_or(0, |g| g.index);
     let threads = o.setting("H3_THREADS").and_then(|v| v.parse().ok()).unwrap_or(8);
     let t0 = std::time::Instant::now();
-    // its own context on the GPU (H3's device), as each worker process had
-    let dev = device::Device::open_index(gpu).map_err(ve)?;
+    let mpeg = o.setting("H3_MPEG").is_some_and(|v| v == "1");
+    let silo = if mpeg { ffi::silo().map_err(|e| nextsycl_video::Error(e.0))? } else { None };
+    // its own context on the GPU (H3's device), as each worker process had; with MPEG-Diffusion's silo, a context on the
+    // core's queue of the card, so the silo's kernels are ordered with the engine's
+    let dev = match (silo, gpus.first()) {
+        // SAFETY: the core's GPU (its queue's owner) is kept in the engine beside the device.
+        (Some(_), Some(g)) => unsafe { device::Device::on_queue(g.queue(), g.index) }.map_err(ve)?,
+        _ => device::Device::open_index(gpu).map_err(ve)?,
+    };
     let resident = o.setting("H3_RESIDENT_BLOCKS").and_then(|v| v.parse().ok());
-    let e = jobs::Engine::load_resident(dev, denoiser, None, resident, threads, log).map_err(ve)?;
-    Ok(Box::new(H3 { e, files: files.clone(), load_s: t0.elapsed().as_secs_f64() }))
+    let mut e = jobs::Engine::load_resident(dev, denoiser, None, resident, threads, log).map_err(ve)?;
+    if mpeg {
+        for role in ["mpeg-maps", "region-head"] {
+            if files.get(role).is_none() {
+                return Err(nextsycl_video::Error(format!("{ARCH}: H3_MPEG=1 needs the {role} file (the minimax-h3-mpeg card)")));
+            }
+        }
+        match (silo, gpus.first()) {
+            (Some(s), Some(g)) => {
+                e.model.gather = Some(ffi::gather(g, s));
+                log(format!("{ARCH}: MPEG-Diffusion on, the {} silo's gather", ffi::SILO));
+            }
+            _ => log(format!("{ARCH}: MPEG-Diffusion on, no {} silo: the two-track steps copy a row at a time", ffi::SILO)),
+        }
+    }
+    let mpeg = mpeg.then(|| MPEG_SETTINGS.iter().filter_map(|(var, key)| Some((key.to_string(), o.setting(var)?))).collect());
+    Ok(Box::new(H3 { e, files: files.clone(), load_s: t0.elapsed().as_secs_f64(), mpeg, _gpu: gpus.first().cloned() }))
 }
 
 fn ve(e: Error) -> nextsycl_video::Error {
@@ -98,6 +134,10 @@ pub struct H3 {
     pub e: jobs::Engine,
     files: ModelFiles,
     load_s: f64,
+    /// MPEG-Diffusion on (H3_MPEG=1): the card's settings as the generate job's keys
+    mpeg: Option<Vec<(String, String)>>,
+    /// the core's GPU, whose queue the device may share (kept for its life)
+    _gpu: Option<Arc<Gpu>>,
 }
 
 impl H3 {
@@ -110,6 +150,17 @@ impl H3 {
                     // the tokenizer is a directory (vocab.json, merges.txt, tokenizer_config.json): a file's
                     let p = if *role == "tokenizer" && p.is_file() { p.parent().map(Path::to_path_buf).unwrap_or_else(|| p.clone()) } else { p.clone() };
                     m.insert((*key).into(), json!(p));
+                }
+            }
+            // MPEG-Diffusion: the generate job's two-track sampler, unless the request says "mpeg": false
+            if let (Some(set), Some("generate")) = (&self.mpeg, m.get("kind").and_then(Value::as_str)) {
+                if !m.contains_key("mpeg") {
+                    m.insert("mpeg".into(), json!(true));
+                }
+                for (k, v) in set {
+                    if !m.contains_key(k) {
+                        m.insert(k.clone(), json!(v));
+                    }
                 }
             }
             // the effect embeddings (roles embedding-NAME): `embedding:NAME` in a prompt finds them in their directory

@@ -416,7 +416,7 @@ pub fn regen2k(e: &Engine, s: &RegenSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     ]), &BTreeMap::new())?;
 
     // 3. the frames, the draft's length and sound
-    let rep = jobs::decode_latents(dev, e.threads, Latents { video: joined, t: lt, h: uh, w: uw, audio: None },
+    let rep = jobs::decode_latents(dev, e.threads, Latents { video: joined, t: lt, h: uh, w: uw, audio: None, paste: None },
                                    &Vaes { video: s.vae, audio: None, upscale: None, pixel: None }, Some(out), None, ctl)?;
     note_peak(dev);
     finish(out, s.draft, real, frames, (tw, th), s.keep_h, ctl)?;

@@ -17,6 +17,7 @@ pub mod exposure;
 pub mod jobs;
 pub mod kquant;
 pub mod media;
+pub mod mpeg;
 pub mod gguf;
 pub mod hyperflow;
 pub mod layout;

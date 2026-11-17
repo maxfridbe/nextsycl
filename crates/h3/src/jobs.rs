@@ -507,7 +507,7 @@ pub fn decode(dev: &Arc<Device>, threads: usize, latents: &Path, vaes: &Vaes, ou
         Some(k) => Some((crate::dtype::bytes_to_f32(&lat.read(k)?, lat.get(k)?.dtype)?, lat.get(k)?.shape[3])), // [1, 32, 2, T]
         None => None,
     };
-    decode_latents(dev, threads, Latents { video, t: shape[2], h: shape[3], w: shape[4], audio }, vaes, out, check, ctl)
+    decode_latents(dev, threads, Latents { video, t: shape[2], h: shape[3], w: shape[4], audio, paste: None }, vaes, out, check, ctl)
 }
 
 /// A clip's finished latents: video [24, t, h, w], and audio [32, 2, T] with its T.
@@ -517,6 +517,9 @@ pub struct Latents {
     pub h: usize,
     pub w: usize,
     pub audio: Option<(Vec<f32>, usize)>,
+    /// MPEG-Diffusion's paste (mpeg.rs): the half-res track decoded too, enlarged and pasted under the full-res frames
+    /// outside the region
+    pub paste: Option<crate::mpeg::Paste>,
 }
 
 /// Latents in memory -> frames and sound (and an .mp4); see `decode`.
@@ -533,7 +536,7 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
     let (t, mut h, mut w) = (lat.t, lat.h, lat.w);
     let mut z = lat.video;
     let mut report = json!({});
-    let latent_up = if vaes.pixel.is_some() { None } else { vaes.upscale };
+    let latent_up = if vaes.pixel.is_some() || lat.paste.is_some() { None } else { vaes.upscale };
     if let Some((up, s)) = latent_up {
         let t0 = Instant::now();
         let u = crate::upscale::Upscaler::load(dev, &Checkpoint::open(up)?)?;
@@ -585,6 +588,24 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
     }
     report["vae_float32_tiles"] = json!(redone.len());
     let mut px = px;
+    if let Some(p) = &lat.paste {
+        // MPEG-Diffusion: the half-res track decoded at its own size, its pixels enlarged x2 (bicubic) and pasted under
+        // the full-res frames with the region's ramp
+        let t0 = Instant::now();
+        let (lp, lf) = dec.decode(&p.lr, t, p.lr_h, p.lr_w, &mut || {
+            dev.wait()?;
+            ctl.check()
+        })?;
+        if lf != frames || 2 * 16 * p.lr_h != fh || 2 * 16 * p.lr_w != fw {
+            return Err(Error(format!("the half-res track decoded to {lf} frames of {}x{}, the clip {frames} of {fw}x{fh}", 16 * p.lr_w, 16 * p.lr_h)));
+        }
+        let up = crate::mpeg::bicubic2x(&lp, 3 * lf, 16 * p.lr_h, 16 * p.lr_w, 0.0, 1.0);
+        drop(lp);
+        crate::mpeg::paste(&mut px, &up, &p.weight, t, frames, fh, fw);
+        let secs = t0.elapsed().as_secs_f64();
+        ctl.say(format!("mpeg   : half-res track decoded ({}x{}), enlarged and pasted in {secs:.1} s", 16 * p.lr_w, 16 * p.lr_h));
+        report["paste_seconds"] = json!(secs);
+    }
     if let Some((pp, s)) = vaes.pixel {
         // the size the latent upscaler would have given: its latent size, in pixels
         let (ho, wo) = (((h as f32 * s).round() as usize) * 16, ((w as f32 * s).round() as usize) * 16);
@@ -858,6 +879,8 @@ pub struct ClipSpec<'a> {
     /// LoRAs and their strengths (they stack)
     pub lora: Vec<(&'a Path, f32)>,
     pub inputs: ClipInputs<'a>,
+    /// MPEG-Diffusion's two-track sampler (mpeg.rs) instead of the clip at full resolution all through
+    pub mpeg: Option<crate::mpeg::Spec<'a>>,
 }
 
 /// The request's `exposure_fix` settings
@@ -1425,6 +1448,28 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     }
     let shape = Shape { t: lt, h: c.height / 16, w: c.width / 16, audio_t: at };
     ctl.say(format!("clip   : {}x{}, {frames} frames ({:.2} s), {} steps, seed {}", c.width, c.height, frames as f64 / 24.0, c.steps, c.seed));
+    // MPEG-Diffusion: the denoiser runs at half resolution, the full-res rows join it after the switch (mpeg.rs)
+    let run_shape = match &c.mpeg {
+        Some(_) => {
+            let i = &c.inputs;
+            if !c.width.is_multiple_of(64) || !c.height.is_multiple_of(64) {
+                return Err(Error(format!("MPEG-Diffusion: the canvas must be a multiple of 64 on both sides, got {}x{}", c.width, c.height)));
+            }
+            if c.refine.is_some() || c.knots.len() >= 2 || c.sampler != nextsycl_diffusion::Sampler::Euler || c.schedule != nextsycl_diffusion::Schedule::Shift {
+                return Err(Error("MPEG-Diffusion runs Euler on H3's own schedule: no refine, knots, other samplers or schedules".into()));
+            }
+            if i.first_latent.is_some() || i.first_frame.is_some() || i.last_frame.is_some() || !i.guides.is_empty() || i.first_audio.is_some()
+                || i.soundtrack.is_some() || !i.ref_audio.is_empty() || !i.ref_images.is_empty() || !i.ref_videos.is_empty() || i.control_video.is_some()
+                || i.control_mask.is_some() || i.source.is_some() {
+                return Err(Error("MPEG-Diffusion makes a clip from its prompt alone: no keyframes, guides, references, sound, ControlNet or source (the full-res model takes those)".into()));
+            }
+            if c.vaes.upscale.is_some() && c.vaes.pixel.is_none() {
+                return Err(Error("MPEG-Diffusion pastes decoded pixels: no latent upscaler (a pixel_upscaler works)".into()));
+            }
+            Shape { h: shape.h / 2, w: shape.w / 2, ..shape }
+        }
+        None => shape,
+    };
     // the keyframes and the references first (their pictures are part of the prompt's presentation)
     let mut cond = Conditions { seed: c.seed, ..Conditions::default() };
     if let Some(a) = c.inputs.cond_noise_aug {
@@ -1514,7 +1559,7 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     };
     // vision blocks run on the video tables (tag 0), the rest on the text ones
     let tags = presented.has_vision().then(|| presented.tags.clone());
-    let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, schedule, &cond)?;
+    let mut d = Denoiser::new(&e.model, &e.outer, text, tags, run_shape, schedule, &cond)?;
     d.lora = lora.as_ref();
     if let (Some(net), Some((h, ch))) = (control.as_ref(), hint.as_ref()) {
         d.set_control(net, h, *ch)?;
@@ -1556,9 +1601,44 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     };
     ctl.say(format!("tokens : {} in the denoiser", d.tokens()));
     let nblocks = e.model.blocks.len();
-    let steps = sigmas.len() - 1;
+    let mut steps = sigmas.len() - 1;
     let t0 = Instant::now();
-    let (v, a) = {
+    let mut paste = None;
+    let mut mpeg_report = None;
+    let (v, a) = if let Some(m) = &c.mpeg {
+        // the network calls: the half-res steps, then the tail's
+        steps = m.settings.switch + m.settings.tail(&sigmas).len() - 1;
+        let dev = e.dev.clone();
+        let cancel = ctl.cancel;
+        let mut progress = ctl.progress.take();
+        let mut times = Vec::new();
+        let mut t_step = Instant::now();
+        let r = crate::mpeg::sample(&mut d, m, &sigmas, c.vaes.video, e.threads, c.seed, &mut *ctl.log, &mut |i, b| {
+            if b == 0 || b == nblocks / 2 {
+                dev.wait()?;
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(Error("cancelled".into()));
+                }
+            }
+            if let Some(p) = progress.as_mut() {
+                p(i * nblocks + b, steps * nblocks);
+            }
+            Ok(())
+        }, &mut |_| {
+            times.push(t_step.elapsed().as_secs_f64());
+            t_step = Instant::now();
+            Ok(())
+        });
+        ctl.progress = progress;
+        let r = r?;
+        ctl.say(format!("sampled: {steps} steps ({} half-res, {} two-track) in {:.1} s ({})", m.settings.switch, steps - m.settings.switch,
+                        t0.elapsed().as_secs_f64(), times.iter().map(|s| format!("{s:.2}")).collect::<Vec<_>>().join(" ")));
+        let mut rep = r.report;
+        rep["step_seconds"] = json!(times);
+        mpeg_report = Some(rep);
+        paste = Some(r.paste);
+        (r.video, r.audio)
+    } else {
         let dev = e.dev.clone();
         let cancel = ctl.cancel;
         let mut progress = ctl.progress.take();
@@ -1606,7 +1686,10 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     if c.refine.as_ref().is_some_and(|r| r.window) {
         return Ok(json!({"sample_seconds": sample_secs}));
     }
-    let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video: v, t: shape.t, h: shape.h, w: shape.w, audio: Some((a, shape.audio_t)) }, &c.vaes, Some(out), None, Some(out), exposure.as_ref(), ctl)?;
+    let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video: v, t: shape.t, h: shape.h, w: shape.w, audio: Some((a, shape.audio_t)), paste }, &c.vaes, Some(out), None, Some(out), exposure.as_ref(), ctl)?;
+    if let Some(m) = mpeg_report {
+        rep["mpeg"] = m;
+    }
     if let Some((p, start)) = c.inputs.soundtrack {
         // the clip carries the song itself, not the audio decoder's rendering of it
         crate::media::mux_sound(out, p, start, frames as f64 / 24.0)?;
@@ -1677,7 +1760,7 @@ fn generate_windows(e: &Engine, mut c: ClipSpec, out: &Path, ctl: &mut Ctl) -> R
         ("samples.video".to_string(), (vec![1, 24, lt, h, w], video.clone())),
         ("samples.audio".to_string(), (vec![1, 32, 2, draft_at], draft_a.clone())),
     ]), &BTreeMap::new())?;
-    let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video, t: lt, h, w, audio: Some((draft_a, draft_at)) }, &c.vaes, Some(out), None, Some(out), None, ctl)?;
+    let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video, t: lt, h, w, audio: Some((draft_a, draft_at)), paste: None }, &c.vaes, Some(out), None, Some(out), None, ctl)?;
     let total = t_all.elapsed().as_secs_f64();
     rep["windows"] = json!(plan.len());
     rep["sample_seconds"] = json!(sampled);
@@ -1864,6 +1947,19 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     regen_box: s("regen_box").and_then(|r| {
                         let v: Vec<usize> = r.split(',').filter_map(|x| x.trim().parse().ok()).collect();
                         (v.len() == 4).then(|| (v[0], v[1], v[2], v[3]))
+                    }),
+                },
+                // MPEG-Diffusion (the model card's H3_MPEG: the engine adds "mpeg" and the card's files)
+                mpeg: match spec.get("mpeg").and_then(Value::as_bool).unwrap_or(false) {
+                    false => None,
+                    true => Some(crate::mpeg::Spec {
+                        maps: Path::new(s("mpeg_maps").ok_or("mpeg needs \"mpeg_maps\": the fitted K/V maps (up_maps_tt.safetensors)")?),
+                        head: Path::new(s("region_head").ok_or("mpeg needs \"region_head\": the region head (region_head_tt.safetensors)")?),
+                        settings: crate::mpeg::Settings::from_env(&|k: &str| {
+                            // a job's own key (mpeg_switch ...) over the variable (H3_MPEG_SWITCH ...)
+                            let key = k.trim_start_matches("H3_").to_lowercase();
+                            spec.get(&key).map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string)).or_else(|| std::env::var(k).ok())
+                        }),
                     }),
                 },
             };

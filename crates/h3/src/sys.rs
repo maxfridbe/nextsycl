@@ -159,6 +159,12 @@ pub struct Api {
         *mut c_void,    // out
         c_int,          // out_dt
     ) -> c_int,
+    /// RoPE alone, in place (nsd_rms_rope without its norm): x, x_dt, M, H, D, stride, cs, rot_dim
+    pub rope: unsafe extern "C" fn(*mut c_void, *mut c_void, c_int, i64, i64, i64, i64, *const f32, c_int) -> c_int,
+    /// Sq query rows (stride qs) over Skv key / value rows (stride kvs), no mask: q, Sq, qs, k, v, Skv, kvs, dt, H, D, out,
+    /// out_dt (MPEG-Diffusion's full-resolution queries over their own key set)
+    #[allow(clippy::type_complexity)]
+    pub attention_qk: unsafe extern "C" fn(*mut c_void, *const c_void, i64, i64, *const c_void, *const c_void, i64, i64, c_int, i64, i64, *mut c_void, c_int) -> c_int,
 }
 
 
@@ -235,6 +241,8 @@ impl Api {
             gate_add: sym!("nsd_gate_add"),
             attention: sym!("nsd_attention"),
             attention_batch: sym!("nsd_attention_batch"),
+            rope: sym!("nsd_rope"),
+            attention_qk: sym!("nsd_attention_qk"),
         })
     }
 

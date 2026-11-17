@@ -370,6 +370,15 @@ pub type Tap<'a> = &'a mut dyn FnMut(&str, &Tensor) -> Result<()>;
 /// true; false (or none set) leaves a call to the shared kernels
 pub type AttentionFn = Box<dyn Fn(Rows, Rows, Rows, &Tensor) -> Result<bool> + Send + Sync>;
 
+/// An attention that is not one over every row of the sequence (MPEG-Diffusion's two tracks, mpeg.rs): told the qkv
+/// buffer before q and k are normalized and rotated, then asked for the attention in place of the one over all rows
+pub trait SplitAttention {
+    /// qkv [S, 3 H D] as the qkv linear wrote it (k_norm: this block's per-head key norm)
+    fn before_rope(&self, index: usize, qkv: &Tensor, k_norm: &Tensor) -> Result<()>;
+    /// q and k rotated in qkv; write every row's attention output into att [S, H D]
+    fn attend(&self, index: usize, qkv: &Tensor, att: &Tensor) -> Result<()>;
+}
+
 /// Another engine's whole product with a k-quant block matrix (the matrix, x, out, the stack's 16-bit expansion buffer
 /// for its own use): true when it did it; false leaves the expansion and the product to the rest
 pub type ProductFn = Box<dyn Fn(&KLinear, &Tensor, &Tensor, &Tensor) -> Result<bool> + Send + Sync>;
@@ -390,6 +399,9 @@ pub struct Blocks {
     pub product: Option<ProductFn>,
     /// the streamed blocks' card copy (`load_streamed`): one block's matrices at a time
     staging: Option<Staging>,
+    /// rows gathered by index from a strided buffer, when an engine brings the kernel (the H3 video silo's, for
+    /// MPEG-Diffusion's two-track attention); else one copy a row
+    pub gather: Option<crate::mpeg::GatherFn>,
 }
 
 impl Blocks {
@@ -446,7 +458,12 @@ impl Blocks {
             }
             None => None,
         };
-        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf, attention: None, product: None, staging })
+        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf, attention: None, product: None, staging, gather: None })
+    }
+
+    /// The card the blocks are on
+    pub fn device(&self) -> Option<Arc<Device>> {
+        self.blocks.first().map(|b| b.norm1.buf.device().clone())
     }
 
     /// How many blocks stay on the card (the rest stream from the file)
@@ -508,7 +525,14 @@ impl Blocks {
 
     /// Runs block `index` on the stream `x` [S, hidden], in place.
     /// `lora`: this block's LoRAs, if any.
-    pub fn block(&self, index: usize, x: &Tensor, step: &Step, s: &Scratch, lora: Option<&crate::lora::BlockLora>, mut tap: Option<Tap>) -> Result<()> {
+    pub fn block(&self, index: usize, x: &Tensor, step: &Step, s: &Scratch, lora: Option<&crate::lora::BlockLora>, tap: Option<Tap>) -> Result<()> {
+        self.block_split(index, x, step, s, lora, tap, None)
+    }
+
+    /// `block`, with an attention of its own (`SplitAttention`) in place of the one over every row
+    #[allow(clippy::too_many_arguments)]
+    pub fn block_split(&self, index: usize, x: &Tensor, step: &Step, s: &Scratch, lora: Option<&crate::lora::BlockLora>, mut tap: Option<Tap>,
+                       split: Option<&dyn SplitAttention>) -> Result<()> {
         let cfg = &self.cfg;
         let b = &self.blocks[index];
         self.stage(index)?;
@@ -527,10 +551,15 @@ impl Blocks {
         tap("qkv", &s.qkv)?;
         let w = cfg.heads * cfg.head_dim;
         let part = |i: usize| Rows { t: &s.qkv, offset: i * w, stride: 3 * w, tokens: step.tokens, heads: cfg.heads, dim: cfg.head_dim };
+        if let Some(sp) = split {
+            sp.before_rope(index, &s.qkv, &b.k_norm)?;
+        }
         ops::rms_rope(part(0), &b.q_norm, cfg.qk_eps, &step.cs, cfg.rot_dim)?;
         ops::rms_rope(part(1), &b.k_norm, cfg.qk_eps, &step.cs, cfg.rot_dim)?;
         tap("qkv_rotated", &s.qkv)?;
-        if !self.attention.as_ref().map_or(Ok(false), |f| f(part(0), part(1), part(2), &s.att))? {
+        if let Some(sp) = split {
+            sp.attend(index, &s.qkv, &s.att)?;
+        } else if !self.attention.as_ref().map_or(Ok(false), |f| f(part(0), part(1), part(2), &s.att))? {
             ops::attention(part(0), part(1), part(2), &s.att)?;
         }
         tap("att", &s.att)?;

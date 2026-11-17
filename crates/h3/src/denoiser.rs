@@ -415,6 +415,31 @@ pub struct Denoiser<'a> {
     control: Option<ControlRun<'a>>,
     /// HyperFlow's two-time tables for this run's noise levels (hyperflow.rs), in place of the curve's
     pub hyperflow: Option<&'a crate::hyperflow::Prepared>,
+    /// (block, states): the next `net` call reads the video rows' stream after that block into the vector as float32
+    /// [video rows, hidden] (MPEG-Diffusion's region head reads block 25's)
+    pub capture: Option<(usize, Vec<f32>)>,
+}
+
+/// The final layer on `n` rows of the stream `x` from row `start`: norm, the timestep's shift and scale (`t_rows`:
+/// each row's timestep index into the tables), the output linear; float32 [n, outputs], in chunks of rows
+#[allow(clippy::too_many_arguments)]
+fn final_head(dev: &Arc<Device>, o: &Outer, hidden: usize, x: &Tensor, start: usize, n: usize, t_rows: &[i32], lin: &Linear, shift: &Tensor, scale: &Tensor)
+              -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(n * lin.outputs());
+    let mut done = 0;
+    while done < n {
+        let m = FINAL_CHUNK.min(n - done);
+        let rows = Tensor::new(dev, DType::BF16, &[m, hidden])?;
+        rows.copy_rows(0, x, start + done, m)?;
+        let table = Tensor::from_bytes(dev, DType::I32, &[m], &t_rows[done..done + m].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        let h = Tensor::new(dev, DType::F32, &[m, hidden])?;
+        ops::rms_norm_mod(&rows, &o.final_norm, o.final_eps, Some(&Mod { rows: &table, scale, shift }), &h)?;
+        let y = Tensor::new(dev, DType::F32, &[m, lin.outputs()])?;
+        lin.forward(&h, &y)?;
+        out.extend(y.to_f32()?);
+        done += m;
+    }
+    Ok(out)
 }
 
 /// A ControlNet's per-clip state: its hint rows per video-like segment, the audio rows it leaves alone, and the
@@ -532,6 +557,7 @@ impl<'a> Denoiser<'a> {
             masks: None,
             control: None,
             hyperflow: None,
+            capture: None,
         })
     }
 
@@ -703,6 +729,12 @@ impl<'a> Denoiser<'a> {
             };
             let lora = staged.as_ref().or_else(|| self.lora.and_then(|l| l.blocks.get(i)));
             self.blocks.block(i, &self.x, &step, &self.scratch, lora, None)?;
+            if let Some((b, states)) = self.capture.as_mut().filter(|(b, _)| *b == i) {
+                let _ = b;
+                let rows = Tensor::new(&dev, DType::BF16, &[nv, cfg.hidden])?;
+                rows.copy_rows(0, &self.x, ts_video.start, nv)?;
+                *states = rows.to_f32()?;
+            }
             if let (Some(c), Some(cs)) = (control, cstep.as_ref()) {
                 if let Some(k) = c.net.at.iter().position(|l| *l == i) {
                     if k == 0 {
@@ -722,29 +754,95 @@ impl<'a> Denoiser<'a> {
         let r = ts.values.len();
         let shift = Tensor::from_bytes(&dev, DType::F32, &[r, cfg.hidden], &f32_bytes(&shift))?;
         let scale = Tensor::from_bytes(&dev, DType::F32, &[r, cfg.hidden], &f32_bytes(&scale))?;
-        let head = |start: usize, n: usize, t_rows: &[i32], lin: &Linear| -> Result<Vec<f32>> {
-            let mut out = Vec::with_capacity(n * lin.outputs());
-            let mut done = 0;
-            while done < n {
-                let m = FINAL_CHUNK.min(n - done);
-                let rows = Tensor::new(&dev, DType::BF16, &[m, cfg.hidden])?;
-                rows.copy_rows(0, &self.x, start + done, m)?;
-                let table = Tensor::from_bytes(&dev, DType::I32, &[m], &t_rows[done..done + m].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
-                let h = Tensor::new(&dev, DType::F32, &[m, cfg.hidden])?;
-                ops::rms_norm_mod(&rows, &o.final_norm, o.final_eps, Some(&Mod { rows: &table, scale: &scale, shift: &shift }), &h)?;
-                let y = Tensor::new(&dev, DType::F32, &[m, lin.outputs()])?;
-                lin.forward(&h, &y)?;
-                out.extend(y.to_f32()?);
-                done += m;
-            }
-            Ok(out)
-        };
+        let head = |start: usize, n: usize, t_rows: &[i32], lin: &Linear| final_head(&dev, o, cfg.hidden, &self.x, start, n, t_rows, lin, &shift, &scale);
         let v = head(ts_video.start, nv, &final_v, &o.video_out)?;
         let a = head(ts_audio.start, na, &final_a, &o.audio_out)?;
         let mut v = unpatchify(&v, o.video_c, sh.t, sh.h, sh.w);
         let mut a = unpack_audio(&a, o.audio_c, sh.audio_t);
         v.iter_mut().chain(a.iter_mut()).for_each(|x| *x = -*x);
         Ok((v, a))
+    }
+
+    /// MPEG-Diffusion's network call (mpeg.rs): the half-res clip `lr` [C, T, H, W] (this denoiser's shape), the
+    /// full-res latent `hr` [C, T, 2H, 2W] of which only `tt`'s region is in the sequence, the sound, at `sigma` ->
+    /// velocities (half-res video, full-res video - zero outside the region -, audio), with the reference's sign
+    pub fn net_two_track(&mut self, tt: &crate::mpeg::TwoTrack, lr: &[f32], hr: &[f32], audio: &[f32], sigma: f32, between: Between)
+                         -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let cfg = self.blocks.cfg;
+        let (o, sh) = (self.outer, self.shape);
+        let dev = self.x.buf.device().clone();
+        if self.masks.is_some() || self.control.is_some() || self.hyperflow.is_some() || !self.cond_rows.is_empty() {
+            return Err(Error("two-track steps take a clip from text alone: no keyframes, references, masks, ControlNet or HyperFlow".into()));
+        }
+        let (ts, final_v, final_a) = self.timesteps(sigma);
+        let p = &tt.plan;
+        let nh = p.hr_count();
+        let mut rows = ts.rows.clone();
+        rows.extend(std::iter::repeat_n(ts.video_index as i32 * 3 + Kind::Video.modality(), nh));
+        let t_emb = ts.embeddings(&o.t_table, cfg.t_dim);
+        let step = Step::new_with(&dev, self.blocks, &rows, &tt.positions, &o.inv_freq, &t_emb, self.lora.map(|l| l.adaln.as_slice()))?;
+        let seg = |k: Kind| self.layout.segment(k).ok_or_else(|| Error(format!("no {k:?} rows in the layout")));
+        let (ts_text, ts_audio, ts_video) = (seg(Kind::Text)?, seg(Kind::Audio)?, seg(Kind::Video)?);
+        let embed = |rows: Vec<f32>, n: usize, lin: &Linear| -> Result<Tensor> {
+            let input = Tensor::from_bytes(&dev, DType::F32, &[n, lin.inputs()], &f32_bytes(&rows))?;
+            let out = Tensor::new(&dev, DType::BF16, &[n, cfg.hidden])?;
+            lin.forward(&input, &out)?;
+            Ok(out)
+        };
+        let nv = ts_video.stop - ts_video.start;
+        let na = ts_audio.stop - ts_audio.start;
+        let pw = o.video_c * PATCH * PATCH;
+        let hr_all = patchify(hr, o.video_c, sh.t, 2 * sh.h, 2 * sh.w);
+        let hr_rows: Vec<f32> = p.hr_index.iter().flat_map(|i| hr_all[i * pw..(i + 1) * pw].iter().copied()).collect();
+        let x = &tt.x;
+        x.copy_rows(ts_text.start, &self.text, 0, ts_text.stop - ts_text.start)?;
+        x.copy_rows(ts_audio.start, &embed(pack_audio(audio, o.audio_c, sh.audio_t), na, &o.audio_patch)?, 0, na)?;
+        x.copy_rows(ts_video.start, &embed(patchify(lr, o.video_c, sh.t, sh.h, sh.w), nv, &o.video_patch)?, 0, nv)?;
+        if nh > 0 {
+            x.copy_rows(ts_video.stop, &embed(hr_rows, nh, &o.video_patch)?, 0, nh)?;
+        }
+        for i in 0..self.blocks.blocks.len() {
+            between(i)?;
+            let staged = match self.lora {
+                Some(l) if l.on_host() => l.device_block(&dev, i)?,
+                _ => None,
+            };
+            let lora = staged.as_ref().or_else(|| self.lora.and_then(|l| l.blocks.get(i)));
+            self.blocks.block_split(i, x, &step, &tt.scratch, lora, None, Some(tt))?;
+        }
+        let (shift, scale) = o.final_tables(&cfg, &t_emb);
+        let r = ts.values.len();
+        let shift = Tensor::from_bytes(&dev, DType::F32, &[r, cfg.hidden], &f32_bytes(&shift))?;
+        let scale = Tensor::from_bytes(&dev, DType::F32, &[r, cfg.hidden], &f32_bytes(&scale))?;
+        let v = final_head(&dev, o, cfg.hidden, x, ts_video.start, nv, &final_v, &o.video_out, &shift, &scale)?;
+        let vh = final_head(&dev, o, cfg.hidden, x, ts_video.stop, nh, &vec![ts.video_index as i32; nh], &o.video_out, &shift, &scale)?;
+        let a = final_head(&dev, o, cfg.hidden, x, ts_audio.start, na, &final_a, &o.audio_out, &shift, &scale)?;
+        let mut full = vec![0f32; 4 * nv * pw];
+        for (k, i) in p.hr_index.iter().enumerate() {
+            full[i * pw..(i + 1) * pw].copy_from_slice(&vh[k * pw..(k + 1) * pw]);
+        }
+        let mut v = unpatchify(&v, o.video_c, sh.t, sh.h, sh.w);
+        let mut vh = unpatchify(&full, o.video_c, sh.t, 2 * sh.h, 2 * sh.w);
+        let mut a = unpack_audio(&a, o.audio_c, sh.audio_t);
+        v.iter_mut().chain(vh.iter_mut()).chain(a.iter_mut()).for_each(|x| *x = -*x);
+        Ok((v, vh, a))
+    }
+
+    /// `denoised` for a two-track step: (half-res x, full-res x, audio as the sampler carries it) -> their denoised
+    /// estimates (the full-res one equal to x outside the region: its velocity is zero there)
+    pub fn denoised_two_track(&mut self, tt: &crate::mpeg::TwoTrack, xv: &[f32], xh: &[f32], xa: &[f32], sigma: f32, between: Between)
+                              -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let sc = self.schedule;
+        let sigma_v = (sigma * 1000.0 / 1000.0).max(1e-6);
+        let sigma_a = time_shift_sigma(sigma_v as f64, sc.shift_video as f64, sc.shift_audio as f64) as f32;
+        let carry = sigma_a / sigma_v;
+        let audio_in: Vec<f32> = xa.iter().map(|x| x * carry).collect();
+        let (out_v, out_h, out_a) = self.net_two_track(tt, xv, xh, &audio_in, sigma, between)?;
+        let k = 1.0 + (sc.audio_scale - 1.0) * sigma_a;
+        let dv = xv.iter().zip(&out_v).map(|(x, o)| x - o * sigma).collect();
+        let dh = xh.iter().zip(&out_h).map(|(x, o)| x - o * sigma).collect();
+        let da = xa.iter().zip(audio_in.iter().zip(&out_a)).map(|(x, (ai, o))| x - ((1.0 - sc.audio_scale) * ai + k * o) * sigma).collect();
+        Ok((dv, dh, da))
     }
 
     /// The model as the sampler sees it: x (video, and audio as the sampler carries it) at `sigma` -> the denoised

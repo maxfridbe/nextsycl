@@ -1,0 +1,46 @@
+# MiniMax H3 MPEG-Diffusion (int8; half resolution, then full-resolution tokens on a region the model picks)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# MPEG-Diffusion (Menn et al., arXiv 2611.12069) as scrya-com/mpeg-diffusion ports it to H3 (its quality recipe), run by
+# the H3 engine's generate job (crates/h3/src/mpeg.rs; docs/ports/mpeg-diffusion.md): 16 of 20 steps on the whole clip
+# at half resolution, a linear region head on block 25 picks a region, the clean half-res estimate there is upscaled
+# (VAE round trip) and re-noised as full-resolution tokens, 6 more steps run both tracks in one sequence (the full-res
+# queries read the half-res keys through fitted rank-128 K/V up-maps), and the half-res frame is pasted under the full-res
+# region after the decode. Text to video with sound only (no keyframes, references or ControlNet: the minimax-h3 card).
+# Research weights (upstream: "it needs training"): the region is sharp, the rest is the half-res track enlarged.
+id: minimax-h3-mpeg
+kind: video
+arch: minimax-h3
+title: 'MiniMax H3 MPEG-Diffusion (int8; two tracks: half resolution, full resolution on the subject)'
+about: the int8 FL2VA H3 with MPEG-Diffusion's two-track sampler (scrya-com's port, region head v3 and fitted K/V maps) - 20 steps, 16 at half resolution then 6 with full-resolution tokens on the region the model picks (people, faces); text to video with sound
+license: minimax-h3-community
+commercial: true
+license_note: 'MiniMax H3''s denoiser, VAEs and the Qwen3-VL-32B text encoder as MiniMax ships it (Comfy-Org''s repack; the GGUFs unsloth''s), and MPEG-Diffusion''s fitted K/V up-maps and region head v3 (johndpope/MiniMax-H3-MPEG-Diffusion, derived from H3): the MiniMax H3 Community License (not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; products show "Powered by MiniMax H3"; its Acceptable Use Policy; outputs may not improve another model). The encoder underneath is Qwen3-VL-32B (Apache-2.0); the Qwen2.5 tokenizer files come from ComfyUI''s GPL-3.0 repository; the method''s code (scrya-com/mpeg-diffusion lot/) is Apache-2.0, ported here, not copied. Not an official MiniMax product, nor the paper authors'' release.'
+gpus: '0'
+defaults:
+  steps: 20
+  seconds: 3.04
+  size: 1344x768
+env:
+  H3_MPEG: '1'
+files:
+  denoiser: h3-denoiser-int8
+  text-encoder: h3-te-32b-q4km
+  tokenizer: h3-tokenizer-vocab
+  tokenizer-merges: h3-tokenizer-merges
+  tokenizer-config: h3-tokenizer-config
+  vae: h3-vae
+  audio-vae: h3-audio-vae
+  vision: h3-te-visual
+  mpeg-maps:
+    key: h3-mpeg-kv-maps
+    url: https://huggingface.co/johndpope/MiniMax-H3-MPEG-Diffusion/resolve/e2cc71831ff468374024d78e2b53d6607daab84d/kv_maps/up_maps_tt.safetensors
+    size: 32784896
+    sha256: a105eae0aa4f30d9a4cf1c861e7d78e8efd6393957ed6cfde09e34378984c648
+    path: minimax-h3-mpeg/kv_maps/up_maps_tt.safetensors
+  region-head:
+    key: h3-mpeg-region-head-v3
+    url: https://huggingface.co/johndpope/MiniMax-H3-MPEG-Diffusion/resolve/e2cc71831ff468374024d78e2b53d6607daab84d/region_head_v3/region_head_tt.safetensors
+    size: 21780
+    sha256: 9a43b94c84b12c422cbf0d303c2145c87f0ed11d7ecd0e74b8bd5fa3a9715984
+    path: minimax-h3-mpeg/region_head_v3/region_head_tt.safetensors
+guide: guides/minimax-h3.md

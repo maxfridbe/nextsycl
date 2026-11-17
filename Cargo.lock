@@ -1508,6 +1508,7 @@ dependencies = [
 name = "nextsycl-video-h3"
 version = "0.0.0"
 dependencies = [
+ "nextsycl-core",
  "nextsycl-h3",
  "nextsycl-video",
  "serde_json",
