@@ -19,7 +19,7 @@ which Haru-4B will share. The wfe audio page has a live Conversation panel.
   vision tower: not downloaded, the audio path does not read it), `talker/model.safetensors` (Qwen3-TTS-12Hz-1.7B-Base
   fine-tuned, bf16; its config.json and `speech_tokenizer/` are the Base checkpoint's byte for byte), `voices/*.pt`
   (x-vectors: chelsie, brand; en / zh). On hardac1: `/var/mnt/4TBSSD/nextsycl-models/sophon-realtime/Flash`.
-- **Card**: `model-cards/audio/sophon-realtime-32b-flash.yml` (the talker's config and the codec reuse the
+- **Cards**: `model-cards/audio/sophon-realtime-32b-flash.yml` (Base's talker, tags out) and `-tags.yml` (Flash's talker, tags performed): Talkers below (the talker's config and the codec reuse the
   qwen3-tts-base card's keys `q3t-base-config`, `q3t-codec`).
 
 ## License
@@ -69,7 +69,7 @@ one used with permission, be cloned.
 | `audio/sophon/src/speak.rs` | the talker fed text as it comes, voices (.pt x-vectors; recordings by the speaker encoder), the codec |
 | `audio/sophon/src/talker.rs`, `sample.rs`, `speaker.rs` | copies of the Qwen3-TTS engine's (an engine depends on no other), without its silo |
 | `audio/sophon/src/text.rs` | prompts, the turn question (its option permutation precomputed), tag_clean, tool calls |
-| `audio/sophon/src/check.rs` | stage checks against reference/sophon/ref.py's dumps |
+| `audio/sophon/src/check.rs` | stage checks against reference/sophon/ref.py's and talker_ref.py's dumps; `speak` takes several voices (a recording's clone or a release voice) and a temperature for A/Bs |
 | `kernels/audio/sophon/sp.{h,cpp}` | FP8 / bf16 -> q4 / q8 on the card; their decode product; their half expansion; cache attention; the ear's patches and window attention |
 | `glue/serve/src/realtime.rs` | the WebSocket (RFC 6455, SHA-1 of our own) and OpenAI Realtime's events over a `Conversation` |
 | `glue/serve/src/audio.rs`, `http.rs`, `home/{api,mod}.rs` | `/v1/realtime` on the audio server; the front door's splice (`/v1/realtime?model=`, `/open/<id>/v1/realtime`) |
@@ -169,6 +169,62 @@ The answers' audio, written down by the box's Whisper (`nextsycl audio transcrib
   a high of 21 degrees and a low of 12 degrees."
 - a saved voice (cloned from a 4 s recording): the first answer, word for word.
 - every answer's text and audio agree (`reference/sophon/client.py` sessions on hardac1: ~/src/sophon-out/convo5).
+
+## Talkers (2026-11-17): Base clones closer, Flash performs the tags
+
+Two registry entries, the same brain:
+- `sophon-realtime-32b-flash`: Qwen3-TTS-12Hz-1.7B-Base's model.safetensors as the talker, with `NS_SOPHON_TAGS=0`.
+- `sophon-realtime-32b-flash-tags`: the release's own talker, which performs the tags.
+
+The release's talker is Base fine-tuned. NOTICE says "the language model was fine-tuned to perform sound tags"; the
+training data is not published. Compared tensor by tensor with Base's:
+- the speaker encoder (74 tensors) is identical;
+- the talker's layers differ (rel 1.8e-3), as do the code predictor (7.3e-3), the codec head and the text projection.
+
+So a recording gives the same x-vector under either talker, and only what the talker makes of it differs.
+
+**The clone path is upstream's.** Upstream's talker.py `_load_voice` takes `voices/<name>.wav`:
+- the channels are averaged and the first `SOPHON_MAX_REF_SECONDS` (15) kept;
+- vLLM-Omni's `extract_speaker_embedding` (librosa to 24 kHz, qwen-tts's mel, the loaded talker's ECAPA encoder in bf16) makes the x-vector;
+- the prompt is the x-vector-only one. There is no ICL, no transcript, no loudness normalisation, and no `.pt` written.
+
+Ours is `Talk::clone_voice` (15 s, our resample, speaker.rs). `reference/sophon/talker_ref.py --ref-wav` on Skippy1's
+15.9 s recording, then `audio check --stages talker` (B65), gives:
+- the x-vector: rel 1.1e-6 to upstream's float32 one, and rel 1.6e-3 (cos 0.9999996) to the bf16 one upstream feeds;
+- the first code 1995 in both, and the first 51 greedy frames identical.
+
+**The A/B.** Settings:
+- `audio check DIR --stages speak` (lines.json: `voices` and `temperature`), the talker alone on the B65;
+- two lines with no tags, seeds 1-3, the four saved voices and chelsie;
+- each take scored with ZONOS3-Mini's speaker encoder (`spk-encoder-cli`, the platform's; 192-d, cosine), and Whisper large-v3-turbo through `/rpc/audio.transcribe`.
+
+At the served temperature (0.9), speaker similarity to the recording (mean of 6 takes):
+
+| voice (recording) | Base | Flash | Base, in-context | among takes Base / Flash | WER Base / Flash |
+|---|---|---|---|---|---|
+| Skippy1 (15.9 s, a man's audiobook voice) | 0.606 | 0.520 | 0.696 | 0.74 / 0.75 | 0 / 0 |
+| Meeseeks (11.7 s, a TV clip) | 0.553 | 0.471 | 0.707 | 0.76 / 0.80 | 0 / 0 |
+| mission (10.0 s, a film clip) | 0.659 | 0.600 | 0.773 | 0.80 / 0.80 | 0 / 0 |
+| keeper (6.4 s, a voice-design model's sample) | 0.835 | 0.721 | 0.834 | 0.87 / 0.89 | 0 / 0 |
+
+What the A/B shows:
+- **Flash's talker drifts.** It is 0.06-0.11 further from every recording, human or synthetic, as stable from take to take as Base, and only 0.63-0.79 like Base's own takes.
+- **It matches the platform's measurement.** Skippy1 0.61 then 0.52 here, against the platform's 0.61 / 0.54 / 0.48 then 0.50.
+- **Temperature 0.7 (upstream's deploy config for the talker and its predictor) does not close the gap:** Flash 0.45-0.72.
+- **Pitch moves no more one way than the other** (median F0 of the takes against the recording).
+- **Chelsie** (a release voice) is equally stable under both talkers (0.86-0.89 among takes).
+
+**In-context cloning.** Qwen3-TTS's ICL prompt puts the recording's codes and its transcript in the prompt. It was run
+through the qwen3-tts engine, with each talker's weights:
+- **With Base it clones closest of all** (Skippy1 0.70). It still reads tags aloud ("bagels, laughter. Oh").
+- **With Flash's talker it fails.** Speech ends early (WER 0.26-0.74; Skippy1 "Thank you." in 3 of 9 takes), though Keeper's "[laughter]" was performed and not read.
+
+So no measured path gives both a faithful clone and performed tags. The fine-tune learned the x-vector prompt alone.
+ICL with Base is a candidate for the plain entry (the saved voices keep their transcripts). It is not ported: speak.rs
+builds upstream's x-vector prompt only.
+
+Files: hardac1 `~/src/talkerab-out` (ab/<config>/*.wav, transcripts.json, scores.json; emb/), scripts
+`~/src/talkerab-scripts`.
 
 ## Speed and memory (hardac1)
 

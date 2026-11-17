@@ -31,4 +31,17 @@ Its text keeps the sound tags it performs: `[laughter]`, `[breath]`, `[sigh]`, `
 sound tags work here too, as in a conversation: `[laughter]`, `[sigh]` and `[breath]` are performed (a laugh, a sigh,
 a breath where the tag stands; the word is not said), `<laughter>...</laughter>` is not read; `[cough]` is weak in
 English, `[quick_breath]` is sometimes said as words, and `<strong>` hardly stresses anything (upstream says so of
-this build). Heard 2026-11-16, voice chelsie, three seeds each.
+this build). Heard 2026-11-16, voice chelsie, three seeds each. That is the `-tags` entry; the plain entry's voice says
+nothing for a tag (below).
+
+## Which entry: the voice or the tags
+Two entries run the same brain and differ only in the voice that speaks:
+- `sophon-realtime-32b-flash`: the voice is Qwen3-TTS-12Hz-1.7B-Base. Choose it for a character with a saved, cloned
+  voice. It sounds closest to the recording: 0.55-0.84 speaker similarity to it, against 0.47-0.74 with the tags
+  entry's talker (four saved voices, measured 2026-11-17). It cannot perform the sound tags. The brain still writes
+  them in its text, but they are taken out of what the voice reads, so they are silent.
+- `sophon-realtime-32b-flash-tags`: the voice is the release's own talker, a fine-tune of Base. Choose it for a
+  built-in voice (`chelsie`, `brand`) or when the laughs and sighs matter more than the likeness. It performs the
+  tags, as listed above. A cloned voice keeps its words and its manner, but it drifts towards a generic voice: the
+  saved voice "Skippy1" measured 0.52 to its recording, against 0.61 with Base.
+- A good recording for either is 5-15 s of one speaker, clean, in a steady voice (upstream asks for 3-10 s).

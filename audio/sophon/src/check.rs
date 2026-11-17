@@ -17,8 +17,11 @@
 //!
 //! ```text
 //!   talker  request.json's text          -> the speakable ids against ids.npy, the prompt's rows against prefill.npy,
-//!                                           the first logits against logits0.npy, greedy codes against codes.npy
-//!   speak   lines.json (lines x seeds)   -> <name>-s<seed>.wav here, sampled as served (NS_SOPHON_TAGS applies)
+//!                                           the first logits against logits0.npy, greedy codes against codes.npy;
+//!           (its "reference": a recording) -> the clone's x-vector against xvec.npy (talker_ref.py --ref-wav), ns_xvec.npy
+//!   speak   lines.json (lines x seeds)   -> <name>-s<seed>.wav here, sampled as served (NS_SOPHON_TAGS applies);
+//!           (its "voices": [{name, reference?}]) -> <voice>-<name>-s<seed>.wav and <voice>.xvec.npy, each voice a
+//!           release voice by name or a recording's clone; "temperature" draws the talker and its predictor at it
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -63,6 +66,32 @@ pub fn read_npy(path: &Path) -> Result<(Vec<usize>, Vec<f64>)> {
         return Err(Error(format!("{}: a Fortran-order array", path.display())));
     }
     Ok((shape, v))
+}
+
+/// A float32 .npy of one row
+fn write_npy(path: &Path, v: &[f32]) -> Result<()> {
+    let mut head = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({},), }}", v.len());
+    while (10 + head.len() + 1) % 64 != 0 {
+        head.push(' ');
+    }
+    head.push('\n');
+    let mut b = b"\x93NUMPY\x01\x00".to_vec();
+    b.extend_from_slice(&(head.len() as u16).to_le_bytes());
+    b.extend_from_slice(head.as_bytes());
+    b.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+    std::fs::write(path, b).map_err(|e| Error(format!("{}: {e}", path.display())))
+}
+
+/// A voice for a check: a recording's clone (`reference`: a WAV's path) or a release voice by name
+fn check_voice(talk: &Talk, v: &serde_json::Value, lang: &str) -> Result<Vec<f32>> {
+    match v["reference"].as_str() {
+        Some(p) => {
+            let b = std::fs::read(p).map_err(|e| Error(format!("{p}: {e}")))?;
+            let (samples, rate) = nextsycl_audio::decode_wav(&b).map_err(|e| Error(format!("{p}: {e}")))?;
+            talk.clone_voice(&samples, rate)
+        }
+        None => talk.voice(v["voice"].as_str().or_else(|| v["name"].as_str()).unwrap_or("chelsie"), lang),
+    }
 }
 
 fn f32s(path: &Path) -> Result<Vec<f32>> {
@@ -221,7 +250,13 @@ pub fn talker(files: &ModelFiles, gpu: &Arc<Gpu>, dir: &Path, stages: &[String],
         let req = json(&dir.join("request.json"))?;
         let text = req["text"].as_str().unwrap_or_default();
         let lang = req["lang"].as_str().unwrap_or("en");
-        let xvec = talk.voice(req["voice"].as_str().unwrap_or("chelsie"), lang)?;
+        let xvec = check_voice(&talk, &req, lang)?;
+        if req["reference"].is_string() {
+            write_npy(&dir.join("ns_xvec.npy"), &xvec)?;
+            if dir.join("xvec.npy").exists() {
+                report(log, &mut worst, "talker: the clone's x-vector", &xvec, &f32s(&dir.join("xvec.npy"))?);
+            }
+        }
         // the tags handed over whatever NS_SOPHON_TAGS says: the reference is upstream's path (a dump made with tags)
         let ids = crate::speakable_ids(&tok, text, true, true);
         let ids_ref: Vec<u32> = read_npy(&dir.join("ids.npy"))?.1.iter().map(|x| *x as u32).collect();
@@ -252,24 +287,40 @@ pub fn talker(files: &ModelFiles, gpu: &Arc<Gpu>, dir: &Path, stages: &[String],
     if want("speak") {
         let lj = json(&dir.join("lines.json"))?;
         let lang = lj["lang"].as_str().unwrap_or("en");
-        let xvec = talk.voice(lj["voice"].as_str().unwrap_or("chelsie"), lang)?;
+        // one voice (lines.json's "voice": the files <line>-s<seed>.wav), or several (its "voices": <voice>-<line>-s<seed>.wav)
+        let voices: Vec<(String, Vec<f32>)> = match lj["voices"].as_array() {
+            Some(vs) => vs.iter().map(|v| {
+                let name = v["name"].as_str().unwrap_or("voice").to_string();
+                let x = check_voice(&talk, v, lang)?;
+                write_npy(&dir.join(format!("{name}.xvec.npy")), &x)?;
+                Ok((format!("{name}-"), x))
+            }).collect::<Result<_>>()?,
+            None => vec![(String::new(), check_voice(&talk, &lj, lang)?)],
+        };
         let seeds: Vec<u64> = lj["seeds"].as_array().into_iter().flatten().filter_map(|v| v.as_u64()).collect();
-        log(format!("speak: the sound tags {} the talker (NS_SOPHON_TAGS)", if crate::tags_spoken() { "handed to" } else { "kept from" }));
-        for line in lj["lines"].as_array().into_iter().flatten() {
-            let (name, text) = (line["name"].as_str().unwrap_or("line"), line["text"].as_str().unwrap_or_default());
-            let ids = crate::speakable_ids(&tok, text, true, crate::tags_spoken());
-            for &seed in &seeds {
-                let mut wav = Vec::new();
-                let mut next = |_: usize| Feed { ids: ids.clone(), done: true };
-                let mut keep = |x: &[f32]| {
-                    wav.extend_from_slice(x);
-                    Ok(())
-                };
-                let t = Instant::now();
-                let sp = talk.speak(&xvec, lang, Draw::DEFAULT, seed, &mut next, &mut keep, &|| false)?;
-                let path = dir.join(format!("{name}-s{seed}.wav"));
-                Audio { rate: crate::speak::RATE, channels: 1, samples: wav }.write_wav(&path, &[("ICMT", text)]).map_err(Error)?;
-                log(format!("speak: {} ({} frames) in {:.1} s: {text:?}", path.display(), sp.frames, t.elapsed().as_secs_f64()));
+        let draw = match lj["temperature"].as_f64() {
+            Some(t) => Draw { temperature: t as f32, ..Draw::DEFAULT },
+            None => Draw::DEFAULT,
+        };
+        log(format!("speak: the sound tags {} the talker (NS_SOPHON_TAGS); temperature {}", if crate::tags_spoken() { "handed to" } else { "kept from" },
+                    draw.temperature));
+        for (voice, xvec) in &voices {
+            for line in lj["lines"].as_array().into_iter().flatten() {
+                let (name, text) = (line["name"].as_str().unwrap_or("line"), line["text"].as_str().unwrap_or_default());
+                let ids = crate::speakable_ids(&tok, text, true, crate::tags_spoken());
+                for &seed in &seeds {
+                    let mut wav = Vec::new();
+                    let mut next = |_: usize| Feed { ids: ids.clone(), done: true };
+                    let mut keep = |x: &[f32]| {
+                        wav.extend_from_slice(x);
+                        Ok(())
+                    };
+                    let t = Instant::now();
+                    let sp = talk.speak(xvec, lang, draw, seed, &mut next, &mut keep, &|| false)?;
+                    let path = dir.join(format!("{voice}{name}-s{seed}.wav"));
+                    Audio { rate: crate::speak::RATE, channels: 1, samples: wav }.write_wav(&path, &[("ICMT", text)]).map_err(Error)?;
+                    log(format!("speak: {} ({} frames) in {:.1} s: {text:?}", path.display(), sp.frames, t.elapsed().as_secs_f64()));
+                }
             }
         }
     }

@@ -317,8 +317,13 @@ impl AudioEngine for Sophon {
             clone_needs_text: false,
             clone_takes_text: false,
             direction: false,
-            events: ["[laughter]", "[breath]", "[sigh]", "[cough]", "[quick_breath]", "<laughter>...</laughter>", "<strong>...</strong>"]
-                .iter().map(|s| s.to_string()).collect(),
+            // none when the talker is not handed them (NS_SOPHON_TAGS=0: the plain entry's Base talker, which reads them)
+            events: if tags_spoken() {
+                ["[laughter]", "[breath]", "[sigh]", "[cough]", "[quick_breath]", "<laughter>...</laughter>", "<strong>...</strong>"]
+                    .iter().map(|s| s.to_string()).collect()
+            } else {
+                Vec::new()
+            },
             requires: None,
             enrolled: false,
             speakers: 1,

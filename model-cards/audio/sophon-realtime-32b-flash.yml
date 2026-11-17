@@ -1,19 +1,22 @@
-# Sophon-Realtime 32B Flash (full-duplex voice conversation: a 32B brain that listens, a voice that laughs; /v1/realtime)
+# Sophon-Realtime 32B Flash (full-duplex voice conversation: a 32B brain that listens; its voice Qwen3-TTS Base's - a saved voice as recorded; /v1/realtime)
 # model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets.
 # adventists-ai/Sophon-Realtime-32B-Flash @ 13b33529 (Apache-2.0): the thinker (DuplexJev-32B-Para: Qwen3-ASR's audio
-# encoder, an Ultravox projector and Qwen3-VL-32B's language model with a merged tag-writing adapter, FP8 a channel),
-# the talker (Qwen3-TTS-12Hz-1.7B-Base fine-tuned to perform sound tags; its config.json and the 12 Hz codec are the
-# Base checkpoint's, byte for byte: the q3t-base keys) and the release's voices. The vision tower's file is not taken
-# (the audio path does not read it). The brain's matrices are made 4-bit on the card as it loads (NS_SOPHON_BITS=4,
-# audio/sophon brain.rs) - one card; the talker on the other. docs/ports/sophon-realtime.md has the checks.
+# encoder, an Ultravox projector and Qwen3-VL-32B's language model with a merged tag-writing adapter, FP8 a channel)
+# and the release's voices; the talker is Qwen3-TTS-12Hz-1.7B-Base itself (qwen3-tts-base.yml's file), not the
+# release's fine-tune of it: a saved voice cloned from its recording sounds closer to it (ZONOS3 speaker similarity
+# 0.55-0.84 against 0.47-0.74, four saved voices, 2026-11-17: docs/ports/sophon-realtime.md, Talkers), but Base reads a
+# sound tag aloud, so the talker is not handed them (NS_SOPHON_TAGS 0). sophon-realtime-32b-flash-tags.yml is the
+# same model with the release's talker: tags performed. The vision tower's file is not taken (the audio path does not
+# read it). The brain's matrices are made 4-bit on the card as it loads (NS_SOPHON_BITS=4, audio/sophon brain.rs) -
+# one card; the talker on the other. docs/ports/sophon-realtime.md has the checks.
 id: sophon-realtime-32b-flash
 kind: audio
 arch: sophon-realtime
 license: apache-2.0
 commercial: true
-license_note: 'Apache-2.0 code and weights (Adventists AI); derived from Qwen3-VL-32B-Instruct, Qwen3-ASR and Qwen3-TTS-12Hz-1.7B-Base (Qwen, Apache-2.0); the release asks that only your own voice, or one you have permission to use, be cloned'
-title: 'Sophon-Realtime 32B Flash (full-duplex voice conversation; Rust + SYCL)'
-about: 'A live voice conversation over /v1/realtime (OpenAI Realtime events): the 32B brain hears your speech itself, decides when you have finished (DuplexJev''s turn question) and writes a reply with sound tags ([laughter], [sigh], <strong>); a Qwen3-TTS voice speaks it as it is written; barge-in, voice cloning from a saved voice, tool calls. The brain q4 on the first card, the voice on the second'
+license_note: 'Apache-2.0 code and weights: the thinker and voices Adventists AI''s (derived from Qwen3-VL-32B-Instruct and Qwen3-ASR, Qwen, Apache-2.0), the talker Qwen3-TTS-12Hz-1.7B-Base itself (Qwen, Apache-2.0); the release asks that only your own voice, or one you have permission to use, be cloned'
+title: 'Sophon-Realtime 32B Flash (full-duplex voice conversation; a saved voice as recorded, no sound tags; Rust + SYCL)'
+about: 'A live voice conversation over /v1/realtime (OpenAI Realtime events): the 32B brain hears your speech itself, decides when you have finished (DuplexJev''s turn question) and writes a reply; Qwen3-TTS-12Hz-1.7B-Base speaks it as it is written, in a saved voice cloned from its recording (the closest to it of the two Sophon entries) or a built-in one; barge-in, tool calls. The brain''s sound tags stay in its text but are not spoken (the -tags entry performs them). The brain q4 on the first card, the voice on the second'
 gpus: '0,1'
 spans: true                      # one copy over both cards (audio start --gpus 0,1): the brain on the first, the talker on the second
 vram_gib: 23.0                   # the brain's card (q4, 6K context)
@@ -21,39 +24,12 @@ vram_gib_per_card: [23.0, 5.5]   # the brain's card, the talker's
 speech:
 - clone                          # a saved voice (its recording's x-vector), or a recording
 - realtime                       # a live conversation: /v1/realtime
-annotations_note: 'Its sound tags, kept as written in a text to speak (the engine''s markup()) and handed to the talker as upstream hands them (NS_SOPHON_TAGS=0 takes them out); in a /v1/realtime conversation its own replies carry them (strip them for display). Performed, not read, by Flash''s own talker: heard 2026-11-16 through the talker''s speech path (a build copy, `audio check --stages speak`, voice chelsie, seeds 1-3, Whisper large-v3-turbo), the tag''s word written in 1 of 21 takes ([quick_breath] once). The 21-of-21 "read aloud" of earlier that day was a wrong talker - the registry''s `talker` was Qwen3-TTS-12Hz-1.7B-Base''s model.safetensors, linked by pull --from for its name and size - so an install made before the fix must have that file pulled again. Not checked in a /v1/realtime conversation.'
-annotations:
-- syntax: '[laughter]'
-  keep: '\[laughter\]'
-  does: 'a laugh where it stands (upstream: 77% en / 83% zh)'
-  tested: 'verified 2026-11-16, performed (Flash talker, voice chelsie, seeds 1-3, "They would be bagels! [laughter] Oh, that is a classic."): Whisper wrote no tag word in 3 of 3; the gap between "bagels" and "Oh" 1.20 / 1.34 / 1.22 s with 0.81 / 0.43 / 0.48 s of sound above -40 dBFS, against 0.28 / 0.48 / 0.58 s and 0.08 / 0.10 / 0.11 s for the line without the tag; upstream''s own path (talker_ref.py, greedy) the same: a 2.1 s laugh of short bursts there'
-- syntax: '[breath]'
-  keep: '\[breath\]'
-  does: 'a breath where it stands'
-  tested: 'verified 2026-11-16, performed (Flash talker, voice chelsie, seeds 1-3, "Okay, here we go. [breath] Let us start the meeting now."): no tag word in 3 of 3; the gap "go" - "Let" 1.72 / 1.54 / 0.88 s with 0.29 / 0.54 / 0.42 s of sound, without the tag 0.24 / 0.26 / 0.68 s with 0.04 / 0.01 / 0.04 s'
-- syntax: '[sigh]'
-  keep: '\[sigh\]'
-  does: 'a sigh where it stands (upstream: 100% en / 90% zh)'
-  tested: 'verified 2026-11-16, performed (Flash talker, voice chelsie, seeds 1-3, "Well, I suppose we have to start over. [sigh] Fine, let us do it."): no tag word in 3 of 3; the gap "over" - "Fine" 1.48 / 1.18 / 0.96 s with 0.70 / 0.32 / 0.36 s of sound, without the tag 0.50 / 0.62 / 0.34 s with 0.06 / 0.07 / 0.08 s'
-- syntax: '[cough]'
-  keep: '\[cough\]'
-  does: 'a cough where it stands - weak in English (upstream: 50% en / 90% zh)'
-  tested: 'verified 2026-11-16, weak (Flash talker, voice chelsie, seeds 1-3, "Excuse me, [cough] as I was saying, the meeting is at noon."): no tag word in 3 of 3; the take ~1 s longer than without the tag, but the gap "me" - "as" holds 0.03 / 0.02 / 0.15 s of sound against 0.05 / 0.06 / 0.08 s: a cough heard in one take at most'
-- syntax: '[quick_breath]'
-  keep: '\[quick_breath\]'
-  does: 'a quick breath where it stands; sometimes read aloud'
-  tested: 'verified 2026-11-16, mostly performed (Flash talker, voice chelsie, seeds 1-3, "Okay, here we go. [quick_breath] Let us start the meeting now."): "Quick breath." written in 1 of 3; the other two a gap "go" - "Let" of 0.78 / 1.84 s with 0.10 / 0.12 s of sound'
-- syntax: '<laughter>...</laughter>'
-  keep: '<laughter>[^<\n]{0,300}</laughter>'
-  does: 'the words spoken laughing (upstream: 71% en / 78% zh)'
-  tested: 'verified 2026-11-16, tags not read (Flash talker, voice chelsie, seeds 1-3, "I cannot believe it. <laughter>You actually did it, you crazy person.</laughter> Well done."): Whisper wrote the words only, 3 of 3; the takes 0.6-1.4 s longer than without the tags, the gap "person" - "Well" 0.84 / 1.18 / 0.74 s with 0.13 / 0.30 / 0.21 s of sound against 0.58 / 0.36 / 0.50 s with 0.10 / 0.06 / 0.06 s; laughing in the words themselves not measured'
-- syntax: '<strong>...</strong>'
-  keep: '<strong>[^<\n]{0,300}</strong>'
-  does: 'the words stressed - weak in this build (upstream says so)'
-  tested: 'verified 2026-11-16, not read, stress unreliable (Flash talker, voice chelsie, seeds 1-3, "No, I said the <strong>blue</strong> one, not the red one."): no tag word in 3 of 3; "blue" -1.9 / +4.1 / +0.8 dB against the whole line, without the tags -0.7 / +1.0 / +0.9'
+annotations_note: 'No sound tags: its talker, Qwen3-TTS-12Hz-1.7B-Base, reads a tag aloud ("Laughter.", 21 of 21 takes, 2026-11-16), so they are taken out of what it reads (NS_SOPHON_TAGS 0) - a [laughter] in a text to speak, or in the brain''s own reply, is silent; the reply''s text keeps them (strip them for display). For performed tags use sophon-realtime-32b-flash-tags (the release''s own talker), whose cloned voices sound less like their recordings (docs/ports/sophon-realtime.md, Talkers).'
+annotations: []
 defaults:
   seconds: 60.0
-env: {}
+env:
+  NS_SOPHON_TAGS: '0'             # Base reads a tag aloud ("Laughter."): the talker is not handed them; the reply text keeps them
 files:
   thinker-1:
     key: sophon-flash-thinker-01
@@ -163,12 +139,7 @@ files:
     size: 11422840
     sha256: 0422f49acb9b2b8861f8a8c9fc5883758d7be3e805fdc014ade10478ea8fb1c9
     path: sophon-realtime-32b-flash/thinker/tokenizer.json
-  talker:
-    key: sophon-flash-talker
-    url: https://huggingface.co/adventists-ai/Sophon-Realtime-32B-Flash/resolve/13b33529d07c506687e4cb91e61ac503f6b83c86/talker/model.safetensors
-    size: 3857413744
-    sha256: b1d57164d4370ec8692e06ce7212fd2e73c613cd51e2ba3706805de8ed4752ad
-    path: sophon-realtime-32b-flash/talker/model.safetensors
+  talker: q3t-base-model           # Qwen3-TTS-12Hz-1.7B-Base (qwen3-tts-base.yml): clones a saved voice faithfully; reads sound tags (NS_SOPHON_TAGS 0 takes them out)
   talker-config: q3t-base-config
   codec: q3t-codec
   voice-1:

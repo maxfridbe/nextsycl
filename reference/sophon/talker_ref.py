@@ -16,7 +16,13 @@ codec bos; the rest of the text then tts_eos fed a frame each). With the whole t
 qwen-tts package's generate() builds for a voice_clone_prompt in x_vector_only_mode with non_streaming_mode=False, so
 the qwen-tts model (the Flash talker's weights) runs it, greedy.
 
-Dumps (DIR): request.json, ids.npy (the speakable ids), prefill.npy [L, 2048] (the talker's input rows), logits0.npy
+--ref-wav PATH: the voice is a recording's clone, as talker.py's _load_voice makes it for voices/<name>.wav: the
+channels averaged, the first SOPHON_MAX_REF_SECONDS (15) kept, made 24 kHz (vLLM's AudioResampler: librosa), the
+loaded talker's speaker encoder over qwen-tts's mel. Upstream runs the encoder in the talker's dtype (bf16) and keeps
+the x-vector bf16: xvec.npy is the float32 x-vector rounded to bf16 (the prompt takes it), xvec_f32.npy unrounded.
+--talker DIR: another talker directory (Qwen3-TTS-12Hz-1.7B-Base's, for an A/B; the release's by default).
+
+Dumps (DIR): request.json (its "reference" with --ref-wav), xvec.npy and xvec_f32.npy (--ref-wav), ids.npy (the speakable ids), prefill.npy [L, 2048] (the talker's input rows), logits0.npy
 (the first codebook's logits after them), codes.npy [T, 16] (greedy), speech.wav.
 """
 import argparse
@@ -62,6 +68,8 @@ def main():
     ap.add_argument("--voice", default="chelsie")
     ap.add_argument("--lang", default="en")
     ap.add_argument("--frames", type=int, default=400)
+    ap.add_argument("--ref-wav", default=None)
+    ap.add_argument("--talker", default=None)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     torch.set_num_threads(max(1, os.cpu_count() or 1))
@@ -77,15 +85,33 @@ def main():
     print("pieces:", [tok.decode([i]) for i in ids])
     np.save(os.path.join(a.out, "ids.npy"), np.asarray(ids, dtype=np.int64))
     with open(os.path.join(a.out, "request.json"), "w") as f:
-        json.dump({"text": a.text, "speakable": text, "voice": a.voice, "lang": a.lang}, f, ensure_ascii=False)
+        req = {"text": a.text, "speakable": text, "voice": a.voice, "lang": a.lang}
+        if a.ref_wav:
+            req["reference"] = os.path.abspath(a.ref_wav)
+        json.dump(req, f, ensure_ascii=False)
 
     from qwen_tts import Qwen3TTSModel
-    tts = Qwen3TTSModel.from_pretrained(os.path.join(a.release, "talker"), device_map="cpu", dtype=torch.float32, attn_implementation="sdpa")
+    tts = Qwen3TTSModel.from_pretrained(a.talker or os.path.join(a.release, "talker"), device_map="cpu", dtype=torch.float32,
+                                        attn_implementation="sdpa")
     m = tts.model
-    # talker.py's voice lookup: <voice>_<lang>.pt, then <voice>.pt
-    vdir = os.path.join(a.release, "voices")
-    vp = next(p for p in (os.path.join(vdir, f"{a.voice}_{a.lang}.pt"), os.path.join(vdir, f"{a.voice}.pt")) if os.path.exists(p))
-    xvec = torch.load(vp, map_location="cpu", weights_only=True).reshape(-1).float()
+    if a.ref_wav:
+        # talker.py's _load_voice for a .wav / .flac, then prompt_embeds_builder's extract_speaker_embedding
+        wav, sr = sf.read(a.ref_wav, dtype="float32", always_2d=True)
+        wav = np.ascontiguousarray(wav.mean(1)[: int(sr * float(os.environ.get("SOPHON_MAX_REF_SECONDS", "15")))])
+        if sr != 24000:
+            import librosa
+            wav = librosa.resample(wav, orig_sr=int(sr), target_sr=24000)
+        with torch.no_grad():
+            x32 = m.extract_speaker_embedding(wav.astype(np.float32), 24000).reshape(-1).float()
+        np.save(os.path.join(a.out, "xvec_f32.npy"), x32.numpy())
+        xvec = x32.to(torch.bfloat16).float()
+        np.save(os.path.join(a.out, "xvec.npy"), xvec.numpy())
+        print(f"clone: {len(wav) / 24000:.2f} s kept, x-vector norm {float(xvec.norm()):.3f}")
+    else:
+        # talker.py's voice lookup: <voice>_<lang>.pt, then <voice>.pt
+        vdir = os.path.join(a.release, "voices")
+        vp = next(p for p in (os.path.join(vdir, f"{a.voice}_{a.lang}.pt"), os.path.join(vdir, f"{a.voice}.pt")) if os.path.exists(p))
+        xvec = torch.load(vp, map_location="cpu", weights_only=True).reshape(-1).float()
 
     seen = {}
 
