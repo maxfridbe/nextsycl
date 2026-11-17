@@ -21,7 +21,7 @@ env: {}
 files:
   transformer:
     key: moss-image-sft-q5kxl
-    url: https://huggingface.co/unsloth/MOSS-Image-SFT-GGUF/resolve/a013f7442e672e67b21f485b4b4f369df5500847/MOSS-Image-SFT-UD-Q5_K_XL.gguf
+    url: https://huggingface.co/unsloth/MOSS-Image-SFT-GGUF/resolve/40d3b35cea314e6069cd09bd5ac9a4005760b3b1/MOSS-Image-SFT-UD-Q5_K_XL.gguf
     size: 3949236384
     sha256: 37d6db1e2a696fd862df92c2a1cf0767a1ce99b37582b3118096948fbfe318fd
     path: moss-image/MOSS-Image-SFT-UD-Q5_K_XL.gguf
