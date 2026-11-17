@@ -282,15 +282,19 @@ fn fetch(cat: &Catalog, root: &Path, key: &str, f: &Value, from: &[PathBuf], ver
     // the same content under another catalog path, or a copy elsewhere on the machine (by name and size)
     let same = cat.files.iter().filter(|(k, o)| *k != key && s(o, "sha256") == sha).map(|(_, o)| root.join(s(o, "path")))
         .find(|p| std::fs::metadata(p).is_ok_and(|m| m.len() == size));
-    let copy = same.or_else(|| from.iter().find_map(|d| find_copy(d, &name, size, 4)));
-    // a small copy found by its name and size is hashed whatever --verify says, and passed over when it differs:
-    // waifu2x's three scale2.0x_model.param files share a name and a size, and the wrong one linked runs the wrong model
-    let copy = match copy {
-        Some(src) if !verify && size < (256 << 20) && sha256_of(&src)? != sha => {
-            println!("  {key}: {} has the name and size but not the content: not used", src.display());
-            None
-        }
-        c => c,
+    // a copy found by its name and size is hashed whatever --verify says, and passed over when it differs: waifu2x's
+    // three scale2.0x_model.param files share a name and a size, and so does a fine-tune with its base model -
+    // Sophon-Realtime Flash's talker/model.safetensors linked from Qwen3-TTS-12Hz-1.7B-Base's (3,857,413,744 bytes
+    // each) read every sound tag aloud (2026-11-16)
+    let copy = match same {
+        Some(s) => Some(s),
+        None => match from.iter().find_map(|d| find_copy(d, &name, size, 4)) {
+            Some(src) if !verify && sha256_of(&src)? != sha => {
+                println!("  {key}: {} has the name and size but not the content: not used", src.display());
+                None
+            }
+            c => c,
+        },
     };
     if let Some(src) = copy {
         if verify && sha256_of(&src)? != sha {
@@ -814,6 +818,32 @@ mod tests {
         assert_eq!(e["env"], json!({"A": "/m/x.gguf", "C": "plain"}));
         let e = entry(&m, &paths, &BTreeMap::from([("mtp".to_string(), "/d/rt".to_string())]));
         assert_eq!(e["env"]["B"], "/d/rt");
+    }
+
+    /// A copy under --from with the file's name and size but other content (a fine-tune's base model) is not linked,
+    /// whatever its size; the one with the content is
+    #[test]
+    fn a_copy_with_the_name_and_size_but_not_the_content_is_not_linked() {
+        let d = std::env::temp_dir().join(format!("nextsycl-from-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (base, tuned) = (b"base weights 0001".to_vec(), b"tuned weights 002".to_vec());
+        assert_eq!(base.len(), tuned.len());
+        std::fs::create_dir_all(d.join("from/a-base")).unwrap();
+        std::fs::write(d.join("from/a-base/model.safetensors"), &base).unwrap();
+        let sha = |b: &[u8]| Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let cat = Catalog { files: Map::new(), models: Vec::new(), dir: d.clone() };
+        let f = json!({"path": "m/talker/model.safetensors", "size": tuned.len(), "sha256": sha(&tuned), "url": "http://127.0.0.1:9/none"});
+        let root = d.join("root");
+        // only the base model there: not linked (the download is tried instead, and fails here)
+        assert!(fetch(&cat, &root, "talker", &f, &[d.join("from")], false).is_err());
+        assert!(std::fs::symlink_metadata(root.join("m/talker/model.safetensors")).is_err(), "the base model was linked");
+        // the fine-tune's own copy beside it: linked
+        std::fs::create_dir_all(d.join("from/b-tuned")).unwrap();
+        std::fs::remove_file(d.join("from/a-base/model.safetensors")).unwrap();
+        std::fs::write(d.join("from/b-tuned/model.safetensors"), &tuned).unwrap();
+        let got = fetch(&cat, &root, "talker", &f, &[d.join("from")], false).unwrap();
+        assert_eq!(std::fs::read(got).unwrap(), tuned);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
