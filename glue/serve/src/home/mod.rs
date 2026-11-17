@@ -37,6 +37,7 @@ mod methods;
 mod precheck;
 mod pulls;
 mod spec;
+mod transcribe;
 pub mod registry;
 
 /// What the #[rpc] methods make (methods.rs, rpcgen), as (path under the repo, content): the typed client of the
@@ -357,6 +358,9 @@ impl Home {
         let me = h.clone();
         std::thread::spawn(move || me.backplane_loop());
         h.resume_jobs();
+        // saved voices without what they say: heard once by the recogniser (transcribe.rs)
+        let me = h.clone();
+        std::thread::spawn(move || me.voice_ears_loop());
         // the video daemon as the enabled video models say (it is this page's to start and stop)
         let me = h.clone();
         std::thread::spawn(move || {

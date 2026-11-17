@@ -1131,6 +1131,10 @@ impl Home {
                 if let Some(owner) = o("owner") {
                     v = self.voices().tag(&s(b, "name"), "owner", json!(owner)).map_err(|e| (500, e))?;
                 }
+                // saved without what it says: the recogniser hears it now (transcribe.rs), its text kept with it
+                if crate::voices::needs_transcript(&v) {
+                    self.hear_voices_soon();
+                }
                 Ok(json!({"voice": v, "sample": format!("http://nextsycl/v1/audio/voices/{}.wav", s(b, "name"))}))
             }
             ("audio", "voices.design") => self.design_voice(b, &all),
