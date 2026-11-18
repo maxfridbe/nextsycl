@@ -6,7 +6,11 @@
 # (VAE round trip) and re-noised as full-resolution tokens, 6 more steps run both tracks in one sequence (the full-res
 # queries read the half-res keys through fitted rank-128 K/V up-maps), and the half-res frame is pasted under the full-res
 # region after the decode. Text to video with sound only (no keyframes, references or ControlNet: the minimax-h3 card).
-# Research weights (upstream: "it needs training"): the region is sharp, the rest is the half-res track enlarged.
+# Measured on hardac1 (docs/ports/mpeg-diffusion.md), 1344x768, 20 steps, sampling + decode: B70 3 s 216.6 -> 100-119 s
+# (1.8-2.2x), 6 s 577 -> 220-247 s (2.3-2.6x); B65 332 -> 186 s and 892 -> 383 s. The region (people, faces, a car) is
+# clean with no seam at its edge, but softer than a full-res render (the late switch leaves 6 steps for detail; same
+# with full-res tokens everywhere); the rest is the half-res track enlarged; a scene without a subject spends the
+# region on random edge tokens. Research weights (upstream: "it needs training").
 id: minimax-h3-mpeg
 kind: video
 arch: minimax-h3
@@ -16,6 +20,7 @@ license: minimax-h3-community
 commercial: true
 license_note: 'MiniMax H3''s denoiser, VAEs and the Qwen3-VL-32B text encoder as MiniMax ships it (Comfy-Org''s repack; the GGUFs unsloth''s), and MPEG-Diffusion''s fitted K/V up-maps and region head v3 (johndpope/MiniMax-H3-MPEG-Diffusion, derived from H3): the MiniMax H3 Community License (not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; products show "Powered by MiniMax H3"; its Acceptable Use Policy; outputs may not improve another model). The encoder underneath is Qwen3-VL-32B (Apache-2.0); the Qwen2.5 tokenizer files come from ComfyUI''s GPL-3.0 repository; the method''s code (scrya-com/mpeg-diffusion lot/) is Apache-2.0, ported here, not copied. Not an official MiniMax product, nor the paper authors'' release.'
 gpus: '0'
+vram_gib: 27.3                   # two-track, 141 frames at 1344x768 (the driver's peak 27,915 MB on the B70; 3 s: 25.0)
 defaults:
   steps: 20
   seconds: 3.04
