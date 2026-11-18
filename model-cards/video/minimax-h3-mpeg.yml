@@ -5,7 +5,12 @@
 # at half resolution, a linear region head on block 25 picks a region, the clean half-res estimate there is upscaled
 # (VAE round trip) and re-noised as full-resolution tokens, 6 more steps run both tracks in one sequence (the full-res
 # queries read the half-res keys through fitted rank-128 K/V up-maps), and the half-res frame is pasted under the full-res
-# region after the decode. Text to video with sound only (no keyframes, references or ControlNet: the minimax-h3 card).
+# region after the decode. Text to video with sound; keyframes (first_frame, last_frame, guide_clip) and sound inputs
+# (first_audio, soundtrack) condition both tracks as they condition H3 (half-size encodings for the half-res track, the
+# full-size keyframe rows inside the region); no references ("REF2VA is not supported by MPEG yet"), ControlNet or masked
+# runs: the minimax-h3 card. Singer A/B against INT8 (4 chunks, 107 frames, 1344x768, docs/ports/mpeg-diffusion.md): 20 steps
+# 2.2-2.7x faster on the B70, lip sync kept but looser (r 0.29-0.39 against 0.34-0.51), face and mouth softer, carried
+# frames 31-33 dB against the guide (INT8 34-36), no seam: a fast draft, not the final engine for singers.
 # Measured on hardac1 (docs/ports/mpeg-diffusion.md), 1344x768, 20 steps, sampling + decode: B70 3 s 216.6 -> 100-119 s
 # (1.8-2.2x), 6 s 577 -> 220-247 s (2.3-2.6x); B65 332 -> 186 s and 892 -> 383 s. The region (people, faces, a car) is
 # clean with no seam at its edge, but softer than a full-res render (the late switch leaves 6 steps for detail; same
@@ -15,7 +20,7 @@ id: minimax-h3-mpeg
 kind: video
 arch: minimax-h3
 title: 'MiniMax H3 MPEG-Diffusion (int8; two tracks: half resolution, full resolution on the subject)'
-about: the int8 FL2VA H3 with MPEG-Diffusion's two-track sampler (scrya-com's port, region head v3 and fitted K/V maps) - 20 steps, 16 at half resolution then 6 with full-resolution tokens on the region the model picks (people, faces); text to video with sound
+about: the int8 FL2VA H3 with MPEG-Diffusion's two-track sampler (scrya-com's port, region head v3 and fitted K/V maps) - 20 steps, 16 at half resolution then 6 with full-resolution tokens on the region the model picks (people, faces); text to video with sound, keyframes, guide clips and a driving soundtrack (no reference pictures)
 license: minimax-h3-community
 commercial: true
 license_note: 'MiniMax H3''s denoiser, VAEs and the Qwen3-VL-32B text encoder as MiniMax ships it (Comfy-Org''s repack; the GGUFs unsloth''s), and MPEG-Diffusion''s fitted K/V up-maps and region head v3 (johndpope/MiniMax-H3-MPEG-Diffusion, derived from H3): the MiniMax H3 Community License (not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; products show "Powered by MiniMax H3"; its Acceptable Use Policy; outputs may not improve another model). The encoder underneath is Qwen3-VL-32B (Apache-2.0); the Qwen2.5 tokenizer files come from ComfyUI''s GPL-3.0 repository; the method''s code (scrya-com/mpeg-diffusion lot/) is Apache-2.0, ported here, not copied. Not an official MiniMax product, nor the paper authors'' release.'

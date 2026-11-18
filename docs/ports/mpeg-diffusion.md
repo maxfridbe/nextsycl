@@ -78,9 +78,12 @@ without H3_MPEG nothing changes for H3.
   shape, the switch's fresh noise from seed + 2 (upstream: CUDA generators seeded seed, seed + 1, seed + 2). So a
   two-track clip and a full-res clip of the same seed start from different noise and compose different pictures -
   upstream says the same of its own ("Full res and two-track compose different pictures from the same seed").
-- **Requests it takes**: text (and the effect embeddings) only - no keyframes, guides, references, sound inputs,
-  ControlNet, masked runs, refine, other samplers or knots: the job fails at once, naming the limit. Upstream's node takes text
-  only too. Canvas sides multiples of 64.
+- **Requests it takes**: text (and the effect embeddings), keyframes (`first_frame`, `last_frame`, `guide_clip` - clips
+  and pictures) and sound (`first_audio`, `soundtrack`): the singer film's inputs (below, "Keyframes and sound"). Not
+  references (`ref_images` / `ref_videos`: "REF2VA is not supported by MPEG yet"; `ref_audios`), `first_latent`,
+  ControlNet, masked runs, refine, other samplers or knots: the job fails at once, naming the limit, and the studio
+  refuses them with a 400 first. Upstream's node takes text only. Canvas sides multiples of 64 (the studio says so
+  too: the platform's 864x480 is not one).
 - **Settings** (card env or job keys, docs/environment.md): H3_MPEG_SWITCH 16, H3_MPEG_HR_STEPS 6, H3_MPEG_ALPHA 0.5,
   H3_MPEG_FLOOR none, H3_MPEG_FEATHER 4 - upstream's quality preset.
 - **Turbo**: upstream's "Turbo LoRA (v4), 8 steps" is an 8-step distillation LoRA for the FL2VA base (Comfy-Org's
@@ -89,6 +92,127 @@ without H3_MPEG nothing changes for H3.
 - **Q6_K / Q4_K_M**: the maps were fitted on the int8 checkpoint's keys. The GGUF denoisers are the same model
   re-quantized (their keys differ by quantization noise), so the maps should transfer, but that is untested: no cards
   for them.
+
+## Keyframes and sound (the singer film's inputs)
+
+What the platform's singer passes send - `soundtrack` (the song pinned under the clip), `guide_clip` (the previous
+pass's last 22 frames, often with the group's anchor picture as a one-frame guide at frame 0), `first_frame` /
+`last_frame` - condition both tracks the way H3 conditions a full-res clip (keyframes are extra rows of the sequence,
+presented at timestep 0.999 / 1.0, never denoised; nothing in the clip itself is pinned or masked):
+
+- **The half-res track is H3 at half size.** The pictures and guide clips are read and encoded again at half size
+  (the same reader, fit and exposure gain as a 672x384 H3 clip), their rows augmented from the seed as H3's are; the
+  sound keyframe is the same latent (it does not depend on the size). Its rows sit in the half-res queries' prefix,
+  so text, sound, keyframe and half-res video queries are exactly H3 at half resolution through the switch and the
+  two-track steps.
+- **The full-res queries** (the region's rows) see the text, the sound's rows and the target audio as before, and the
+  keyframes as the full-res model would: each keyframe token inside the region (a keyframe latent frame takes M of
+  the clip latent frame its first pixel frame falls in: a 22-frame guide at 0 its frames 0-6, a last-frame picture
+  the last) comes in as its four full-res rows - the full-size encoding's 2x2 patches, augmented exactly as H3
+  augments them, at the full-res layout's positions and the conditioning timestep - as extra queries beside the
+  region's; a keyframe token outside it is expanded to its cells by the fitted K/V map, as the half-res video is
+  (the half-res keyframe rows themselves are not in their key set). With the region everything this is the full-res
+  model's view of its keyframes (checked below); with it empty, the clip is H3 at half size, enlarged.
+- **The sound**: the latents and their rows are size-free (identical below), but H3 places the right stereo
+  channel's rows at the far end of the width axis, which moves with the grid: 35.15 at half size, 36.16 at full
+  size (the left end, time and height are the same). The audio rows run on the half-res track, so they carry the
+  half-size coordinate - as in every MPEG clip, and as in H3 at 672x384.
+- Cost: the keyframes' full-res rows inside the region join the two-track sequence (a 22-frame guide + an anchor
+  at 1344x768 is 8,064 full-res rows over the whole frame; inside a 20% region about 1,600), the rows outside add
+  four expanded cells each to the full-res queries' keys.
+
+### Conditioning checks (exact)
+
+`cond_dump` (a generate job key) writes the keyframes' rows as the denoiser is given them (patches or stereo rows,
+augmented, before the patch projection), their positions and timesteps; with MPEG also the switch's two-track rows
+(`<cond_dump>.switch.safetensors`). `reference/mpeg-diffusion/exact.py` compares them. Inputs: chunk A of the A/B
+below (a 22-frame guide + anchor picture + the song from 29.25 s), 39 frames, seed 7, `te_pictures` off.
+
+| Check | Against | Result |
+|---|---|---|
+| E1, region empty (`mpeg_floor` 1e9), 1344x768, 10 steps: the half-res denoiser's layout and its keyframe rows (the 22-frame guide, the anchor picture, the song: patches / stereo rows augmented, positions, timesteps) | H3 at 672x384, same inputs and seed | identical (every segment, every value) |
+| E2, region everything (`mpeg_alpha` -1000): the switch's full-res keyframe rows (which rows, the augmented patches, positions) and the full-res layout | H3 at 1344x768, same inputs (its first step's rows) | identical; no keyframe row expanded |
+| the sound keyframe's rows and timesteps, MPEG against H3 1344x768 | | identical |
+| the sound keyframe's positions | | time and height identical; width: the left channel identical, the right 35.15 against 36.16 (the half-size grid's end, above) |
+| E3, the default region (18.6%, 1,232 keyframe rows inside, 1,708 expanded), 20 steps: the first two-track call's half-res video and sound outputs | `Denoiser::net` (H3 at half size) on the same x, sigma and keyframes, in the same process | identical: max 0, rel 0 (video and sound) |
+
+A whole run is not reproducible bit for bit (two H3 runs at 672x384 with the same inputs, 3 steps: video latents
+differ by up to 1.76, sound 0.12 - H3's own run-to-run noise), so the checks are of the conditioning and of single
+calls. E3 was added after the A/B's carried-frame measurement found a bug E1 and E2 could not see: the first version
+left the half-res keyframe rows out of the two-track call's stream, so the half-res track lost its guide in the last
+6 steps (carried frames 22 dB against the guide; 31-33 dB once fixed).
+
+### The singer A/B: MPEG against INT8 with the same inputs
+
+Four singer chunks made from the platform's own singer film (2026-11-18, "Wake UP! The robots are here.": the song,
+its anchor pictures, its passes' prompts without the `<Picture 1>` sentence, since references are not in MPEG), 107
+frames (4.46 s) at 1344x768, each pass's own seed, INT8 (`minimax-h3`) and MPEG (`minimax-h3-mpeg`) with identical
+requests: **A** = pass 4 (`guide_clip` pass 3's last 22 frames + anchor 1 as a one-frame guide, the song from
+29.25 s), **B** = pass 8 (pass 7 + anchor 2, from 68.25 s), **C** = pass 3 (pass 2's 22 frames, `last_frame` anchor
+1, from 19.5 s), **D** = pass 2 (`first_frame` anchor 0, no guide, from 9.75 s). 20 steps on the B70, 10 steps (the
+studio's default; the platform sends 12) on the B65 - so times compare within a row pair, not across step counts.
+
+Measured by `reference/mpeg-diffusion/ab_metrics.py` (CPU, its own venv, `python -I`) and `ab_table.py`:
+- **lip sync**: mouth opening per frame (MediaPipe face landmarker: inner-lip gap 13-14 over mouth width 78-308) against
+  the vocal stem's loudness per frame (htdemucs two-stem separation of the song span, RMS dB per 1/24 s), Pearson r over
+  the frames after the carried 22, at lag 0 and the best within +-4 frames (negative: the mouth leads the sound); the
+  null is the same mouth against the other chunks' vocals (what not following this song scores);
+- **face**: Laplacian variance of luma in the landmarks' face box and mouth box (new frames); ArcFace (insightface
+  buffalo_l w600k_r50, onnxruntime) cosine of each new frame's face to the carried frames' face (their mean embedding)
+  and to the anchor picture;
+- **carried frames**: PSNR of frames 0-21 against the guide's last 22 frames (cover-fitted, as the engine reads them),
+  whole frame and face box (D: frame 0 against its first-frame picture); the **seam**: mean |Sobel| of luma on the
+  MPEG region's edge over a 3 px band either side (1.0: no step; INT8 measured at the same place as the control);
+- **time**: the job report's sampling and total (text encoder, keyframe encodes, decode, paste included).
+
+| Chunk | Steps | Engine | Lip r lag 0 | Lip r best +-4 (lag) | Null: other songs | Face sharp | Mouth sharp | ID vs carried | ID vs anchor | Carried PSNR whole / face | Seam edge/near carried, new | Sampling + rest = total s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A | 20 | INT8 | 0.11 | 0.49 (-3) | 0.08 | 100 | 144 | 0.82 | 0.33 | 35.7 / 31.5 | 0.95, 0.97 | 516 + 61 = 577 |
+| A | 20 | MPEG | 0.37 | 0.39 (-1) | 0.14 | 51 | 70 | 0.77 | 0.31 | 31.1 / 30.5 | 0.95, 0.98 | 165 + 67 = **231** |
+| A | 10 | INT8 | 0.08 | 0.49 (-3) | 0.09 | 92 | 131 | 0.85 | 0.35 | 35.7 / 31.9 | 0.95, 0.96 | 399 + 68 = 467 |
+| A | 10 | MPEG | 0.19 | 0.31 (-2) | 0.10 | 51 | 71 | 0.78 | 0.31 | 31.1 / 29.9 | 0.95, 0.98 | 163 + 87 = **250** |
+| B | 20 | INT8 | 0.33 | 0.34 (1) | 0.07 | 37 | 72 | 0.89 | 0.34 | 35.9 / 32.8 | 1.00, 0.97 | 518 + 50 = 568 |
+| B | 20 | MPEG | 0.29 | 0.29 (-1) | 0.13 | 27 | 53 | 0.84 | 0.32 | 32.8 / 30.9 | 1.00, 0.98 | 191 + 71 = **262** |
+| B | 10 | INT8 | 0.33 | 0.36 (1) | 0.07 | 36 | 66 | 0.89 | 0.35 | 35.7 / 32.6 | 1.01, 0.98 | 401 + 77 = 479 |
+| B | 10 | MPEG | 0.29 | 0.33 (-1) | 0.11 | 28 | 54 | 0.87 | 0.33 | 32.8 / 30.6 | 1.00, 0.98 | 191 + 93 = **284** |
+| C | 20 | INT8 | -0.14 | 0.28 (-4) | 0.15 | 100 | 139 | 0.68 | 0.56 | 34.2 / 31.0 | 1.01, 0.97 | 539 + 60 = 599 |
+| C | 20 | MPEG | -0.11 | 0.34 (-4) | 0.33 | 92 | 102 | 0.65 | 0.46 | 31.6 / 29.8 | 0.95, 0.96 | 151 + 68 = **219** |
+| C | 10 | INT8 | -0.19 | 0.16 (-4) | 0.15 | 92 | 126 | 0.75 | 0.52 | 33.9 / 31.4 | 1.04, 0.97 | 417 + 80 = 498 |
+| C | 10 | MPEG | -0.15 | 0.28 (-4) | 0.36 | 84 | 101 | 0.69 | 0.46 | 31.2 / 29.8 | 0.97, 0.96 | 141 + 100 = **241** |
+| D | 20 | INT8 | 0.47 | 0.51 (-2) | 0.15 | 174 | 204 | 0.82 | 0.71 | 18.4 / 24.8 (frame 0) | 1.01, 0.99 | 405 + 44 = 450 |
+| D | 20 | MPEG | 0.24 | 0.31 (-2) | 0.07 | 149 | 141 | 0.75 | 0.60 | 18.4 / 24.9 (frame 0) | 0.93, 0.98 | 157 + 51 = **208** |
+| D | 10 | INT8 | -0.01 | 0.11 (-4) | 0.06 | 169 | 197 | 0.79 | 0.71 | 18.5 / 24.7 (frame 0) | 0.98, 0.99 | 312 + 57 = 369 |
+| D | 10 | MPEG | 0.00 | 0.11 (-3) | 0.11 | 117 | 119 | 0.69 | 0.60 | 18.6 / 24.4 (frame 0) | 0.94, 0.97 | 147 + 64 = **211** |
+
+Regions 12-24% of the frame (the singer's head and torso); keyframe rows inside them 144-1,688, expanded 216-1,895.
+Card peaks: INT8 27.1-28.8 GB, MPEG 26.5-27.6 GB.
+
+- **Lip sync holds, weaker.** Where the measure works (A, B, D at 20 steps: the INT8 mouth beats the null by 0.2-0.4),
+  MPEG's best r is 0.39 / 0.29 / 0.31 against INT8's 0.49 / 0.34 / 0.51 - below INT8 every time, above the null every
+  time; at 10 steps A 0.31 against 0.49, B 0.33 against 0.36. The lag is the same or closer (-1 to -2 frames against
+  INT8's -3 to +1): no drift of the mouth against the song. C (a guide and a last-frame anchor) and D at 10 steps do not
+  separate from the null in either engine: no verdict there. These are 83-106 frames a clip; differences under ~0.1
+  are within what one chunk's noise looks like.
+- **The face is softer**: face box 0.5-0.9x INT8's Laplacian variance, the mouth box 0.5-0.8x (A 70 against 144);
+  identity to the carried singer 0.02-0.10 lower (0.65-0.87 against 0.68-0.89), to the anchor 0.02-0.11 lower.
+- **Carried frames**: 31-33 dB against the guide (INT8 34-36), face 30-31 dB (INT8 31-33): the guide is followed, a
+  little less exactly (the half-res track's picture outside the region, enlarged). No seam at the region's edge in the
+  carried or the new frames (edge/near 0.93-1.00, INT8 at the same place 0.95-1.04).
+- **Time**: 20 steps on the B70 **2.2-2.7x** faster (450-599 s -> 208-262 s), 10 steps on the B65 1.7-2.1x (369-498 s
+  -> 211-284 s; the switch's VAE round trip, 24-79 s, is a larger share of a short run).
+
+Looking at the frames (face crops at frames 10, 30, 50, 70, 90, both engines): MPEG's singer is the same man, clean,
+no artefacts on the face, mouth shapes that open and close with the words; skin, stubble, teeth and hair strands are
+smoother than INT8's (INT8 shows teeth and lip edges MPEG blurs), and in B and D MPEG's performance is calmer - fewer
+head turns, eyes lowered where INT8 looks into the lens, the microphone over the mouth more often. Outside the region
+(the cardboard costume's edges, the shoulders in D) the enlarged half-res track smears tape texture. The carried
+frames match the guide in both.
+
+**Verdict**: as a "Fast draft" for singers MPEG is usable - the mouth follows the song (r above the null in every
+chunk where INT8's is), the carried frames continue the guide without a seam, and a 20-step pass is 2.2-2.7x faster -
+but it is a draft: the lip sync is measurably looser than INT8 (r 0.29-0.39 against 0.34-0.51), and the face and mouth
+are visibly softer. For a final singer film INT8 stays the engine; MPEG fits previews and timing checks. The platform's
+canvas (864x480) is not a multiple of 64: MPEG refuses it (768x448 or 896x512 are the near ones).
 
 ## Files
 
@@ -254,7 +378,8 @@ loaded and freed (`Device::trim`) before it. The 19.5 GiB of int8 blocks stay on
 ```sh
 nextsycl models pull minimax-h3-mpeg      # the two small files; the rest is minimax-h3's
 nextsycl video job generate --here --model minimax-h3-mpeg --prompt "..." --width 1344 --height 768 --seconds 3.04 --steps 20 --out clip.mp4
-    [--mpeg_switch 16 --mpeg_hr_steps 6 --mpeg_alpha 0.5 --mpeg_floor X --mpeg_feather 4] [--mpeg false] [--mpeg_dump F]
+    [--mpeg_switch 16 --mpeg_hr_steps 6 --mpeg_alpha 0.5 --mpeg_floor X --mpeg_feather 4] [--mpeg false] [--mpeg_dump F] [--cond_dump F]
+    [--guide_clip prev.mp4:22:0,anchor.png] [--first_frame a.png] [--last_frame b.png] [--soundtrack song.flac --soundtrack_start S]
 ```
 
 Front door: `video.generate {"model": "minimax-h3-mpeg", "prompt": ..., "width": 1344, "height": 768, "seconds": 3.04,
@@ -271,5 +396,5 @@ times.
 - **No subject** (p3): the head spends 14-17% on random edge tokens; `H3_MPEG_FLOOR` untuned.
 - **Isolated one-token regions** show a block edge; dropping islands below a few tokens (not upstream's rule) would
   avoid it.
-- Turbo (an 8-step FL2V LoRA we do not have as a card), Q6_K / Q4_K_M with the int8-fitted maps, other sizes and step
-  counts, keyframes and references: untested.
+- Turbo (an 8-step FL2V LoRA we do not have as a card), Q6_K / Q4_K_M with the int8-fitted maps, other sizes: untested.
+  References (REF2VA: ref_images, ref_videos) and voice references: not ported.
