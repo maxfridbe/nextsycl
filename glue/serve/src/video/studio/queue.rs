@@ -291,6 +291,8 @@ pub fn quant_of(id: &str) -> &'static str {
         "ref2va" => "REF2VA",
         // minimax-h3-regen2k-ic: Open-H3-Regenerate-2K-IC (the regen2k job)
         "ic" => "REGEN2K",
+        // minimax-h3-mpeg: MPEG-Diffusion's two-track sampler (video.generate engine: "MPEG")
+        "mpeg" => "MPEG",
         _ => "INT8",
     }
 }
