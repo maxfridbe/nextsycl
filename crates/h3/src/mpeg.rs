@@ -21,6 +21,15 @@
 //! H3's positions are normalised by the frame's area (layout.rs), so the two grids share one coordinate frame: a
 //! half-res token sits on the top-left cell of its 2x2.
 //!
+//! Keyframes (first_frame / last_frame pictures, guide clips) and sound (an audio keyframe: first_audio, soundtrack)
+//! condition both tracks as they condition H3 (`Keyframes`): the half-res track is H3 at half resolution with the
+//! keyframes' half-res latents (their pictures encoded at half size) and the sound's latents - its conditioning rows
+//! sit in the half-res queries' prefix, untouched. The full-res queries see the sound's rows and, per keyframe
+//! token, what the full-res model would: inside M the keyframe's own full-res rows (2x2 cells of the full-res
+//! encoding, augmented as H3 augments them) as extra full-res rows of the sequence, outside M the half-res keyframe
+//! token's key / value expanded to its cells by the fitted map, as the half-res video's are. A keyframe's latent frame
+//! takes M of the clip's latent frame its pixel frame falls in.
+//!
 //! The full-res queries' attention is assembled from the qkv buffer without a copy a row by the H3 silo's gather
 //! (kernels/video/h3/silo, bound by the video engine as `Blocks::gather`); without it, one device copy a row.
 
@@ -325,6 +334,102 @@ impl Plan {
         }
         Ok(p)
     }
+}
+
+// ---- the keyframes on two tracks ------------------------------------------------------------------------------
+
+/// What a two-track run is conditioned on besides its text: the keyframes as the half-res denoiser's layout has them
+/// (`Denoiser::new` with the half-res latents), each video keyframe's latent at full resolution beside it
+#[derive(Default)]
+pub struct Keyframes {
+    /// the layout's keyframes, in its order
+    pub list: Vec<crate::layout::Keyframe>,
+    /// per keyframe, its video latent at full resolution [24, vt, 2H, 2W] (None: a sound-only keyframe)
+    pub video_hr: Vec<Option<Vec<f32>>>,
+    /// the video keyframes' augmentation (`Conditions::visual_aug`) and the seed its noise is drawn from
+    pub visual_aug: f32,
+    pub seed: u64,
+    /// the clip's pixel frames (a keyframe's latent frame -> the clip's latent frame whose region it takes)
+    pub frames: usize,
+}
+
+/// The keyframes' part of a two-track sequence (`cond_rows`)
+#[derive(Default, Clone)]
+pub struct CondRows {
+    /// the full-res keyframe rows inside M, in 2x2 patches as the full-res model is given them [rows, 4 x 24]
+    pub patches: Vec<f32>,
+    /// their positions [rows, 3] (the full-res layout's)
+    pub positions: Vec<f64>,
+    /// per row: a sequence row of its keyframe's half-res rows (its timestep table row is theirs)
+    pub table_from: Vec<usize>,
+    /// per row: its row in the full-res layout (the checks' dump)
+    pub hr_rows: Vec<usize>,
+    /// the half-res keyframe rows outside M (sequence rows): expanded to their 2x2 cells for the full-res queries
+    pub out_rows: Vec<usize>,
+    /// those cells' positions, per cell c [out_rows, 3]
+    pub out_positions: [Vec<f64>; 4],
+}
+
+impl CondRows {
+    pub fn rows(&self) -> usize {
+        self.table_from.len()
+    }
+}
+
+/// The keyframes' rows of a two-track sequence: `lr` the half-res layout (the denoiser's), `hr` the full-res one of
+/// the same text, keyframes and sound; `video_c` the latent's channels
+pub fn cond_rows(p: &Plan, kfs: &Keyframes, lr: &crate::layout::Layout, hr: &crate::layout::Layout, video_c: usize) -> Result<CondRows> {
+    use crate::layout::{Kind, Segment};
+    let segs = |l: &crate::layout::Layout| -> Vec<Segment> { l.segments.iter().copied().filter(|s| s.kind == Kind::Cond).collect() };
+    let (ls, hs) = (segs(lr), segs(hr));
+    let video: Vec<(&crate::layout::Keyframe, &Option<Vec<f32>>)> = kfs.list.iter().zip(&kfs.video_hr).filter(|(k, _)| k.video_latent_t.is_some()).collect();
+    if kfs.list.len() != kfs.video_hr.len() || video.len() != ls.len() || ls.len() != hs.len() {
+        return Err(Error(format!("two-track keyframes: {} video keyframes, {} / {} in the layouts", video.len(), ls.len(), hs.len())));
+    }
+    let (th, tw) = (p.h, p.w);
+    let (hh, hw) = (2 * th, 2 * tw);
+    let of = frame_of(p.t, kfs.frames.max(1));
+    let pw = video_c * 4;
+    let mut out = CondRows::default();
+    for ((k, v), (l, h)) in video.iter().zip(ls.iter().zip(&hs)) {
+        let vt = k.video_latent_t.unwrap_or(0);
+        let v = v.as_ref().ok_or("a video keyframe without its full-res latent")?;
+        if v.len() != video_c * vt * 2 * hh * 2 * hw || l.stop - l.start != vt * th * tw || h.stop - h.start != vt * hh * hw {
+            return Err(Error(format!("a keyframe of {} values, {} / {} rows, for {vt} latent frames of {th} x {tw} tokens", v.len(), l.stop - l.start, h.stop - h.start)));
+        }
+        let rows = crate::denoiser::keyframe_rows(v, video_c, (vt, 2 * hh, 2 * hw), kfs.visual_aug, kfs.seed);
+        let mut inside = Vec::new();
+        let mut pixel = k.frame_index.max(0.0) as usize;
+        for j in 0..vt {
+            // the clip's latent frame this keyframe frame sits on (its first pixel frame's)
+            let lj = of[pixel.min(of.len() - 1)];
+            pixel += if j % 5 == 0 { 1 } else { 4 };
+            for u in 0..th {
+                for x in 0..tw {
+                    if p.mask[(lj * th + u) * tw + x] {
+                        for c in 0..4 {
+                            inside.push((j * hh + 2 * u + c / 2) * hw + 2 * x + c % 2);
+                        }
+                    } else {
+                        out.out_rows.push(l.start + (j * th + u) * tw + x);
+                        for (c, pos) in out.out_positions.iter_mut().enumerate() {
+                            let r = h.start + (j * hh + 2 * u + c / 2) * hw + 2 * x + c % 2;
+                            pos.extend_from_slice(&hr.positions[r * 3..r * 3 + 3]);
+                        }
+                    }
+                }
+            }
+        }
+        // raster order, as the region's own full-res rows
+        inside.sort_unstable();
+        for i in inside {
+            out.patches.extend_from_slice(&rows[i * pw..(i + 1) * pw]);
+            out.positions.extend_from_slice(&hr.positions[(h.start + i) * 3..(h.start + i) * 3 + 3]);
+            out.table_from.push(l.start);
+            out.hr_rows.push(h.start + i);
+        }
+    }
+    Ok(out)
 }
 
 // ---- the Level-of-Token layout the region implies (reported; upstream's `layout` drawing) -------------------
@@ -663,21 +768,28 @@ pub struct TwoTrack<'a> {
     pub plan: Plan,
     maps: &'a UpMaps,
     blocks: &'a Blocks,
-    /// rows before the half-res video (text, audio)
+    /// rows before the half-res video (text, keyframes, audio)
     pub prefix: usize,
-    /// the sequence: prefix + half-res video + full-res rows
+    /// of those, the rows the full-res queries see (all but the half-res keyframe rows: text, the sound's)
+    pub kv_prefix: usize,
+    /// the keyframes' rows (their full-res rows follow the region's in the sequence)
+    pub cond: CondRows,
+    /// the sequence: prefix + half-res video + full-res rows (the region's, then the keyframes')
     pub tokens: usize,
-    /// the full-res queries' keys and values [prefix + hr + 4 lr_out, H D]: the prefix's and the full-res rows'
-    /// (rotated, gathered from the qkv buffer), then the expanded cells (cell 0 of every token outside M, cell 1 ...)
+    /// half-res rows expanded to 2x2 cells: the video tokens outside M, then the keyframe tokens outside M
+    pub expanded: usize,
+    /// the full-res queries' keys and values [kv_prefix + full-res rows + 4 expanded, H D]: the prefix's and the
+    /// full-res rows' (rotated, gathered from the qkv buffer), then the expanded cells (cell 0 of every expanded row,
+    /// cell 1 ...)
     k2: Tensor,
     v2: Tensor,
-    /// the half-res tokens outside M: raw k, v (then k normalized) [lr_out, H D]
+    /// the expanded rows: raw k, v (then k normalized) [expanded, H D]
     kx: Tensor,
     vx: Tensor,
-    /// int32: the sequence rows of the half-res tokens outside M; of the prefix and the full-res rows
+    /// int32: the sequence rows expanded; of the prefix the full-res queries see and the full-res rows
     idx_out: Tensor,
     idx_kv: Tensor,
-    /// the expanded cells' rotations [4 lr_out, rot / 2, 2]
+    /// the expanded cells' rotations [4 expanded, rot / 2, 2]
     cs_exp: Tensor,
     /// the packed sequence's positions [tokens, 3]
     pub positions: Vec<f64>,
@@ -686,16 +798,19 @@ pub struct TwoTrack<'a> {
     pub(crate) scratch: crate::dit::Scratch,
 }
 
-/// The full-res queries' key rows a block reads: prefix + hr + 4 lr_out
-pub fn key_rows(p: &Plan, prefix: usize) -> usize {
-    prefix + p.hr_count() + 4 * p.lr_out.len()
+/// The full-res queries' key rows a block reads: the prefix they see + the full-res rows (region, keyframes) + 4 per
+/// expanded row (the video's and the keyframes' outside M)
+pub fn key_rows(p: &Plan, kv_prefix: usize, cond: &CondRows) -> usize {
+    kv_prefix + p.hr_count() + cond.rows() + 4 * (p.lr_out.len() + cond.out_rows.len())
 }
 
 impl<'a> TwoTrack<'a> {
-    /// `lr`, `hr`: the half-res clip's layout and a full-res one of the same text and sound (positions); `mlp_rows`:
-    /// the MLP's row chunk (None: all rows)
-    pub fn new(blocks: &'a Blocks, maps: &'a UpMaps, inv_freq: &[f32], plan: Plan, lr: &crate::layout::Layout, hr: &crate::layout::Layout, mlp_rows: Option<usize>)
-               -> Result<TwoTrack<'a>> {
+    /// `lr`, `hr`: the half-res clip's layout and a full-res one of the same text, keyframes and sound (positions);
+    /// `cond`: the keyframes' rows (`cond_rows`; empty without keyframes); `mlp_rows`: the MLP's row chunk (None: all
+    /// rows)
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(blocks: &'a Blocks, maps: &'a UpMaps, inv_freq: &[f32], plan: Plan, lr: &crate::layout::Layout, hr: &crate::layout::Layout, cond: CondRows,
+               mlp_rows: Option<usize>) -> Result<TwoTrack<'a>> {
         let cfg = &blocks.cfg;
         if cfg.head_dim != HEAD_DIM || maps.layers != blocks.blocks.len() || maps.dev.len() != maps.layers {
             return Err(Error(format!("the maps ({} layers, on the card: {}) do not fit {} blocks of heads of {}", maps.layers, maps.dev.len(), blocks.blocks.len(), cfg.head_dim)));
@@ -707,20 +822,34 @@ impl<'a> TwoTrack<'a> {
         let dev = blocks_device(blocks)?;
         let w = cfg.heads * cfg.head_dim;
         let prefix = vseg.start;
-        let (nh, no) = (plan.hr_count(), plan.lr_out.len());
-        let tokens = lr.tokens() + nh;
-        let positions = plan.positions(lr, hr)?;
-        let kr = key_rows(&plan, prefix);
+        // the prefix rows the full-res queries see: all but the half-res keyframe rows (they have their own full-res
+        // rows and cells)
+        let seen: Vec<usize> = lr.segments.iter().filter(|s| s.stop <= prefix && s.kind != crate::layout::Kind::Cond).flat_map(|s| s.start..s.stop).collect();
+        let kv_prefix = seen.len();
+        let (nh, nc) = (plan.hr_count(), cond.rows());
+        let no = plan.lr_out.len() + cond.out_rows.len();
+        let tokens = lr.tokens() + nh + nc;
+        let mut positions = plan.positions(lr, hr)?;
+        positions.extend_from_slice(&cond.positions);
+        let kr = key_rows(&plan, kv_prefix, &cond);
         let i32s = |v: Vec<i32>| -> Result<Tensor> {
             let n = v.len().max(1);
             let mut b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
             b.resize(n * 4, 0);
             Tensor::from_bytes(&dev, DType::I32, &[n], &b)
         };
-        let idx_out = i32s(plan.lr_out.iter().map(|i| (prefix + i) as i32).collect())?;
+        let idx_out = i32s(plan.lr_out.iter().map(|i| prefix + i).chain(cond.out_rows.iter().copied()).map(|i| i as i32).collect())?;
         let split = prefix + plan.lr_count();
-        let idx_kv = i32s((0..prefix).chain(split..split + nh).map(|i| i as i32).collect())?;
-        let cs = crate::dit::rotations(&plan.expanded_positions(hr)?, inv_freq);
+        let idx_kv = i32s(seen.iter().copied().chain(split..split + nh + nc).map(|i| i as i32).collect())?;
+        // the expanded cells' positions: cell c of the video's rows outside M, then of the keyframes', for c = 0..4
+        let video_cells = plan.expanded_positions(hr)?;
+        let per = 3 * plan.lr_out.len();
+        let mut exp = Vec::with_capacity(4 * no * 3);
+        for c in 0..4 {
+            exp.extend_from_slice(&video_cells[c * per..(c + 1) * per]);
+            exp.extend_from_slice(&cond.out_positions[c]);
+        }
+        let cs = crate::dit::rotations(&exp, inv_freq);
         let cs_exp = Tensor::from_bytes(&dev, DType::F32, &[(4 * no).max(1), cfg.rot_dim / 2, 2],
                                         &{
                                             let mut b: Vec<u8> = cs.iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -742,16 +871,24 @@ impl<'a> TwoTrack<'a> {
             maps,
             blocks,
             prefix,
+            kv_prefix,
+            cond,
             tokens,
+            expanded: no,
         })
     }
 
     /// Bytes on the card a run of this plan adds (the packed stream and scratch, the key and value sets)
-    pub fn bytes(cfg: &Config, p: &Plan, prefix: usize, mlp_rows: Option<usize>) -> usize {
+    pub fn bytes(cfg: &Config, p: &Plan, prefix: usize, cond: &CondRows, mlp_rows: Option<usize>) -> usize {
         let w = cfg.heads * cfg.head_dim;
-        let tokens = prefix + p.lr_count() + p.hr_count();
-        2 * tokens * cfg.hidden + crate::dit::Scratch::bytes(cfg, tokens, mlp_rows.unwrap_or(tokens)) + 2 * 2 * key_rows(p, prefix) * w
-            + 2 * 2 * p.lr_out.len() * w
+        let tokens = prefix + p.lr_count() + p.hr_count() + cond.rows();
+        2 * tokens * cfg.hidden + crate::dit::Scratch::bytes(cfg, tokens, mlp_rows.unwrap_or(tokens)) + 2 * 2 * key_rows(p, prefix, cond) * w
+            + 2 * 2 * (p.lr_out.len() + cond.out_rows.len()) * w
+    }
+
+    /// The full-res queries: the region's rows, then the keyframes'
+    pub fn hr_rows(&self) -> usize {
+        self.plan.hr_count() + self.cond.rows()
     }
 
     fn gather(&self, dst: &Tensor, dst_row: usize, src: &Tensor, col: usize, idx: &Tensor, rows: usize) -> Result<()> {
@@ -797,11 +934,12 @@ impl SplitAttention for TwoTrack<'_> {
     fn before_rope(&self, index: usize, qkv: &Tensor, k_norm: &Tensor) -> Result<()> {
         let cfg = &self.blocks.cfg;
         let (w, d) = (cfg.heads * cfg.head_dim, cfg.head_dim);
-        let no = self.plan.lr_out.len();
+        let no = self.expanded;
         if no == 0 {
             return Ok(());
         }
-        // the half-res tokens outside M: raw k and v, k then normalized (its per-head RMS norm, no rotation)
+        // the half-res tokens outside M (video, then keyframes): raw k and v, k then normalized (its per-head RMS norm,
+        // no rotation)
         self.gather(&self.kx, 0, qkv, w, &self.idx_out, no)?;
         self.gather(&self.vx, 0, qkv, 2 * w, &self.idx_out, no)?;
         let dev = qkv.buf.device();
@@ -814,7 +952,7 @@ impl SplitAttention for TwoTrack<'_> {
         dev.check(rc)?;
         // the four cells: cell c = x + x D_c^T, a [no H, 128] x [128, 128] product a cell, into k2 / v2 after the
         // prefix's and the full-res rows' places
-        let base = self.prefix + self.plan.hr_count();
+        let base = self.kv_prefix + self.hr_rows();
         let rb = w * 2;
         for (j, (x, dst)) in [(&self.kx, &self.k2), (&self.vx, &self.v2)].into_iter().enumerate() {
             let m = &self.maps.dev[index][j];
@@ -845,7 +983,7 @@ impl SplitAttention for TwoTrack<'_> {
         let dev = qkv.buf.device();
         let dt = DType::BF16.kernel_code()?;
         let split = self.prefix + self.plan.lr_count();
-        let nh = self.plan.hr_count();
+        let nh = self.hr_rows();
         if qkv.shape[0] < self.tokens || att.shape[0] < self.tokens {
             return Err(Error("two-track attention: the buffers are smaller than the sequence".into()));
         }
@@ -862,9 +1000,9 @@ impl SplitAttention for TwoTrack<'_> {
             return Ok(());
         }
         // the prefix's and the full-res rows' keys (rotated) and values next to the expanded cells
-        self.gather(&self.k2, 0, qkv, w, &self.idx_kv, self.prefix + nh)?;
-        self.gather(&self.v2, 0, qkv, 2 * w, &self.idx_kv, self.prefix + nh)?;
-        let kr = key_rows(&self.plan, self.prefix);
+        self.gather(&self.k2, 0, qkv, w, &self.idx_kv, self.kv_prefix + nh)?;
+        self.gather(&self.v2, 0, qkv, 2 * w, &self.idx_kv, self.kv_prefix + nh)?;
+        let kr = key_rows(&self.plan, self.kv_prefix, &self.cond);
         // SAFETY: q rows [split, split + nh) of qkv; k2 / v2 kr rows of w; att rows from split
         let rc = unsafe {
             let q = qkv.buf.ptr().cast::<u16>().add(split * 3 * w).cast_const().cast();
@@ -946,6 +1084,32 @@ pub struct Spec<'a> {
     pub settings: Settings,
     /// write what the first two-track call saw and gave here (the reference checks: reference/mpeg-diffusion)
     pub dump: Option<&'a Path>,
+    /// write the keyframes' two-track rows here at the switch (the conditioning checks: `dump_cond`)
+    pub cond_dump: Option<&'a Path>,
+}
+
+/// The keyframes' two-track rows as the switch builds them (docs/ports/mpeg-diffusion.md, the conditioning checks):
+/// the region, the full-res keyframe rows (patches, their rows in the full-res layout, positions), the half-res rows
+/// expanded, both layouts' positions and segments
+fn dump_cond(path: &Path, p: &Plan, c: &CondRows, lr: &crate::layout::Layout, hr: &crate::layout::Layout, sigma: f32, log: &mut dyn FnMut(String)) -> Result<()> {
+    use std::collections::BTreeMap;
+    let f = |v: &[usize]| v.iter().map(|x| *x as f32).collect::<Vec<f32>>();
+    let segs = |l: &crate::layout::Layout| l.segments.iter().map(|s| format!("{:?}:{}:{}", s.kind, s.start, s.stop)).collect::<Vec<_>>().join(",");
+    let n = c.rows();
+    let mut m: BTreeMap<String, (Vec<usize>, Vec<f32>)> = BTreeMap::new();
+    m.insert("mask".into(), (vec![p.t, p.h, p.w], p.mask.iter().map(|b| *b as u8 as f32).collect()));
+    m.insert("cond_hr.patches".into(), (vec![n, c.patches.len() / n.max(1)], c.patches.clone()));
+    m.insert("cond_hr.rows".into(), (vec![n], f(&c.hr_rows)));
+    m.insert("cond_hr.table_from".into(), (vec![n], f(&c.table_from)));
+    m.insert("cond_out.rows".into(), (vec![c.out_rows.len()], f(&c.out_rows)));
+    // positions in float64 would need another writer: float32 is what the rotation reads
+    m.insert("cond_hr.positions".into(), (vec![n, 3], c.positions.iter().map(|x| *x as f32).collect()));
+    m.insert("lr.positions".into(), (vec![lr.tokens(), 3], lr.positions.iter().map(|x| *x as f32).collect()));
+    m.insert("hr.positions".into(), (vec![hr.tokens(), 3], hr.positions.iter().map(|x| *x as f32).collect()));
+    let meta = BTreeMap::from([("sigma".to_string(), format!("{sigma:.9}")), ("lr_segments".to_string(), segs(lr)), ("hr_segments".to_string(), segs(hr))]);
+    crate::safetensors::write_f32(path, &m, &meta)?;
+    log(format!("mpeg   : the keyframes' two-track rows written to {}", path.display()));
+    Ok(())
 }
 
 /// What a two-track run gives the decode
@@ -956,22 +1120,27 @@ pub struct Sampled {
     pub audio: Vec<f32>,
     /// the half-res track and the paste's weight (all zero with no region: the clip is the half-res track alone)
     pub paste: Paste,
+    /// the network calls: the half-res steps, the two-track ones
+    pub calls: (usize, usize),
     pub report: serde_json::Value,
 }
 
-/// Euler from x to the next noise level along the denoised estimate
+/// Euler from x to the next noise level along the denoised estimate, in the float32 arithmetic of H3's own sampler
+/// (`denoiser::sample_masked`), so that the half-res track is bit for bit H3 at half size until the switch
 fn euler(x: &mut [f32], dn: &[f32], s: f32, next: f32) {
     for (x, d) in x.iter_mut().zip(dn) {
-        *x = d + (*x - d) * (next / s);
+        let slope = (*x - d) / s;
+        *x += slope * (next - s);
     }
 }
 
 /// The two-track sampler (module doc) on `d`, a denoiser at half resolution (its shape: the clip's latent halved in
-/// space) over H3's schedule of `steps` (`sigmas`). `vae`: the video VAE, for the switch's round trip. `between(step,
+/// space) over H3's schedule of `steps` (`sigmas`), conditioned on `kfs` (the keyframes `d` was made with, their
+/// full-res latents; empty for a clip from text). `vae`: the video VAE, for the switch's round trip. `between(step,
 /// block)` before each block; `on_step(step)` after each step. The steps counted are the network calls: switch +
 /// the tail's.
 #[allow(clippy::too_many_arguments)]
-pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, sigmas: &[f32], vae: &Path, threads: usize, seed: u64, log: &mut dyn FnMut(String),
+pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, kfs: &Keyframes, sigmas: &[f32], vae: &Path, threads: usize, seed: u64, log: &mut dyn FnMut(String),
               between: &mut dyn FnMut(usize, usize) -> Result<()>, on_step: &mut dyn FnMut(usize) -> Result<()>) -> Result<Sampled> {
     use std::time::Instant;
     let steps = sigmas.len() - 1;
@@ -1040,7 +1209,7 @@ pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, sigmas: &[f32], va
         }
         xa.iter_mut().for_each(|x| *x /= d.schedule.audio_scale);
         let video = latent2x(&xv, 24, t, sh.h, sh.w);
-        return Ok(Sampled { video, audio: xa, paste: Paste { lr: xv, lr_h: sh.h, lr_w: sh.w, weight: vec![0.0; t * hh * hw] }, report });
+        return Ok(Sampled { video, audio: xa, paste: Paste { lr: xv, lr_h: sh.h, lr_w: sh.w, weight: vec![0.0; t * hh * hw] }, calls: (steps, 0), report });
     }
     // 3. the full-res track's start: the clean estimate x2 (inside M's box through the VAE), re-noised
     let t1 = Instant::now();
@@ -1106,12 +1275,23 @@ pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, sigmas: &[f32], va
     let mut xh: Vec<f32> = start.iter().zip(&eps).map(|(s, e)| (1.0 - sw) * s + sw * e).collect();
     drop(start);
     // 4. the two tracks
-    let hr_layout = crate::layout::Layout::new(d.layout.segment(crate::layout::Kind::Text).map_or(0, |s| s.stop - s.start), t, hh, hw, sh.audio_t, &[], &[])?;
-    let need = TwoTrack::bytes(&d.blocks.cfg, &plan, d.layout.segment(crate::layout::Kind::Video).map_or(0, |s| s.start), None);
-    log(format!("mpeg   : two-track sequence {} rows (half-res {} + full-res {}), the full-res queries over {} keys; {:.2} GiB more on the card",
-                d.layout.tokens() + plan.hr_count(), plan.lr_count(), plan.hr_count(),
-                key_rows(&plan, d.layout.segment(crate::layout::Kind::Video).map_or(0, |s| s.start)), need as f64 / (1u64 << 30) as f64));
-    let tt = TwoTrack::new(d.blocks, &maps, &d.outer.inv_freq, plan, &d.layout, &hr_layout, None)?;
+    // the full-res layout: the same text, keyframes and sound (the full-res rows' positions, the keyframes' cells')
+    let hr_layout = crate::layout::Layout::new(d.layout.segment(crate::layout::Kind::Text).map_or(0, |s| s.stop - s.start), t, hh, hw, sh.audio_t, &kfs.list, &[])?;
+    let cond = cond_rows(&plan, kfs, &d.layout, &hr_layout, d.outer.video_c)?;
+    let prefix = d.layout.segment(crate::layout::Kind::Video).map_or(0, |s| s.start);
+    let need = TwoTrack::bytes(&d.blocks.cfg, &plan, prefix, &cond, None);
+    if !kfs.list.is_empty() {
+        log(format!("mpeg   : keyframes: {} full-res rows inside the region, {} half-res rows outside it expanded to cells", cond.rows(), cond.out_rows.len()));
+    }
+    log(format!("mpeg   : two-track sequence {} rows (half-res {} + full-res {} + keyframes' full-res {}), the full-res queries over at most {} keys; {:.2} GiB more on the card",
+                d.layout.tokens() + plan.hr_count() + cond.rows(), plan.lr_count(), plan.hr_count(), cond.rows(), key_rows(&plan, prefix, &cond),
+                need as f64 / (1u64 << 30) as f64));
+    report["keyframe_rows_full_res"] = serde_json::json!(cond.rows());
+    report["keyframe_rows_expanded"] = serde_json::json!(cond.out_rows.len());
+    if let Some(p) = spec.cond_dump {
+        dump_cond(&p.with_extension("switch.safetensors"), &plan, &cond, &d.layout, &hr_layout, sigmas[st.switch], log)?;
+    }
+    let tt = TwoTrack::new(d.blocks, &maps, &d.outer.inv_freq, plan, &d.layout, &hr_layout, cond, None)?;
     let tail = st.tail(sigmas);
     let t2 = Instant::now();
     for k in 0..tail.len() - 1 {
@@ -1136,7 +1316,7 @@ pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, sigmas: &[f32], va
     let n = t * hh * hw;
     let video: Vec<f32> = (0..xh.len()).map(|i| inside[i % n] * xh[i] + (1.0 - inside[i % n]) * ctx[i]).collect();
     let weight = mask_to_latent(&plan, 4, st.feather);
-    Ok(Sampled { video, audio: xa, paste: Paste { lr: xv, lr_h: sh.h, lr_w: sh.w, weight }, report })
+    Ok(Sampled { video, audio: xa, paste: Paste { lr: xv, lr_h: sh.h, lr_w: sh.w, weight }, calls: (st.switch, tail.len() - 1), report })
 }
 
 #[cfg(test)]
@@ -1193,6 +1373,53 @@ mod tests {
         let tail = Settings::default().tail(&crate::denoiser::sigmas(20, 12.0));
         let want: Vec<f32> = fx["tail_16_6"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
         assert_eq!(tail, want);
+    }
+
+    /// The keyframes on two tracks: with M the whole clip the full-res rows are the full-res model's keyframe rows
+    /// (the same augmented patches, positions); with M empty every half-res keyframe token is expanded to cells at the
+    /// full-res layout's positions; a last-frame keyframe takes the last latent frame's region
+    #[test]
+    fn keyframes_split_by_the_region_as_the_full_res_model_has_them() {
+        use crate::layout::{Keyframe, Kind, Layout};
+        // a clip of 22 frames (7 latent frames), half-res tokens 2 x 3; a 22-frame guide at 0, a picture at the last frame
+        // with a sound keyframe beside it at 0
+        let (t, th, tw, frames, at, text) = (7, 2, 3, 22, 37, 5);
+        let list = vec![
+            Keyframe { frame_index: 0.0, video_latent_t: Some(7), audio_latent_t: Some(4) },
+            Keyframe { frame_index: (frames - 1) as f64, video_latent_t: Some(1), audio_latent_t: None },
+        ];
+        let lat = |vt: usize, seed: u32| -> Vec<f32> { (0..24 * vt * 4 * th * 4 * tw).map(|i| (((i as u32).wrapping_mul(2654435761) ^ seed) % 1000) as f32 / 500.0 - 1.0).collect() };
+        let kfs = Keyframes { video_hr: vec![Some(lat(7, 1)), Some(lat(1, 2))], list: list.clone(), visual_aug: 0.999, seed: 7, frames };
+        let lr = Layout::new(text, t, 2 * th, 2 * tw, at, &list, &[]).unwrap();
+        let hr = Layout::new(text, t, 4 * th, 4 * tw, at, &list, &[]).unwrap();
+        let hsegs: Vec<_> = hr.segments.iter().filter(|s| s.kind == Kind::Cond).copied().collect();
+        // M everywhere: every full-res keyframe row, in the full-res layout's order, augmented as Denoiser::new does
+        let all = Plan::new(vec![true; t * th * tw], t, th, tw).unwrap();
+        let c = cond_rows(&all, &kfs, &lr, &hr, 24).unwrap();
+        assert!(c.out_rows.is_empty());
+        let want: Vec<usize> = hsegs.iter().flat_map(|s| s.start..s.stop).collect();
+        assert_eq!(c.hr_rows, want);
+        let mut patches = crate::denoiser::keyframe_rows(kfs.video_hr[0].as_ref().unwrap(), 24, (7, 4 * th, 4 * tw), 0.999, 7);
+        patches.extend(crate::denoiser::keyframe_rows(kfs.video_hr[1].as_ref().unwrap(), 24, (1, 4 * th, 4 * tw), 0.999, 7));
+        assert_eq!(c.patches, patches);
+        let pos: Vec<f64> = want.iter().flat_map(|r| hr.positions[r * 3..r * 3 + 3].to_vec()).collect();
+        assert_eq!(c.positions, pos);
+        // M nowhere: every half-res keyframe row expanded, its cells at the full-res positions
+        let none = Plan::new(vec![false; t * th * tw], t, th, tw).unwrap();
+        let c = cond_rows(&none, &kfs, &lr, &hr, 24).unwrap();
+        assert_eq!(c.rows(), 0);
+        let lsegs: Vec<_> = lr.segments.iter().filter(|s| s.kind == Kind::Cond).copied().collect();
+        assert_eq!(c.out_rows, lsegs.iter().flat_map(|s| s.start..s.stop).collect::<Vec<_>>());
+        // the guide's first token's cell 3: full-res row (0 * 4 + 0 + 1) * 6 + 0 + 1 of the full-res keyframe
+        assert_eq!(&c.out_positions[3][..3], &hr.positions[(hsegs[0].start + 7) * 3..(hsegs[0].start + 7) * 3 + 3]);
+        // M on the last latent frame only: the guide's last latent frame and the last-frame picture are inside
+        let mut m = vec![false; t * th * tw];
+        m[(t - 1) * th * tw..].fill(true);
+        let c = cond_rows(&Plan::new(m, t, th, tw).unwrap(), &kfs, &lr, &hr, 24).unwrap();
+        assert_eq!(c.rows(), 2 * 4 * th * tw);
+        assert_eq!(c.out_rows.len(), 6 * th * tw);
+        assert_eq!(c.hr_rows[0], hsegs[0].start + 6 * 4 * th * tw);
+        assert_eq!(c.hr_rows[4 * th * tw], hsegs[1].start);
     }
 
     #[test]

@@ -952,6 +952,8 @@ pub struct ClipSpec<'a> {
     pub inputs: ClipInputs<'a>,
     /// MPEG-Diffusion's two-track sampler (mpeg.rs) instead of the clip at full resolution all through
     pub mpeg: Option<crate::mpeg::Spec<'a>>,
+    /// write the keyframes' rows as the denoiser is given them here (`cond_dump`: the conditioning checks)
+    pub cond_dump: Option<&'a Path>,
 }
 
 /// The request's `exposure_fix` settings
@@ -1198,9 +1200,46 @@ fn is_still(p: &Path) -> bool {
     p.extension().and_then(|e| e.to_str()).is_some_and(|e| ["png", "jpg", "jpeg", "webp"].contains(&e.to_lowercase().as_str()))
 }
 
+/// The conditioning checks' dump (`cond_dump`, docs/ports/mpeg-diffusion.md): each keyframe segment's rows as the
+/// denoiser is given them (patches or stereo rows, augmented, before the patch projection), their positions and their
+/// timesteps at `sigma` (the first step's), the layout's segments; for comparing two runs' conditioning exactly
+fn write_cond_dump(path: &Path, d: &Denoiser, cond: &Conditions, sigma: f32) -> Result<()> {
+    use crate::layout::Kind;
+    let (sh, o) = (d.shape, d.outer);
+    let ts = d.row_timesteps(sigma);
+    let segs: Vec<_> = d.layout.segments.iter().filter(|s| matches!(s.kind, Kind::Cond | Kind::CondAudio)).collect();
+    let mut rows = Vec::new();
+    for k in &cond.keyframes {
+        if let Some((v, vt)) = &k.video {
+            rows.push(denoiser::keyframe_rows(v, o.video_c, (*vt, sh.h, sh.w), cond.visual_aug, cond.seed));
+        }
+        if let Some((a, rt)) = &k.audio {
+            rows.push(denoiser::augment(denoiser::pack_audio(a, o.audio_c, *rt), cond.audio_aug, cond.seed + 1));
+        }
+    }
+    if rows.len() != segs.len() {
+        return Err(Error(format!("cond_dump: {} keyframe row sets for {} segments", rows.len(), segs.len())));
+    }
+    let mut m: BTreeMap<String, (Vec<usize>, Vec<f32>)> = BTreeMap::new();
+    for (i, (s, r)) in segs.iter().zip(rows).enumerate() {
+        let n = s.stop - s.start;
+        m.insert(format!("seg{i}.rows"), (vec![n, r.len() / n.max(1)], r));
+        m.insert(format!("seg{i}.positions"), (vec![n, 3], d.layout.positions[s.start * 3..s.stop * 3].iter().map(|x| *x as f32).collect()));
+        m.insert(format!("seg{i}.t"), (vec![n], ts[s.start..s.stop].iter().map(|x| *x as f32).collect()));
+    }
+    let meta = BTreeMap::from([
+        ("segments".to_string(), d.layout.segments.iter().map(|s| format!("{:?}:{}:{}", s.kind, s.start, s.stop)).collect::<Vec<_>>().join(",")),
+        ("shape".to_string(), format!("{} {} {} {}", sh.t, sh.h, sh.w, sh.audio_t)),
+        ("sigma".to_string(), format!("{sigma:.9}")),
+    ]);
+    crate::safetensors::write_f32(path, &m, &meta)
+}
+
 /// The video keyframes and audio keyframe of a clip, encoded (the encoders loaded only when a picture or sound
-/// needs them).
-fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frames): (usize, usize, usize), ctl: &mut Ctl) -> Result<(Vec<KeyframeIn>, Vec<Frames>, Option<Anchor>)> {
+/// needs them). `video_only`: the pictures and guides alone (MPEG-Diffusion's half-size encodings, the sound being
+/// the same at any size).
+fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frames): (usize, usize, usize), video_only: bool, ctl: &mut Ctl)
+                  -> Result<(Vec<KeyframeIn>, Vec<Frames>, Option<Anchor>)> {
     let mut kfs: Vec<KeyframeIn> = Vec::new();
     let pictures = std::cell::RefCell::new(Vec::new());
     // the luma of the frames the clip should start with (the exposure fix): a guide's, else the first picture's
@@ -1284,7 +1323,7 @@ fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frame
         kfs.push(KeyframeIn { frame_index: index, video: Some((z, vt)), audio: None });
     }
     drop(venc);
-    if let Some((p, secs)) = inp.first_audio {
+    if let Some((p, secs)) = inp.first_audio.filter(|_| !video_only) {
         // the audio encoder needs ~0.6 s at least (0.5 s fails in its convolutions); H3 held it to 1 s, which with a
         // 22-frame (0.917 s) motion guide carries 2 frames more sound than picture - so the floor is 0.75 s
         let secs = secs.max(0.75);
@@ -1308,7 +1347,7 @@ fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frame
             None => kfs.push(KeyframeIn { frame_index: 0, video: None, audio: Some((z, rt)) }),
         }
     }
-    if let Some((p, start)) = inp.soundtrack {
+    if let Some((p, start)) = inp.soundtrack.filter(|_| !video_only) {
         // the clip's length of the song, encoded; fitted to the clip's audio latent length (cut, or its last frame repeated)
         let rate = crate::audio::SAMPLE_RATE;
         let at = (frames as f64 / 24.0 * 40.0).round() as usize;
@@ -1529,10 +1568,19 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
             if c.refine.is_some() || c.knots.len() >= 2 || c.sampler != nextsycl_diffusion::Sampler::Euler || c.schedule != nextsycl_diffusion::Schedule::Shift {
                 return Err(Error("MPEG-Diffusion runs Euler on H3's own schedule: no refine, knots, other samplers or schedules".into()));
             }
-            if i.first_latent.is_some() || i.first_frame.is_some() || i.last_frame.is_some() || !i.guides.is_empty() || i.first_audio.is_some()
-                || i.soundtrack.is_some() || !i.ref_audio.is_empty() || !i.ref_images.is_empty() || !i.ref_videos.is_empty() || i.control_video.is_some()
-                || i.control_mask.is_some() || i.source.is_some() {
-                return Err(Error("MPEG-Diffusion makes a clip from its prompt alone: no keyframes, guides, references, sound, ControlNet or source (the full-res model takes those)".into()));
+            // keyframes (first_frame, last_frame, guide_clip) and sound (first_audio, soundtrack) condition both tracks
+            // (mpeg.rs `Keyframes`); the rest is not ported
+            if !i.ref_images.is_empty() || !i.ref_videos.is_empty() {
+                return Err(Error("REF2VA is not supported by MPEG yet: reference pictures and clips (ref_images, ref_videos) need the Ref2VA denoiser".into()));
+            }
+            if !i.ref_audio.is_empty() {
+                return Err(Error("MPEG-Diffusion takes no voice references (ref_audios) yet: the full-res model does".into()));
+            }
+            if i.first_latent.is_some() {
+                return Err(Error("MPEG-Diffusion takes a first picture, not a latent (first_latent is at full resolution only): give first_frame".into()));
+            }
+            if i.control_video.is_some() || i.control_mask.is_some() || i.source.is_some() {
+                return Err(Error("MPEG-Diffusion takes no ControlNet, mask or source (masked runs): the full-res model does".into()));
             }
             if c.vaes.upscale.is_some() && c.vaes.pixel.is_none() {
                 return Err(Error("MPEG-Diffusion pastes decoded pixels: no latent upscaler (a pixel_upscaler works)".into()));
@@ -1546,8 +1594,34 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     if let Some(a) = c.inputs.cond_noise_aug {
         cond.visual_aug = a;
     }
-    let (keyframes, kf_pictures, guide_luma) = clip_keyframes(&e.dev, &c.inputs, &c.vaes, (c.width, c.height, frames), ctl)?;
-    cond.keyframes = keyframes;
+    let (keyframes, kf_pictures, guide_luma) = clip_keyframes(&e.dev, &c.inputs, &c.vaes, (c.width, c.height, frames), false, ctl)?;
+    // MPEG-Diffusion: the denoiser (the half-res track) gets the pictures and guides encoded at half size, as H3 at half
+    // resolution would; the full-res encodings wait for the switch (mpeg::cond_rows); the sound is the same latent
+    let mut mpeg_kfs = crate::mpeg::Keyframes { visual_aug: cond.visual_aug, seed: c.seed, frames, ..Default::default() };
+    cond.keyframes = match &c.mpeg {
+        Some(_) => {
+            let mut half = match keyframes.iter().any(|k| k.video.is_some()) {
+                true => {
+                    ctl.say(format!("mpeg   : the keyframes again at half size ({}x{}) for the half-res track", c.width / 2, c.height / 2));
+                    clip_keyframes(&e.dev, &c.inputs, &c.vaes, (c.width / 2, c.height / 2, frames), true, ctl)?.0.into_iter().filter_map(|k| k.video).collect()
+                }
+                false => Vec::new(),
+            }.into_iter();
+            let mut lr = Vec::with_capacity(keyframes.len());
+            for k in keyframes {
+                let v = match &k.video {
+                    Some((_, vt)) => Some(half.next().filter(|h| h.1 == *vt).ok_or("the half-size keyframes do not match the full-size ones")?),
+                    None => None,
+                };
+                mpeg_kfs.list.push(crate::layout::Keyframe { frame_index: k.frame_index as f64, video_latent_t: v.as_ref().map(|v| v.1),
+                                                             audio_latent_t: k.audio.as_ref().map(|a| a.1) });
+                mpeg_kfs.video_hr.push(k.video.map(|v| v.0));
+                lr.push(KeyframeIn { frame_index: k.frame_index, video: v, audio: k.audio });
+            }
+            lr
+        }
+        None => keyframes,
+    };
     // the exposure fix's anchor: the guide's frames' luma, else the request's, else the first picture's
     let exposure = c.inputs.exposure_fix.map(|o| {
         let first = c.inputs.first_frame.is_some().then(|| kf_pictures.first().map(|f| crate::media::luma(&f.frames[0]))).flatten();
@@ -1671,20 +1745,26 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         _ => noise_v,
     };
     ctl.say(format!("tokens : {} in the denoiser", d.tokens()));
+    if let Some(p) = c.cond_dump {
+        write_cond_dump(p, &d, &cond, sigmas[0])?;
+        ctl.say(format!("dump   : the keyframes' rows written to {}", p.display()));
+    }
     let nblocks = e.model.blocks.len();
     let mut steps = sigmas.len() - 1;
     let t0 = Instant::now();
     let mut paste = None;
     let mut mpeg_report = None;
+    let mut mpeg_lr = None;
     let (v, a) = if let Some(m) = &c.mpeg {
-        // the network calls: the half-res steps, then the tail's
-        steps = m.settings.switch + m.settings.tail(&sigmas).len() - 1;
+        // the network calls: the half-res steps, then the tail's (the settings as this run's step count has them)
+        let st = m.settings.for_steps(sigmas.len() - 1);
+        steps = st.switch + st.tail(&sigmas).len() - 1;
         let dev = e.dev.clone();
         let cancel = ctl.cancel;
         let mut progress = ctl.progress.take();
         let mut times = Vec::new();
         let mut t_step = Instant::now();
-        let r = crate::mpeg::sample(&mut d, m, &sigmas, c.vaes.video, e.threads, c.seed, &mut *ctl.log, &mut |i, b| {
+        let r = crate::mpeg::sample(&mut d, m, &mpeg_kfs, &sigmas, c.vaes.video, e.threads, c.seed, &mut *ctl.log, &mut |i, b| {
             if b == 0 || b == nblocks / 2 {
                 dev.wait()?;
                 if cancel.load(Ordering::Relaxed) {
@@ -1702,11 +1782,12 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         });
         ctl.progress = progress;
         let r = r?;
-        ctl.say(format!("sampled: {steps} steps ({} half-res, {} two-track) in {:.1} s ({})", m.settings.switch, steps - m.settings.switch,
+        ctl.say(format!("sampled: {} steps ({} half-res, {} two-track) in {:.1} s ({})", r.calls.0 + r.calls.1, r.calls.0, r.calls.1,
                         t0.elapsed().as_secs_f64(), times.iter().map(|s| format!("{s:.2}")).collect::<Vec<_>>().join(" ")));
         let mut rep = r.report;
         rep["step_seconds"] = json!(times);
         mpeg_report = Some(rep);
+        mpeg_lr = Some((r.paste.lr.clone(), r.paste.lr_h, r.paste.lr_w));
         paste = Some(r.paste);
         (r.video, r.audio)
     } else {
@@ -1749,10 +1830,15 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         crate::safetensors::write_f32(&p, &BTreeMap::from([("latent".to_string(), (vec![1, 24, 1, shape.h, shape.w], last))]), &BTreeMap::new())?;
         // and the whole clip's latents: a later masked run regenerates part of it or extends it
         let p = out.with_extension("latents.safetensors");
-        crate::safetensors::write_f32(&p, &BTreeMap::from([
+        let mut t = BTreeMap::from([
             ("samples.video".to_string(), (vec![1, 24, shape.t, shape.h, shape.w], v.clone())),
             ("samples.audio".to_string(), (vec![1, 32, 2, shape.audio_t], a.clone())),
-        ]), &BTreeMap::new())?;
+        ]);
+        // MPEG-Diffusion: its half-res track too (what an H3 run at half size would have made, until the switch)
+        if let Some((lr, lh, lw)) = mpeg_lr {
+            t.insert("mpeg.half_res_video".to_string(), (vec![1, 24, shape.t, lh, lw], lr));
+        }
+        crate::safetensors::write_f32(&p, &t, &BTreeMap::new())?;
     }
     if c.refine.as_ref().is_some_and(|r| r.window) {
         return Ok(json!({"sample_seconds": sample_secs}));
@@ -2028,6 +2114,7 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                         maps: Path::new(s("mpeg_maps").ok_or("mpeg needs \"mpeg_maps\": the fitted K/V maps (up_maps_tt.safetensors)")?),
                         head: Path::new(s("region_head").ok_or("mpeg needs \"region_head\": the region head (region_head_tt.safetensors)")?),
                         dump: s("mpeg_dump").map(Path::new),
+                        cond_dump: s("cond_dump").map(Path::new),
                         settings: crate::mpeg::Settings::from_env(&|k: &str| {
                             // a job's own key (mpeg_switch ...) over the variable (H3_MPEG_SWITCH ...)
                             let key = k.trim_start_matches("H3_").to_lowercase();
@@ -2035,6 +2122,9 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                         }),
                     }),
                 },
+                // the conditioning checks: the keyframes' rows as the denoiser gets them (and, with mpeg, the switch's
+                // two-track rows beside it: <cond_dump>.switch.safetensors)
+                cond_dump: s("cond_dump").map(Path::new),
             };
             // "PATH[:STRENGTH][,PATH[:STRENGTH]...]"
             let lora: Vec<(&Path, f32)> = s("lora")

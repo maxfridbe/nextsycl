@@ -337,6 +337,22 @@ pub struct KeyframeIn {
     pub audio: Option<(Vec<f32>, usize)>,
 }
 
+/// A conditioning row set's noise augmentation: `a * rows + (1 - a) * noise`, the noise drawn from `seed` afresh (the
+/// reference restarts the same stream for every keyframe); a = 1: the rows as they are
+pub fn augment(mut rows: Vec<f32>, a: f32, seed: u64) -> Vec<f32> {
+    if a < 1.0 {
+        let noise = crate::noise::Mt19937::new(seed).randn(rows.len());
+        rows.iter_mut().zip(noise).for_each(|(r, n)| *r = a * *r + (1.0 - a) * n);
+    }
+    rows
+}
+
+/// A video keyframe's rows as the denoiser is given them: its latent [c, vt, h, w] in 2x2 patches, augmented
+/// (`augment`, from the sampling seed). MPEG-Diffusion's full-resolution keyframe rows are these too (mpeg.rs).
+pub fn keyframe_rows(v: &[f32], c: usize, (vt, h, w): (usize, usize, usize), aug: f32, seed: u64) -> Vec<f32> {
+    augment(patchify(v, c, vt, h, w), aug, seed)
+}
+
 /// What a clip is conditioned on besides its text: keyframes, and how much the denoiser is told to trust them.
 pub struct Conditions {
     pub keyframes: Vec<KeyframeIn>,
@@ -485,13 +501,7 @@ impl<'a> Denoiser<'a> {
                 lin.forward(&input, &out)?;
                 Ok(out)
             };
-            let aug = |mut rows: Vec<f32>, a: f32, seed: u64| -> Vec<f32> {
-                if a < 1.0 {
-                    let noise = crate::noise::Mt19937::new(seed).randn(rows.len());
-                    rows.iter_mut().zip(noise).for_each(|(r, n)| *r = a * *r + (1.0 - a) * n);
-                }
-                rows
-            };
+            let aug = augment;
             let mut segs = layout.segments.iter().filter(|s| matches!(s.kind, Kind::Cond | Kind::CondAudio | Kind::RefAudio | Kind::RefImg));
             for k in &cond.keyframes {
                 if let Some((v, vt)) = &k.video {
@@ -499,7 +509,7 @@ impl<'a> Denoiser<'a> {
                         return Err(Error(format!("a video keyframe of {} values for {} x {vt} x {} x {}", v.len(), outer.video_c, shape.h, shape.w)));
                     }
                     let s = segs.next().ok_or("keyframe rows missing from the layout")?;
-                    let rows = aug(patchify(v, outer.video_c, *vt, shape.h, shape.w), cond.visual_aug, cond.seed);
+                    let rows = keyframe_rows(v, outer.video_c, (*vt, shape.h, shape.w), cond.visual_aug, cond.seed);
                     cond_rows.push((s.start, embed(rows, &outer.video_patch)?));
                 }
                 if let Some((a, rt)) = &k.audio {
@@ -618,6 +628,12 @@ impl<'a> Denoiser<'a> {
 
     pub fn tokens(&self) -> usize {
         self.layout.tokens()
+    }
+
+    /// Each row's timestep at video noise level `sigma` (the conditioning checks' dumps)
+    pub fn row_timesteps(&self, sigma: f32) -> Vec<f64> {
+        let (ts, _, _) = self.timesteps(sigma);
+        ts.rows.iter().map(|r| ts.values[(*r / 3) as usize]).collect()
     }
 
     /// Each token's table row and the distinct timesteps at video noise level `sigma`, and per target row (video,
@@ -778,14 +794,17 @@ impl<'a> Denoiser<'a> {
         let cfg = self.blocks.cfg;
         let (o, sh) = (self.outer, self.shape);
         let dev = self.x.buf.device().clone();
-        if self.masks.is_some() || self.control.is_some() || self.hyperflow.is_some() || !self.cond_rows.is_empty() {
-            return Err(Error("two-track steps take a clip from text alone: no keyframes, references, masks, ControlNet or HyperFlow".into()));
+        if self.masks.is_some() || self.control.is_some() || self.hyperflow.is_some()
+            || self.layout.segments.iter().any(|s| matches!(s.kind, Kind::RefImg | Kind::RefAudio)) {
+            return Err(Error("two-track steps take text, keyframes and sound: no references, masks, ControlNet or HyperFlow".into()));
         }
         let (ts, final_v, final_a) = self.timesteps(sigma);
         let p = &tt.plan;
         let nh = p.hr_count();
         let mut rows = ts.rows.clone();
         rows.extend(std::iter::repeat_n(ts.video_index as i32 * 3 + Kind::Video.modality(), nh));
+        // the keyframes' full-res rows: their half-res rows' table row (the conditioning timestep, video-like)
+        rows.extend(tt.cond.table_from.iter().map(|r| ts.rows[*r]));
         let t_emb = ts.embeddings(&o.t_table, cfg.t_dim);
         let step = Step::new_with(&dev, self.blocks, &rows, &tt.positions, &o.inv_freq, &t_emb, self.lora.map(|l| l.adaln.as_slice()))?;
         let seg = |k: Kind| self.layout.segment(k).ok_or_else(|| Error(format!("no {k:?} rows in the layout")));
@@ -807,6 +826,13 @@ impl<'a> Denoiser<'a> {
         x.copy_rows(ts_video.start, &embed(patchify(lr, o.video_c, sh.t, sh.h, sh.w), nv, &o.video_patch)?, 0, nv)?;
         if nh > 0 {
             x.copy_rows(ts_video.stop, &embed(hr_rows, nh, &o.video_patch)?, 0, nh)?;
+        }
+        let nc = tt.cond.rows();
+        if nc > 0 {
+            if tt.cond.patches.len() != nc * pw {
+                return Err(Error(format!("the keyframes' full-res rows: {} values for {nc} rows", tt.cond.patches.len())));
+            }
+            x.copy_rows(ts_video.stop + nh, &embed(tt.cond.patches.clone(), nc, &o.video_patch)?, 0, nc)?;
         }
         for i in 0..self.blocks.blocks.len() {
             between(i)?;
