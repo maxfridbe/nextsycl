@@ -939,7 +939,7 @@ pub struct Sampled {
     pub video: Vec<f32>,
     /// the sound's latents in the model's own scale
     pub audio: Vec<f32>,
-    /// the half-res track and the paste's weight (None: no region, the clip is the half-res track alone)
+    /// the half-res track and the paste's weight (all zero with no region: the clip is the half-res track alone)
     pub paste: Paste,
     pub report: serde_json::Value,
 }

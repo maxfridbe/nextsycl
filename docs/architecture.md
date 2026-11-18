@@ -54,6 +54,8 @@ video/                     VIDEO
   contract   nextsycl-video      the contract: VideoEngine (generate; jobs / run_job), VideoRequest (+ Keyframe),
                                  Progress, Clip, VideoKind
   h3         nextsycl-video-h3   MiniMax H3: H3's engine, jobs and mp4 writer
+                                 (MPEG-Diffusion's two-track sampler with H3_MPEG=1: crates/h3/src/mpeg.rs, its silo
+                                 kernels/video/h3/silo - docs/ports/mpeg-diffusion.md)
   example    nextsycl-video-example  a template
 
 audio/                     AUDIO

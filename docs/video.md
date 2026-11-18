@@ -54,5 +54,6 @@ What a clip can be made from (ComfyUI's H3 nodes, each checked against them wher
 | video inpainting | a mask (white: regenerate; a picture or a video) over a source video, through the same ControlNet | `control_mask`, `control_source` |
 | regenerate a stretch / box, extend | a clip's latents kept outside the seconds and box asked for | `source`, `regen`, `regen_box` |
 | a 768p draft at 2560x1440 (Open-H3-Regenerate-2K-IC) | the draft as `<Video 1>` on the Ref2VA denoiser + HyperFlow 8-step + LMS Sharp + the IC LoRA, 3 steps from the upscaled draft; its sound kept (the `regen2k` job, the `minimax-h3-regen2k-ic` model; docs/ports/open-h3-regenerate-2k.md) | `regen2k`, `regen_sampler`, `regen_resolution`, `sharp` |
+| text to video+audio on two tracks (MPEG-Diffusion) | 16 of 20 steps at half resolution, then full-resolution tokens on the region a head on block 25 picks (people, faces), the rest the half-res track enlarged; ~2x faster at 1344x768 on the B70 (3 s: 216.6 s -> 100-111 s; 6 s: 577.7 s -> 220-237 s, sampling + decode), the region softer than a full-res render (the `minimax-h3-mpeg` model; docs/ports/mpeg-diffusion.md) | the model id; `mpeg: false` runs it at full resolution |
 
 ![the video studio](screenshots/video-studio.webp)
