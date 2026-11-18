@@ -103,7 +103,7 @@ The llm kind's common options (`nextsycl_llm::COMMON_OPTIONS`); what each engine
 
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
-| `NS_PROFILE` | off | Time the passes by section (1: GPU synced at each boundary; gpu: device timestamps, no syncs; deepseek2: 1 its decode passes, prompt its prompt passes) (--opt-profile) | llm glm5next, llm qwen35 (NS_Q35_PROFILE needs gpu), llm deepseek2, llm minimaxm3, kernels:ns (gpu: profiling queues) |
+| `NS_PROFILE` | off | Time the passes by section (1: GPU synced at each boundary; gpu: device timestamps, no syncs; deepseek2: 1 its decode passes, prompt its prompt passes) (--opt-profile) | llm glm5next, llm qwen35 (NS_Q35_PROFILE needs gpu), llm deepseek2, llm minimaxm3, image depthanything (1: each op class of a pass), kernels:ns (gpu: profiling queues) |
 | `NS_SPLIT` | even by layer count (glm5next); planned by free VRAM (qwen4exp, qwen35) | Layers per GPU. glm5next: A,B,... layer counts of each GPU but the last; qwen4exp, qwen35: the first layer of each GPU after the first (same for two GPUs) (--opt-split) | llm glm5next, llm qwen4exp, llm qwen35 |
 | `NS_VRAM_GUARD_GIB` | glm5next: off; qwen4exp: 1.5 | VRAM (GiB) to keep free. glm5next: a prompt read stops with an error once a GPU has less free after a chunk; qwen4exp: the load plan's margin a GPU (--opt-vram-guard-gib) | llm glm5next, llm qwen4exp; cli (passes it to the container) |
 
@@ -327,6 +327,8 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 | `H3_MPEG_FLOOR` | none | with H3_MPEG: a clip whose 99th-percentile smoothed score is under this stays half resolution (--opt-mpeg-floor; mpeg_floor) | video h3 |
 | `H3_MPEG_FEATHER` | 4 | with H3_MPEG: the paste's ramp inside the region's edge, in full-res latent pixels (--opt-mpeg-feather; mpeg_feather) | video h3 |
 | `H3_VAE_ATTN_PER_TILE` | off | 1: the video decoder's attention a tile at a time (--opt-vae-attn-per-tile) | video h3 |
+| `H3_REGEN_VAE` | standard | regen2k's decoder: `fast` - Open-H3-Regenerate-2K's fast decoder (the card's fast-vae file, crates/h3/src/fastvae.rs; needs the H3 video silo, dist/silo/libnextsycl-h3.so, and falls back to the video decoder without it or without the room) - or `standard`, the H3 video decoder; a request's `regen_vae` overrides (--opt-regen-vae; the minimax-h3-regen2k-ic card) | video h3 |
+| `H3_DECODE_FRAMES` | unset | a path: the decode job also writes its frames there as a check dump (`images` [F, H, W, 3], float32 in [0, 1]) - for comparing one decoder with another through the decode job's `check` | video h3 |
 | `H3_VAE_FLOAT32` | off | 1: every tile of the fp16 video decoder in float32 (~8x slower; for checks). Without it, only a tile that comes out non-finite in half precision is decoded again in float32, and the job log names it | video h3 |
 | `NS_VIDEO_CHARACTERS` | docs/video/characters.example.json | characters for the speech tool | cli (video tools) |
 | `NS_VIDEO_DOOR` | 127.0.0.1:8000 | the front door the studio asks which cards a pin or hold has and the host's free memory (`--door` wins; off: none) | studio |
@@ -356,6 +358,7 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 | Variable | Default | What it does | Read by |
 |---|---|---|---|
 | `NS_AUDIO_OUT` | ~/.local/share/nextsycl/audio | where songs, speech and saved voices are kept | cli (audio), serve |
+| `NS_VOICE_TRANSCRIBE` | 1 | the front door hears each saved voice that has no text or no word times (never heard) once with the enabled recogniser (Whisper large-v3-turbo: an `audio.transcribe` job labelled "voice transcript: NAME", priority -5, one at a time; a minute after the start, then every 10 min, and at once after `audio.voices.add` without text) and keeps the transcript with it: `text` filled when it had none (a text given stays), `words` (their times: an in-context clone cuts the recording between two words and takes that part's transcript from them), `transcribed` {model, at, text}; 0: the voices are left as they are | serve |
 | `NS_YUE2_DUMP` | off | Debug: a folder to write each song's abc.u32, codes.u32 and latents.f32 into (raw little-endian), to compare runs stage by stage | audio yue2 |
 | `NS_YUE2_ACT` | half | the flow's and prefill's product inputs: half, or bf16 with NS_SILO=0 only (coarser: oneDNN's product stays in the type) | audio yue2 |
 | `NS_YUE2_MIN_CODES` | 200 | Debug: the song may not end before this many codes: the 360 s worst case, for measuring memory | audio yue2 |
@@ -473,6 +476,9 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 | `NS_SOPHON_*` | - | every NS_SOPHON_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
 | `NS_SOPHON_BITS` | 4 | Sophon-Realtime's brain (Qwen3-32B): 4 (q4, made on the card from the FP8 checkpoint: ~19.5 GiB, one card) or 8 (q8: ~33 GiB, split over two cards; the close one, for checks) (--opt-bits) | audio sophon |
 | `NS_SOPHON_TAGS` | 1 | 1: the talker is handed the sound tags ([laughter], [sigh], <laughter>...</laughter>, <strong>...) as upstream's is - Flash's own talker performs them (card sophon-realtime-32b-flash-tags); 0: they are taken out of what it reads and the engine lists no vocal events (the reply's text keeps them either way) - the card sophon-realtime-32b-flash sets 0 because its talker is Qwen3-TTS-12Hz-1.7B-Base's, which clones a saved voice closer but reads a tag aloud ("Laughter.") | audio sophon |
+| `NS_SOPHON_CLONE` | xvector | how a cloned voice (a saved voice, a request's or session's reference) is spoken: `xvector` (its x-vector alone, upstream's talker.py way) or `icl` (Qwen3-TTS's in-context clone: the recording's codec frames and its transcript in the talker's prompt; its x-vector when no transcript is known). The card sophon-realtime-32b-flash sets icl (its Base talker clones closest that way), sophon-realtime-32b-flash-tags xvector (its fine-tuned talker ends its speech early in context); also a request's / session's option clone (--opt-clone) | audio sophon |
+| `NS_SOPHON_ICL_MAX_S` | 16 | an in-context clone's recording at most this long (seconds, 3-60): a longer one is cut between two words by the saved voice's word times (Whisper's, kept by the front door), at a sentence's end in its second half when there is one; without word times it is cloned by its x-vector (--opt-icl-max-s) | audio sophon |
+| `NS_SOPHON_ICL_LIVE` | prompt | a /v1/realtime reply's in-context layout: `prompt` (upstream's, as /v1/audio/speech uses: the reply's text beside the recording's frames, so the talker waits until the reply covers them or is whole - first audio later than with the x-vector) or `stream` (the recording's transcript beside its frames, then the reply fed a token a frame as written: experimental, WER 1.0 in 24 of 24 takes 2026-11-17) (--opt-icl-live) | audio sophon |
 | `NS_SOPHON_SPLIT` | 30 | with two cards and bits 8: the brain's first layer on the second card (--opt-split) | audio sophon |
 | `NS_SOPHON_Q8_LAYERS` | 62,63 | with bits 4: the brain's layers kept in q8 (comma-separated; `none`: all q4) - the last ones, where Qwen3's large activations make 4-bit codes cost the most (~0.2 GiB a layer) (--opt-q8-layers) | audio sophon |
 | `NS_SOPHON_CTX` | 6144 | the positions a conversation's context holds (its history: 8 turns, 120 s of the user's speech at most) (--opt-ctx) | audio sophon |
@@ -498,7 +504,7 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 | `NS_WH_NO_SPEECH` | 0.6 | a window is skipped as silence when <\|nospeech\|> is likelier than this and its text unsure; also a request's option no-speech (--opt-no-speech) | audio whisper |
 | `NS_Z3_ENC_F32` | 0 | Debug: 1 runs ZONOS3's reference encoder (raw-reference cloning) in float32 instead of Zyphra's BF16 recipe - a diagnostic: the codes drift from the reference's | audio zonos3 |
 | `NS_Z3_ENC_DUMP` | - | Debug: a directory where the reference encoder writes its first lane's stages as .npy (named as zac-encoder-cli --dump names them), for reference/zonos3 | audio zonos3 |
-| `NS_Z3_EDIT_DUMP` | - | Debug: a directory where a speech edit writes its first region's prompt (ids.npy, ids.cond.json) for Zyphra's zonos3-cli | audio zonos3 |
+| `NS_Z3_EDIT_DUMP` | - | Debug: a directory where a speech edit writes its first region's prompt (ids.npy, ids.cond.json: zonos3-cli's sidecar), its generated rows as fed back (rows.npy), the window's codes (codes.npy), its text and spans (edit.json) and the file `edit` - for `audio check --stages forced` and reference/zonos3/edit_ref.py | audio zonos3 |
 
 ## 3D
 
@@ -880,6 +886,7 @@ Inputs of the checks and unit tests that need files outside the repository (unse
 | `NS_TEST_WHISPER_CONFIG` | test skipped | whisper-large-v3-turbo's config.json for its sizes' test | audio whisper (cargo test) |
 | `NS_TEST_WHISPER_GENERATION` | test skipped | whisper-large-v3-turbo's generation_config.json (with NS_TEST_WHISPER_TOKENIZER) for the vocabulary, rules and alignment tests | audio whisper (cargo test) |
 | `NS_TEST_WHISPER_REF` | test skipped | a folder of reference/whisper/ref.py dumps (short/, long/, song/): the mel, greedy-rule, alignment and placement tests against openai-whisper | audio whisper (cargo test) |
+| `CHROME` | ~/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome | the browser reference/haru/page_test.mjs drives headless (the wfe Conversation page with a fake microphone; not checked: JavaScript) | reference/haru (page_test.mjs) |
 | `NS_TEST_WHISPER_TOKENIZER` | test skipped | whisper-large-v3-turbo's tokenizer.json for the byte-level tokenizer test and the vocabulary tests | tests (crates/tok), audio whisper (cargo test) |
 | `NS_TEST_QWEN_TOKENIZER` | test skipped | a Qwen3-VL tokenizer.json for the tokenizer test (with NS_TEST_QWEN_TOKENS) | tests (crates/tok) |
 | `NS_TEST_QWEN_TOKENS` | test skipped | the reference pipeline's tokens.json the tokenizer test compares against | tests (crates/tok) |

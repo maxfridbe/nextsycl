@@ -100,7 +100,7 @@ pub fn run(e: &VibeVoice, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Strin
         for i in 0..n_voices {
             let b = std::fs::read(dir.join(format!("voice{i}.wav"))).map_err(|x| Error(format!("voice{i}.wav: {x}")))?;
             let (samples, rate) = nextsycl_audio::decode_audio(&b).map_err(Error)?;
-            let x = e.voice_samples(&Reference { samples, rate, text: None })?;
+            let x = e.voice_samples(&Reference { samples, rate, text: None, words: Vec::new() })?;
             frames.push(Some(x.len() / e.cfg.hop()));
             let t = Instant::now();
             let got = e.encode(&x)?;

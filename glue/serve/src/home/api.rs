@@ -45,6 +45,12 @@ const FEATURES: &[&str] = &[
     "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars", "image.loras.request", "video.soundtrack", "video.exposure_fix",
     "backplane", "system.busy.engines", "models.profile", "system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long", "jobs.eta", "video.on_demand", "video.multi_guide",
     "image.describe", "image.describe.describer", "image.describers", "video.regen2k", "cards_taken.gpus",
+    // 2026-11-17: video.control as nextcuda's - a clip turned into a ControlNet control video (canny edges, gray: the
+    // studio, on the CPU), for control_video; video.control.depth (a depth model's job in the image queue: Depth Anything
+    // V2 Small) is listed only while a depth model is enabled (features_now)
+    "video.control", "video.control.canny", "video.control.gray", "video.control.depth",
+    // 2026-11-17: YuE2's instrumental covers (the `instrumental` option: a recording's lead played, not sung), as nextcuda's
+    "audio.yue2.instrumental",
 ];
 
 /// Qwen-Image's sizes: its training buckets (multiples of 16) and the guide's defaults
@@ -163,7 +169,7 @@ fn field_of(method: &str, m: &str) -> Option<String> {
 type Fail = (u16, String);
 
 /// A call to a kind's server whose failure keeps that server's status (a 400 stays a 400); 502 when it does not answer
-fn relay(t: &crate::http::Target, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, Fail> {
+pub(super) fn relay(t: &crate::http::Target, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, Fail> {
     match http::call_status(t, method, path, body, secs) {
         Ok((200, v)) => Ok(v),
         Ok((st, v)) => Err((st, v["error"]["message"].as_str().or_else(|| v["error"].as_str()).unwrap_or("request failed").to_string())),
@@ -466,8 +472,11 @@ impl Home {
     /// code (busy, not_running ...) - with the files it names as URLs through here
     /// `base`: scheme://host as the caller reached this door (the files an answer links)
     fn studio_rpc(&self, name: &str, b: &Value, base: &str) -> Option<(u16, Value)> {
-        // video.upscale is the image servers' (an upscaler's job), not the studio's
+        // video.upscale is the image servers' (an upscaler's job), not the studio's; so is video.control's depth
         let method = name.strip_prefix("video.").filter(|m| !matches!(*m, "upload" | "describePromptGuideMD" | "upscale"))?;
+        if super::control::by_model(name, b) {
+            return None;
+        }
         let all = self.models();
         let envelope = |st: u16, m: String| (st, json!({"ok": false, "error": rpc_error(name, st, None, &m)}));
         if let Err((st, m)) = self.checked(name, b, &all) {
@@ -667,7 +676,7 @@ impl Home {
         if super::backplane::runs_model(name) {
             super::backplane::check_fields(b)?;
         }
-        if super::jobs::METHODS.contains(&name) {
+        if super::jobs::runs_as_job(name, b) {
             let all = self.models();
             self.checked(name, b, &all)?;
             // what the server would refuse, refused now (wait: false would answer OK, then fail)
@@ -716,7 +725,7 @@ impl Home {
             ("system", "version") => {
                 let on = self.kinds_on(&all);
                 let methods: Vec<String> = table::methods().iter().filter(|m| on.contains(&m.runs_on())).map(|m| m.full().to_string()).collect();
-                Ok(json!({"version": crate::VERSION, "api": API_VERSION, "kinds": on, "features": FEATURES, "methods": methods,
+                Ok(json!({"version": crate::VERSION, "api": API_VERSION, "kinds": on, "features": features_now(super::control::depth_enabled(&all)), "methods": methods,
                           "maintenance": self.maintenance().map(|n| super::maint::public(&n))}))
             }
             ("system", "files.stat" | "files.delete") => self.file_op(m.name, b),
@@ -878,7 +887,8 @@ impl Home {
                     self.pick("image", b, &all)?
                 } else {
                     // no model named: the loaded or first enabled one that draws (not a reader, not an upscaler)
-                    let draws = |m: &Value| !s(m, "arch").contains("ocr") && !upscales(m) && !vectorizes(m) && !removes_background(m) && !crate::describe::is_native(m);
+                    let draws = |m: &Value| !s(m, "arch").contains("ocr") && !upscales(m) && !vectorizes(m) && !removes_background(m) && !crate::describe::is_native(m)
+                        && !super::control::estimates_depth(m);
                     let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "image" && m["enabled"] != false && draws(m)).collect();
                     self.loaded_of("image").into_iter().find(|l| on.iter().any(|m| m["id"] == l.as_str())).or_else(|| on.first().map(|m| s(m, "id")))
                         .ok_or_else(|| (409, "no image model that draws is enabled (system.enable qwen-image-2.1-q8)".to_string()))?
@@ -894,6 +904,9 @@ impl Home {
                 }
                 if all.iter().any(|m| m["id"] == id.as_str() && removes_background(m)) {
                     return Err((400, format!("{id} removes backgrounds; image.{} needs a model that draws (image.remove_background for {id})", m.name)));
+                }
+                if all.iter().any(|m| m["id"] == id.as_str() && super::control::estimates_depth(m)) {
+                    return Err((400, format!("{id} estimates depth; image.{} needs a model that draws (video.control with control depth for {id})", m.name)));
                 }
                 let job = b["request_id"].as_str();
                 let t = self.ensure_for(&id, job)?;
@@ -951,9 +964,7 @@ impl Home {
                 if let Some(f) = b["file"].as_str().filter(|f| !f.is_empty()) {
                     let plain = crate::files::plain(f.rsplit('/').next().unwrap_or(f)).ok_or_else(|| (400, format!("file {f}: a clip's name")))?;
                     let name = if plain.ends_with(".mp4") { plain.to_string() } else { format!("{plain}.mp4") };
-                    let dir = self.o.cfg.get("NS_VIDEO_OUT").filter(|d| !d.is_empty())
-                        .unwrap_or_else(|| format!("{}/.local/share/nextsycl/video", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())));
-                    let path = std::path::Path::new(&dir).join(&name);
+                    let path = self.clips_dir().join(&name);
                     if !path.is_file() {
                         return Err((404, format!("file {f}: no clip {name} here (video.list)")));
                     }
@@ -1120,6 +1131,10 @@ impl Home {
                 if let Some(owner) = o("owner") {
                     v = self.voices().tag(&s(b, "name"), "owner", json!(owner)).map_err(|e| (500, e))?;
                 }
+                // saved without what it says: the recogniser hears it now (transcribe.rs), its text kept with it
+                if crate::voices::needs_transcript(&v) {
+                    self.hear_voices_soon();
+                }
                 Ok(json!({"voice": v, "sample": format!("http://nextsycl/v1/audio/voices/{}.wav", s(b, "name"))}))
             }
             ("audio", "voices.design") => self.design_voice(b, &all),
@@ -1129,6 +1144,7 @@ impl Home {
                 let r = self.studio_upload(&s(b, "name"), &data)?;
                 Ok(r)
             }
+            ("video", "control") if super::control::by_model(name, b) => self.control_by_model(b, &all),
             ("video", method) => {
                 let v = call_for(&t, "POST", &format!("/rpc/{method}"), Some(b), 120).map_err(|e| (502, e))?;
                 Ok(v.get("result").cloned().unwrap_or(v))
@@ -1847,6 +1863,12 @@ pub(super) fn describe_target(t: &str, all: &[Value]) -> Result<(crate::describe
 }
 
 /// A registry entry that upscales (an upscaler's architecture) rather than draws or reads
+/// The features system.version lists now: all of FEATURES, but video.control.depth only while a depth model is
+/// enabled (a client offers depth control videos only where they are made)
+pub(super) fn features_now(depth: bool) -> Vec<&'static str> {
+    FEATURES.iter().copied().filter(|f| depth || *f != "video.control.depth").collect()
+}
+
 pub(super) fn upscales(m: &Value) -> bool {
     matches!(s(m, "arch").as_str(), "realesrgan" | "waifu2x" | "seedvr2" | "flashvsr")
 }

@@ -81,8 +81,8 @@ impl Host for H {
     fn cancelled(&self, j: &str) -> bool {
         self.f.cancelled(j)
     }
-    fn learn_ask(&self, i: &str, e: &str, g: usize, w: u64) -> bool {
-        self.f.learn_ask(i, e, g, w)
+    fn learn_ask(&self, i: &str, e: &str, g: usize, w: u64, r: bool) -> bool {
+        self.f.learn_ask(i, e, g, w, r)
     }
     fn wait_lock_kind<'a>(&'a self, _k: &str) -> Box<dyn Guard + 'a> {
         assert!(!self.k.kind_lock_held.get(), "waited for the kind's lock while another model loads");
@@ -137,7 +137,7 @@ fn host(cards: &[u64]) -> H {
 
 fn ask(h: &H, m: &ModelInfo, job: Option<&str>, wait_s: u64) -> Result<(usize, u16), Fail> {
     let need = m.gpus.iter().map(|g| (*g, 4096)).collect::<BTreeMap<_, _>>();
-    let req = PlaceReq { model: m, job, need_mb: &need, asked_mb: 0 };
+    let req = PlaceReq { model: m, job, need_mb: &need, asked_mb: 0, asked_rest_mb: 0 };
     ensure(h, &req, Duration::from_secs(wait_s), None, &json!({}))
 }
 
@@ -265,7 +265,7 @@ fn span_host() -> H {
 /// The asking for `m` with its need on each card
 fn ask_span(h: &H, m: &ModelInfo, per: &[(usize, u64)], wait_s: u64) -> Result<(usize, u16), Fail> {
     let need: BTreeMap<usize, u64> = per.iter().copied().collect();
-    let req = PlaceReq { model: m, job: None, need_mb: &need, asked_mb: 0 };
+    let req = PlaceReq { model: m, job: None, need_mb: &need, asked_mb: 0, asked_rest_mb: 0 };
     ensure(h, &req, Duration::from_secs(wait_s), None, &json!({}))
 }
 
@@ -316,6 +316,43 @@ fn a_spanning_model_waits_when_one_card_is_busy_and_stops_nothing_meanwhile() {
     ask_span(&h, &s, &SOPHON, 90).unwrap();
     assert!(h.f.log().iter().any(|l| l == "unload chat chat"), "{:?}", h.f.log());
     assert_eq!(h.f.count("start audio sophon slot"), 1);
+}
+
+#[test]
+fn a_spanning_models_refusal_on_its_second_card_is_learned_there_and_waited_for() {
+    // 2026-11-11 on nextcuda (cf2debd): a split model's starts were refused on its second card 36 times, each learned for
+    // the first card and sent back as a failure. Here: memory no snapshot shows held on card 1 for 30 s
+    let h = span_host();
+    let s = h.f.add_span("sophon", "audio", &SOPHON, Profile::default());
+    h.f.hide(1, 28000, 30.0);
+    ask_span(&h, &s, &SOPHON, 90).unwrap();
+    let log = h.f.log();
+    // refused for card 1, learned for card 1 (a card past its first), and the request waited: one start in the end
+    assert!(log.iter().any(|l| l == "refused audio sophon: short on card 1"), "{log:?}");
+    assert!(log.iter().any(|l| l == "learn sophon gpu 1 (rest)"), "{log:?}");
+    assert!(!log.iter().any(|l| l == "learn sophon gpu 0"), "{log:?}");
+    assert_eq!(h.f.count("start audio sophon slot"), 1, "{log:?}");
+    // the room on each card taken before every try, at its own figure
+    let r = h.k.reserved.borrow().clone();
+    assert!(r.contains(&(0, 23552 + room::MARGIN_MB)) && r.contains(&(1, 5632 + room::MARGIN_MB)), "{r:?}");
+}
+
+#[test]
+fn a_spanning_model_without_room_on_its_second_card_ends_in_no_room() {
+    let h = span_host();
+    let s = h.f.add_span("sophon", "audio", &SOPHON, Profile::default());
+    // card 1 held past the wait: 503 no_room (retryable), not a failure; nothing started
+    h.f.hide(1, 28000, 10_000.0);
+    let (code, why) = ask_span(&h, &s, &SOPHON, 60).unwrap_err();
+    assert_eq!(code, 503, "{why}");
+    assert!(why.contains("GPU 1"), "{why}");
+    assert_eq!(h.f.count("start audio sophon slot"), 0);
+    // a need past the card's whole memory fails at once (it would never load there)
+    let big = h.f.add_span("big", "audio", &[(0, 1000), (1, 40000)], Profile::default());
+    let started = std::time::Instant::now();
+    let (code, why) = ask_span(&h, &big, &[(0, 1000), (1, 1000)], 600).unwrap_err();
+    assert!(why.contains("on card 1"), "{code} {why}");
+    assert!(started.elapsed().as_secs() < 5);
 }
 
 #[test]

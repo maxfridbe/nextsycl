@@ -14,6 +14,9 @@
 //! crashes - leaves no card blocked: the lock goes with its process, and the file left behind names a pid that holds
 //! nothing. A holder with no side file, or one naming another pid or no card, takes every card (the old runners only
 //! flock). The video queue still pauses while any card is taken.
+//!
+//! Since 2026-11-17 a run on some cards holds each card's own lock instead (`card_file`: /tmp/ds2run.gpu1.lock), so runs
+//! on different cards go side by side; the box's lock is still every card for a run that names none.
 
 use std::path::{Path, PathBuf};
 
@@ -123,11 +126,42 @@ impl Taken {
     }
 }
 
-/// Who holds the lock file now and which cards it takes (none: free, no file, or no lock file set)
+/// A card's own lock file beside the box's: `ds2run.lock` -> `ds2run.gpu1.lock`. A run that uses only some cards holds
+/// theirs (gpu-lock.sh since 2026-11-17), so two runs on two cards go side by side - the box's one lock let only one
+/// run at a time, whatever cards it used
+pub fn card_file(lock: &Path, g: usize) -> PathBuf {
+    let stem = lock.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "ds2run".into());
+    lock.with_file_name(format!("{stem}.gpu{g}.lock"))
+}
+
+/// Who holds the lock now and which cards are taken (none: free, no file, or no lock file set): the box's lock (its
+/// side file naming the cards, else every card) and each card's own lock (that card)
 pub fn taken(file: &Path) -> Option<Taken> {
-    let holder = held(file)?;
-    let gpus = std::fs::read_to_string(cards_file(file)).ok().and_then(|t| declared(&t, holder.pid));
-    Some(Taken { holder, gpus })
+    let main = held(file).map(|holder| {
+        let gpus = std::fs::read_to_string(cards_file(file)).ok().and_then(|t| declared(&t, holder.pid));
+        Taken { holder, gpus }
+    });
+    let mut cards = Vec::new();
+    let mut first = None;
+    for g in 0..16 {
+        if let Some(h) = held(&card_file(file, g)) {
+            cards.push(g);
+            first.get_or_insert(h);
+        }
+    }
+    match (main, first) {
+        (Some(mut t), Some(_)) => {
+            if let Some(v) = t.gpus.as_mut() {
+                v.extend(cards);
+                v.sort_unstable();
+                v.dedup();
+            }
+            Some(t)
+        }
+        (Some(t), None) => Some(t),
+        (None, Some(holder)) => Some(Taken { holder, gpus: Some(cards) }),
+        (None, None) => None,
+    }
 }
 
 /// The sentence a refused request or a waiting job reads
@@ -241,6 +275,30 @@ mod tests {
         assert_eq!(t.expect("held").gpus, Some(vec![1]));
         assert!(taken(&f).is_none(), "the run ended: the file left behind takes nothing");
         let _ = std::fs::remove_file(cards_file(&f));
+        let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
+    fn a_cards_own_lock_takes_that_card_only() {
+        // two runs on two cards hold ds2run.gpu0.lock / ds2run.gpu1.lock side by side; skipped where there is no `flock`
+        let f = std::env::temp_dir().join(format!("ns-gpulock-card-{}.lock", std::process::id()));
+        std::fs::write(&f, "").unwrap();
+        let c1 = card_file(&f, 1);
+        assert!(c1.to_string_lossy().ends_with(&format!("ns-gpulock-card-{}.gpu1.lock", std::process::id())));
+        std::fs::write(&c1, "").unwrap();
+        let Ok(mut c) = std::process::Command::new("flock").arg(&c1).args(["sleep", "2"]).spawn() else { return };
+        let t0 = std::time::Instant::now();
+        let mut t = None;
+        while t.is_none() && t0.elapsed().as_secs() < 3 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            t = taken(&f);
+        }
+        let _ = c.wait();
+        let t = t.expect("held");
+        assert_eq!(t.gpus, Some(vec![1]));
+        assert!(!t.takes(0) && t.takes(1), "card 0 serves on");
+        assert!(taken(&f).is_none());
+        let _ = std::fs::remove_file(c1);
         let _ = std::fs::remove_file(f);
     }
 }

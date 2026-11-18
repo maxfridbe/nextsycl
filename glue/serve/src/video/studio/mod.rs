@@ -9,6 +9,7 @@
 //! State: the queue and holds (`queue.json`, `paused.json`) and the running clips (`jobs.json`) in the studio's own
 //! directory; each finished clip's record (`<clip>.json`) beside its mp4 in the clips directory.
 
+pub mod control;
 pub mod http;
 pub mod library;
 pub mod llm;
@@ -587,6 +588,7 @@ impl Studio {
                 crate::files::stat(&self.out.join(&n)).map_err(|_| RpcError::not_found(&format!("no file {n}")))?
             }
             "files.delete" => self.delete(&ps("name"))?,
+            "control" => self.control(p)?,
             "jobs.get" => self.job_record(p)?,
             other => return Err(RpcError::new("unknown_method", &format!("unknown method {other}"), 404)),
         })
@@ -594,6 +596,25 @@ impl Studio {
 
     /// A finished clip and every file of it (its record, last frame, latents, sound tail, still), or an upload;
     /// never the clip being made
+    /// A clip in the clips directory turned into a ControlNet control video beside it (control.rs): canny or gray, made
+    /// here on the CPU while the call waits; depth is the front door's (a depth model's job on the image servers)
+    fn control(&self, p: &Value) -> Result<Value, RpcError> {
+        let (src, n) = control::source(&self.out, p)?;
+        let (w, h, seconds) = control::probe(&src).ok_or_else(|| RpcError::param(&format!("{n}: not a clip ffprobe reads (no video stream)")))?;
+        let mut s = control::settings(p, (w, h, seconds))?;
+        if !control::KINDS.contains(&s.control.as_str()) {
+            return Err(RpcError::param(&format!("control {}: made by a model on the image servers - the front door's video.control runs it", s.control)));
+        }
+        // a dim clip's brightness stretched for canny, so its edges pass the thresholds
+        if s.control == "canny" && s.normalize {
+            s.levels = control::levels(&src, s.start_s, s.frames as f64 / 24.0);
+        }
+        let name = control::output_name(&n, &s.control, now() as u64);
+        let t0 = std::time::Instant::now();
+        let (_, given) = control::make(&src, &self.out.join(&name), &s).map_err(|e| RpcError::new("internal", &e, 500))?;
+        Ok(control::answer(&name, &s, given, seconds, t0.elapsed().as_secs_f64()))
+    }
+
     fn delete(&self, name: &str) -> Result<Value, RpcError> {
         let n = crate::files::plain(name).ok_or_else(|| RpcError::param("name: a clip (h3_YYYYMMDD_HHMMSS[.mp4]) or an upload (ref_...)"))?;
         let mut gone = Vec::new();

@@ -1121,6 +1121,108 @@ pub struct VideoUpscaleReq {
     pub rest: serde_json::Map<String, serde_json::Value>,
 }
 
+/// A control signal H3's Fun ControlNet-Union steers by
+#[derive(Deserialize, Serialize, Rpc, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum ControlKind {
+    /// edges, white on black (OpenCV's Canny: thresholds low / high)
+    Canny,
+    /// the clip's brightness (the 2.0 checkpoint's gray control: recolouring)
+    Gray,
+    /// a depth map, near bright (a depth model's: Depth Anything V2 - an image-queue job)
+    Depth,
+    /// a body-pose skeleton (an estimator's: DWPose)
+    Pose,
+}
+
+/// What video.control takes.
+#[derive(Deserialize, Serialize, Rpc)]
+#[allow(non_snake_case)]
+pub struct VideoControlReq {
+    /// depth: hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// depth: the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
+    /// depth only (a job of the image queue): a group inside the project
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 60)]
+    pub batch: Option<String>,
+    /// depth only: queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = false)]
+    pub held: Option<bool>,
+    /// depth only: names the job for image.status and image.cancel (default: its id)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub label: Option<String>,
+    /// depth only: what people call this job: free text, 120 characters, never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
+    /// depth only: a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = -9, max = 9, default = 0)]
+    pub priority: Option<i64>,
+    /// depth only: a group of jobs held or released together (<kind>.queue.pause / resume), listed with <kind>.jobs {project}
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 60)]
+    pub project: Option<String>,
+    /// depth only: false: refused at once (409 busy, retryable) when the job would not start now - a server free and no runnable job waiting before it; true (default): it waits its turn
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = true)]
+    pub queue: Option<bool>,
+    /// depth only: idempotent submit: a job of this id queued, running or done is answered instead of a new one (failed / cancelled: made again)
+    #[serde(rename = "reentrant_id", default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 200)]
+    pub reentrant_id: Option<String>,
+    /// depth only: true: answer when it ends (the job goes on if the call drops); false: answer at once with the job. Canny and gray answer while the call waits
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = true)]
+    pub wait: Option<bool>,
+    /// the clip to read: a file in the clips directory (video.upload it - MP4, WebM, MOV, MKV - or a finished clip's name)
+    pub file: String,
+    /// what to make of it (default canny); the ones this box makes are its features video.control.<control> - the rest are refused (400). depth needs a depth model enabled (409 otherwise)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<ControlKind>,
+    /// depth: the depth model's id; none: the loaded one, else the first enabled (capability depth)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// the canvas the clip will be made at (the source is scaled to cover it and cut in the middle, as video.generate does with a control video); none: the source's aspect at about 768 x 576
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = 256, max = 1344)]
+    pub width: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = 256, max = 1344)]
+    pub height: Option<i64>,
+    /// the clip's length in frames at 24 fps (17k + 5, 22-362); none: the most the source has from start_s. A shorter source holds its last frame
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = 22, max = 362)]
+    pub frames: Option<i64>,
+    /// seconds into the source to start from
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0, default = 0)]
+    pub start_s: Option<f64>,
+    /// canny: the lower threshold on the gradient's size (cv2.Canny's, 0-255 pictures): weaker edges are dropped unless joined to a strong one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0, max = 1000, default = 100)]
+    pub low: Option<f64>,
+    /// canny: the upper threshold: stronger edges are always kept
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0, max = 1000, default = 200)]
+    pub high: Option<f64>,
+    /// canny: stretch the clip's brightness (its 1st to 99th percentile) to the full range first, so a dim room's edges pass the thresholds
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = true)]
+    pub normalize: Option<bool>,
+    /// what else the caller sent: passed on as it came
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
+}
+
 /// What image.ocr takes.
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
@@ -3634,6 +3736,12 @@ fn video_upload(h: &Arc<Home>, req: VideoUploadReq) -> Answer {
     h.legacy("video.upload", req)
 }
 
+/// A clip turned into a ControlNet control video for video.generate's control_video: canny edges or its brightness (gray), made on the CPU while the call waits (seconds), or its depth (near bright; the clip scaled by one range), a depth model's job in the image queue (image.status / image.cancel; wait false answers with the job) - at the clip's canvas and length (24 fps, scaled to cover, a short source's last frame held). The answer names the file beside the clips (control_video takes the name; system.files.delete removes it) and links it
+#[rpc(name = "video.control", tags = "video", example = r#"{"control": "canny", "file": "ref_1792400000_take.webm", "frames": 124, "height": 576, "width": 768}"#)]
+fn video_control(h: &Arc<Home>, req: VideoControlReq) -> Answer {
+    h.legacy("video.control", req)
+}
+
 /// How to prompt the model, as Markdown
 #[rpc(name = "video.describePromptGuideMD", tags = "video", example = r#"{"model": "minimax-h3"}"#)]
 fn video_describe_prompt_guide_md(h: &Arc<Home>, req: VideoDescribePromptGuideMdReq) -> Answer {
@@ -3657,7 +3765,7 @@ rpcgen::rpc_methods![sync Arc<Home>, RpcFail;
     model3d_upload, model3d_cancel, model3d_describe_prompt_guide_md, video_generate, video_status, video_wait,
     video_cancel, video_queue_list, video_queue_move, video_queue_remove, video_queue_pause, video_queue_resume,
     video_queue_clear, video_jobs_list, video_jobs_get, video_timeline, video_projects_list, video_films_list,
-    video_templates_list, video_engines_list, video_canvases_list, video_summary, video_upload, video_describe_prompt_guide_md,
+    video_templates_list, video_engines_list, video_canvases_list, video_summary, video_upload, video_control, video_describe_prompt_guide_md,
 ];
 
 #[cfg(test)]

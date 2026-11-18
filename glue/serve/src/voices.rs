@@ -4,17 +4,26 @@
 //! ```text
 //!   <audio output>/voices/<name>/sample.wav    the recording (mono, its own rate)
 //!                                /voice.json    {name, text (what it says), description, language, kind: clone |
-//!                                               design, seconds, rate, created, from}
+//!                                               design, seconds, rate, created, from; words [{start, end, text}]
+//!                                               and transcribed {model, at, text} once Whisper has heard it}
 //!                                /enrolled/<arch>.npy   the voice fitted for a model without an encoder (Voxtral
 //!                                               TTS: `nextsycl audio voice enroll`), its report beside it (.json)
 //! ```
 //!
 //! The audio server reads them (the output directory is mounted into its container); the front door and the
 //! command line write them.
+//!
+//! A voice without its words' times (saved with no text, or with a text but never heard) is heard once by the front
+//! door's recogniser (home/transcribe.rs: Whisper, word times on): the transcript fills `text` when it was empty (a
+//! text given stays), `words` keeps when each word is said, so an in-context clone (Sophon's) cuts the recording
+//! between two words - its first seconds, a clipped last word left off - and takes what that part says from the
+//! words. (A text given can be wrong: Skippy1's "Heidi, hold their monkeys. Tis eye" is "Hidey-ho there, monkeys. Tis
+//! I", and the recording ends on a clipped "Since..." - in context it ran on past its line in 5 of 8 takes, 0 of 8
+//! cut by Whisper's words, 2026-11-17.)
 
 use std::path::{Path, PathBuf};
 
-use nextsycl_audio::{Audio, Reference};
+use nextsycl_audio::{Audio, Reference, Timed};
 use serde_json::{json, Value};
 
 /// The library beside an audio output directory
@@ -25,6 +34,19 @@ pub struct Library {
 /// The shortest and longest recording kept (seconds): long enough to carry a voice, short enough for a prompt
 const MIN_S: f64 = 1.0;
 const MAX_S: f64 = 60.0;
+/// Whether a voice's record wants Whisper's ear: no text, or no words' times (it was never heard)
+pub fn needs_transcript(v: &Value) -> bool {
+    let said = v["text"].as_str().is_some_and(|t| !t.trim().is_empty());
+    let timed = v["words"].as_array().is_some_and(|w| !w.is_empty()) || v["transcribed"].is_object();
+    !said || !timed
+}
+
+/// A record's words ({start, end, text} each)
+pub fn words_of(v: &Value) -> Vec<Timed> {
+    v["words"].as_array().into_iter().flatten().filter_map(|w| {
+        Some(Timed { start: w["start"].as_f64()?, end: w["end"].as_f64()?, text: w["text"].as_str()?.to_string(), probability: None })
+    }).collect()
+}
 
 /// A voice's name: lowercase letters, digits, '-' and '_', 1-40 long, a letter first
 pub fn check_name(name: &str) -> Result<(), String> {
@@ -100,7 +122,29 @@ impl Library {
         let p = self.sample_path(name).ok_or_else(|| format!("voice {name}: its sample.wav is missing"))?;
         let b = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         let (samples, rate) = nextsycl_audio::decode_wav(&b).map_err(|e| format!("{}: {e}", p.display()))?;
-        Ok(Reference { samples, rate, text: v["text"].as_str().filter(|t| !t.trim().is_empty()).map(str::to_string) })
+        Ok(Reference { samples, rate, text: v["text"].as_str().filter(|t| !t.trim().is_empty()).map(str::to_string), words: words_of(&v) })
+    }
+
+    /// What a recogniser heard in a voice's recording, kept with it: `text` when the record has none (a text given
+    /// stays), the words' times, and who heard it (`transcribed`). `created`: the record's when the recording was
+    /// read - a voice replaced (or removed) since is left alone. The record
+    pub fn transcribed(&self, name: &str, created: &Value, text: &str, words: &[Value], model: &str) -> Result<Value, String> {
+        let mut v = self.get(name).ok_or_else(|| format!("no saved voice {name:?}"))?;
+        if &v["created"] != created {
+            return Err(format!("voice {name}: replaced while it was heard"));
+        }
+        let text = text.trim();
+        if v["text"].as_str().is_none_or(|t| t.trim().is_empty()) && !text.is_empty() {
+            v["text"] = json!(text);
+        }
+        let r = |x: &Value| x.as_f64().map(|f| (f * 100.0).round() / 100.0);
+        let words: Vec<Value> = words.iter().filter_map(|w| Some(json!({"start": r(&w["start"])?, "end": r(&w["end"])?, "text": w["text"].as_str()?})))
+            .collect();
+        v["words"] = json!(words);
+        v["transcribed"] = json!({"model": model, "at": now(), "text": text});
+        let f = self.dir.join(name).join("voice.json");
+        std::fs::write(&f, serde_json::to_string_pretty(&v).unwrap_or_default()).map_err(|e| format!("{}: {e}", f.display()))?;
+        Ok(v)
     }
 
     /// Keep a recording (any format decode_audio reads) under `name`: its record returned. `replace`: over a voice of
@@ -198,6 +242,22 @@ mod tests {
         let rf = lib.reference("anna").unwrap();
         assert_eq!((rf.rate, rf.samples.len(), rf.text.as_deref()), (16000, 32000, Some("Hello.")));
         assert!(lib.add("short", &wav[..1000], None, None, None, "clone", "test", false).is_err());
+        // heard by a recogniser: a text given stays, the words' times are kept and come with the reference
+        let created = lib.get("anna").unwrap()["created"].clone();
+        let w = vec![json!({"start": 0.1, "end": 0.5, "text": " Hello.", "probability": 0.9})];
+        assert!(lib.transcribed("anna", &json!(0), "Hi.", &w, "whisper").is_err());
+        let v = lib.transcribed("anna", &created, "Hi.", &w, "whisper").unwrap();
+        assert_eq!((v["text"].as_str(), v["transcribed"]["text"].as_str()), (Some("Hello."), Some("Hi.")));
+        assert!(!needs_transcript(&v));
+        let rf = lib.reference("anna").unwrap();
+        assert_eq!(rf.words, vec![Timed { start: 0.1, end: 0.5, text: " Hello.".into(), probability: None }]);
+        lib.add("anna", &wav, None, None, None, "clone", "test", true).unwrap();
+        assert!(needs_transcript(&lib.get("anna").unwrap()) && lib.reference("anna").unwrap().words.is_empty());
+        let created = lib.get("anna").unwrap()["created"].clone();
+        assert_eq!(lib.transcribed("anna", &created, " Hello. ", &w, "whisper").unwrap()["text"], "Hello.");
+        // a text but never heard: heard (its words' times); heard once, even to no words: not again
+        assert!(needs_transcript(&json!({"text": "x", "seconds": 9.0})));
+        assert!(!needs_transcript(&json!({"text": "x", "seconds": 9.0, "words": [], "transcribed": {"model": "whisper"}})));
         lib.remove("anna").unwrap();
         assert!(lib.list().is_empty());
         std::fs::remove_dir_all(&dir).ok();

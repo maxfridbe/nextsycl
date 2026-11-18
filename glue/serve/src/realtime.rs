@@ -339,7 +339,7 @@ impl Names {
 }
 
 /// The voice library's recording of a saved voice (for a model that clones)
-pub type VoiceLookup<'a> = &'a dyn Fn(&str) -> Option<(Vec<f32>, u32)>;
+pub type VoiceLookup<'a> = &'a dyn Fn(&str) -> Option<Reference>;
 
 /// Reads a session.update's `session` into the settings (beta and GA shapes, Sophon's extra_body, ours under nextsycl)
 fn apply(s: &mut Session, v: &Value, voices: VoiceLookup, built_in: &[String]) -> Result<(), String> {
@@ -430,8 +430,9 @@ fn apply(s: &mut Session, v: &Value, voices: VoiceLookup, built_in: &[String]) -
         } else if built_in.contains(&low) {
             s.conf.voice = Some(low);
             s.conf.reference = None;
-        } else if let Some((samples, rate)) = voices(name) {
-            s.conf.reference = Some(Reference { samples, rate, text: None });
+        } else if let Some(r) = voices(name) {
+            // the recording with what it says (and when): a model that clones in context takes them
+            s.conf.reference = Some(r);
             s.conf.voice = None;
         } else {
             return Err(format!("voice {name:?}: one of {} or a saved voice", built_in.join(", ")));
@@ -956,9 +957,9 @@ mod tests {
                                                              "output": {"voice": "chelsie"}}}), &none, &voices).unwrap();
         assert_eq!((s.conf.voice.as_deref(), s.input, s.conf.turn_detection, s.ga), (Some("chelsie"), Fmt::Pcm16(24000), true, true));
         assert!(apply(&mut s, &json!({"voice": "nobody"}), &none, &voices).is_err());
-        let saved = |n: &str| (n == "alice").then(|| (vec![0.0; 16000], 16000));
+        let saved = |n: &str| (n == "alice").then(|| Reference { samples: vec![0.0; 16000], rate: 16000, text: Some("Hi.".into()), words: Vec::new() });
         apply(&mut s, &json!({"voice": "alice"}), &saved, &voices).unwrap();
-        assert!(s.conf.reference.is_some() && s.conf.voice.is_none());
+        assert!(s.conf.reference.as_ref().is_some_and(|r| r.text.as_deref() == Some("Hi.")) && s.conf.voice.is_none());
         // an empty voice: the model's own (its first built-in one; none for a model without)
         apply(&mut s, &json!({"voice": ""}), &saved, &voices).unwrap();
         assert!(s.conf.reference.is_none() && s.conf.voice.as_deref() == Some("chelsie"));

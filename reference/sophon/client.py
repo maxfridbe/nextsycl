@@ -3,8 +3,9 @@ then silence, and records what comes back: the events, the model's speech (answe
 that matter for a conversation (the first audio after the user stopped, the real-time factor of the answer's audio).
 
     python3 -I client.py --url ws://127.0.0.1:8087/v1/realtime --wav q.wav --out DIR [--token T] [--voice chelsie]
-                         [--lang en] [--silence 8] [--then q2.wav [--barge-at 1.0]] [--turns N]
+                         [--lang en] [--silence 8] [--then q2.wav [--barge-at 1.0]] [--turns N] [--options '{"clone": "icl"}']
 
+--options: the engine's options for the session (nextsycl.options: clone, icl-live ...).
 --then: a second recording after the first answer (a second turn); --barge-at S: sent S seconds into the first
 answer's audio instead (a barge-in: the answer should stop, the second turn be answered). Writes DIR/events.jsonl,
 DIR/answer-N.wav (each answer's audio, 24 kHz) and DIR/summary.json.
@@ -121,12 +122,13 @@ def main():
     ap.add_argument("--lang", default="en")
     ap.add_argument("--silence", type=float, default=8.0)
     ap.add_argument("--tools", action="store_true", help="offer a get_weather function and answer its calls")
+    ap.add_argument("--options", default=None, help="the engine's options as JSON (nextsycl.options)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     ws = Ws(a.url, a.token)
     t0 = time.time()
     log = open(os.path.join(a.out, "events.jsonl"), "w")
-    st = {"answers": {}, "order": [], "stopped": [], "first_audio": {}, "text": {}, "done": {}, "started": [], "calls": [], "errors": []}
+    st = {"answers": {}, "order": [], "stopped": [], "first_audio": {}, "text": {}, "done": {}, "started": [], "calls": [], "errors": [], "created": {}}
     lock = threading.Lock()
     closed = threading.Event()
 
@@ -152,6 +154,7 @@ def main():
                 elif t == "response.created":
                     st["order"].append(rid)
                     st["answers"][rid] = bytearray()
+                    st["created"][rid] = now
                 elif t in ("response.audio.delta", "response.output_audio.delta"):
                     st["answers"].setdefault(rid, bytearray()).extend(base64.b64decode(v["delta"]))
                     st["first_audio"].setdefault(rid, now)
@@ -174,6 +177,8 @@ def main():
                "nextsycl": {"language": a.lang}}
     if a.voice:
         session["voice"] = a.voice
+    if a.options:
+        session["nextsycl"]["options"] = json.loads(a.options)
     if a.tools:
         session["tools"] = [{"type": "function", "name": "get_weather", "description": "The weather forecast for a city",
                              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
@@ -229,6 +234,7 @@ def main():
         stop_before = [s for s in st["stopped"] if fa is not None and s <= fa]
         summary["answers"].append({"id": rid, "status": done[1], "text": st["text"].get(rid, ""), "audio_s": round(secs, 2),
                                    "first_audio_after_speech_end_s": round(fa - stop_before[-1], 3) if stop_before and fa else None,
+                                   "first_audio_after_reply_start_s": round(fa - st["created"][rid], 3) if fa and rid in st["created"] else None,
                                    "first_audio_t": round(fa, 3) if fa else None, "done_t": round(done[0], 3) if done[0] else None})
     json.dump(summary, open(os.path.join(a.out, "summary.json"), "w"), indent=1, ensure_ascii=False)
     print(json.dumps(summary, indent=1, ensure_ascii=False))

@@ -493,6 +493,9 @@ pub struct Vaes<'a> {
     /// instead: the pixel upscaler (an ESRGAN-type network, esrgan.rs) and the factor - the clip is decoded at its
     /// sampled size and the frames enlarged to the size the latent upscaler would give
     pub pixel: Option<(&'a Path, f32)>,
+    /// Open-H3-Regenerate-2K's fast decoder (fastvae.rs) instead of the video decoder, when the engine has its silo and
+    /// the card the room (else the video decoder, said in the log)
+    pub fast: Option<&'a Path>,
 }
 
 /// Latents -> a clip: the video decoder (and the audio decoder) on the latents in `latents` (a `.safetensors` with
@@ -564,34 +567,87 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
         drop(u);
         (z, h, w) = (z2, ho, wo);
     }
-    let ck = Checkpoint::open(vae)?;
-    let dec = crate::vae::VideoDecoder::load(dev, &ck, threads)?;
-    ctl.say(format!("vae    : {} loaded, {:.2} GiB in {:.1} s", vae.display(), gib(dec.load_bytes), dec.load_seconds));
-    ctl.say(format!("latents: video {t}x{h}x{w}"));
-    let t0 = Instant::now();
-    let mut tiles = 0usize;
     let cancel = ctl.cancel;
-    let (px, frames) = dec.decode(&z, t, h, w, &mut || {
-        tiles += 1;
-        dev.wait()?;
-        if cancel.load(Ordering::Relaxed) {
-            return Err(Error("cancelled".into()));
+    // the fast decoder when asked for, its silo there and the card the room
+    let fast = match vaes.fast {
+        Some(fp) => {
+            let need = crate::fastvae::FastDecoder::need_bytes(t, h, w) as u64 + (7u64 << 29);
+            match dev.mem_free() {
+                Some(free) if free < need => {
+                    ctl.say(format!("vae    : the fast decoder needs about {:.1} GiB, {:.1} GiB free: the video decoder instead", gib(need), gib(free)));
+                    None
+                }
+                _ => match crate::fastvae::FastDecoder::load(dev.index, fp, vae, threads)? {
+                    Some(d) => {
+                        ctl.say(format!("vae    : the fast decoder {} ({} layers) loaded, {:.2} GiB read in {:.1} s", fp.display(), d.layers(), gib(d.load_bytes),
+                                        d.load_seconds));
+                        Some(d)
+                    }
+                    None => {
+                        ctl.say("vae    : the fast decoder's kernels (the H3 video silo) are not here: the video decoder instead".to_string());
+                        None
+                    }
+                },
+            }
         }
-        Ok(())
-    })?;
+        None => None,
+    };
+    let t0;
+    let mut tiles = 0usize;
+    // the video decoder, when it decoded the clip (MPEG-Diffusion's half-res track below reuses it)
+    let mut std_dec = None;
+    let (px, frames) = match &fast {
+        Some(d) => {
+            ctl.say(format!("latents: video {t}x{h}x{w}"));
+            t0 = Instant::now();
+            let r = d.decode(&z, t, h, w, &mut || {
+                tiles += 1;
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(Error("cancelled".into()));
+                }
+                Ok(())
+            })?;
+            report["vae"] = json!("fast");
+            r
+        }
+        None => {
+            let ck = Checkpoint::open(vae)?;
+            let dec = crate::vae::VideoDecoder::load(dev, &ck, threads)?;
+            ctl.say(format!("vae    : {} loaded, {:.2} GiB in {:.1} s", vae.display(), gib(dec.load_bytes), dec.load_seconds));
+            ctl.say(format!("latents: video {t}x{h}x{w}"));
+            t0 = Instant::now();
+            let r = dec.decode(&z, t, h, w, &mut || {
+                tiles += 1;
+                dev.wait()?;
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(Error("cancelled".into()));
+                }
+                Ok(())
+            })?;
+            let redone = std::mem::take(&mut *dec.redone.lock().unwrap());
+            for r in &redone {
+                ctl.say(format!("vae    : non-finite in half precision, decoded again in float32: {r}"));
+            }
+            report["vae_float32_tiles"] = json!(redone.len());
+            report["vae"] = json!("standard");
+            std_dec = Some(dec);
+            r
+        }
+    };
+    drop(fast);
     let secs = t0.elapsed().as_secs_f64();
     let (mut fh, mut fw) = (h * 16, w * 16);
-    ctl.say(format!("decoded: {frames} frames of {fw}x{fh} in {secs:.1} s ({tiles} batches of tiles)"));
-    let redone = std::mem::take(&mut *dec.redone.lock().unwrap());
-    for r in &redone {
-        ctl.say(format!("vae    : non-finite in half precision, decoded again in float32: {r}"));
-    }
-    report["vae_float32_tiles"] = json!(redone.len());
+    ctl.say(format!("decoded: {frames} frames of {fw}x{fh} in {secs:.1} s ({tiles} {})", if report["vae"] == "fast" { "temporal windows and frames" } else { "batches of tiles" }));
     let mut px = px;
     if let Some(p) = &lat.paste {
         // MPEG-Diffusion: the half-res track decoded at its own size, its pixels enlarged x2 (bicubic) and pasted under
         // the full-res frames with the region's ramp
         let t0 = Instant::now();
+        let dec = match std_dec.take() {
+            Some(d) => d,
+            // the clip went through the fast decoder: the half-res track still takes the video decoder
+            None => crate::vae::VideoDecoder::load(dev, &Checkpoint::open(vae)?, threads)?,
+        };
         let (lp, lf) = dec.decode(&p.lr, t, p.lr_h, p.lr_w, &mut || {
             dev.wait()?;
             ctl.check()
@@ -606,6 +662,7 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
         ctl.say(format!("mpeg   : half-res track decoded ({}x{}), enlarged and pasted in {secs:.1} s", 16 * p.lr_w, 16 * p.lr_h));
         report["paste_seconds"] = json!(secs);
     }
+    drop(std_dec);
     if let Some((pp, s)) = vaes.pixel {
         // the size the latent upscaler would have given: its latent size, in pixels
         let (ho, wo) = (((h as f32 * s).round() as usize) * 16, ((w as f32 * s).round() as usize) * 16);
@@ -619,6 +676,20 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
     }
     for (k, v) in [("frames", json!(frames)), ("width", json!(fw)), ("height", json!(fh)), ("seconds", json!(secs)), ("tiles", json!(tiles))] {
         report[k] = v;
+    }
+    // H3_DECODE_FRAMES: the frames as a check dump (`images` [F, H, W, 3] in [0, 1]) - one decoder's against another's
+    if let Some(p) = std::env::var_os("H3_DECODE_FRAMES").filter(|p| !p.is_empty()) {
+        let plane = fh * fw;
+        let mut v = vec![0f32; px.len()];
+        for c in 0..3 {
+            for fi in 0..frames {
+                for i in 0..plane {
+                    v[(fi * plane + i) * 3 + c] = px[(c * frames + fi) * plane + i];
+                }
+            }
+        }
+        crate::safetensors::write_f32(Path::new(&p), &BTreeMap::from([("images".to_string(), (vec![frames, fh, fw, 3], v))]), &BTreeMap::new())?;
+        ctl.say(format!("frames : written to {}", Path::new(&p).display()));
     }
     if let Some(c) = check {
         let d = Checkpoint::open(c)?;
@@ -1846,7 +1917,7 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
             // "upscale": 1 decodes at the latents' own size, whatever upscaler the model's card names
             let upscale = s("upscaler").filter(|_| factor > 1.0).map(|p| (p, factor));
             let pixel = s("pixel_upscaler").map(|p| (p, factor));
-            decode(&e.dev, e.threads, latents, &Vaes { video, audio: s("audio_vae"), upscale, pixel }, s("out"), s("check"), ctl)
+            decode(&e.dev, e.threads, latents, &Vaes { video, audio: s("audio_vae"), upscale, pixel, fast: s("fast_vae") }, s("out"), s("check"), ctl)
         }
         "generate" => {
             let s = |k: &str| spec.get(k).and_then(|d| d.as_str());
@@ -1905,6 +1976,7 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                         }
                         there
                     }),
+                    fast: None,
                 },
                 lora: Vec::new(),
                 inputs: ClipInputs {
@@ -2029,6 +2101,13 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                 adaln: need("adaln", "the bf16 Ref2VA time embedder and AdaLN projections")?,
                 sharp: s("sharp_lora").map(|p| (Path::new(p), sharp)),
                 silence: need("silence", "the silence latent")?,
+                // the decoder: "regen_vae" fast (the release's fast decoder, the card's regen_fast_vae file) or standard (the
+                // H3 video decoder); the card's H3_REGEN_VAE sets it for the model, standard when neither says
+                fast_vae: match s("regen_vae").unwrap_or("standard") {
+                    "fast" => Some(need("regen_fast_vae", "the fast decoder (regen_vae fast)")?),
+                    "standard" => None,
+                    x => return Err(Error(format!("regen_vae {x}? (fast, standard)"))),
+                },
                 mlp_rows: n("mlp_rows").map_or(16384, |v| v as usize),
                 check_dump: s("check_dump").map(Path::new),
             };

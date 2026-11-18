@@ -136,7 +136,9 @@ pub fn run(e: &Haru, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)) -
         let tokens = ints(&dir.join("p_tokens.npy"))?;
         let p = Prompt { model: run_of(&f32s(&dir.join("p_model.npy"))?, &ints(&dir.join("p_mmask.npy"))?, d),
                          user: run_of(&f32s(&dir.join("p_user.npy"))?, &ints(&dir.join("p_umask.npy"))?, d), tokens };
-        let mut s = m.lm.state(&m.ops, p.tokens.len() + 64)?;
+        // room for the dump's frames (a long teacher-forced run: ref.py --frames 300)
+        let nf = if want("frames") { ints(&dir.join("f_tok.npy"))?.len() } else { 0 };
+        let mut s = m.lm.state(&m.ops, p.tokens.len() + 64 + nf)?;
         let t = Instant::now();
         let (emb, taps) = prefill_tapped(&m, &mut s, &p)?;
         log(format!("prompt: {} positions in {:.0} ms", p.tokens.len(), t.elapsed().as_secs_f64() * 1e3));
@@ -163,6 +165,15 @@ pub fn run(e: &Haru, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)) -
         let (fnz, flat) = (f32s(&dir.join("f_noise.npy"))?, f32s(&dir.join("f_latent.npy"))?);
         let v = c.vocab;
         let (mut agree, mut hw, mut lw, mut zw, mut z1w) = (0, 0f64, 0f64, 0f64, 0f64);
+        // the silent-or-speak decision as the session samples it (temperature 0.7): P(PAD or EOP) here and in the
+        // reference, frame by frame
+        let silent = |l: &[f32]| {
+            let mx = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let e = |x: f32| ((x as f64 - mx) / 0.7).exp();
+            let z: f64 = l.iter().map(|x| e(*x)).sum();
+            (e(l[c.pad as usize]) + e(l[c.eop as usize])) / z
+        };
+        let (mut ps_here, mut ps_ref, mut ps_worst) = (0f64, 0f64, 0f64);
         let mut sess = m.session(Settings { latent_noise: false, ..Default::default() }, 16)?;
         std::mem::swap(&mut sess.state, &mut s);
         for k in 0..=tok.len() {
@@ -174,6 +185,8 @@ pub fn run(e: &Haru, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)) -
             if argmax(&lg) == argmax(&fl[k * v..(k + 1) * v]) {
                 agree += 1;
             }
+            let (sh, sr) = (silent(&lg), silent(&fl[k * v..(k + 1) * v]));
+            (ps_here, ps_ref, ps_worst) = (ps_here + sh, ps_ref + sr, ps_worst.max((sh - sr).abs()));
             // the head alone: from the reference's own hidden state (the language model's difference left out)
             m.lm.hidden.write(0, &crate::weights::bytes(&fh[k * c.hidden..(k + 1) * c.hidden]))?;
             let z1 = m.head.sample(&m.ops, m.lm.hidden.fp(), &fnz[k * d..(k + 1) * d], 1.5)?;
@@ -189,6 +202,9 @@ pub fn run(e: &Haru, dir: &Path, stages: &[&str], log: &mut dyn FnMut(String)) -
         }
         log(format!("frames: {} teacher-forced; argmax agrees on {agree} of {}; worst rel: hidden {hw:.2e}, logits {lw:.2e}, head latent {zw:.2e} \
                      (from the reference's hidden {z1w:.2e})", tok.len(), tok.len() + 1));
+        let n = (tok.len() + 1) as f64;
+        log(format!("frames: P(silent: PAD or EOP) at temperature 0.7, mean {:.4} here / {:.4} in the reference, worst frame differs by {ps_worst:.2e}",
+                    ps_here / n, ps_ref / n));
         worst = worst.max(hw).max(lw).max(z1w);
     }
     if want("speed") && !stages.is_empty() {

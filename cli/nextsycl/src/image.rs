@@ -29,6 +29,8 @@ nextsycl image upscale-check PICTURE REFERENCE.png [upscale's options]   (agains
 nextsycl image vectorize PICTURE [--model starvector-1b-im2svg | --dir CHECKPOINT_DIR] [--max-length N] [--beams N] [--greedy] [--top-p P] [--seed S] [--out FILE.svg] [--gpu N]
 nextsycl image vectorize PICTURE --check REFERENCE_DIR [--stages pixels,encoder,prefill,logits,greedy] [--dir ...]   (against reference/starvector/ref.py's dumps)
 nextsycl image remove-background PICTURE [--model birefnet|isnet-general-use | --file MODEL_FILE] [--post-process] [--out FILE.png] [--mask FILE.png] [--gpu N]
+nextsycl image depth PICTURE [--model ID | --file MODEL.safetensors] [--out DEPTH.png] [--gpu N]   (the picture's relative depth, 8-bit grey)
+nextsycl image depth --check REFERENCE_DIR [--model ID | --file ...] [--gpu N]   (against reference/depthanything/ref.py's dumps)
 nextsycl image remove-background --check REFERENCE_DIR [--model ... | --file ...] [--gpu N]   (against reference/rembg/ref.py's dumps)
 nextsycl image engines | selftest [--gpu N]";
 
@@ -36,13 +38,14 @@ nextsycl image engines | selftest [--gpu N]";
 pub fn engines() -> Vec<nextsycl_image::ImageKind> {
     vec![nextsycl_image_qwenimage21::kind(), nextsycl_image_unlimitedocr::kind(), nextsycl_image_paddleocrvl::kind(), nextsycl_image_olmocr2::kind(), nextsycl_image_hunyuanimage21::kind(),
          nextsycl_image_upscale::kind(), nextsycl_image_starvector::kind(), nextsycl_image_mingimage::kind(), nextsycl_image_mossimage::kind(), nextsycl_image_seedvr2::kind(),
-         nextsycl_image_flashvsr::kind(), nextsycl_image_rembg::kind(), nextsycl_image_ph3image::kind(), nextsycl_image_h3image::kind(), nextsycl_image_zimage::kind(),
+         nextsycl_image_flashvsr::kind(), nextsycl_image_rembg::kind(), nextsycl_image_depthanything::kind(), nextsycl_image_ph3image::kind(), nextsycl_image_h3image::kind(), nextsycl_image_zimage::kind(),
          nextsycl_image_vldescribe::kind(), nextsycl_image_example::kind()]
 }
 
-/// `--gpu 0` or `--gpu 0,1` (an engine that splits over two cards takes the second too)
+/// `--gpu 0` or `--gpu 0,1` (an engine that splits over two cards takes the second too); `--gpus A,B` wins (what the
+/// front door starts a model whose one copy spans its cards with: `--gpu A --gpus A,B`)
 fn gpus(args: &[String]) -> Result<Vec<std::sync::Arc<nextsycl_core::Gpu>>, String> {
-    let list = opt(args, "--gpu").unwrap_or("0");
+    let list = opt(args, "--gpus").or_else(|| opt(args, "--gpu")).unwrap_or("0");
     let mut v = Vec::new();
     for i in list.split(',').filter(|x| !x.trim().is_empty()) {
         let i: usize = i.trim().parse().map_err(|_| format!("--gpu {list}: card numbers, comma separated"))?;
@@ -597,6 +600,50 @@ fn remove_background_cmd(cfg: &Config, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `nextsycl image depth`: a picture's depth as a grey PNG, or the network against the reference's dumps
+fn depth_cmd(cfg: &Config, args: &[String]) -> Result<(), String> {
+    let mut pos = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a.starts_with("--") {
+            it.next();
+        } else {
+            pos.push(a.clone());
+        }
+    }
+    nextsycl_core::use_kind("image");
+    let files = match opt(args, "--file") {
+        Some(f) => ModelFiles::from([("model".to_string(), PathBuf::from(f))]),
+        None => model(cfg, Some(opt(args, "--model").unwrap_or("depth-anything-v2-small")))?.1,
+    };
+    let gs = gpus(args)?;
+    let mut log = |s: String| eprintln!("{s}");
+    if let Some(d) = opt(args, "--check") {
+        let f = files.get("model").or_else(|| files.values().next()).ok_or("depth-anything-v2: no file")?;
+        let net = nextsycl_image_depthanything::net::DepthNet::load(f, &gs[0]).map_err(|e| e.0)?;
+        let rows = nextsycl_image_depthanything::check::run(&net, Path::new(d), &mut log).map_err(|e| e.0)?;
+        let worst = |f: &dyn Fn(&nextsycl_image_depthanything::check::Row) -> f64| rows.iter().map(f).fold(0.0, f64::max);
+        println!("{} pictures on {}: worst relative error: input {:.1e}, embeddings {:.1e}, taps {:.1e}, fusion {:.1e}, prediction {:.1e}, depth {:.1e}; depth8 at least {:.4}% equal (at most {} apart)",
+                 rows.len(), gs[0].name, worst(&|r| r.input.1), worst(&|r| r.emb.1), worst(&|r| r.taps.iter().map(|t| t.1).fold(0.0, f64::max)), worst(&|r| r.fused.1),
+                 worst(&|r| r.pred.1), worst(&|r| r.depth.1), rows.iter().map(|r| r.depth8.0).fold(1.0, f64::min) * 100.0,
+                 rows.iter().map(|r| r.depth8.1).max().unwrap_or(0));
+        return Ok(());
+    }
+    let input = pos.first().ok_or(USAGE)?;
+    let kinds = engines();
+    let k = nextsycl_image::kind_for(&kinds, nextsycl_image_depthanything::ARCH)?;
+    let e = (k.load)(&files, &gs, &Default::default(), &mut log).map_err(|e| e.0)?;
+    let pic = nextsycl_image::Picture::decode(&std::fs::read(input).map_err(|e| format!("{input}: {e}"))?)?;
+    let t0 = std::time::Instant::now();
+    let d = e.depth(&pic).map_err(|e| e.0)?;
+    eprintln!("{}x{}: depth in {:.3} s on {}", pic.width, pic.height, t0.elapsed().as_secs_f64(), gs[0].name);
+    let g = &nextsycl_image_depthanything::depth8(&[&d])[0];
+    let out = opt(args, "--out").map(str::to_string).unwrap_or_else(|| format!("{}-depth.png", input.trim_end_matches(|c: char| c != '.').trim_end_matches('.')));
+    nextsycl_image_depthanything::grey_rgb(pic.width, pic.height, g).write_png(Path::new(&out), &[("model", "depth-anything-v2-small".into())])?;
+    eprintln!("saved {out}");
+    Ok(())
+}
+
 fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let dir = Path::new(args.first().ok_or(USAGE)?);
     nextsycl_core::use_kind("image");
@@ -825,8 +872,9 @@ fn serve_here(cfg: &Config, m: &Value, files: ModelFiles, args: &[String], out: 
     let arch = m["arch"].as_str().unwrap_or("").to_string();
     let ks = engines();
     let load_fn = nextsycl_image::kind_for(&ks, &arch)?.load;
-    let i: usize = opt(args, "--gpu").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let gpu = nextsycl_core::Gpu::open(i).map_err(|e| e.0)?;
+    // every card it loads on (a model whose one copy spans its cards: `--gpus A,B`); the first is the server's own
+    let gs = gpus(args)?;
+    let gpu = gs[0].clone();
     let first = options(cfg, m, args)?;
     let loras = loras_for(cfg, m)?;
     let known: Vec<KnownLora> = loras.iter().filter_map(|l| Some(KnownLora {
@@ -849,7 +897,7 @@ fn serve_here(cfg: &Config, m: &Value, files: ModelFiles, args: &[String], out: 
             }
         }
     }
-    let g = gpu.clone();
+    let g = gs;
     let loader: nextsycl_serve::image::Loader = Box::new(move |use_: &[LoraUse], log: &mut dyn FnMut(String)| {
         let mut o = base.clone();
         o.merge_loras = use_.to_vec();
@@ -858,7 +906,7 @@ fn serve_here(cfg: &Config, m: &Value, files: ModelFiles, args: &[String], out: 
                 o.settings.extend(env.iter().cloned());
             }
         }
-        load_fn(&files, std::slice::from_ref(&g), &o, log).map_err(|e| e.0)
+        load_fn(&files, &g, &o, log).map_err(|e| e.0)
     });
     let wfe = args.iter().any(|a| a == "--wfe").then(|| cfg.dist.join("wfe"));
     let cors: Vec<String> = opt(args, "--cors").or(cfg.get("NS_CORS").as_deref()).map(|c| c.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default();
@@ -884,6 +932,7 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         Some("upscale-check") => upscale_cmd(cfg, rest, true),
         Some("vectorize") => vectorize_cmd(cfg, rest),
         Some("remove-background") => remove_background_cmd(cfg, rest),
+        Some("depth") => depth_cmd(cfg, rest),
         Some("ocr") => ocr(cfg, rest),
         Some("describe") => describe_cmd(cfg, rest),
         Some("serve") => serve(cfg, rest),

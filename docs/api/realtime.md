@@ -82,7 +82,10 @@ doing, not a turn rule's. On this socket:
 | not taken | `conversation.item.create` (a turn as text: it hears audio only), function calls (`tools`: it calls none) |
 | the end | the context (`NS_HARU_CTX`: about an hour) full: an `error`, `response.done` failed; a new session starts over |
 
-A client plays the deltas back to back behind a short jitter buffer (the wfe's Conversation panel keeps 0.2 s) and
+A client plays the deltas back to back behind a short jitter buffer (the wfe's Conversation panel keeps 0.2 s, and
+catches up after a burst - the frames queued while the prompt ran, a stall - by dropping quiet frames once 0.35 s is
+queued and any frame past 1 s, as the release's client drops its oldest audio; otherwise the burst would delay
+everything after it) and
 records with echo cancellation (or headphones): the model hears whatever the microphone picks up, its own voice
 included. `reference/haru/client.py` streams a recording at real time and records both sides.
 

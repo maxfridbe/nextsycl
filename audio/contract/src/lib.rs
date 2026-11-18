@@ -51,6 +51,10 @@ pub struct Reference {
     pub samples: Vec<f32>,
     pub rate: u32,
     pub text: Option<String>,
+    /// what is said when, word by word (a recogniser's word times: a saved voice transcribed by Whisper keeps them);
+    /// empty: not known. An engine that keeps only the first seconds of a recording cuts it between two words and
+    /// takes those words as that part's transcript
+    pub words: Vec<Timed>,
 }
 
 /// A recording to write down (a recogniser: `AudioEngine::recogniser` Some)

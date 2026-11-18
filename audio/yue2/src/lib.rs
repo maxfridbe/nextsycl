@@ -53,12 +53,14 @@ pub const FPS: f32 = 25.0;
 /// the longest song: the semantic phase's 9000 codes
 pub const MAX_SECONDS: f32 = 360.0;
 pub const ODE_STEPS: u32 = 32;
+/// an instrumental cover's guidance when the request names none (the style's "no vocals" held against the instruction)
+pub const INSTRUMENTAL_CFG: f32 = 1.3;
 
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "cot", env: "NS_YUE2_COT", value: "full|melody|off", help: "what the model writes before the music: a score of melody and chords (full, the default), a melody alone (melody: covers), or none (off)", at: At::Both },
     EngineOption { name: "abc", env: "", value: "TEXT", help: "a score (ABC) to sing over instead of one drawn (cot melody or full): a cover's melody, or the score of an earlier song (its `score`) to sing it again with new words - same seed and style", at: At::Request },
     EngineOption { name: "sing-lead", env: "", value: "1|0", help: "a cover of an instrumental recording: its lead line (SheetSage2's Ins voice) moved to the voice YuE2 sings (on; 0: the score as transcribed - an instrumental cover)", at: At::Request },
-    EngineOption { name: "instrumental", env: "", value: "true|false", help: "a cover that is played, not sung: the recording's lead line stays in SheetSage2's Ins voice (the score as transcribed) and no lyrics are needed (any given are not used); only with a recording (source)", at: At::Request },
+    EngineOption { name: "instrumental", env: "", value: "true|false", help: "a cover played, not sung: the recording's lead stays where an instrument plays it (SheetSage2's Ins voice), the voice YuE2 sings is left all rests and the lyrics are the score's sections, empty - no words needed (any given are not used); the style is the arrangement; guided by 1.3 unless cfg is given. Needs a recording (source)", at: At::Request },
     EngineOption { name: "score-tokens", env: "", value: "4096", help: "the most tokens the score may take (32 to 4096; a longer score is cut and closed)", at: At::Request },
     EngineOption { name: "score-only", env: "", value: "true|false", help: "with a recording (source): only its score - SheetSage2's transcription, the melody for cot melody, melody and chords for cot full - comes back (the answer's score), no song is made", at: At::Request },
 ];
@@ -107,10 +109,17 @@ pub fn is_off(v: &str) -> bool {
     matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
 }
 
-/// A cover's score as sung: an instrumental recording's lead (the Ins voice) moved to the voice YuE2 sings, unless the
-/// cover is instrumental (the lead stays in Ins, played) or `sing-lead` is off (the score as transcribed)
+/// A cover's score as sung: an instrumental recording's lead (the Ins voice) moved to the voice YuE2 sings; an
+/// instrumental cover's lead where an instrument plays it (the Ins voice, passage by passage) and the Vocal voice all
+/// rests (prompt::played_lead); `sing-lead` off: the score as transcribed
 pub fn cover_score(abc: &str, instrumental: bool, sing_lead: Option<&str>) -> String {
-    if instrumental || sing_lead.is_some_and(is_off) { abc.to_string() } else { prompt::sung_lead(abc).0 }
+    if instrumental {
+        prompt::played_lead(abc)
+    } else if sing_lead.is_some_and(is_off) {
+        abc.to_string()
+    } else {
+        prompt::sung_lead(abc).0
+    }
 }
 
 /// What a song is made from, once the request is read
@@ -121,7 +130,7 @@ pub struct Song {
     pub lyrics: String,
     /// the score given (its text), cot melody or full
     pub abc: Option<String>,
-    /// a cover that is played: the lead stays in the Ins voice, no lyrics
+    /// a cover that is played: the lead in the Ins voice, the Vocal voice all rests, the lyrics the score's bare sections
     pub instrumental: bool,
     pub seed: u64,
     /// the semantic phase's guidance (1: one branch)
@@ -241,7 +250,8 @@ impl Yue2 {
         if instrumental && self.opt(req, "sing-lead", "").is_some_and(|v| !is_off(&v)) {
             return Err(Error("instrumental and sing-lead 1 contradict: the lead line is played or sung".into()));
         }
-        // an instrumental has no words to sing: lyrics given are left out of the prompt
+        // an instrumental has no words to sing: lyrics given are left out; its lyrics are the score's sections, written
+        // once it is transcribed (generate)
         let lyrics = if instrumental { String::new() } else { req.lyrics.clone().unwrap_or_default() };
         let seconds = req.seconds.unwrap_or(MAX_SECONDS);
         if !(1.0..=MAX_SECONDS).contains(&seconds) {
@@ -251,7 +261,9 @@ impl Yue2 {
             Some(v) => v.trim().parse::<usize>().map_err(|_| Error(format!("score-tokens {v}: a whole number")))?.clamp(32, sample::ABC.max_tokens),
             None => sample::ABC.max_tokens,
         };
-        let cfg = req.cfg.unwrap_or(cot.default_cfg());
+        // an instrumental cover is guided by default: unguided, some takes mumble a wordless voice over their last third
+        // (nextcuda 2026-11-11, Paganini's Caprice 24: 38 s and 95 s in 2 of 5 takes); the same take guided by 1.3 dropped it
+        let cfg = req.cfg.unwrap_or(if instrumental { INSTRUMENTAL_CFG } else { cot.default_cfg() });
         if !(0.0..=20.0).contains(&cfg) {
             return Err(Error(format!("cfg {cfg}: 0 to 20")));
         }
@@ -509,8 +521,12 @@ impl AudioEngine for Yue2 {
             let abc = s.abc.clone().ok_or_else(|| Error(format!("the recording's score: {}", s.error.as_deref().unwrap_or("none was made"))))?;
             // an instrumental recording's tune is in the Ins voice: moved to the Vocal voice, the one YuE2 sings (else it
             // makes an instrumental: measured on a bluegrass Jingle Bells, Whisper heard no words in any of three styles)
-            // (instrumental: the lead stays in the Ins voice and is played; sing-lead 0 keeps the score the same way)
+            // (instrumental: the lead in the Ins voice, played, the Vocal voice all rests and the lyrics the score's
+            // sections without words; sing-lead 0 keeps the score as transcribed)
             let abc = cover_score(&abc, song.instrumental, self.opt(req, "sing-lead", "").as_deref());
+            if song.instrumental {
+                song.lyrics = prompt::bare_sections(&abc);
+            }
             *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(abc.clone());
             if self.opt(req, "score-only", "").is_some_and(|v| v.trim() == "true" || v.trim() == "1") {
                 return Ok(Audio { rate: RATE, channels: 2, samples: Vec::new() });
@@ -563,11 +579,15 @@ mod tests {
 
     #[test]
     fn an_instrumental_cover_keeps_the_lead_in_ins() {
-        // sung (the default): the Ins line moves to Vocal; instrumental: the score is as transcribed
+        // sung (the default): the Ins line moves to Vocal; instrumental: the lead stays in Ins
         assert_ne!(cover_score(INS_SCORE, false, None), INS_SCORE);
         assert_eq!(cover_score(INS_SCORE, true, None), INS_SCORE);
         assert_eq!(cover_score(INS_SCORE, false, Some("0")), INS_SCORE);
         assert_eq!(cover_score(INS_SCORE, true, Some("0")), INS_SCORE);
+        // a sung lead (Vocal alone) is moved to Ins for an instrumental cover; its lyrics are the bare sections
+        let sung = cover_score(INS_SCORE, false, None);
+        assert_eq!(cover_score(&sung, true, None), INS_SCORE);
+        assert_eq!(prompt::bare_sections(INS_SCORE), "[Intro]\n");
     }
 
     #[test]

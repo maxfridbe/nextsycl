@@ -36,7 +36,7 @@ fn box1(slots: usize) -> FakeHost {
 
 /// The request for model `m` that needs `mb` on each of its cards
 fn req<'a>(m: &'a ModelInfo, needs: &'a BTreeMap<usize, u64>) -> PlaceReq<'a> {
-    PlaceReq { model: m, job: None, need_mb: needs, asked_mb: 0 }
+    PlaceReq { model: m, job: None, need_mb: needs, asked_mb: 0, asked_rest_mb: 0 }
 }
 
 fn needs(m: &ModelInfo, mb: u64) -> BTreeMap<usize, u64> {
@@ -239,7 +239,7 @@ fn s15_a_cancel_ends_a_jobs_wait() {
     h.pin("a", true);
     h.cancel("job-1");
     let n = needs(&b, 7000);
-    let r = PlaceReq { model: &b, job: Some("job-1"), need_mb: &n, asked_mb: 0 };
+    let r = PlaceReq { model: &b, job: Some("job-1"), need_mb: &n, asked_mb: 0, asked_rest_mb: 0 };
     let e = ensure(&h, &r, Duration::from_secs(1800), None, &json!({})).unwrap_err();
     assert_eq!(e.0, 499);
 }

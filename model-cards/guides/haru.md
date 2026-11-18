@@ -8,6 +8,11 @@ microphone, and talk. Wired headphones help: it hears whatever the microphone pi
 - Every 133 ms it takes one frame of your audio and gives one of its own, silence included: it listens while it
   speaks. It decides itself when to answer, when to say "mm-hm" while you talk, and when to stop because you cut in -
   there are no turns and no turn detection.
+- What to expect (measured against the release's own code: the same): back-channels come now and then, not on every
+  pause - a "yeah", "mm", "mm-hmm", "oh" or "I see" in about one 30 s monologue of yours in four or five. Just as often it
+  talks over a long turn: the default card has the two of you introduce yourselves, so it may tell you who it is
+  while you talk, echo your words, or now and then say the words of its voice recording. It answers within about a
+  second of you stopping. The card's `backchannel` setting made no clear difference in tests.
 - Its text comes with its audio (`response.audio_transcript.delta`), word pieces as it says them; a run of silent
   frames shows as one space.
 - It is a pretrained base model: it chats naturally in character but is not an assistant - no facts to rely on, no

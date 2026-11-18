@@ -53,8 +53,11 @@ is split (`dit.rs` `SplitAttention`, `mpeg::TwoTrack`):
 Key order does not matter to attention, so the full-res queries' key set is [prefix | own rows | cell 0 of every
 token outside M | cell 1 | ...] rather than the raster grid upstream builds: the same set, the same positions.
 
-The one new kernel is `ns_video_h3_silo_gather` (kernels/video/h3/silo, `dist/silo/libnextsycl-h3.so`: rows picked by
-an index from a strided buffer, 16 bytes a work-item, an exact copy). Without the silo the same rows are copied one
+The one new kernel is `ns_video_h3_silo_gather` (kernels/video/h3/silo/tla/gather.cpp, `dist/silo/libnextsycl-h3.so`:
+rows picked by an index from a strided buffer, 16 bytes a work-item, an exact copy). It shares the H3 video silo with
+Open-H3-Regenerate-2K's fast decoder: that silo is sycl-tla sources alone, built as one library with sycl-tla's flags,
+so the gather takes the GPU's SYCL queue (`Gpu::queue`) rather than the shared part's `ns_gpu` and reports through
+`ns_video_h3_silo_error`; video/h3/src/silo.rs binds both. Without the silo the same rows are copied one
 `nsd_copy` a row (the same bits, slower). The engine opens the silo only with H3_MPEG=1, and then puts its device on the
 core's queue of the card (`Device::on_queue`, as the image engines on H3 do) so the silo's work is ordered with it;
 without H3_MPEG nothing changes for H3.

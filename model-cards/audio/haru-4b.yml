@@ -11,7 +11,7 @@ license: apache-2.0
 commercial: true
 license_note: 'Apache-2.0 code and weights (higurashi.ai); a pretrained base model, released for research - it holds a natural conversation but is not a reliable source of facts and does not follow instructions as an assistant does; it imitates the voice of a reference clip: clone only your own voice or one you have permission to use'
 title: 'Haru-4B (full-duplex voice conversation in lockstep; Rust + SYCL)'
-about: 'A live voice conversation over /v1/realtime in lockstep: every 133 ms one frame of your audio in, one frame of its own out (silence included), so it listens while it speaks - back-channels, interruptions and overlaps are its own. A character card (persona, names, relationship, situation; nine languages) sets who it is, a saved voice (3 s - 3 min of one speaker) how it sounds. One card'
+about: 'A live voice conversation over /v1/realtime in lockstep: every 133 ms one frame of your audio in, one frame of its own out (silence included), so it listens while it speaks: it answers, overlaps, stops when cut in on and now and then back-channels (a "yeah" or "mm-hm" in about one long turn of yours in four or five) by itself - and, as the release does, it often talks over a long turn of yours. A character card (persona, names, relationship, situation; nine languages) sets who it is, a saved voice (3 s - 3 min of one speaker) how it sounds. One card'
 gpus: '0|1'
 vram_gib: 11.5                   # measured on the B65: 9.9 GiB loaded, 10.9 with a conversation of an hour (28,672 positions);
                                  #   the fast start's buffers add 0.18 (B70 2026-11-16: 10.06 loaded, 11.13 with a conversation)

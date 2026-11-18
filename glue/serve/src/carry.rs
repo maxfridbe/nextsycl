@@ -67,7 +67,8 @@ pub fn join(a: Reference, b: Reference) -> Reference {
         (Some(x), Some(y)) => Some(format!("{} {}", x.trim(), y.trim())),
         (x, y) => x.or(y),
     };
-    Reference { samples, rate: a.rate, text }
+    // a's words still say when they are (it comes first)
+    Reference { samples, rate: a.rate, text, words: a.words }
 }
 
 /// Linear resampling (a reference's, where a little softness does not matter)
@@ -122,8 +123,8 @@ mod tests {
 
     #[test]
     fn a_reference_is_joined_at_one_rate() {
-        let a = Reference { samples: vec![0.1; 2000], rate: 2000, text: Some("voice.".into()) };
-        let b = Reference { samples: vec![0.2; 1000], rate: 1000, text: Some("before.".into()) };
+        let a = Reference { samples: vec![0.1; 2000], rate: 2000, text: Some("voice.".into()), words: Vec::new() };
+        let b = Reference { samples: vec![0.2; 1000], rate: 1000, text: Some("before.".into()), words: Vec::new() };
         let j = join(a, b);
         assert_eq!(j.rate, 2000);
         assert_eq!(j.samples.len(), 2000 + 600 + 2000);

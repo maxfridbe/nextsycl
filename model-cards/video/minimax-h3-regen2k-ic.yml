@@ -26,6 +26,9 @@ defaults:
   size: 2560x1440
 env:
   H3_RESIDENT_BLOCKS: '0'
+  # regen2k's decoder: fast (the release's fast decoder below, on the H3 video silo; the video decoder when the silo or the
+  # room is missing) or standard (the H3 video decoder)
+  H3_REGEN_VAE: 'fast'
 files:
   denoiser: h3-denoiser-ref2va-int8
   text-encoder: h3-te-32b-q4km
@@ -51,4 +54,10 @@ files:
     size: 26768
     sha256: dc90d8b8505f7160110b4122fb78348b232877e2928f7049c6833dcebde3f18c
     path: open-h3-regenerate-2k-ic/assets/silence_audio_124f.safetensors
+  fast-vae:
+    key: h3-regen2k-fast-vae
+    url: https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K-IC/resolve/54a7104b204fb46486cf85c2f600942118186d57/vae_fast/fast_h3_vae_v2_24l.safetensors
+    size: 6471256328
+    sha256: b7527bf0dbac4b4ffc37e106478e5caabc96894f29cd1ebfe38cea0b44982eb0
+    path: open-h3-regenerate-2k-ic/vae_fast/fast_h3_vae_v2_24l.safetensors
 guide: guides/minimax-h3.md

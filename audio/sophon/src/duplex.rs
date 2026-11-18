@@ -84,7 +84,9 @@ struct Playing {
 struct State {
     cfg: RealtimeSession,
     lang: String,
-    xvec: Option<Vec<f32>>,
+    /// the voice (an x-vector, or a recording in context) and a live reply's in-context layout
+    voice: Option<speak::Voice>,
+    layout: speak::IclLayout,
     tools: Vec<serde_json::Value>,
     /// the input rate and the samples not yet framed
     rate: u32,
@@ -144,7 +146,8 @@ impl Duplex {
         let st = State {
             cfg: RealtimeSession::default(),
             lang: "en".into(),
-            xvec: None,
+            voice: None,
+            layout: speak::IclLayout::Prompt,
             tools: Vec::new(),
             rate: ear::RATE,
             rem: Vec::new(),
@@ -208,16 +211,23 @@ impl Conversation for Duplex {
         let eng = &self.s.eng;
         let lang = c.language.as_deref().filter(|l| !l.is_empty()).unwrap_or("en").to_lowercase();
         let lang = lang.chars().take(2).collect::<String>();
-        let xvec = match &c.reference {
-            Some(r) => Some(lock(&eng.talk).as_ref().ok_or_else(|| Error("loaded without its talker".into()))?.clone_voice(&r.samples, r.rate)?),
-            None => Some(eng.voice(c.voice.as_deref(), &lang)?),
+        // the voice made now (an in-context clone's recording encoded once, kept), not at the first reply
+        let voice = match &c.reference {
+            Some(r) => {
+                let g = lock(&eng.talk);
+                let talk = g.as_ref().ok_or_else(|| Error("loaded without its talker".into()))?;
+                eng.speaker(talk, Some(r), None, &lang, &c.extra)?
+            }
+            None => speak::Voice::XVector(eng.voice(c.voice.as_deref(), &lang)?),
         };
+        let layout = eng.live_layout(&c.extra)?;
         let tools: Vec<serde_json::Value> = c.tools.iter().filter_map(|t| serde_json::from_str(t).ok()).collect();
         let tools = text::normalize_tools(&tools);
         let mut st = lock(&self.s.st);
         st.cfg = c.clone();
         st.lang = lang;
-        st.xvec = xvec;
+        st.voice = Some(voice);
+        st.layout = layout;
         st.tools = tools;
         Ok(())
     }
@@ -632,10 +642,10 @@ fn start_reply(s: &Arc<Shared>, st: &mut State) {
     }
     let turns = st.turns.clone();
     let cfg = st.cfg.clone();
-    let (lang, tools, xvec) = (st.lang.clone(), st.tools.clone(), st.xvec.clone());
+    let (lang, tools, voice, layout) = (st.lang.clone(), st.tools.clone(), st.voice.clone(), st.layout);
     let s = s.clone();
     std::thread::spawn(move || {
-        let r = reply(&s, &id, &turns, &cfg, &lang, &tools, xvec, &stop);
+        let r = reply(&s, &id, &turns, &cfg, &lang, &tools, voice, layout, &stop);
         let mut st = lock(&s.st);
         let (status, rep, audio_s, first) = match r {
             Ok(x) => x,
@@ -681,10 +691,10 @@ type ReplyResult = (&'static str, Reply, f64, Option<Instant>);
 /// The reply: the brain writes (this thread), the talker speaks (its own); returns its status, the reply as the history
 /// keeps it, its audio's seconds and when its first audio went out
 #[allow(clippy::too_many_arguments)]
-fn reply(s: &Arc<Shared>, id: &str, turns: &[Turn], cfg: &RealtimeSession, lang: &str, tools: &[serde_json::Value], xvec: Option<Vec<f32>>, stop: &Arc<AtomicBool>)
-         -> Result<ReplyResult> {
+fn reply(s: &Arc<Shared>, id: &str, turns: &[Turn], cfg: &RealtimeSession, lang: &str, tools: &[serde_json::Value], voice: Option<speak::Voice>,
+         layout: speak::IclLayout, stop: &Arc<AtomicBool>) -> Result<ReplyResult> {
     let eng = &s.eng;
-    let xvec = xvec.ok_or_else(|| Error("no voice".into()))?;
+    let voice = voice.ok_or_else(|| Error("no voice".into()))?;
     // the messages: system, the session's text history, the turns (audio where it was spoken whole)
     let mut sys = cfg.instructions.clone().filter(|i| !i.trim().is_empty()).unwrap_or_else(|| text::system(lang).to_string());
     if !tools.is_empty() {
@@ -763,7 +773,7 @@ fn reply(s: &Arc<Shared>, id: &str, turns: &[Turn], cfg: &RealtimeSession, lang:
                 s.emit(RealtimeEvent::AudioDelta { id: id.clone(), samples: w.to_vec() });
                 Ok(())
             };
-            talk.speak(&xvec, &lang, tdraw, seed, &mut next, &mut out, &|| stop.load(Ordering::SeqCst))?;
+            talk.speak(&voice, layout, &lang, tdraw, seed, &mut next, &mut out, &|| stop.load(Ordering::SeqCst))?;
             Ok((all, first))
         })
     };

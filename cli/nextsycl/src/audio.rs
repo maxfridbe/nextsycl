@@ -174,7 +174,7 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
     let read_ref = |f: &str, text: Option<String>| -> Result<nextsycl_audio::Reference, String> {
         let b = std::fs::read(f).map_err(|e| format!("{f}: {e}"))?;
         let (samples, rate) = nextsycl_audio::decode_audio(&b).map_err(|e| format!("{f}: {e}"))?;
-        Ok(nextsycl_audio::Reference { samples, rate, text })
+        Ok(nextsycl_audio::Reference { samples, rate, text, words: Vec::new() })
     };
     let mut references = Vec::new();
     for f in recordings.iter().skip(1) {

@@ -40,6 +40,7 @@ nextsycl-image-ph3image.workspace = true
 nextsycl-image-h3image.workspace = true
 nextsycl-image-upscale.workspace = true
 nextsycl-image-rembg.workspace = true
+nextsycl-image-depthanything.workspace = true
 nextsycl-image-starvector.workspace = true
 nextsycl-video.workspace = true
 nextsycl-video-example.workspace = true

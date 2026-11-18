@@ -414,17 +414,14 @@ impl AudioServer {
     }
 
     /// A live conversation (/v1/realtime upgraded to a WebSocket: crate::realtime) until either side closes; saved
-    /// voices by name are their recordings, cloned
+    /// voices by name are their recordings (with what they say, and when), cloned
     fn realtime(&self, s: Conn, req: &http::Request) {
         self.sessions.fetch_add(1, Ordering::SeqCst);
         if let Some(i) = self.idle {
             i.touch();
         }
         let lib = self.voices();
-        let lookup = |name: &str| -> Option<(Vec<f32>, u32)> {
-            let p = lib.as_ref()?.sample_path(name)?;
-            nextsycl_audio::decode_audio(&std::fs::read(p).ok()?).ok()
-        };
+        let lookup = |name: &str| -> Option<nextsycl_audio::Reference> { lib.as_ref()?.reference(name).ok() };
         let e = self.engine.read().unwrap_or_else(|x| x.into_inner());
         if let Err(m) = crate::realtime::serve(s, req, &**e, &self.model, &lookup) {
             eprintln!("nextsycl audio: a conversation ended: {m}");
@@ -661,7 +658,7 @@ impl AudioServer {
             Some(a) => {
                 let wav = http::unbase64(&a).map_err(|e| bad(format!("ref_audio: {e}")))?;
                 let (samples, rate) = nextsycl_audio::decode_wav(&wav).map_err(|e| bad(format!("ref_audio: {e}")))?;
-                Some(nextsycl_audio::Reference { samples, rate, text: text(&["ref_text", "reference_text"]) })
+                Some(nextsycl_audio::Reference { samples, rate, text: text(&["ref_text", "reference_text"]), words: Vec::new() })
             }
             None => None,
         };
@@ -796,7 +793,7 @@ impl AudioServer {
             for (i, a) in recs.iter().enumerate() {
                 let wav = http::unbase64(a).map_err(|e| bad(format!("ref_audios[{i}]: {e}")))?;
                 let (samples, rate) = nextsycl_audio::decode_wav(&wav).map_err(|e| bad(format!("ref_audios[{i}]: {e}")))?;
-                refs.push(nextsycl_audio::Reference { samples, rate, text: None });
+                refs.push(nextsycl_audio::Reference { samples, rate, text: None, words: Vec::new() });
             }
             req.reference = Some(refs.remove(0));
             req.references = refs;
@@ -819,7 +816,7 @@ impl AudioServer {
             let bytes = std::fs::read(&path).map_err(|e| (500u16, format!("{name}: {e}")))?;
             let (samples, rate) = nextsycl_audio::decode_wav(&bytes).map_err(bad)?;
             let (end, end_text) = crate::carry::tail(&samples, rate, &said, crate::carry::KEEP_S);
-            let before = nextsycl_audio::Reference { samples: end, rate, text: Some(end_text) };
+            let before = nextsycl_audio::Reference { samples: end, rate, text: Some(end_text), words: Vec::new() };
             req.reference = Some(match req.reference.take() {
                 Some(voice) if voice.text.is_some() => crate::carry::join(voice, before),
                 _ => before,
