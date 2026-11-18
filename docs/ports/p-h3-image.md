@@ -30,8 +30,10 @@ reference is diffusers' modular pipeline at commit 84532a058702c74ae5d1dd6ceb056
 - **VAE (new decoder):** H3's conv encoder (`crates/h3` venc, a new `moments_of_picture` for the posterior) and P-H3's own
   transformer decoder (image/ph3image/src/vae.rs: H3's video decoder adapted to one frame - its time coordinate
   2 (0.5 / 7) - 1, a 768-wide output, the residual stream in float32), 256-pixel tiles cross-faded as the reference's.
-- **Silo** (`kernels/image/ph3image/silo`, `dist/silo/libnextsycl-ph3image.so`): the denoiser's attention. Same kernel as
-  the shared SageAttention (ARK's int8 prefill in libnextsycl-flash.so); the passes around it rewritten to stream. The
+- **Silo** (`kernels/image/ph3image/silo`, `dist/silo/libnextsycl-ph3image.so`): the denoiser's attention. Its own copy
+  of MiniMax-H3-Image's Sage kernel (`silo/tla` -> `dist/silo/libnextsycl-ph3image-tla.so`; see "The silo's own Sage
+  kernel" below), ARK's int8 prefill in libnextsycl-flash.so with `NS_PH3_SAGE_TLA=0` or without that library; the
+  passes around it rewritten to stream. The
   engine's H3 context is opened on the core GPU's queue (`Device::on_queue`, `nsd_create`) so the text encoder, the
   denoiser and the silo share one queue and one context.
 
@@ -106,7 +108,66 @@ decoder at 8 MP (225 tiles of 261 tokens): 5.3 s in bf16 at ~85 TFLOPS (its matr
 difference), 4.1 s in int8. An edit at 4 MP (one picture): text 14 - 20 s the first time (the vision tower and the VAE
 encoder loaded), the picture's latents 7.4 s, 8 steps 33 s (~9,300 tokens).
 
-B70: not measured - the card ran production video jobs for the whole session (see "open").
+B70: see the next section (int8, 8 steps: 1 MP 2.50 s, 8 MP 18.94 - 19.00 s; ~1.53x the B65 a step).
+
+## The silo's own Sage kernel (2026-11-17)
+
+The silo now has its own copy of the Sage kernel MiniMax-H3-Image's silo got on 2026-11-16 (docs/ports/minimax-h3-image.md,
+"Third pass": what it is, what was tried): `kernels/image/ph3image/silo/tla/` (`sage.cpp`, `ark/sage_mainloop.hpp`) ->
+`dist/silo/libnextsycl-ph3image-tla.so`, opened by the silo's `sage.cpp` beside itself. ARK's int8 prefill kernel around a
+copy of its mainloop with the scores' scale folded into the exponent's fma, the result written as bfloat16 straight into
+the activations: no half result buffer (0.11 GiB at 8 MP), no conversion pass. The code is h3image's under this silo's
+names (`ns_image_ph3_tla_*`, namespace `nsph3`); silos stay apart, neither engine calls the other's. `NS_PH3_SAGE_TLA=0`
+(--opt-sage-tla) or a missing library: ARK's kernel and the conversion pass, as before. `NS_PH3_PROFILE` now also prints
+the silo's preparation / kernel / result times every 50 calls (a step), naming the kernel.
+
+**Exact, the kernel alone** (`reference/h3-image/sagebench.cpp` built against this silo's copy - its header has the two
+flags; 56 heads of 128, random q / k / v with a per-column k offset, quantized as the silo does; "int8 math" = float32
+attention of the dequantized int8 q / k and half v; ARK's half result rounded to bfloat16 as the conversion pass does).
+The same digits on the B65 and the B70:
+
+| tokens | kernel | vs int8 math: max / mean abs | vs float32 q k v: max / mean abs, relative |
+|---|---|---|---|
+| 1,061 (1 MP) | ARK | 8.772e-3 / 2.897e-4 | 1.118e-1 / 4.864e-3, 2.437e-2 |
+| 1,061 | silo | 7.812e-3 / 2.853e-4 | 1.118e-1 / 4.863e-3, 2.437e-2 |
+| 8,318 (8 MP) | ARK | 8.773e-3 / 1.583e-4 | 1.014e-1 / 2.984e-3, 2.700e-2 |
+| 8,318 | silo | 7.802e-3 / 1.559e-4 | 1.014e-1 / 2.983e-3, 2.700e-2 |
+
+The silo rounds once (float -> bfloat16) where ARK's path rounds twice (float -> half -> bfloat16): no looser anywhere.
+
+**Parity, 576 x 384 seed 3, Sage forced** (`NS_PH3_SAGE_MIN_S=64`: the default runs oneDNN at 253 tokens and the table
+above is unchanged; `image check --stages dit,steps`, each step from the reference's latents), int8 file, B65, the same
+build, ARK by `NS_PH3_SAGE_TLA=0`; ARK's text-to-image velocities repeat the forced
+row above (2.8e-2 / 3.2e-2 / 1.7e-2; its free-run final latents read 6.3e-2 here against 5.5e-2 then):
+
+| | text to image: silo kernel | text to image: ARK | edit: silo kernel | edit: ARK |
+|---|---|---|---|---|
+| velocity, steps 0 / 3 / 7 | 3.35e-2 / 3.17e-2 / 1.82e-2 | 2.85e-2 / 3.23e-2 / 1.72e-2 | 4.10e-2 / 4.79e-2 / 3.35e-2 | 4.07e-2 / 4.34e-2 / 3.45e-2 |
+| velocity, steps 0 .. 7 | 1.62e-2 - 3.99e-2 (mean 2.79e-2) | 1.67e-2 - 3.62e-2 (mean 2.79e-2) | 2.66e-2 - 6.11e-2 (mean 3.94e-2) | 2.60e-2 - 5.15e-2 (mean 3.72e-2) |
+| velocity cosine, worst | 0.99921 | 0.99935 | 0.99818 | 0.99870 |
+| final latents (8 steps from the reference's noise) | 4.57e-2, cos 0.99896 | 6.29e-2, cos 0.99803 | 3.30e-2, cos 0.99946 | 4.11e-2, cos 0.99916 |
+
+Refined text, noise, positions: identical in all four. Step by step the two kernels trade places (the rounding paths
+differ by one rounding); the edit's mean velocity error is 6 % higher with the silo kernel and its final latents 20 %
+lower, the text-to-image means equal: inside the per-step spread, as MiniMax-H3-Image's table found. At the attention
+itself the silo kernel is no looser (above).
+
+**Speed** (kernel alone: the bench above, median of 20, order ARK / silo / silo / ARK, TFLOPS as 4 S^2 D H; in the engine:
+`NS_PH3_PROFILE`, a step's 50 calls at 8 MP = 8,335 tokens; pictures: `image gen --local`, int8, seed 7, the second picture
+of n = 2 (the text encoder resident), 8 steps, runs alternated silo / ARK / silo / ARK, both cards the same night):
+
+| | B65: ARK | B65: silo kernel | B70: ARK | B70: silo kernel |
+|---|---|---|---|---|
+| kernel, 1,061 tokens | 0.452 / 0.454 ms (71.3 TFLOPS) | 0.430 / 0.430 ms (75.0) | 0.300 / 0.299 ms (107.7) | 0.292 / 0.293 ms (110.4) |
+| kernel, 8,318 tokens | 20.85 / 20.85 ms (95.1) | 20.15 / 20.17 ms (98.5) | 13.08 / 13.12 ms (151.6) | 12.87 / 12.88 ms (154.1) |
+| attention in a step, 8 MP (preparation + kernel + result) | 89 + 1,028 + 25 = 1,142 ms | 89 + 988 + 0 = 1,077 ms | 85 + 634 + 23 = 742 ms | 85 + 608 + 0 = 693 ms |
+| 1024 x 1024: 8 steps / decode | 3.74 / 3.74 s; 0.47 | 3.68 / 3.68 s; 0.46 | 2.52 / 2.52 s; 0.31 | 2.50 / 2.50 s; 0.31 |
+| 1024 x 1024: whole picture (refiner + steps + decode) | 4.42 / 4.40 s | 4.30 / 4.32 s | 3.00 / 3.01 s | 2.99 / 2.99 s |
+| 2912 x 2912 (8 MP): 8 steps / decode | 29.51 / 29.59 s; 4.08 / 4.07 | 28.92 / 29.08 s; 4.08 / 4.08 | 19.36 / 19.36 s; 2.77 / 2.77 | 18.94 / 19.00 s; 2.77 / 2.83 |
+| 2912 x 2912: whole picture | 33.79 / 33.84 s | 33.18 / 33.34 s | 22.32 / 22.34 s | 21.89 / 22.04 s |
+
+So: the kernel 3 - 5 % faster on the B65 and about 2 % on the B70, the attention op 6 - 7 % at 8 MP (the conversion pass
+gone too), the 8 steps 1.6 - 2.0 % faster (B65 1 / 8 MP) and 0.8 - 2.0 % (B70), a whole 8 MP picture 1.6 % on either card. Exact and not slower: **on by default** (`NS_PH3_SAGE_TLA` 1 when the library is built).
 
 ## Open
 
@@ -115,7 +176,7 @@ B70: not measured - the card ran production video jobs for the whole session (se
   Qwen3.5/3.8 family, but Pruna ships the upsampler only as safetensors (bf16, int8 ConvRot, w4a8) of a fine-tuned 9B
   with a vision tower; serving it needs a conversion to GGUF and the vision path, and the front door's image methods
   would need to call an llm first. Not started.
-- B70 numbers (expected ~1.6x faster per step than the B65).
+- B70 numbers beyond the Sage table above (2048 x 2048, edits, the first-pass table).
 - The edit's VAE encoder (H3's half-precision convolutions, loaded per request) and the per-picture refiner load are
   the slow parts of an edit; keep both resident when the card has room.
 - w4a8 files (Pruna's, realrebelai's w6a8) need a 4-bit codebook kernel; AD-Q3_K-based GGUFs need Q3_K in the dequant.
