@@ -135,6 +135,9 @@ fn clip_model(row: &Value, all: &[Value]) -> Option<String> {
     let engine = s(row, "engine").trim().to_uppercase();
     let named = if engine == "REGEN2K" || row["regen2k"].as_str().is_some_and(|d| !d.trim().is_empty()) {
         id_with("regen2k")
+    } else if engine == "MPEG" {
+        // asked for by name: its own model whatever the clip carries (the studio refuses references with it)
+        id_with("mpeg")
     } else if engine == "REF2VA" || row["ref_images"].is_array() || row["ref_videos"].is_array() {
         id_with("ref2va")
     } else if engine.is_empty() || engine == "INT8" || engine == "Q8_0" {
@@ -812,6 +815,9 @@ mod tests {
         assert_eq!(clip_model(&json!({"engine": "Q6_K"}), &all).as_deref(), Some("minimax-h3-q6k"));
         assert_eq!(clip_model(&json!({"ref_images": []}), &all).as_deref(), Some("minimax-h3-ref2va"));
         assert_eq!(clip_model(&json!({"prompt": "x"}), &[json!({"id": "other", "kind": "video"})]).as_deref(), Some("other"), "no minimax-h3: the first");
+        // MPEG asked for by name stays on its model, keyframes and sound or not
+        let all = vec![json!({"id": "minimax-h3", "kind": "video"}), json!({"id": "minimax-h3-mpeg", "kind": "video"}), json!({"id": "minimax-h3-ref2va", "kind": "video"})];
+        assert_eq!(clip_model(&json!({"engine": "MPEG", "guide_clip": "a.mp4", "soundtrack": "s.flac"}), &all).as_deref(), Some("minimax-h3-mpeg"));
     }
 
     /// A 2K regeneration runs on its own model (its ETA history apart from H3's 45 s clips) and, with no history, is given

@@ -2228,7 +2228,7 @@ export interface VideoGenerateReq {
   /** a ControlNet control clip (file); not with Ref2VA */
   control_video?: string | null;
   /**
-   * the denoiser, by video.engines.list's quant (Q8_0 is read as INT8); REF2VA is chosen by itself when ref_images or ref_videos are given
+   * the denoiser, by video.engines.list's quant (Q8_0 is read as INT8); REF2VA is chosen by itself when ref_images or ref_videos are given. MPEG (minimax-h3-mpeg): a fast draft on two tracks - half resolution, then full resolution on the subject the model picks; it takes keyframes, guides and sound (first_frame, last_frame, guide_clip, first_audio, soundtrack), not references ("REF2VA is not supported by MPEG yet"), ControlNet, masked runs or other samplers; width and height multiples of 64
    * @default "INT8"
    */
   engine?: string | null;
@@ -3255,7 +3255,7 @@ export interface Methods {
    */
   "video.templates.list": { req: VideoTemplatesListReq; resp: any };
   /**
-   * The denoisers the daemon has, and the video.generate keys each takes: INT8 / Q6_K / Q4_K_M (text and image to video: anchors, guides, ControlNet, masked runs) and REF2VA (reference pictures and clips; no ControlNet or masked runs). ref_audios, anchors and guides work with every one
+   * The denoisers the daemon has, and the video.generate keys each takes: INT8 / Q6_K / Q4_K_M (text and image to video: anchors, guides, ControlNet, masked runs), REF2VA (reference pictures and clips; no ControlNet or masked runs) and MPEG (a fast two-track draft: anchors, guides and sound; no references, ControlNet or masked runs). Anchors and guides work with every one; ref_audios with all but MPEG
    * @tags video
    * @example {}
    */
@@ -3917,7 +3917,7 @@ export function client(post: Post, raw?: PostRaw) {
      */
     "video.templates.list": (req: VideoTemplatesListReq = {}): Promise<any> => post("video.templates.list", req),
     /**
-     * The denoisers the daemon has, and the video.generate keys each takes: INT8 / Q6_K / Q4_K_M (text and image to video: anchors, guides, ControlNet, masked runs) and REF2VA (reference pictures and clips; no ControlNet or masked runs). ref_audios, anchors and guides work with every one
+     * The denoisers the daemon has, and the video.generate keys each takes: INT8 / Q6_K / Q4_K_M (text and image to video: anchors, guides, ControlNet, masked runs), REF2VA (reference pictures and clips; no ControlNet or masked runs) and MPEG (a fast two-track draft: anchors, guides and sound; no references, ControlNet or masked runs). Anchors and guides work with every one; ref_audios with all but MPEG
      * @tags video
      * @example {}
      */

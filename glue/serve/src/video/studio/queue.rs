@@ -212,6 +212,37 @@ fn ignored_keys() -> Vec<String> {
     IGNORED.iter().map(|k| k.to_string()).chain(["chain.pin_renorm".to_string()]).collect()
 }
 
+/// The common keys the MPEG engine refuses (crates/h3/src/jobs.rs `generate`: what its two-track sampler does not run);
+/// references and the ControlNet besides
+pub const MPEG_NOT: [&str; 8] = ["ref_audios", "sampler", "schedule", "knots", "speed", "source", "regen", "regen_box"];
+
+/// A queue item for engine MPEG: what its two-track sampler does not run, refused here (a 400) rather than by the
+/// engine when the clip starts. Keyframes (first_frame, last_frame, guide_clip) and sound (first_audio, soundtrack)
+/// it takes.
+fn mpeg_check(it: &Map<String, Value>) -> Result<(), RpcError> {
+    let set = |k: &str| !it.get(k).is_none_or(|v| v.is_null() || v.as_str() == Some("") || v.as_array().is_some_and(|a| a.is_empty()));
+    if set("ref_images") || set("ref_videos") {
+        return Err(RpcError::param("REF2VA is not supported by MPEG yet: ref_images and ref_videos need engine REF2VA"));
+    }
+    let w = it.get("width").and_then(Value::as_i64).unwrap_or(0);
+    let h = it.get("height").and_then(Value::as_i64).unwrap_or(0);
+    if w % 64 != 0 || h % 64 != 0 {
+        return Err(RpcError::param(&format!("engine MPEG makes the clip at half resolution first: width and height must be multiples of 64 ({w}x{h}; e.g. 1344x768, 768x576, 896x512)")));
+    }
+    for (k, what) in [("ref_audios", "voice references"), ("control_video", "a ControlNet"), ("control_mask", "a ControlNet mask"), ("source", "a masked run (source)"),
+                      ("regen", "a masked run (regen)"), ("knots", "knots")] {
+        if set(k) {
+            return Err(RpcError::param(&format!("engine MPEG takes no {k} ({what}) yet: INT8 does")));
+        }
+    }
+    let euler = it.get("sampler").and_then(Value::as_str).is_none_or(|s| nextsycl_diffusion::Sampler::parse(s) == Some(nextsycl_diffusion::Sampler::Euler));
+    let shift = it.get("schedule").and_then(Value::as_str).is_none_or(|s| nextsycl_diffusion::Schedule::parse(s) == Some(nextsycl_diffusion::Schedule::Shift));
+    if !euler || !shift {
+        return Err(RpcError::param("engine MPEG runs Euler on H3's own schedule: no other sampler, schedule or speed"));
+    }
+    Ok(())
+}
+
 pub fn inputs_of(quant: &str) -> Value {
     let common = ["prompt", "title", "seconds", "frames", "steps", "seed", "width", "height", "te", "first_frame", "last_frame", "exposure_ref", "guide_clip",
                   "first_audio", "first_audio_s", "soundtrack", "soundtrack_start", "exposure_fix", "exposure_offset", "exposure_ease", "exposure_target", "ref_audios", "loras", "upscale", "upscaler", "shift_video", "shift_audio", "sampler", "schedule", "knots", "speed", "chain", "source", "regen", "regen_box"];
@@ -220,6 +251,13 @@ pub fn inputs_of(quant: &str) -> Value {
                "not": ["width", "height", "seconds", "frames", "steps", "first_frame", "last_frame", "guide_clip", "ref_images", "ref_videos", "ref_audios", "loras",
                        "control_video", "control_mask", "source", "upscale"],
                "chosen": "by itself when regen2k (a draft clip) is given", "ignored": ignored_keys()})
+    } else if quant == "MPEG" {
+        // MPEG-Diffusion (minimax-h3-mpeg): the INT8 denoiser on two tracks; keyframes, guides and sound condition both
+        json!({"takes": common.iter().filter(|k| !MPEG_NOT.contains(k)).collect::<Vec<_>>(),
+               "not": MPEG_NOT.iter().chain(["ref_images", "ref_videos", "control_video", "control_mask", "control_source", "control_strength", "control_start",
+                                             "control_end"].iter()).collect::<Vec<_>>(),
+               "chosen": "by engine: a fast draft (half resolution, then full resolution on the subject the model picks); canvas sides multiples of 64",
+               "ignored": ignored_keys()})
     } else if quant == "REF2VA" {
         json!({"takes": common.iter().chain(["ref_images", "ref_videos", "ref_image_size", "ref_video_sound", "te_pictures"].iter()).collect::<Vec<_>>(),
                "not": ["control_video", "control_mask", "control_source", "control_strength", "control_start", "control_end"],
@@ -464,8 +502,12 @@ impl Studio {
             }
             it.insert(k.into(), if list.is_empty() { Value::Null } else { json!(list) });
         }
-        // pictures and clips as references: the Ref2VA denoiser, the one trained for them
+        // pictures and clips as references: the Ref2VA denoiser, the one trained for them (not when MPEG is asked for: its
+        // two-track sampler runs the FL2VA denoiser)
         if it["ref_images"].is_array() || it["ref_videos"].is_array() {
+            if it["engine"] == "MPEG" {
+                return Err(RpcError::param("REF2VA is not supported by MPEG yet: ref_images and ref_videos need engine REF2VA (or INT8 to have it chosen); drop them for MPEG"));
+            }
             let _ = self.engines(); // the daemon's list (a model added since the studio started)
             if !engine_known("REF2VA") {
                 return Err(RpcError::param("reference pictures and clips need the Ref2VA denoiser (nextsycl models pull minimax-h3-ref2va, then add it to NS_VIDEO_ENGINES)"));
@@ -586,6 +628,9 @@ impl Studio {
         }
         let ris = p.get("ref_image_size").and_then(|v| v.as_str()).filter(|v| *v == "match" || *v == "max");
         it.insert("ref_image_size".into(), ris.map_or(Value::Null, |v| json!(v)));
+        if it["engine"] == "MPEG" {
+            mpeg_check(&it)?;
+        }
         Ok(Value::Object(it))
     }
 }
@@ -761,6 +806,33 @@ fn pika_flex_lora(denoisers: &[String]) -> Option<String> {
 mod tests {
     /// A regen2k draft: the platform's 864x480 10.125 s clip is two windows, all of it; a portrait one, a 3 s one and a
     /// 20 s one are refused, saying why
+    /// Engine MPEG takes the singer film's keyframes and sound, and refuses references with a message naming REF2VA
+    #[test]
+    fn mpeg_takes_keyframes_and_sound_but_not_references() {
+        let it = |extra: Value| -> Map<String, Value> {
+            let mut m = json!({"engine": "MPEG", "width": 1344, "height": 768, "guide_clip": "h3_a.mp4:22:0,anchor.png", "first_frame": "a.png",
+                               "last_frame": "b.png", "soundtrack": "song.flac", "first_audio": null, "sampler": null, "schedule": null, "knots": null,
+                               "ref_images": null, "ref_audios": null}).as_object().unwrap().clone();
+            m.extend(extra.as_object().unwrap().clone());
+            m
+        };
+        assert!(super::mpeg_check(&it(json!({}))).is_ok());
+        assert!(super::mpeg_check(&it(json!({"sampler": "euler", "schedule": "shift"}))).is_ok());
+        let e = super::mpeg_check(&it(json!({"ref_images": ["p.png"]}))).unwrap_err().message;
+        assert!(e.contains("REF2VA is not supported by MPEG yet"), "{e}");
+        assert!(super::mpeg_check(&it(json!({"width": 864, "height": 480}))).unwrap_err().message.contains("multiples of 64"));
+        assert!(super::mpeg_check(&it(json!({"sampler": "lcm"}))).is_err());
+        assert!(super::mpeg_check(&it(json!({"control_video": "c.mp4"}))).is_err());
+        let i = inputs_of("MPEG");
+        let has = |k: &str, l: &str| i[l].as_array().unwrap().iter().any(|v| v == k);
+        for k in ["first_frame", "last_frame", "guide_clip", "first_audio", "first_audio_s", "soundtrack", "soundtrack_start"] {
+            assert!(has(k, "takes") && !has(k, "not"), "{k}");
+        }
+        for k in ["ref_images", "ref_videos", "control_video", "ref_audios"] {
+            assert!(has(k, "not") && !has(k, "takes"), "{k}");
+        }
+    }
+
     #[test]
     fn a_regen_draft_is_taken_whole_or_refused() {
         assert_eq!(super::check_draft("a", 864.0, 480.0, 10.125).ok(), Some(243));
