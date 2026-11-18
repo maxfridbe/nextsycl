@@ -35,7 +35,7 @@ nextsycl audio voice enroll NAME [--gpu N] [--steps 2000] [--replace] [--direct]
 nextsycl audio voice rm NAME            (addvoice / clonevoice NAME ... = voice add; designvoice = voice design)
 nextsycl audio transcribe FILE [--model ID | --dir DIR] [--language L] [--translate] [--no-words] [--prompt TEXT] [--opt-NAME VALUE]...
                    [--json] [--gpu N]   (speech to text: a recogniser, whisper-large-v3-turbo; any rate, WAV, MP3, FLAC, Ogg, M4A)
-nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | mel,encoder,logits,transcribe | prompt,lm,head,codec,run | prompt,frames,flow,codec | mel,ear,lm,check,write | talker,speak | prompt,encode,pass,run,codec,post | codec,prompt,frames,speed | prompt,lm,forced,decoder,speaker,encoder,stream,align,edit] [--gpu N | --gpus A,B]
+nextsycl audio check <dump dir> [--model ID | --dir DIR] [--stages ar,dit,voc,chunks | prompt,frames,codec | mel,encoder,logits,transcribe | prompt,lm,head,codec,run | prompt,frames,flow,codec | mel,ear,lm,check,write | talker,speak | prompt,encode,pass,run,codec,post | codec,prompt,frames,speed | prompt,lm,forced,decoder,speaker,encoder,stream,align,edit | vaebench --source SONG [--against EARLIER-DIR]] [--gpu N | --gpus A,B]
 nextsycl audio engines | selftest [--gpu N]";
 
 /// The audio engines this program has (audio/<arch>)
@@ -439,6 +439,12 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("tokens,ar,neg,noise,vel,steps,solve,vae").split(',').collect();
         let e = nextsycl_audio_yue2::Yue2::load(&files, &gs, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
         nextsycl_audio_yue2::check::run(&e, dir, &stages, &mut log).map_err(|e| e.0)?
+    } else if m["arch"] == nextsycl_audio_acestep::ARCH && opt(args, "--stages") == Some("vaebench") {
+        // the VAE alone on a recording, timed, against an earlier run's outputs (DIR: where this run's go)
+        let src = opt(args, "--source").ok_or("vaebench: --source SONG")?;
+        let e = nextsycl_audio_acestep::AceStep::load(&files, &gpus(args)?, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+        nextsycl_audio_acestep::check::vae_bench(&e, dir, Path::new(src), opt(args, "--against").map(Path::new), &mut log).map_err(|e| e.0)?;
+        0.0
     } else if m["arch"] == nextsycl_audio_acestep::ARCH {
         let stages: Vec<&str> = opt(args, "--stages").unwrap_or("text,te,enc,velocity,sample,vae").split(',').collect();
         let e = nextsycl_audio_acestep::AceStep::load(&files, &gpus(args)?, &options(&m, args)?, &mut log).map_err(|e| e.0)?;

@@ -493,3 +493,211 @@ fn lm_stage(e: &AceStep, dir: &Path, log: &mut dyn FnMut(String), worst: &mut f6
     }
     Ok(())
 }
+
+fn write_f32(path: &Path, v: &[f32]) -> Result<()> {
+    std::fs::write(path, crate::nn::f32_bytes(v)).map_err(|e| Error(format!("{}: {e}", path.display())))
+}
+
+fn read_f32_file(path: &Path) -> Result<Vec<f32>> {
+    let b = std::fs::read(path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+    Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+/// (max |d|, mean |d|, SNR in dB: the reference's energy over the difference's)
+fn diff_stats(got: &[f32], want: &[f32]) -> (f64, f64, f64) {
+    let (mut mx, mut sum, mut e2, mut w2) = (0f64, 0f64, 0f64, 0f64);
+    for (g, w) in got.iter().zip(want) {
+        let d = (*g as f64 - *w as f64).abs();
+        mx = mx.max(d);
+        sum += d;
+        e2 += d * d;
+        w2 += (*w as f64) * (*w as f64);
+    }
+    let snr = if e2 == 0.0 { f64::INFINITY } else { 10.0 * (w2 / e2).log10() };
+    (mx, sum / got.len().max(1) as f64, snr)
+}
+
+/// An in-place radix-2 FFT (n a power of two)
+fn fft(re: &mut [f64], im: &mut [f64]) {
+    let n = re.len();
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        let ang = -2.0 * std::f64::consts::PI / len as f64;
+        for start in (0..n).step_by(len) {
+            for k in 0..len / 2 {
+                let (wr, wi) = ((ang * k as f64).cos(), (ang * k as f64).sin());
+                let (a, b) = (start + k, start + k + len / 2);
+                let (tr, ti) = (re[b] * wr - im[b] * wi, re[b] * wi + im[b] * wr);
+                re[b] = re[a] - tr;
+                im[b] = im[a] - ti;
+                re[a] += tr;
+                im[a] += ti;
+            }
+        }
+        len <<= 1;
+    }
+}
+
+/// Two stereo [2, n] signals' spectra (Hann windows of 2048, hop 2048) in dB: (mean, max |dB difference|) over the bins
+/// within 80 dB of the reference's loudest
+fn spectral_diff(got: &[f32], want: &[f32], n: usize) -> (f64, f64) {
+    const W: usize = 2048;
+    let hann: Vec<f64> = (0..W).map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / W as f64).cos()).collect();
+    let spec = |x: &[f32]| -> Vec<f64> {
+        let mut out = Vec::new();
+        let mut t = 0;
+        while t + W <= n {
+            let mut re: Vec<f64> = (0..W).map(|i| x[t + i] as f64 * hann[i]).collect();
+            let mut im = vec![0f64; W];
+            fft(&mut re, &mut im);
+            out.extend((0..W / 2 + 1).map(|k| 20.0 * (re[k].hypot(im[k]) + 1e-12).log10()));
+            t += W;
+        }
+        out
+    };
+    let (mut sum, mut cnt, mut mx) = (0f64, 0usize, 0f64);
+    for ch in 0..2 {
+        let (g, w) = (spec(&got[ch * n..(ch + 1) * n]), spec(&want[ch * n..(ch + 1) * n]));
+        let top = w.iter().cloned().fold(f64::MIN, f64::max);
+        for (a, b) in g.iter().zip(&w) {
+            if *b > top - 80.0 {
+                let d = (a - b).abs();
+                sum += d;
+                cnt += 1;
+                mx = mx.max(d);
+            }
+        }
+    }
+    (sum / cnt.max(1) as f64, mx)
+}
+
+/// The VAE alone on a recording, timed (the `vaebench` stage: `nextsycl audio check OUT --model acestep-1.5 --stages
+/// vaebench --source SONG [--against EARLIER-OUT]`):
+///   encode  the recording (stereo, 48 kHz) to latents in the handler's 30 s windows, each window's posterior mean (no
+///           draw: the same in every run)
+///   decode  latents to stereo in the decode windows (NS_ACE_DECODE_CHUNK, else the card's): the earlier run's latents
+///           when it has them, so the decode is compared on the same input
+/// OUT gets latents.f32 [frames, 64], wav.f32 [2, n] (channel-major) and bench.json; with `against`, both compared
+/// (max and mean |d|, SNR, the spectra in dB, and the samples about each window's seam against the rest). With
+/// NS_ACE_VAE_PROFILE=1 each kind of operation's time is logged (every operation waited for: slower in all)
+pub fn vae_bench(e: &AceStep, out: &Path, source: &Path, against: Option<&Path>, log: &mut dyn FnMut(String)) -> Result<()> {
+    use crate::vae::{Vae, HOP, OVERLAP};
+    let a = nextsycl_audio::read_audio(&std::fs::read(source).map_err(|e| Error(format!("{}: {e}", source.display())))?).map_err(Error)?;
+    let wav = crate::source::stereo48(&a)?;
+    let n = wav.len() / 2;
+    std::fs::create_dir_all(out).map_err(|e| Error(format!("{}: {e}", out.display())))?;
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let free = || e.ops.gpu.memory().ok().and_then(|m| m.1).map_or(-1.0, gib);
+    log(format!("vaebench: {:.2} s of stereo at 48 kHz, the VAE's convolutions: {}; {:.2} GiB free after the load", n as f64 / 48_000.0,
+                e.vae.convs(), free()));
+    let mut s = Scratch::default();
+    let print_profile = |log: &mut dyn FnMut(String), what: &str| {
+        let p = crate::vae::take_profile();
+        if p.is_empty() {
+            return;
+        }
+        let total: f64 = p.iter().map(|x| x.1).sum();
+        log(format!("  {what} profile ({total:.2} s of timed operations):"));
+        for (k, t, c) in &p {
+            log(format!("    {k:<28} {t:8.3} s  {:5.1}%  {c:6} calls  {:.2} ms a call", 100.0 * t / total, 1e3 * t / *c as f64));
+        }
+    };
+    let t0 = Instant::now();
+    let mut enc_windows = 0;
+    let lat = e.vae.encode(&e.ops, &mut s, &wav, None, &mut |_, b| {
+        enc_windows = b;
+        Ok(())
+    })?;
+    let enc_s = t0.elapsed().as_secs_f64();
+    let enc_scratch = s.bytes();
+    let held = |e: &AceStep| {
+        let (w, s) = e.vae.silo_peak();
+        let (nw, ns) = e.vae.silo_held();
+        format!("; the silo held up to {:.2} GiB of weights and a {:.2} GiB scratchpad (now {:.2} / {:.2})", gib(w), gib(s), gib(nw), gib(ns))
+    };
+    log(format!("encode: {:.2} s ({enc_windows} windows; {} latent frames); scratch {:.2} GiB, {:.2} GiB free after{}", enc_s, lat.len() / LATENT,
+                gib(enc_scratch as u64), free(), held(e)));
+    print_profile(log, "encode");
+    s.clear();
+    write_f32(&out.join("latents.f32"), &lat)?;
+    let dec_in = match against {
+        Some(d) if d.join("latents.f32").is_file() => read_f32_file(&d.join("latents.f32"))?,
+        _ => lat.clone(),
+    };
+    let chunk = std::env::var("NS_ACE_DECODE_CHUNK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or_else(|| Vae::auto_chunk(&e.ops, &s));
+    let t0 = Instant::now();
+    let mut dec_windows = 0;
+    let w = e.vae.decode(&e.ops, &mut s, &dec_in, chunk, &mut |_, b| {
+        dec_windows = b;
+        Ok(())
+    })?;
+    let dec_s = t0.elapsed().as_secs_f64();
+    let dec_scratch = s.bytes();
+    log(format!("decode: {:.2} s ({dec_windows} windows of {chunk} frames); scratch {:.2} GiB, {:.2} GiB free after{}", dec_s, gib(dec_scratch as u64), free(),
+                held(e)));
+    print_profile(log, "decode");
+    s.clear();
+    write_f32(&out.join("wav.f32"), &w)?;
+    let meta = serde_json::json!({"seconds": n as f64 / 48_000.0, "convs": e.vae.convs(), "encode_s": enc_s, "encode_windows": enc_windows,
+                                  "decode_s": dec_s, "decode_windows": dec_windows, "decode_chunk": chunk, "frames": dec_in.len() / LATENT,
+                                  "encode_scratch_bytes": enc_scratch, "decode_scratch_bytes": dec_scratch});
+    std::fs::write(out.join("bench.json"), meta.to_string()).map_err(|e| Error(e.to_string()))?;
+    let Some(d) = against else { return Ok(()) };
+    let lat_ref = read_f32_file(&d.join("latents.f32"))?;
+    let wav_ref = read_f32_file(&d.join("wav.f32"))?;
+    if lat_ref.len() != lat.len() || wav_ref.len() != w.len() {
+        return Err(Error(format!("against {}: {} latents and {} samples, here {} and {}", d.display(), lat_ref.len(), wav_ref.len(), lat.len(), w.len())));
+    }
+    let (mx, mean, snr) = diff_stats(&lat, &lat_ref);
+    let (_, cos, _) = compare(&lat, &lat_ref);
+    log(format!("latents vs {}: max |d| {mx:.3e}  mean |d| {mean:.3e}  SNR {snr:.1} dB  cos {cos:.9}", d.display()));
+    // the encode's seams: the cores' edges (26 s apart) in latent frames, each +-8 frames, against the rest
+    let enc_stride = (crate::vae::ENC_CHUNK - 2 * crate::vae::ENC_OVERLAP) as f64 / HOP as f64;
+    let frames = lat.len() / LATENT;
+    let near_enc = |f: usize| (1..).map(|i| (i as f64 * enc_stride) as usize).take_while(|b| *b < frames + 8).any(|b| f + 8 >= b && f < b + 8);
+    let (mut seam, mut rest) = (0f64, 0f64);
+    for f in 0..frames {
+        let m = (0..LATENT).map(|c| (lat[f * LATENT + c] - lat_ref[f * LATENT + c]).abs() as f64).fold(0.0, f64::max);
+        if near_enc(f) { seam = seam.max(m) } else { rest = rest.max(m) }
+    }
+    log(format!("latents at the encode windows' seams (+-8 frames): max |d| {seam:.3e}; elsewhere {rest:.3e}"));
+    let wn = w.len() / 2;
+    let (mx, mean, snr) = diff_stats(&w, &wav_ref);
+    let (sm, smx) = spectral_diff(&w, &wav_ref, wn);
+    log(format!("sound vs {}: max |d| {mx:.3e}  mean |d| {mean:.3e}  SNR {snr:.1} dB; spectra: mean |d| {sm:.4} dB, max {smx:.2} dB", d.display()));
+    // the decode's seams: each window's core edge (+-4 latent frames of samples) against the rest
+    let mut overlap = OVERLAP;
+    while chunk <= 2 * overlap && overlap > 4 {
+        overlap /= 2;
+    }
+    let stride = (chunk - 2 * overlap) * HOP;
+    let (mut seam, mut rest) = (0f64, 0f64);
+    for t in 0..wn {
+        let m = (0..2).map(|c| (w[c * wn + t] - wav_ref[c * wn + t]).abs() as f64).fold(0.0, f64::max);
+        let r = t % stride;
+        if t >= stride && (r < 4 * HOP || r + 4 * HOP >= stride) { seam = seam.max(m) } else { rest = rest.max(m) }
+    }
+    log(format!("sound at the decode windows' seams (+-4 frames): max |d| {seam:.3e}; elsewhere {rest:.3e}"));
+    // and the step across each seam in this run's own sound, against the steps about it (a click shows as an outlier)
+    let mut worst_ratio = 0f64;
+    for b in (stride..wn).step_by(stride) {
+        let step = |t: usize| (0..2).map(|c| (w[c * wn + t] - w[c * wn + t - 1]).abs() as f64).fold(0.0, f64::max);
+        let around = (b.saturating_sub(HOP)..(b + HOP).min(wn)).filter(|t| *t != b && *t > 0).map(step).fold(0.0, f64::max);
+        worst_ratio = worst_ratio.max(step(b) / around.max(1e-9));
+    }
+    log(format!("sound: the largest step across a seam is {worst_ratio:.2}x the largest within a frame either side (over 1: a click)"));
+    Ok(())
+}

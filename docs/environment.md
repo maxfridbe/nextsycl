@@ -372,6 +372,9 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 | `NS_ACE_PLANNER` | on | 0: the 5 Hz planner LM is not loaded (no `planner` requests; less VRAM) | audio acestep |
 | `NS_ACE_SHIFT` | 3.0 | the schedule's shift (t' = s t / (1 + (s - 1) t)) (--opt-shift) | audio acestep |
 | `NS_ACE_VAE_SAMPLE` | 1 | 0: a recording's VAE posterior taken at its mean, not sampled as the reference (--opt-vae-sample) | audio acestep |
+| `NS_ACE_VAE_SILO` | 1 | 0: the VAE's convolutions on the shared kernels' plain loops (nsd_conv1d), not the silo's oneDNN ones (libnextsycl-acestep.so) - the A/B's other side, many times slower | audio acestep |
+| `NS_ACE_VAE_FPMATH` | strict | the silo's convolutions: strict (float32), or tf32 / bf16 / f16 (oneDNN may compute narrower; not exact) - an experiment | audio acestep (silo) |
+| `NS_ACE_VAE_PROFILE` | 0 | Debug: 1 waits for and times each VAE operation, by kind (the vaebench stage logs the table; every song slower) | audio acestep |
 | `NS_MM3_*` | - | every NS_MM3_ setting in nextsycl.conf is passed to the audio server | cli (audio serve) |
 | `NS_MM3_DIT_INT8` | 0 | 1: the flow transformer's block matrices in int8 ConvRot (--opt-dit-int8) | audio minimaxmusic3 |
 | `NS_MM3_FPMATH` | strict | the decoder's oneDNN convolutions' math: strict (float32), f16, bf16 or tf32 | kernels:audio (minimaxmusic3) |
