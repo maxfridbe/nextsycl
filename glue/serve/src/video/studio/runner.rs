@@ -682,11 +682,12 @@ impl Studio {
     }
 }
 
-/// A 2K regeneration's whole time, before it has a history: measured on the B65 2026-11-16 (docs/ports/open-h3-regenerate-2k.md)
-/// per window ~2,040 s (its text encoder ~157, three steps of 177k tokens ~1,880), and per draft frame ~1.8 s (the VAE
-/// encode and the 2K decode), plus ~40 s of LoRAs and time tables
+/// A 2K regeneration's whole time, before it has a history: measured on the B65 2026-11-17 with the fast decoder (the
+/// card's default; docs/ports/open-h3-regenerate-2k.md, 5.17 s and 15.08 s drafts) - per window ~180 s (text encoder,
+/// vision tower, latent upscaler) and ~625 s a step of 177k tokens, per draft frame ~1.05 s (the VAE encode ~0.75, the
+/// fast 2K decode with its load ~0.3), plus ~40 s of LoRAs and time tables. (The H3 video decoder adds ~0.8 s a frame.)
 pub fn regen_estimate_s(frames: f64, windows: f64, steps_per_window: f64) -> f64 {
-    40.0 + windows * (160.0 + 627.0 * steps_per_window) + 1.8 * frames
+    40.0 + windows * (180.0 + 625.0 * steps_per_window) + 1.05 * frames
 }
 
 /// A running regeneration's time left, the whole job's (never one stage's): before a step has ended, the first estimate
@@ -696,7 +697,8 @@ fn regen_eta(rec: &Value, elapsed: f64, sampling: bool, frac: Option<f64>, step_
     let frames = rec["frames"].as_f64().unwrap_or(124.0);
     let windows = rec["regen_windows"].as_f64().unwrap_or(1.0).max(1.0);
     let steps = rec["steps"].as_f64().unwrap_or(3.0).max(1.0);
-    let decode = (1.1 * frames).max(10.0);
+    // the fast decoder with its load and the mp4 (~0.3 s a frame at 2K)
+    let decode = (0.3 * frames).max(15.0);
     if sampled {
         return decode;
     }
@@ -706,7 +708,7 @@ fn regen_eta(rec: &Value, elapsed: f64, sampling: bool, frac: Option<f64>, step_
             let per = step_s.iter().sum::<f64>() / step_s.len() as f64;
             let done = (f * steps).max(step_s.len() as f64).min(steps);
             let windows_started = ((done / (steps / windows)).floor() + 1.0).min(windows);
-            per * (steps - done) + 160.0 * (windows - windows_started) + decode
+            per * (steps - done) + 180.0 * (windows - windows_started) + decode
         }
         _ => first,
     }
@@ -806,10 +808,10 @@ mod tests {
         let decoding = regen_eta(&rec, 2160.0, true, Some(1.0), &[580.0, 580.0, 580.0], true);
         assert!(te > early && early > one && one > two && two > decoding, "{te} {early} {one} {two} {decoding}");
         assert!(early > 1500.0, "before a step has ended: the estimate, not a fraction's pace ({early})");
-        assert!((1250.0..1350.0).contains(&one), "two steps of 580 s and the decode ({one})");
+        assert!((1170.0..1230.0).contains(&one), "two steps of 580 s and the fast decode ({one})");
         let rec2 = json!({"frames": 185, "regen_windows": 2, "steps": 6});
         let w1 = regen_eta(&rec2, 1500.0, true, Some(0.30), &[600.0], false);
-        assert!(w1 > 4.0 * 600.0 + 160.0, "the second window's steps and text encoder still ahead ({w1})");
+        assert!(w1 > 4.0 * 600.0 + 180.0, "the second window's steps and text encoder still ahead ({w1})");
     }
 
     #[test]

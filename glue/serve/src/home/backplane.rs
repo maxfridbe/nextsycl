@@ -827,7 +827,7 @@ mod tests {
         assert!((4200.0..4800.0).contains(&e["run_s"].as_f64().unwrap()), "{e}");
         let mut e = json!({"basis": "none", "run_s": null, "wait_s": 0.0});
         regen_first_estimate(&mut e, &json!({"regen2k": "d.mp4"}));
-        assert!((2200.0..2400.0).contains(&e["run_s"].as_f64().unwrap()), "one window, as measured (2,311 s): {e}");
+        assert!((2200.0..2400.0).contains(&e["run_s"].as_f64().unwrap()), "one window, as measured (2,258 s with the fast decoder): {e}");
         let mut e = json!({"basis": "shape", "run_s": 2000.0});
         regen_first_estimate(&mut e, &json!({"regen2k": "d.mp4"}));
         assert_eq!(e["run_s"], 2000.0, "a history wins");

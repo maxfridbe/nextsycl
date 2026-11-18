@@ -18,7 +18,8 @@ denoiser: the int8 Ref2VA DiT + HyperFlow 8-step (block LoRAs + the two-time emb
   rows: [text | z as the reference clip (0.999 z + 0.001 noise, t >= 0.999) | silence latent (kept, t = 1) | target]
   up3: x = (1 - 0.834942) up + 0.834942 noise; Euler on 0.834942, 0.696852, 0.468753, 0 (CFG 1)
   (up4: from 0.923077, 4 steps; hf8: the whole 8-point grid from noise)
--> the H3 video decoder at 2560x1440 -> cut to the draft's real frames -> the draft's own sound muxed back
+-> the release's fast decoder at 2560x1440 (the H3 video decoder with regen_vae standard) -> cut to the draft's real
+   frames -> the draft's own sound muxed back
 ```
 
 ## What we reuse, what we downloaded
@@ -36,7 +37,7 @@ fp32). We checked it against what hardac1 already had before downloading it:
 | sharp curve | `adaln_t_table` by byte range from Comfy-Org's int8 Ref2VA | in our int8 file | the same tensor |
 
 Downloaded (4TB drive, `open-h3-regenerate-2k-ic/`): the IC LoRA (8.3 GB, fp32), HyperFlow (2.8 GB), the silence
-latent, the fast VAE (6.5 GB; not used yet, see Open), and **26 GB of the bf16 Ref2VA checkpoint: only its time
+latent, the fast VAE (6.5 GB, float32; the card's `fast-vae`, below), and **26 GB of the bf16 Ref2VA checkpoint: only its time
 embedder and full AdaLN projections** (Comfy-Org `minimax_h3_ref2va_bf16.safetensors`, card file `h3-ref2va-bf16-adaln`
 with `tensors: ['time_embedder.', 'blocks.*.adaln_proj.', 'final_layer.adaln_proj.']` - the card's `tensors` now takes a
 list of prefixes with `*`). Why that is needed:
@@ -173,12 +174,107 @@ and 7.71 s (185 frames)**; its record says 10.125 s, but that is the length aske
 Files on hardac1: `~/src/regen2k/e2e/out/h3_20261116_082306.mp4`, frames `~/src/regen2k/e2e/look/`, the
 studio's progress `~/src/regen2k/e2e/run.log`.
 
+## The fast decoder (2026-11-17)
+
+The release decodes with `vae_fast/fast_h3_vae_v2_24l.safetensors` (`infer/ref2va_ic/fast_vae/decoder.py`, from
+NVIDIA's StreamRender-H3): the H3 decoder's transformer pruned to 24 of its 36 layers and distilled to decode a whole
+clip in one piece - temporal windows of 5 latent frames (a native block), spatial windows of 16x16 tokens, both shifted
+on odd layers (by 2 latent frames, by 8 tokens), and 5 global tokens a block (the 4 registers + a zero token) that attend
+to their whole block while every window attends to the global tokens of the blocks it overlaps; window-local rotary ids;
+no tiles, no cross-fades. In nextsycl it is `crates/h3/src/fastvae.rs` with the H3 video engine's first silo
+(`kernels/video/h3/silo`, `dist/silo/libnextsycl-h3.so`, bound in `video/h3/src/silo.rs`):
+
+- the clip's residual stream stays whole on the card (float32, a row a token); each layer runs **a temporal window at a
+  time** (72,000 tokens at 2K): its norm, qkv, the window attention, the projection and the MLP (16,384 rows at a time),
+  written back in place. A window's keys are its own tokens and its blocks' global rows, both made before it changes
+  anything, so this is the release's layer exactly, in ~5 GB of buffers whatever the length (the stream: 8 KB a token,
+  4.4 GB for 124 frames, 12.6 GB for 362);
+- **window attention**: the windows' rows gathered (an indexed row copy) into variable-length sequences - every window
+  its tokens, its keys those plus 5 or 10 global rows - and ARK's bfloat16 prefill kernel on sycl-tla with cu_seqlens
+  (`ns_video_h3_silo_varlen`; upstream runs FlashAttention-4's varlen form the same way: no padding, no mask);
+- **global tokens**: their attention over the whole block takes the block's keys a temporal window at a time into a
+  running softmax (max, sum, weighted values in float32; 256 keys a work-group, `ns_video_h3_silo_glob`), finished with
+  the block's own 5 keys after the last window; the last layer's are skipped (never read), as upstream does;
+- bfloat16 matrices and activations (the weights converted from the release's float32 at load, 6.0 GiB read in ~3.4 s),
+  the residual in float32, the input map (de-normalization, the 1x1x1 convolution, the embedding) folded into one
+  [2048, 24] product and rounded to bfloat16 as the release does, the head in float32 (the release's reference engine).
+
+Parity (`reference/regen2k/fastvae_ref.py`: the release's `NonCausalViTDecoder`, CPU, float32, crops of a real 2K
+clip's latents, through the decode job's `check`):
+
+| Latents (T x H x W) | What it covers | PSNR | cosine |
+|---|---|---|---|
+| 7 x 20 x 36 (22 frames) | 2 blocks, shifted windows across them | 76.2 dB | 1.000000 (rel 5.0e-4) |
+| 12 x 33 x 40 (39 frames), from latent frame 5 | 3 blocks, partial windows on every side | 77.8 dB | 1.000000 (rel 3.1e-4) |
+
+A whole clip (regen1's 37 x 90 x 160 latents, 124 frames at 2560x1440) against our H3 video decoder (`H3_DECODE_FRAMES`
+dumps, SSIM on luma, Gaussian 11x11): **PSNR 44.4 dB (min 43.7), SSIM 0.9944 (min 0.9923)** over 34 frames - the
+distillation's own distance from the full decoder (upstream's target is 30 dB+). Frames 10, 60, 115 side by side and as
+face crops (`~/src/regenvae/look1/`): no visible difference, no window or block seams; the sign's lettering and the
+face's texture the same.
+
+| Decoder, 124 frames at 2560x1440 (regen1's latents) | B65 | B70 | Card peak (driver) |
+|---|---|---|---|
+| H3 video decoder (182 tile batches) | 127.4 s | 90.2 s | 5.9 GB |
+| fast decoder | 32.4 s (+3.3 load) | 22.7 s | 11.5 GB |
+
+(The B70's fast decode gives the same frames: PSNR 44.4 dB against the H3 decoder there too. 192 frames, B65: 50.3 s;
+362 frames, B65: 91.5 s - linear in the length.)
+
+It is the card's default (`H3_REGEN_VAE: 'fast'`); `H3_REGEN_VAE: 'standard'` on the card (or `--regen_vae standard`
+on an engine job; video.generate does not take it - the card decides) keeps the H3 video decoder, and the job falls back to it, saying so, when the silo is not built or the card lacks the room.
+
+## Drafts of three lengths (2026-11-17)
+
+All on the **B65** (gpu1), up3, seed 7, `nextsycl video job regen2k --here` in a build copy under `gpu_lock 1`, the card's
+files. 5 s and 15 s: 1344x768 H3 drafts with sound from the studio's out dir (a man seated in a uniform on a ship's
+bridge, a book on his knee, talking to camera; the same prompt at two lengths), the **fast decoder**. 7.7 s: the
+2026-11-16 production test above (864x480, end to end through a test studio, the **H3 video decoder**), plus its saved
+latents through the fast decoder alone.
+
+| | 5.17 s | 7.71 s | 15.08 s |
+|---|---|---|---|
+| draft frames in / out | 124 / 124 | 185 / 185 (decoded 192, cut) | 362 / 362 |
+| windows x steps | 1 x 3 | 2 x 3 | 3 x 3 |
+| **request to finished clip** | **2,294 s** (job 2,258) | **4,395 s** (studio) | **6,609 s** (job 6,573) |
+| draft read + VAE encode | 98.7 | - | 268.1 |
+| LoRAs to host + time tables | 19.8 + 18.1 | - | 19.7 + 17.5 |
+| per window: upscale + vision + text encoder | 6.8 + 6.7 + 164.2 | 162 (TE) | 6.8 + 6.1-6.6 + 165-166 |
+| steps (s) | 634.7, 630.6, 632.4 | 628, 630, 607, 599, 581, 581 | 637, 638, 636 / 638, 636, 635 / 629, 584, 583 |
+| decode | fast 31.2 (+9.5 load, mp4: 42.1) | H3 decoder 196; fast 50.3 (62.8 with load and mp4) | fast 91.5 (104.8 with load and mp4) |
+| card peak (driver; engine) | 28,678 MB; 26.1 GiB | 28,668 MB | 28,696 MB; 26.1 GiB |
+| sound | the draft's AAC copied: its first 162 of 163 packets, identical (pts, size, md5); the last lies past the picture's 5.17 s | 7.71 s | first 472 of 473 packets identical |
+
+The job's figures exclude ~36 s of container start in `job --here` (in the request column). The card peak is the
+sampling's (177k tokens); the fast decode peaks at 11.5 GB (124 frames) and 13.7 GB (192), on a context of its own
+after the sampling's scratch is given back.
+
+Looking: frames 10/60/115 (5 s) and 60/121/180/240/330 (15 s) against the draft enlarged to 2560x1440
+(`~/src/regenvae/look5`, `look15`): the same shot, pose and mouth at every frame; fabric, skin and the insignia sharper.
+Frame-to-frame change of the regen against the draft's (`ref/seam.py`, 640x360 luma): median ratio 0.97 (5 s), 0.96
+(15 s); the largest excess is at the 15 s clip's second window seam (frames 242-246: 0.46-0.82 vs the draft's
+0.29-0.59 of 255) - not visible in the frames around it. Both decoders show a slightly larger change at the 17-frame
+block boundaries (regen1's latents: +19% over the rest with the H3 decoder, +31% with the fast one; ~0.05 of 255).
+
+**The ETA's first estimate** (`regen_estimate_s`, studio/runner.rs), before / after recalibration:
+
+| Draft | Old: 40 + W (160 + 627 S) + 1.8 F | Measured (job) | New: 40 + W (180 + 625 S) + 1.05 F |
+|---|---|---|---|
+| 5.17 s (F 124, W 1, S 3) | 40 + 2,041 + 223 = 2,304 (+2.0%) | 2,258 | 40 + 2,055 + 130 = 2,225 (-1.5%) |
+| 7.71 s (F 185, W 2), H3 decoder | 40 + 4,082 + 333 = 4,455 (+1.4%) | 4,395 | (fast decoder: 40 + 4,110 + 194 = 4,344) |
+| 15.08 s (F 362, W 3, S 3) | 40 + 6,123 + 652 = 6,815 (+3.7%) | 6,573 | 40 + 6,165 + 380 = 6,585 (+0.2%) |
+
+(F frames, W windows, S steps a window.) The old figure was within 4% but carried the H3 decoder's ~1.1 s a frame; with
+the fast decoder the frame term is the encode (0.74-0.80 s a frame) and the decode with its load (0.29-0.34): 1.05. A
+window's text encoder, vision tower and upscaler are ~180 s, a step 625 s (the mean of 12). The running ETA's decode term
+is now 0.3 s a frame (was 1.1), its text encoder 180 s a window.
+
 ## Use
 
 ```sh
 nextsycl models pull minimax-h3-regen2k-ic        # IC LoRA, HyperFlow, silence, 26 GB of AdaLN tensors; the rest is shared
 nextsycl video job regen2k --here --model minimax-h3-regen2k-ic --draft draft.mp4 --caption "<the draft's prompt>" --out out.mp4
-    [--sampler up3|up4|hf8] [--resolution 2k|1080p] [--sharp 1] [--seed N]
+    [--sampler up3|up4|hf8] [--resolution 2k|1080p] [--sharp 1] [--seed N] [--regen_vae fast|standard]
 ```
 
 Front door / studio: `video.generate {"prompt": "<the draft's prompt>", "regen2k": "<clip>.mp4" | "prev", "regen_sampler": "up3",
@@ -187,10 +283,6 @@ panel has "Regenerate 2K".
 
 ## Open
 
-- **The fast VAE v2** (`vae_fast/fast_h3_vae_v2_24l`, downloaded, card file not yet): a 24-layer non-causal distillation
-  of the H3 decoder with shifted 5x16x16 windows and per-block global tokens. It needs a windowed attention with
-  padded (masked) keys - a new kernel (or a varlen gather) we do not have; the release's `--vae standard` path (our
-  H3 decoder) is used instead.
 - Speed: the streamed blocks and host LoRAs cost about 45 s per step (~7%); double-buffered uploads from pinned memory,
   or merging HyperFlow + LMS + IC into the int8 weights once (requantized), would remove most of it. The time tables
   include the audio stream's timesteps, which no row uses (pinned silence): a few wasted points.
