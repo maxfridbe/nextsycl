@@ -298,8 +298,8 @@ from run to run: silo 9.96e-2 - 1.40e-1 (mean 1.25e-1, worst cosine 0.99023), AR
 0.99070) - the reverse of the B70's Q4_K_M ordering, inside that spread. So on the B65: 3 - 6 % on the kernel, 1.4 % on a
 16.8 MP picture, 0.6 % at 1 MP, as exact as ARK's.
 
-- **P-H3-Image** has the same layout (56 heads of 128, the same packed qkv) but does not use this yet: its silo
-  (`kernels/image/ph3image/silo`) would need its own copy of `tla/` (silos are per model) and its own parity run.
+- **P-H3-Image** has the same layout (56 heads of 128, the same packed qkv) and since 2026-11-17 its own copy of `tla/`
+  (`kernels/image/ph3image/silo/tla`, silos are per model; docs/ports/p-h3-image.md, "The silo's own Sage kernel").
 - **Build** (`kernels/build.sh`): a silo with both plain sources (`silo/*.cpp` -> `libnextsycl-<arch>.so`) and sycl-tla
   ones (`silo/tla/*.cpp`) now builds the latter as `dist/silo/libnextsycl-<arch>-tla.so` (FlashVSR's tla-only silo keeps
   its name); its up-to-date check now also sees headers below `tla/` (`ark/*.hpp`).
@@ -319,8 +319,8 @@ from run to run: silo 9.96e-2 - 1.40e-1 (mean 1.25e-1, worst cosine 0.99023), AR
 
 - Attention at 16.8 MP is still a third of a step: the silo's own Sage kernel (third pass) took it from 147 - 152 to 158
   TFLOPS; ARK's tile variants and a transposed kernel did not beat it (the table there). What is left needs less vector
-  work per score (or int8 P V, which ARK has and which is looser: not tried as a default). P-H3-Image can take the same
-  kernel with a copy of the silo's tla/.
+  work per score (or int8 P V, which ARK has and which is looser: not tried as a default). P-H3-Image has its own copy
+  since 2026-11-17.
 - GGUF speed: the bf16 products run at 160 - 175 TFLOPS of the B70's; what is left is int8 math, which only the int8
   file gives exactly. A Q4_K kernel that reads nibbles inside an XMX GEMM could save the expansion (53 ms a step) and
   the extra weight traffic at 1 MP; oneDNN's own (u4) was slower.
