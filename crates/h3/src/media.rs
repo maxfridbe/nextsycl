@@ -183,7 +183,9 @@ pub fn mux_sound(clip: &Path, sound: &Path, start: f64, seconds: f64) -> Result<
         .arg(clip)
         .args(["-ss", &format!("{start:.3}"), "-t", &format!("{seconds:.3}"), "-i"])
         .arg(sound)
-        .args(["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest"])
+        // no -shortest: with the picture copied it cuts at a packet boundary before the clip's end (a 107-frame clip came
+        // out with 105, 2026-11-18; Regen2K's mux had the same 4-frame loss); the sound is already cut to `seconds`
+        .args(["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k"])
         .arg(&tmp)
         .status()
         .ctx("starting ffmpeg")?;
