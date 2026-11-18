@@ -84,6 +84,21 @@ impl Settings {
         s
     }
 
+    /// The settings for a run of `steps`: as they are when the switch falls inside it; else (a run shorter than the
+    /// 20 steps the defaults are for - the studio's 10) the switch and the full-res steps at the same share of the run,
+    /// 16/20 and 6/20 (10 steps: switch 8, 3 full-res steps)
+    pub fn for_steps(&self, steps: usize) -> Settings {
+        if self.switch > 0 && self.switch < steps {
+            return *self;
+        }
+        let mut s = *self;
+        s.switch = ((steps as f64 * 0.8).round() as usize).clamp(1, steps.saturating_sub(1).max(1));
+        if s.hr_steps > 0 {
+            s.hr_steps = ((steps as f64 * 0.3).ceil() as usize).max(2);
+        }
+        s
+    }
+
     /// The noise levels after the switch: `hr_steps` + 1 points linear from the switch's sigma down to 0 (as
     /// torch.linspace in float64), or the schedule's own rest
     pub fn tail(&self, sigmas: &[f32]) -> Vec<f32> {
@@ -959,9 +974,12 @@ fn euler(x: &mut [f32], dn: &[f32], s: f32, next: f32) {
 pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, sigmas: &[f32], vae: &Path, threads: usize, seed: u64, log: &mut dyn FnMut(String),
               between: &mut dyn FnMut(usize, usize) -> Result<()>, on_step: &mut dyn FnMut(usize) -> Result<()>) -> Result<Sampled> {
     use std::time::Instant;
-    let st = spec.settings;
-    let sh = d.shape;
     let steps = sigmas.len() - 1;
+    let st = spec.settings.for_steps(steps);
+    if st != spec.settings {
+        log(format!("mpeg   : {steps} steps: switch {} and {} full-res steps (the 20-step defaults' shares)", st.switch, st.hr_steps));
+    }
+    let sh = d.shape;
     if st.switch == 0 || st.switch >= steps {
         return Err(Error(format!("MPEG-Diffusion: the switch ({}) must fall inside the {steps} steps", st.switch)));
     }
@@ -1124,6 +1142,18 @@ pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, sigmas: &[f32], va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run shorter than the defaults' 20 steps keeps their shares: the studio's 10 steps get switch 8 and 3 full-res
+    /// steps (it refused: "the switch (16) must fall inside the 10 steps")
+    #[test]
+    fn a_short_run_keeps_the_switchs_share() {
+        let d = Settings::default();
+        assert_eq!(d.for_steps(20), d);
+        let s = d.for_steps(10);
+        assert_eq!((s.switch, s.hr_steps), (8, 3));
+        let s = d.for_steps(4);
+        assert!(s.switch >= 1 && s.switch < 4, "{s:?}");
+    }
 
     /// Upstream's own functions on fixed inputs (reference/mpeg-diffusion/tt_ref.py fixtures): the region mask from
     /// scores, the plan's index lists, the packed sequence's positions, the Level-of-Token layout, the tail's sigmas
