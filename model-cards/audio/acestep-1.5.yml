@@ -12,6 +12,10 @@ about: 'ACE-Step''s 1.5 turbo: a 2B flow DiT (24 layers; 8 steps, guidance disti
 gpus: '1'
 vram_gib: 11.3                  # 9.7 GiB of weights (DiT 4.8 with its audio codes, planner LM 3.5, text encoder 0.8, VAE 0.6); peak 11.2-11.5 GiB
 headroom_gib: 1.6               #   measured on the 5070 and the 3060 (30 to 240 s, a cover of 90 s)
+                                #   SYCL (2026-11-18): the VAE's convolutions in the silo (docs/ports/acestep.md) hold, during
+                                #   a pass only, the VAE's weights in oneDNN's layouts (encoder 0.3, decoder 0.5 GiB) and a
+                                #   0.7 GiB scratchpad: a cover's 30 s-window encode peaks ~1 GiB above the shared kernels'
+                                #   (+2.1 GiB of window buffers either way; 15 s windows when the card has not that free)
 defaults:
   seconds: 30.0
   steps: 8

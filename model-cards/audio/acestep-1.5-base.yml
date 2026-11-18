@@ -11,6 +11,7 @@ title: 'ACE-Step 1.5 base (a track made in a recording''s context - the platform
 about: 'ACE-Step''s 1.5 base DiT (not distilled: 50 steps, guidance 7 through APG) with the turbo''s text encoder and VAE, for lego: audio.generate task lego with audio (an instrumental), the track (vocals) sung to input over it; the planner LM not loaded'
 gpus: '1'
 vram_gib: 9.0                   # 6.2 GiB of weights; peak 8.8 GiB (60 s of vocals over an instrumental, the 5070)
+                                # SYCL: the VAE silo's pass adds ~1 GiB at its peak (acestep-1.5.yml, docs/ports/acestep.md)
 defaults:
   seconds: 30.0
   steps: 50
