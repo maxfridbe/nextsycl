@@ -13,6 +13,8 @@
 //     -Xsycl-target-backend=spir64_gen "-device bmg-g31" -Xspirv-translator
 //     -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate -o sagebench
 //   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./sagebench 16434 56 20
+// P-H3-Image's copy of the kernel (kernels/image/ph3image/silo/tla) instead: -Ikernels/image/ph3image/silo/tla
+//   -Dns_image_h3i_tla_sage=ns_image_ph3_tla_sage (the same code under its own names; "silo" then means P-H3-Image's)
 #include <sycl/sycl.hpp>
 #include "sage.cpp"   // the silo's kernel (kernels/image/h3image/silo/tla/sage.cpp), with ARK's headers
 

@@ -73,6 +73,7 @@ const PIXELS: &[u32] = &[1_048_576, 4_194_304, 8_388_608];
 const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "threads", env: "NS_PH3_THREADS", value: "N", help: "threads reading the checkpoints at load (default 8)", at: At::Load },
     EngineOption { name: "sage-min-s", env: "NS_PH3_SAGE_MIN_S", value: "TOKENS", help: "the shortest sequence the silo's SageAttention takes (default 1024; shorter: oneDNN's)", at: At::Load },
+    EngineOption { name: "sage-tla", env: "NS_PH3_SAGE_TLA", value: "0|1", help: "the silo's own SageAttention kernel (libnextsycl-ph3image-tla.so: ARK's with the scale in the exponent, the result written as bfloat16 in place; default 1 when built; 0: ARK's kernel from libnextsycl-flash.so and a conversion pass)", at: At::Load },
     EngineOption { name: "vae-batch", env: "NS_PH3_VAE_BATCH", value: "N", help: "the decoder's tiles decoded together (default 16)", at: At::Load },
     EngineOption { name: "te-resident", env: "NS_PH3_TE_RESIDENT", value: "auto|0|1", help: "keep the text encoder on the card between requests (auto: when the card has room for it beside an 8 MP picture's work)", at: At::Load },
     EngineOption { name: "sigmas", env: "", value: "S,S,..,0", help: "another sampling grid than the checkpoint's 8 steps: strictly falling, ending at 0", at: At::Request },

@@ -1,4 +1,4 @@
-// sage.cpp: the P-H3-Image silo's SageAttention (silo.h). The kernel is H3's (libnextsycl-flash.so's nsflash_sage_square,
+// sage.cpp: the P-H3-Image silo's SageAttention (silo.h; MiniMax-H3-Image's silo, kernels/image/h3image/silo, keeps its own copy). The kernel is H3's (libnextsycl-flash.so's nsflash_sage_square,
 // ARK's int8 prefill on sycl-tla), the same the shared nsd_attention calls for long sequences; what is this silo's own are
 // the passes around it, which in the shared form take 14 ms of a 34 ms attention at P-H3-Image's 8 MP (8,318 tokens,
 // 56 heads of 128):
@@ -9,13 +9,20 @@
 //   the result  half [H, S, D] -> the activations [S, H * D], an element a work-item -> 16 bytes a work-item
 // The arithmetic is the shared form's (the scale m / 127, round half away from zero, clamp to 127); only the order of the
 // mean's sum differs.
+//
+// The kernel itself is this silo's own when its sycl-tla part is built (tla/sage.cpp -> libnextsycl-ph3image-tla.so
+// beside this library, opened on first use): ARK's kernel with its mainloop copied and changed (the scale folded into the
+// exponent) and the result written as bfloat16 straight into `out` - no half result, no conversion pass. Without that
+// library, or with NS_PH3_SAGE_TLA=0, ARK's own kernel from libnextsycl-flash.so and the conversion pass, as before.
 #include "ns.h"
 #include "ns_internal.hpp"
 #include "silo.h"
 
 #include <sycl/sycl.hpp>
 
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
@@ -64,37 +71,89 @@ bool load_flash() {
     return flash.sage != nullptr;
 }
 
-// per GPU: the int8 q and k, the scales, the half v and result, grown to the largest sequence seen
+// this silo's sycl-tla kernel (libnextsycl-ph3image-tla.so beside this library): its own entry and error
+using tla_fn = int (*)(void*, const int8_t*, const int8_t*, const void*, void*, const float*, const float*, int, int64_t, int64_t, int64_t, float);
+struct Tla {
+    tla_fn sage = nullptr;
+    err_fn err = nullptr;
+    bool tried = false;
+};
+Tla tla;
+
+bool load_tla() {
+    std::lock_guard<std::mutex> lk(flash_mu);
+    if (tla.tried) return tla.sage != nullptr;
+    tla.tried = true;
+    if (const char* e = std::getenv("NS_PH3_SAGE_TLA"); e && std::strcmp(e, "0") == 0) return false;
+    Dl_info me;
+    if (!dladdr((void*) &load_tla, &me) || !me.dli_fname) return false;
+    std::string self = me.dli_fname;
+    const size_t slash = self.rfind('/');
+    const std::string path = (slash == std::string::npos ? std::string(".") : self.substr(0, slash)) + "/libnextsycl-ph3image-tla.so";
+    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) return false;
+    tla.sage = (tla_fn) dlsym(h, "ns_image_ph3_tla_sage");
+    tla.err = (err_fn) dlsym(h, "ns_image_ph3_tla_error");
+    if (!tla.sage || !tla.err) tla.sage = nullptr;
+    return tla.sage != nullptr;
+}
+
+// per GPU: the int8 q and k, the scales, the half v, grown to the largest sequence seen; the half result only for ARK's
+// kernel (the silo's own writes `out` itself)
 struct Buffers {
     int8_t* iq = nullptr;
     int8_t* ik = nullptr;
     float* sc = nullptr;
     sycl::half* hv = nullptr;
     sycl::half* ao = nullptr;
-    size_t n = 0, nsc = 0;
+    size_t n = 0, nsc = 0, nao = 0;
 };
 std::mutex mu;
 std::map<ns_gpu*, std::unique_ptr<Buffers>> bufs;
 
-Buffers& buffers(ns_gpu* g, size_t n, size_t nsc) {
+Buffers& buffers(ns_gpu* g, size_t n, size_t nsc, size_t nao) {
     auto& b = bufs[g];
     if (!b) b = std::make_unique<Buffers>();
     if (b->n < n || b->nsc < nsc) {
         g->q.wait();
-        sycl::free(b->iq, g->q); sycl::free(b->ik, g->q); sycl::free(b->sc, g->q); sycl::free(b->hv, g->q); sycl::free(b->ao, g->q);
+        sycl::free(b->iq, g->q); sycl::free(b->ik, g->q); sycl::free(b->sc, g->q); sycl::free(b->hv, g->q);
         b->iq = sycl::malloc_device<int8_t>(n, g->q);
         b->ik = sycl::malloc_device<int8_t>(n, g->q);
         b->sc = sycl::malloc_device<float>(nsc, g->q);
         b->hv = sycl::malloc_device<sycl::half>(n, g->q);
-        b->ao = sycl::malloc_device<sycl::half>(n, g->q);
-        if (!b->iq || !b->ik || !b->sc || !b->hv || !b->ao) {
+        if (!b->iq || !b->ik || !b->sc || !b->hv) {
             b->n = b->nsc = 0;
             throw std::runtime_error("ph3 silo: the attention's buffers do not fit the card");
         }
         b->n = n;
         b->nsc = nsc;
     }
+    if (b->nao < nao) {
+        g->q.wait();
+        sycl::free(b->ao, g->q);
+        b->ao = sycl::malloc_device<sycl::half>(nao, g->q);
+        if (!b->ao) {
+            b->nao = 0;
+            throw std::runtime_error("ph3 silo: the attention's buffers do not fit the card");
+        }
+        b->nao = nao;
+    }
     return *b;
+}
+
+// NS_PH3_PROFILE (set, not 0): the queue drained after each phase, milliseconds summed per phase, printed every 50 calls (a step)
+struct Prof {
+    bool on = std::getenv("NS_PH3_PROFILE") != nullptr && std::strcmp(std::getenv("NS_PH3_PROFILE"), "0") != 0;
+    double ms[4] = {0, 0, 0, 0};
+    int calls = 0;
+};
+Prof prof;
+
+void report(int64_t S, int64_t H, int64_t D, bool own) {
+    const double f = 4.0 * (double) S * S * D * H * 50;
+    std::fprintf(stderr, "ph3 silo sage (%s), 50 calls of %lld tokens: preparation %.0f ms, kernel %.0f ms (%.1f TFLOPS), result %.0f ms\n",
+                 own ? "silo kernel" : "ARK kernel", (long long) S, prof.ms[0], prof.ms[1], f / prof.ms[1] / 1e9, prof.ms[2]);
+    prof.ms[0] = prof.ms[1] = prof.ms[2] = 0;
 }
 
 inline float bf(uint16_t h) {
@@ -114,16 +173,17 @@ extern "C" {
 int ns_image_ph3_silo_sage_supported(ns_gpu* g, int64_t S, int64_t H, int64_t D) {
     (void) g;
     if (D != 128 || S < BLOCK || H <= 0 || S > INT32_MAX / D / H) return 0;
-    return load_flash() ? 1 : 0;
+    return load_tla() || load_flash() ? 1 : 0;
 }
 
 int ns_image_ph3_silo_sage(ns_gpu* g, const void* qkv, int64_t S, int64_t H, int64_t D, int64_t stride, void* out) try {
-    if (D != 128 || stride % 8 != 0 || !load_flash()) return ns_fail("ph3 silo sage: D 128, a row stride of whole 16-byte vectors, flash");
+    const bool own = load_tla();
+    if (D != 128 || stride % 8 != 0 || (!own && !load_flash())) return ns_fail("ph3 silo sage: D 128, a row stride of whole 16-byte vectors, a kernel");
     std::lock_guard<std::mutex> lk(mu);
     sycl::queue& q = g->q;
     const int64_t HD = H * D, nb = (S + BLOCK - 1) / BLOCK;
     const size_t n = (size_t) S * HD;
-    Buffers& b = buffers(g, n, (size_t) (2 * H * nb + HD));
+    Buffers& b = buffers(g, n, (size_t) (2 * H * nb + HD), own ? 0 : n);
     int8_t* iq = b.iq;
     int8_t* ik = b.ik;
     float* qs = b.sc;
@@ -132,6 +192,16 @@ int ns_image_ph3_silo_sage(ns_gpu* g, const void* qkv, int64_t S, int64_t H, int
     sycl::half* hv = b.hv;
     sycl::half* ao = b.ao;
     const uint16_t* x = static_cast<const uint16_t*>(qkv);
+    auto clock = std::chrono::steady_clock::now();
+    auto lap = [&](int i) {
+        if (!prof.on) return;
+        q.wait();
+        const auto now = std::chrono::steady_clock::now();
+        prof.ms[i] += std::chrono::duration<double, std::milli>(now - clock).count();
+        clock = now;
+    };
+    lap(3);   // whatever was queued before: not counted below
+    prof.ms[3] = 0;
 
     // k's column sums: a work-item a (slice of SLICE rows, 8 columns)
     q.memset(ksum, 0, (size_t) HD * sizeof(float));
@@ -197,7 +267,17 @@ int ns_image_ph3_silo_sage(ns_gpu* g, const void* qkv, int64_t S, int64_t H, int
             *reinterpret_cast<sycl::vec<int8_t, 8>*>(dst + (h * S + r) * D + d) = o;
         }
     });
+    lap(0);
+    if (own) {
+        // the silo's kernel: the result straight into `out`
+        if (tla.sage(&q, iq, ik, hv, out, qs, ks, (int) BLOCK, S, H, D, 1.0f / std::sqrt((float) D)) != 0) return ns_fail(tla.err());
+        lap(1);
+        lap(2);
+        if (prof.on && ++prof.calls % 50 == 0) report(S, H, D, true);
+        return 0;
+    }
     if (flash.sage(&q, iq, ik, hv, ao, qs, ks, (int) BLOCK, S, H, D, 1.0f / std::sqrt((float) D)) != 0) return ns_fail(flash.err());
+    lap(1);
     // the result [H, S, D] half -> [S, H * D] bfloat16, 8 values a work-item
     uint16_t* o = static_cast<uint16_t*>(out);
     q.parallel_for(sycl::range<2>((size_t) S, (size_t) (HD / 8)), [=](sycl::id<2> id) {
@@ -207,6 +287,8 @@ int ns_image_ph3_silo_sage(ns_gpu* g, const void* qkv, int64_t S, int64_t H, int
         for (int j = 0; j < 8; ++j) w[j] = to_bf((float) v[j]);
         *reinterpret_cast<sycl::vec<uint16_t, 8>*>(o + s * HD + c) = w;
     });
+    lap(2);
+    if (prof.on && ++prof.calls % 50 == 0) report(S, H, D, false);
     return 0;
 } catch (const std::exception& e) {
     return ns_fail(std::string("ph3 silo sage: ") + e.what());
