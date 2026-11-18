@@ -824,6 +824,10 @@ impl<'a> Denoiser<'a> {
         x.copy_rows(ts_text.start, &self.text, 0, ts_text.stop - ts_text.start)?;
         x.copy_rows(ts_audio.start, &embed(pack_audio(audio, o.audio_c, sh.audio_t), na, &o.audio_patch)?, 0, na)?;
         x.copy_rows(ts_video.start, &embed(patchify(lr, o.video_c, sh.t, sh.h, sh.w), nv, &o.video_patch)?, 0, nv)?;
+        // the keyframes' half-res rows (and the sound's), embedded once, as `net` puts them in place
+        for (start, rows) in &self.cond_rows {
+            x.copy_rows(*start, rows, 0, rows.shape[0])?;
+        }
         if nh > 0 {
             x.copy_rows(ts_video.stop, &embed(hr_rows, nh, &o.video_patch)?, 0, nh)?;
         }

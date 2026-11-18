@@ -1296,6 +1296,30 @@ pub fn sample(d: &mut crate::denoiser::Denoiser, spec: &Spec, kfs: &Keyframes, s
     let t2 = Instant::now();
     for k in 0..tail.len() - 1 {
         let i = st.switch + k;
+        if k == 0 && spec.cond_dump.is_some() {
+            // the conditioning checks: the two-track call's half-res track (text, keyframes, sound, half-res video) is H3 at
+            // half size - its outputs against `net`'s on the same inputs
+            let sc = d.schedule;
+            let s = tail[0].max(1e-6);
+            let sa = crate::layout::time_shift_sigma(s as f64, sc.shift_video as f64, sc.shift_audio as f64) as f32;
+            let audio_in: Vec<f32> = xa.iter().map(|x| x * sa / s).collect();
+            let (v1, a1) = d.net(&xv, &audio_in, tail[0], &mut |_| Ok(()))?;
+            let (v2, _, a2) = d.net_two_track(&tt, &xv, &xh, &audio_in, tail[0], &mut |_| Ok(()))?;
+            let cmp = |a: &[f32], b: &[f32]| -> (f64, f64) {
+                let (mut m, mut num, mut den) = (0f64, 0f64, 0f64);
+                for (x, y) in a.iter().zip(b) {
+                    let e = (*x as f64 - *y as f64).abs();
+                    m = m.max(e);
+                    num += e * e;
+                    den += (*x as f64) * (*x as f64);
+                }
+                (m, (num / den.max(1e-30)).sqrt())
+            };
+            let (cv, ca) = (cmp(&v1, &v2), cmp(&a1, &a2));
+            log(format!("mpeg   : check: the two-track call's half-res video against H3's own call at sigma {}: max {:.3e}, rel {:.3e}; sound max {:.3e}, rel {:.3e}",
+                        tail[0], cv.0, cv.1, ca.0, ca.1));
+            report["check_half_res_call"] = serde_json::json!({"video_max": cv.0, "video_rel": cv.1, "audio_max": ca.0, "audio_rel": ca.1});
+        }
         if k == 0 && spec.dump.is_some() {
             dump(d, &tt, &maps, spec.dump.unwrap_or(Path::new("")), (&xv, &xh, &xa), tail[0], (&states_kept, &scores), log)?;
         }
