@@ -13,7 +13,10 @@ events, docs/api/realtime.md) or the model's page (Conversation), stream your mi
 
 ## The session
 - `instructions`: a system prompt of your own (a persona, a task). Without one it is Sophon, answering in one or two
-  natural spoken sentences. It was tuned with its own; keep yours short and spoken in style, and say it may use sound
+  natural spoken sentences - and in full when asked for something long (a story, an explanation, a list: up to ~11
+  minutes spoken, 2,048 tokens unless max_response_output_tokens says otherwise). Upstream's prompt held every answer
+  to a sentence or two (asked for a story, it declined); a prompt of your own should say long requests are welcome
+  if they are. It was tuned with its own; keep yours short and spoken in style, and say it may use sound
   tags, or it uses fewer.
 - `voice`: `chelsie` (default) or `brand`, or a saved voice by its name (its recording cloned: 3-15 s of one speaker,
   clean). Only clone your own voice or one you have permission to use.
