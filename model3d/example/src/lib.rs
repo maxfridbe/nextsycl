@@ -77,7 +77,7 @@ impl Model3dEngine for Example {
     }
     /// what it does: a generator says how many pictures it takes and whether it paints; a rigger whether it animates
     fn abilities(&self) -> Abilities {
-        Abilities { generate: true, texture: false, views: 1, rig: false, animate: false, splats: false }
+        Abilities { generate: true, texture: false, views: 1, rig: false, animate: false, splats: false, refine: false }
     }
     /// what a request gets when it leaves a setting out
     fn defaults(&self) -> Defaults {

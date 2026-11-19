@@ -112,6 +112,8 @@ model3d/                   3D
   rignet     nextsycl-model3d-rignet   RigNet (GPLv3, its own crate): a skeleton and skin weights from graph networks
   trellis2   nextsycl-model3d-trellis2  TRELLIS.2 and Pixal3D (arch pixal3d): DINOv3, the flow DiTs, the sparse
                                  decoders, the dual-grid mesh, the PBR bake, stage checks
+  hi3d       nextsycl-model3d-hi3d     Hi3D v1.0: a coarse mesh refined like its picture (DINOv2 + CLIP, the sparse
+                                 flow transformers, the self-pruning decoder, FlexiCubes), stage checks
   example    nextsycl-model3d-example  a template
 
 glue/                      WHAT MAKES ENGINES A PRODUCT (libraries too)
@@ -707,6 +709,20 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   kernels do the linears and attention. Checked against `reference/budget3d/ref.py` (and `encoders.py` for the picture
   side) stage by stage (docs/ports/budget3d-idol.md has the numbers). Settings: `NS_M3D_B3D_RESIDENT`,
   `NS_M3D_B3D_PROFILE`; per request `--opt-budget`, `--opt-gaussians`, `--opt-mode`.
+- **hi3d** (`model3d/hi3d`, arch `hi3d`) - Hi3D v1.0 (built on Sparc3D): a coarse mesh and a picture of the same object
+  to a high-resolution geometry-only mesh (`Abilities::refine`: `generate` with `MeshRequest::mesh`; the front door's
+  `model3d.refine`, which makes the coarse mesh first with a generator when none is given). The picture framed as
+  `prepare_image` does, DINOv2-large at 756 px and CLIP ViT-L/14's pooled embedding (L2-normed, side by side: 2,917 x
+  2,048); the mesh's surface voxels (the Triton voxelizer's separating-axis test on the CPU, shrunk 5 % at a time to the
+  pass's budget); per pass (64 -> 512, 128 -> 1024, 192 -> 1536) 25 Heun updates of the 1.8B sparse flow transformer
+  (submanifold-conv I/O stages around 24 blocks of 2112 on the downsampled voxels, rotary positions then QK RMS norm,
+  guidance against the zero condition from sigma 0.7) and the self-pruning PTv3 decoder (group norms over all voxels,
+  window attention along z-order at the latent level, three occupancy-pruned doublings, children's neighbour maps from
+  their parents'); FlexiCubes and ear-clipped holes on the CPU; components, decimation, unit radius. Its kernels
+  (`kernels/model3d/hi3d`; silo `kernels/model3d/hi3d/silo`: fused products, sub-group layer norms): the gathers, the
+  paired downsample's mean, PointGroupNorm, window attention, the rope-then-RMS q / k, heads padded to 128 for the
+  flash kernel. Checked against `reference/hi3d/ref.py` stage by stage (docs/ports/hi3d.md). Settings:
+  `NS_M3D_HI3D_RESIDENT`, `NS_M3D_HI3D_PROFILE`; per request `--opt-euler`.
 
 ## The model registry
 

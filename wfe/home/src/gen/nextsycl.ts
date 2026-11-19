@@ -1476,7 +1476,7 @@ export interface Model3dGenerateReq {
   cfg?: number | null;
   /** at most this many triangles (decimated to it) */
   faces?: number | null;
-  /** or a GLB made here to paint (its file name or url), as mesh */
+  /** or a GLB made here to paint or refine (its file name or url), as mesh */
   file?: string | null;
   /**
    * queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch
@@ -1501,7 +1501,7 @@ export interface Model3dGenerateReq {
    * @maxLength 120
    */
   title?: string | null;
-  /** a mesh to paint instead of making one (a model whose card says paint: Hunyuan3D 2.1, hunyuan3d-2.1-paint): a GLB or OBJ as base64 or a data: URL; image says how it is painted */
+  /** a mesh to paint instead of making one (a model whose card says paint: Hunyuan3D 2.1, hunyuan3d-2.1-paint), or to refine (a model whose card says refine, named: Hi3D - model3d.refine): a GLB or OBJ as base64 or a data: URL; image says how it is painted or what it looks like */
   mesh?: string | null;
   /** the model's id; none: the loaded one, else the first enabled */
   model?: string | null;
@@ -1635,6 +1635,105 @@ export interface Model3dQueueResumeReq {
   project?: string | null;
   /** or the reentrant_id it was submitted with (used when label is absent or empty) */
   reentrant_id?: string | null;
+  /** other keys */
+  [key: string]: unknown;
+}
+
+/** What model3d.refine takes. */
+export interface Model3dRefineReq {
+  /**
+   * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
+  /**
+   * a group inside the project
+   * @maxLength 60
+   */
+  batch?: string | null;
+  /** no mesh given: the model that makes the coarse mesh from the picture first (default: hunyuan3d-2mini-turbo when enabled, else the loaded or first enabled mesh generator); its GLB is linked as coarse */
+  coarse_model?: string | null;
+  /**
+   * the final triangle budget (default 1,000,000; 2,000,000 at 1536)
+   * @minimum 1000
+   */
+  faces?: number | null;
+  /** or the coarse mesh as a GLB made here (its file name or url) */
+  file?: string | null;
+  /**
+   * queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch
+   * @default false
+   */
+  held?: boolean | null;
+  /** the picture of the object: PNG, JPEG or WebP as base64, a data: URL or upload:<name> (model3d.upload); a transparent background frames it by its alpha, an opaque one is cut out (remove_background) */
+  image: string;
+  /**
+   * names the job for <kind>.status and <kind>.cancel (default: its id)
+   * @maxLength 120
+   */
+  label?: string | null;
+  /**
+   * a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+   * @maxLength 120
+   */
+  title?: string | null;
+  /** the coarse mesh of the same object, posed as in the picture: GLB or OBJ as base64, a data: URL or upload:<name>; none (and no file): coarse_model makes it first */
+  mesh?: string | null;
+  /** the refining model's id (system.models: capabilities refine); none: the loaded one, else the first enabled */
+  model?: string | null;
+  /** the engine's own (model3d.info lists them: euler) */
+  options?: Record<string, unknown> | null;
+  /**
+   * a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)
+   * @minimum -9
+   * @maximum 9
+   * @default 0
+   */
+  priority?: number | null;
+  /**
+   * a group of jobs held or released together (<kind>.queue.pause / resume), listed with <kind>.jobs {project}
+   * @maxLength 60
+   */
+  project?: string | null;
+  /**
+   * false: refused at once (409 busy, retryable) when the job would not start now - a server free and no runnable job waiting before it; true (default): it waits its turn
+   * @default true
+   */
+  queue?: boolean | null;
+  /**
+   * idempotent submit (as model3d.generate)
+   * @maxLength 200
+   */
+  reentrant_id?: string | null;
+  /**
+   * cut the background out of an opaque picture
+   * @default true
+   */
+  remove_background?: boolean | null;
+  /**
+   * the extraction grid: 512 (one pass), 1024 (two) or 1536 (three); default: the model's (model3d.info)
+   * @minimum 512
+   * @maximum 1536
+   */
+  resolution?: number | null;
+  /** the noise (and the coarse model's, when it makes one) */
+  seed?: number | null;
+  /**
+   * scheduler updates a pass (default 25)
+   * @minimum 1
+   * @maximum 200
+   */
+  steps?: number | null;
+  /**
+   * true: answer when it ends (the job goes on if the call drops); false: answer at once with the job
+   * @default true
+   */
+  wait?: boolean | null;
   /** other keys */
   [key: string]: unknown;
 }
@@ -3082,6 +3181,12 @@ export interface Methods {
    */
   "model3d.generate": { req: Model3dGenerateReq; resp: any };
   /**
+   * A coarse mesh refined like its picture into a high-resolution, geometry-only mesh (Hi3D: recentred, unit radius); with no mesh or file the coarse mesh is made first from the same picture (coarse_model, hunyuan3d-2mini-turbo by default) and linked as coarse. The answer links the refined GLB. A job like model3d.generate (wait, reentrant_id, status, cancel)
+   * @tags model3d
+   * @example {"image":"data:image/png;base64,iVBORw0...","model":"hi3d-1.0","resolution":1024,"seed":0,"wait":false}
+   */
+  "model3d.refine": { req: Model3dRefineReq; resp: any };
+  /**
    * A mesh given a skeleton and skin weights (UniRig, RigNet), or set in motion by words (AnimateAnyMesh: prompt); the answer links the rigged or animated GLB. A job like model3d.generate
    * @tags model3d
    * @example {"file":"1792132541-trellis2-42.glb","model":"unirig"}
@@ -3743,6 +3848,12 @@ export function client(post: Post, raw?: PostRaw) {
      * @example {"image":"data:image/png;base64,iVBORw0...","model":"trellis2","reentrant_id":"chair-1","seed":42,"texture":true,"wait":false}
      */
     "model3d.generate": (req: Model3dGenerateReq): Promise<any> => post("model3d.generate", req),
+    /**
+     * A coarse mesh refined like its picture into a high-resolution, geometry-only mesh (Hi3D: recentred, unit radius); with no mesh or file the coarse mesh is made first from the same picture (coarse_model, hunyuan3d-2mini-turbo by default) and linked as coarse. The answer links the refined GLB. A job like model3d.generate (wait, reentrant_id, status, cancel)
+     * @tags model3d
+     * @example {"image":"data:image/png;base64,iVBORw0...","model":"hi3d-1.0","resolution":1024,"seed":0,"wait":false}
+     */
+    "model3d.refine": (req: Model3dRefineReq): Promise<any> => post("model3d.refine", req),
     /**
      * A mesh given a skeleton and skin weights (UniRig, RigNet), or set in motion by words (AnimateAnyMesh: prompt); the answer links the rigged or animated GLB. A job like model3d.generate
      * @tags model3d

@@ -1,0 +1,14 @@
+[package]
+name = "nextsycl-model3d-hi3d"
+description = "Hi3D v1.0 (Sparc3D refinement): a coarse mesh and a picture to a high-resolution mesh - DINOv2 + CLIP conditioning, the 1.8B sparse flow transformers, the self-pruning sparse decoder, FlexiCubes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-model3d.workspace = true
+nextsycl-remover.workspace = true
+serde_json.workspace = true

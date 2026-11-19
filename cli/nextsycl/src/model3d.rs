@@ -12,6 +12,8 @@ const USAGE: &str = "nextsycl model3d gen PICTURE [PICTURE[:SIDE]]... [--model I
                    [--resolution N] [--faces N] [--texture-size N] [--mesh FILE.glb|.obj (paint it like the picture; a model that paints)] [--keep-background] [--set NAME=VALUE]... [--opt-NAME VALUE]...
                    [--out FILE.glb|DIR] [--gpu N]                 a mesh from a picture (or several views: front, back, left, right);
                    a splatting model (Budget3D-Idol: --opt-budget 0.5) makes 3D Gaussian splats, FILE.ply
+nextsycl model3d refine PICTURE --mesh COARSE.glb|.obj [--model ID] [--resolution 512|1024|1536] [--seed N] [--steps N] [--faces N] [--keep-background]
+                   [--opt-NAME VALUE]... [--out FILE.glb|DIR] [--gpu N]   a coarse mesh refined like the picture (Hi3D: geometry only, unit radius)
 nextsycl model3d rig MESH.glb|.obj [--model ID] [--prompt \"the motion\"] [--frames N] [--fps X] [--seed N] [--out FILE.glb|DIR] [--gpu N]
                    a skeleton and skin weights (UniRig, RigNet), or motion from words (AnimateAnyMesh)
 nextsycl model3d serve [MODEL] [--port 8088] [--host 127.0.0.1] [--gpu N] [--set NAME=VALUE]... [--wfe] [--out DIR] [--cors ORIGIN]
@@ -30,13 +32,15 @@ nextsycl model3d check DUMP_DIR [--model ID] [--stages pre,remover,dino,ss,ssdec
                    an engine's stages against reference/trellis2/ref.py's dumps
 nextsycl model3d check DUMP_DIR --model ID [--stages noise,ctx,layout,tokens,call,sample,dec | pre,enc | bench] [--gpu N]
                    Budget3D-Idol's stages against reference/budget3d/ref.py's dumps (pre,enc: encoders.py's; bench: timed objects from the zero condition)
+nextsycl model3d check DUMP_DIR --model ID [--stages pre,cond,vox,dit,steps,vae,mesh,post,full] [--structure 64|128] [--picture P] [--mesh COARSE.glb] [--seed N] [--gpu N]
+                   Hi3D's stages against reference/hi3d/ref.py's dumps
 nextsycl model3d engines | selftest [--gpu N]";
 
 /// The 3D engines this program has (model3d/<arch>)
 pub fn engines() -> Vec<nextsycl_model3d::Model3dKind> {
     vec![nextsycl_model3d_trellis2::kind(), nextsycl_model3d_trellis2::kind_pixal(), nextsycl_model3d_hunyuan3d::kind(), nextsycl_model3d_unirig::kind(), nextsycl_model3d_skintokens::kind(),
          nextsycl_model3d_rignet::kind(), nextsycl_model3d_animateanymesh::kind(), nextsycl_model3d_unimate::kind(), nextsycl_model3d_budget3d::kind(),
-         nextsycl_model3d_example::kind()]
+         nextsycl_model3d_hi3d::kind(), nextsycl_model3d_example::kind()]
 }
 
 fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {
@@ -150,6 +154,11 @@ fn load(cfg: &Config, args: &[String], want: &str) -> Result<(Value, Box<dyn nex
 }
 
 fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
+    gen_as(cfg, args, false)
+}
+
+/// `gen`, or `refine` (a coarse mesh given, a model that refines: want "refine")
+fn gen_as(cfg: &Config, args: &[String], refine: bool) -> Result<(), String> {
     let pics = positional(args);
     if pics.is_empty() {
         return Err(USAGE.into());
@@ -169,7 +178,10 @@ fn gen(cfg: &Config, args: &[String]) -> Result<(), String> {
         Some(f) => Some(nextsycl_model3d::read_mesh(&std::fs::read(f).map_err(|e| format!("{f}: {e}"))?).map_err(|e| format!("{f}: {e}"))?),
         None => None,
     };
-    let (m, e) = load(cfg, args, if given.is_some() { "texture" } else { "generate" })?;
+    if refine && given.is_none() {
+        return Err("refine: --mesh COARSE.glb (the coarse mesh of the object in the picture)".into());
+    }
+    let (m, e) = load(cfg, args, if refine { "refine" } else if given.is_some() { "texture" } else { "generate" })?;
     let a = e.abilities();
     let texture = if args.iter().any(|x| x == "--no-texture") { false } else { args.iter().any(|x| x == "--texture") || a.texture };
     let seed = seed(args)?;
@@ -339,6 +351,15 @@ fn check(cfg: &Config, args: &[String]) -> Result<(), String> {
     let worst = match m["arch"].as_str().unwrap_or("") {
         nextsycl_model3d_hunyuan3d::ARCH_21 | nextsycl_model3d_hunyuan3d::ARCH_MINI => return check_hunyuan3d(cfg, args),
         nextsycl_model3d_trellis2::ARCH | nextsycl_model3d_trellis2::ARCH_PIXAL => return check_trellis2(cfg, args),
+        nextsycl_model3d_hi3d::ARCH => {
+            let e = nextsycl_model3d_hi3d::Hi3d::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
+            let st = stages("pre,cond,vox,dit,steps,vae,mesh,post");
+            let st: Vec<&str> = st.iter().map(String::as_str).collect();
+            let pic = opt(args, "--picture").map(|p| nextsycl_model3d_hi3d::Picture::decode(&std::fs::read(p).map_err(|e| format!("{p}: {e}"))?)).transpose()?;
+            let mesh = opt(args, "--mesh").map(read_any).transpose()?;
+            let structure = num(args, "--structure")?.unwrap_or(64);
+            nextsycl_model3d_hi3d::check::run(&e, &dir, &st, structure, pic.as_ref(), mesh.as_ref(), num(args, "--seed")?.unwrap_or(0), &mut log).map_err(|e| e.0)?
+        }
         nextsycl_model3d_budget3d::ARCH => {
             let e = nextsycl_model3d_budget3d::Budget3d::load(&files, &g, &options(&m, args)?, &mut log).map_err(|e| e.0)?;
             let st = stages("noise,ctx,layout,tokens,call,sample,dec");
@@ -509,6 +530,7 @@ pub fn cmd(cfg: &Config, args: &[String], selftest: impl Fn(&[String]) -> Result
         }
         Some("selftest") => selftest(rest),
         Some("gen" | "generate") => gen(cfg, rest),
+        Some("refine") => gen_as(cfg, rest, true),
         Some("rig" | "animate") => rig(cfg, rest),
         Some("tool" | "tools") => tool(rest),
         Some("check") => check(cfg, rest),

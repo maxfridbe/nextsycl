@@ -731,6 +731,7 @@ dependencies = [
  "nextsycl-model3d-animateanymesh",
  "nextsycl-model3d-budget3d",
  "nextsycl-model3d-example",
+ "nextsycl-model3d-hi3d",
  "nextsycl-model3d-hunyuan3d",
  "nextsycl-model3d-rignet",
  "nextsycl-model3d-skintokens",
@@ -1360,6 +1361,18 @@ version = "0.0.0"
 dependencies = [
  "nextsycl-core",
  "nextsycl-model3d",
+]
+
+[[package]]
+name = "nextsycl-model3d-hi3d"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-model3d",
+ "nextsycl-remover",
+ "serde_json",
 ]
 
 [[package]]

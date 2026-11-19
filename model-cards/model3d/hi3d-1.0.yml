@@ -1,0 +1,77 @@
+# Hi3D v1.0 (a coarse mesh refined like its picture: geometry to 1024^3, or 1536^3; Hi3D Open License 1.0)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: hi3d-1.0
+kind: model3d
+arch: hi3d
+license: hi3d-open-license-1.0
+commercial: true
+license_note: 'Hi3D Open License Agreement v1.0 (OCEANO HK HOLDING LIMITED) for the eight Hi3D files: commercial use allowed; a product or service using it above 200,000 monthly active users or USD 1,000,000 monthly revenue must notify the licensor and apply for a separate licence within 60 days; commercial integrations display "Powered by Hi3D 1.0" (linking http://hi3d.ai/); distributing the weights carries the Agreement, its NOTICE text and the Acceptable Use Policy (Schedule 1); outputs (meshes) that contain no Hi3D materials carry none of these duties. Third-party parts keep their own terms: TRELLIS / Pointcept / O-CNN code MIT, FlexiCubes Apache-2.0; the DINOv2-large weights Apache-2.0, CLIP ViT-L/14 MIT; BiRefNet MIT. A coarse mesh from hunyuan3d-2mini-turbo keeps the Hunyuan licence.'
+title: 'Hi3D v1.0 (refines a coarse mesh like its picture: geometry to 1024^3; Hi3D Open License)'
+about: 'Hi3D v1.0 on Sparc3D: the coarse mesh voxelized at 64^3, DINOv2-large (756 px) and CLIP ViT-L/14 condition two 1.8B sparse flow transformers (24 blocks of 2112, 25 Heun updates a pass, guided above sigma 0.7), a self-pruning sparse decoder to signed distances 8x finer and FlexiCubes - 512^3 in one pass, 1024^3 in two (re-voxelized at 128^3), 1536^3 in three; pieces under 0.5 % dropped, decimated to a million faces, recentred to unit radius. Geometry only; give it the picture and a coarse mesh of the same object (hunyuan3d-2mini-turbo makes one in seconds)'
+does: [refine]
+gpus: '0'
+vram_gib: 14.0                   # its memory on the card when it runs (models load stage by stage)
+env: {}
+files:
+  index:
+    key: hi3d-index
+    url: https://huggingface.co/hi3d-official/Hi3Dv1.0/resolve/23d1bace196f618265b4b0b9c90d95fa9a9b1df5/model_index.json
+    size: 224
+    sha256: e24988612733dad44b7354fbfa0b2ef50073ba6ef8d7a677e41023dc2d651386
+    path: hi3d-1.0/model_index.json
+  scheduler:
+    key: hi3d-scheduler
+    url: https://huggingface.co/hi3d-official/Hi3Dv1.0/resolve/23d1bace196f618265b4b0b9c90d95fa9a9b1df5/scheduler/scheduler_config.json
+    size: 127
+    sha256: 40cdcdaaa6149dea32b86a5ff730e581b069ae619d7f580444ef503737fb0bf3
+    path: hi3d-1.0/scheduler/scheduler_config.json
+  vae_config:
+    key: hi3d-vae-config
+    url: https://huggingface.co/hi3d-official/Hi3Dv1.0/resolve/23d1bace196f618265b4b0b9c90d95fa9a9b1df5/vae/config.json
+    size: 131
+    sha256: 71c629eb188485786227277c7bb5b0fa0a1bfcf07a3d21316174da6b4d04f92f
+    path: hi3d-1.0/vae/config.json
+  vae:
+    key: hi3d-vae
+    url: https://huggingface.co/hi3d-official/Hi3Dv1.0/resolve/23d1bace196f618265b4b0b9c90d95fa9a9b1df5/vae/model.safetensors
+    size: 376629712
+    sha256: 605d207c77f8db0b33c567a5861252f0090cf3c3604dfda1cfee09e8f0b53f3e
+    path: hi3d-1.0/vae/model.safetensors
+  transformer_512_config:
+    key: hi3d-transformer-512-config
+    url: https://huggingface.co/hi3d-official/Hi3Dv1.0/resolve/23d1bace196f618265b4b0b9c90d95fa9a9b1df5/transformer_512/config.json
+    size: 1336
+    sha256: 809189b8183c3f44118751322f2cb6fe6fa4ca1922ea16c88cd032970d4bc937
+    path: hi3d-1.0/transformer_512/config.json
+  transformer_512:
+    key: hi3d-transformer-512
+    url: https://huggingface.co/hi3d-official/Hi3Dv1.0/resolve/23d1bace196f618265b4b0b9c90d95fa9a9b1df5/transformer_512/model.safetensors
+    size: 3675679280
+    sha256: 8ba88311dccf23463c6e10dd0d3bd5e0c5c35d1608c6f466413b6428b5ad8e56
+    path: hi3d-1.0/transformer_512/model.safetensors
+  transformer_1024_config:
+    key: hi3d-transformer-1024-config
+    url: https://huggingface.co/hi3d-official/Hi3Dv1.0/resolve/23d1bace196f618265b4b0b9c90d95fa9a9b1df5/transformer_1024/config.json
+    size: 1337
+    sha256: 2f96d851844e159523cb6cf5e5b29ddbc1354e222a333232612c19e1eaf278c2
+    path: hi3d-1.0/transformer_1024/config.json
+  transformer_1024:
+    key: hi3d-transformer-1024
+    url: https://huggingface.co/hi3d-official/Hi3Dv1.0/resolve/23d1bace196f618265b4b0b9c90d95fa9a9b1df5/transformer_1024/model.safetensors
+    size: 3675679280
+    sha256: a2ca5e44dde51cacecd59b42fceeb5f14e75d55e6dd047337752c4e6f281008c
+    path: hi3d-1.0/transformer_1024/model.safetensors
+  dino:
+    key: dinov2-large
+    url: https://huggingface.co/facebook/dinov2-large/resolve/47b73eefe95e8d44ec3623f8890bd894b6ea2d6c/model.safetensors
+    size: 1217522888
+    sha256: 399fba97a95f22c36834418bc69373364a99af3a1153da1c0fb31db567c92e23
+    path: hi3d-1.0/dinov2-large/model.safetensors
+  clip:
+    key: clip-vit-large-patch14
+    url: https://huggingface.co/openai/clip-vit-large-patch14/resolve/32bd64288804d66eefd0ccbe215aa642df71cc41/model.safetensors
+    size: 1710540580
+    sha256: a2bf730a0c7debf160f7a6b50b3aaf3703e7e88ac73de7a314903141db026dcb
+    path: hi3d-1.0/clip-vit-large-patch14/model.safetensors
+  remover: birefnet             # the shared background remover (BiRefNet; defined in trellis2.yml): an opaque picture is cut out
+guide: guides/hi3d.md

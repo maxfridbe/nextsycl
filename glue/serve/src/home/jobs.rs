@@ -1,5 +1,5 @@
 //! Image, audio and 3D requests as jobs, the way the video studio keeps clips: `image.generate`, `image.edit`,
-//! `audio.generate`, `audio.speak`, `audio.transcribe`, `model3d.generate` and `model3d.rig` each become a job with a label, run here in the background (the HTTP call that
+//! `audio.generate`, `audio.speak`, `audio.transcribe`, `model3d.generate`, `model3d.rig` and `model3d.refine` each become a job with a label, run here in the background (the HTTP call that
 //! asked for it can drop: the job goes on), and are read with `<kind>.status {label}` (one) or `<kind>.jobs` (the
 //! list), and stopped with `<kind>.cancel {label}`. With `wait` (the default) the call answers when the job ends;
 //! `wait: false` answers at once with the job. A `reentrant_id` makes a submit idempotent: one that names the id of a
@@ -27,8 +27,8 @@ use super::{now, Home};
 use crate::http::{call_for, Target};
 
 /// The methods that run as jobs
-pub const METHODS: [&str; 14] = ["image.generate", "image.edit", "image.upscale", "image.vectorize", "image.remove_background", "image.describe", "video.upscale", "audio.generate", "audio.speak", "audio.transcribe",
-    "audio.edit", "audio.voices.enroll", "model3d.generate", "model3d.rig"];
+pub const METHODS: [&str; 15] = ["image.generate", "image.edit", "image.upscale", "image.vectorize", "image.remove_background", "image.describe", "video.upscale", "audio.generate", "audio.speak", "audio.transcribe",
+    "audio.edit", "audio.voices.enroll", "model3d.generate", "model3d.rig", "model3d.refine"];
 
 /// The queue a method's jobs wait in: its prefix, but video.upscale runs on the image servers (an upscaler there) and
 /// so waits with the image jobs (image.status / image.cancel read it), as does video.control's depth (a depth model's)

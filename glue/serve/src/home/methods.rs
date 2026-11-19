@@ -2256,7 +2256,7 @@ pub struct Model3dGenerateReq {
     /// at most this many triangles (decimated to it)
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
     pub faces: Option<i64>,
-    /// or a GLB made here to paint (its file name or url), as mesh
+    /// or a GLB made here to paint or refine (its file name or url), as mesh
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     /// queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch
@@ -2278,7 +2278,7 @@ pub struct Model3dGenerateReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 120)]
     pub title: Option<String>,
-    /// a mesh to paint instead of making one (a model whose card says paint: Hunyuan3D 2.1, hunyuan3d-2.1-paint): a GLB or OBJ as base64 or a data: URL; image says how it is painted
+    /// a mesh to paint instead of making one (a model whose card says paint: Hunyuan3D 2.1, hunyuan3d-2.1-paint), or to refine (a model whose card says refine, named: Hi3D - model3d.refine): a GLB or OBJ as base64 or a data: URL; image says how it is painted or what it looks like
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<String>,
     /// the model's id; none: the loaded one, else the first enabled
@@ -2401,6 +2401,95 @@ pub struct Model3dRigReq {
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
     pub steps: Option<i64>,
     /// true: answer when it ends; false: answer at once with the job
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = true)]
+    pub wait: Option<bool>,
+    /// what else the caller sent: passed on as it came
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
+}
+
+/// What model3d.refine takes.
+#[derive(Deserialize, Serialize, Rpc)]
+#[allow(non_snake_case)]
+pub struct Model3dRefineReq {
+    /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START. A known wait over it is declined at once (wait_too_long, retryable, nothing queued or stopped); an unknown one goes ahead and is withdrawn at the limit; a model already loaded with a free server always starts
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
+    /// a group inside the project
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 60)]
+    pub batch: Option<String>,
+    /// no mesh given: the model that makes the coarse mesh from the picture first (default: hunyuan3d-2mini-turbo when enabled, else the loaded or first enabled mesh generator); its GLB is linked as coarse
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coarse_model: Option<String>,
+    /// the final triangle budget (default 1,000,000; 2,000,000 at 1536)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = 1000)]
+    pub faces: Option<i64>,
+    /// or the coarse mesh as a GLB made here (its file name or url)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// queue it held: it waits until <kind>.queue.resume names it (its label), its project or batch
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = false)]
+    pub held: Option<bool>,
+    /// the picture of the object: PNG, JPEG or WebP as base64, a data: URL or upload:<name> (model3d.upload); a transparent background frames it by its alpha, an opaque one is cut out (remove_background)
+    pub image: String,
+    /// names the job for <kind>.status and <kind>.cancel (default: its id)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub label: Option<String>,
+    /// a name for people, shown in the lists in place of the label (the label small beside it; without one, the label); never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 120)]
+    pub title: Option<String>,
+    /// the coarse mesh of the same object, posed as in the picture: GLB or OBJ as base64, a data: URL or upload:<name>; none (and no file): coarse_model makes it first
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<String>,
+    /// the refining model's id (system.models: capabilities refine); none: the loaded one, else the first enabled
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// the engine's own (model3d.info lists them: euler)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<serde_json::Map<String, serde_json::Value>>,
+    /// a waiting job goes ahead of every waiting job of a lower priority (same priority: first come first made)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = -9, max = 9, default = 0)]
+    pub priority: Option<i64>,
+    /// a group of jobs held or released together (<kind>.queue.pause / resume), listed with <kind>.jobs {project}
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 60)]
+    pub project: Option<String>,
+    /// false: refused at once (409 busy, retryable) when the job would not start now - a server free and no runnable job waiting before it; true (default): it waits its turn
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = true)]
+    pub queue: Option<bool>,
+    /// idempotent submit (as model3d.generate)
+    #[serde(rename = "reentrant_id", default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 200)]
+    pub reentrant_id: Option<String>,
+    /// cut the background out of an opaque picture
+    #[serde(rename = "remove_background", default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = true)]
+    pub remove_background: Option<bool>,
+    /// the extraction grid: 512 (one pass), 1024 (two) or 1536 (three); default: the model's (model3d.info)
+    #[serde(rename = "resolution", default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = 512, max = 1536)]
+    pub resolution: Option<i64>,
+    /// the noise (and the coarse model's, when it makes one)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    pub seed: Option<i64>,
+    /// scheduler updates a pass (default 25)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = 1, max = 200)]
+    pub steps: Option<i64>,
+    /// true: answer when it ends (the job goes on if the call drops); false: answer at once with the job
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(default = true)]
     pub wait: Option<bool>,
@@ -3532,6 +3621,12 @@ fn model3d_generate(h: &Arc<Home>, req: Model3dGenerateReq) -> Answer {
     h.legacy("model3d.generate", req)
 }
 
+/// A coarse mesh refined like its picture into a high-resolution, geometry-only mesh (Hi3D: recentred, unit radius); with no mesh or file the coarse mesh is made first from the same picture (coarse_model, hunyuan3d-2mini-turbo by default) and linked as coarse. The answer links the refined GLB. A job like model3d.generate (wait, reentrant_id, status, cancel)
+#[rpc(name = "model3d.refine", tags = "model3d", example = r#"{"image": "data:image/png;base64,iVBORw0...", "model": "hi3d-1.0", "resolution": 1024, "seed": 0, "wait": false}"#)]
+fn model3d_refine(h: &Arc<Home>, req: Model3dRefineReq) -> Answer {
+    h.legacy("model3d.refine", req)
+}
+
 /// A mesh given a skeleton and skin weights (UniRig, RigNet), or set in motion by words (AnimateAnyMesh: prompt); the answer links the rigged or animated GLB. A job like model3d.generate
 #[rpc(name = "model3d.rig", tags = "model3d", example = r#"{"file": "1792132541-trellis2-42.glb", "model": "unirig"}"#)]
 fn model3d_rig(h: &Arc<Home>, req: Model3dRigReq) -> Answer {
@@ -3760,7 +3855,7 @@ rpcgen::rpc_methods![sync Arc<Home>, RpcFail;
     audio_speak, audio_transcribe, audio_edit, audio_voices_list, audio_voices_add, audio_voices_design, audio_voices_enroll, audio_voices_remove,
     audio_info, audio_progress, audio_history, audio_status, audio_jobs, audio_queue_list,
     audio_queue_move, audio_queue_pause, audio_queue_resume, audio_upload, audio_cancel, audio_describe_prompt_guide_md,
-    model3d_generate, model3d_rig, model3d_tool, model3d_info, model3d_progress, model3d_history,
+    model3d_generate, model3d_refine, model3d_rig, model3d_tool, model3d_info, model3d_progress, model3d_history,
     model3d_status, model3d_jobs, model3d_queue_list, model3d_queue_move, model3d_queue_pause, model3d_queue_resume,
     model3d_upload, model3d_cancel, model3d_describe_prompt_guide_md, video_generate, video_status, video_wait,
     video_cancel, video_queue_list, video_queue_move, video_queue_remove, video_queue_pause, video_queue_resume,

@@ -363,7 +363,7 @@ impl Model3dEngine for Hunyuan3d {
         self.arch.name
     }
     fn abilities(&self) -> Abilities {
-        Abilities { generate: true, texture: self.paint.is_some(), views: 1, rig: false, animate: false, splats: false }
+        Abilities { generate: true, texture: self.paint.is_some(), views: 1, rig: false, animate: false, splats: false, refine: false }
     }
     fn defaults(&self) -> Defaults {
         Defaults { steps: self.arch.steps, cfg: self.arch.cfg, resolution: self.arch.resolution, faces: 40_000, texture_size: 2048, frames: 0, fps: 0.0 }

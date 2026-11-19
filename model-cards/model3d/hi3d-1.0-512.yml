@@ -1,0 +1,25 @@
+# Hi3D v1.0, 512 only (a coarse mesh refined like its picture in one pass; the 1024 transformer not downloaded; Hi3D Open License 1.0)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: hi3d-1.0-512
+kind: model3d
+arch: hi3d
+license: hi3d-open-license-1.0
+commercial: true
+license_note: 'Hi3D Open License Agreement v1.0 (OCEANO HK HOLDING LIMITED) for the Hi3D files: commercial use allowed; above 200,000 monthly active users or USD 1,000,000 monthly revenue notify the licensor and apply for a separate licence within 60 days; commercial integrations display "Powered by Hi3D 1.0" (linking http://hi3d.ai/); distributing the weights carries the Agreement, its NOTICE text and the Acceptable Use Policy; outputs containing no Hi3D materials carry none of these duties. Third-party parts keep their own terms: DINOv2-large Apache-2.0, CLIP ViT-L/14 MIT, BiRefNet MIT, FlexiCubes Apache-2.0.'
+title: 'Hi3D v1.0, 512 (refines a coarse mesh like its picture: one pass to 512^3; Hi3D Open License)'
+about: 'hi3d-1.0 without transformer_1024: the one-pass refinement (64^3 voxels -> 512^3 extraction, a million faces), 3.7 GB less to download and a lighter card'
+does: [refine]
+gpus: '0'
+vram_gib: 8.0                    # its memory on the card when it runs (models load stage by stage)
+env: {}
+files:
+  index: hi3d-index
+  scheduler: hi3d-scheduler
+  vae_config: hi3d-vae-config
+  vae: hi3d-vae
+  transformer_512_config: hi3d-transformer-512-config
+  transformer_512: hi3d-transformer-512
+  dino: dinov2-large
+  clip: clip-vit-large-patch14
+  remover: birefnet
+guide: guides/hi3d.md

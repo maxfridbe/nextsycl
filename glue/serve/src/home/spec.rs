@@ -392,7 +392,7 @@ pub fn result(method: &str) -> Option<String> {
   {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (image.status {{label}} for the rest)"}}]}}"#),
         "image.upscale" | "video.upscale" => format!(r#"{{"oneOf": [{{"allOf": [{UPSCALED}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the upscaled picture or clip, and the job"}},
   {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (image.status {{label}} for the rest)"}}]}}"#),
-        "model3d.generate" | "model3d.rig" => format!(r#"{{"oneOf": [{{"allOf": [{}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the mesh, and the job"}},
+        "model3d.generate" | "model3d.rig" | "model3d.refine" => format!(r#"{{"oneOf": [{{"allOf": [{}, {{"type": "object", "properties": {{"job": {JOB_VIEW}}}}}], "description": "wait (default): the mesh, and the job"}},
   {{"allOf": [{JOB_VIEW}], "description": "wait: false - the job at once (model3d.status {{label}} for the rest)"}}]}}"#, meshes()),
         "model3d.tool" => format!(r#"{{"type": "object", "properties": {{"created": {{"type": "integer"}}, "data": {{"type": "array", "items": {MESH_ITEM}}}}}}}"#),
         "model3d.history" => format!(r#"{{"type": "object", "properties": {{"data": {{"type": "array", "description": "newest first (200 at most); url server-relative (/v1/model3d/files/<file>, the same route here)", "items": {MESH_ITEM}}}}}}}"#),
@@ -564,7 +564,7 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
         "system.models.pull" => &[(404, "not_found", "no model card of that id"), (409, "conflict", "it is downloaded already"),
                                   (503, "no_room", "no models folder has the room for it (with 1% of the drive, at least 4 GiB, kept free)")],
         "system.models.pull.cancel" => &[(409, "conflict", "no download of that model is under way")],
-        "image.generate" | "image.edit" | "image.ocr" | "image.upscale" | "image.vectorize" | "image.remove_background" | "image.describe" | "video.upscale" | "audio.generate" | "audio.speak" | "audio.transcribe" | "audio.edit" | "audio.voices.design" | "audio.voices.enroll" | "model3d.generate" | "model3d.rig" =>
+        "image.generate" | "image.edit" | "image.ocr" | "image.upscale" | "image.vectorize" | "image.remove_background" | "image.describe" | "video.upscale" | "audio.generate" | "audio.speak" | "audio.transcribe" | "audio.edit" | "audio.voices.design" | "audio.voices.enroll" | "model3d.generate" | "model3d.rig" | "model3d.refine" =>
             &[(400, "invalid_params", "a value refused, when the job is submitted (wait false too): steps a few-step model does not run, a size, a sampler, a picture that does not decode, a voice or language the speech model does not have, a model that cannot do it (image.remove_background: \"<id> does not remove backgrounds (birefnet, isnet-general-use do)\"), a priority outside -9..9 ..."),
               (404, "not_found", "no such model; a continue_from or upload:<name> that is not here (error.field names which)"), (409, "conflict", "the model is disabled, or none that can do it is enabled (never retry as is)"),
               (409, "busy", "queue: false and the job would not start at once (retryable)"),

@@ -7,7 +7,8 @@
 //!                                 resolution, faces, texture_size, remove_background (bool), options {NAME: value},
 //!                                 response_format: glb (the file) | url (JSON with its link)}; a splatting model
 //!                                 (abilities.splats: Budget3D-Idol) answers with 3D Gaussian splats, a PLY (response_format
-//!                                 ply, or url)
+//!                                 ply, or url); with mesh (GLB / OBJ, base64 or a data: URL) | file (a GLB made here) it
+//!                                 paints that mesh (abilities.texture) or refines it (abilities.refine: Hi3D)
 //!   POST /v1/model3d/rig          a mesh rigged (a skeleton and skin weights) or animated (prompt: the motion):
 //!                                 {mesh (GLB or OBJ, base64 / a data: URL) | file (a GLB made here), prompt, frames,
 //!                                 fps, seed, steps, cfg, options, response_format}
@@ -290,7 +291,8 @@ impl Model3dServer {
         let (a, d) = (e.abilities(), e.defaults());
         json!({
             "model": self.model, "arch": e.arch(), "wfe": self.wfe.is_some(),
-            "abilities": {"generate": a.generate, "texture": a.texture, "views": a.views, "rig": a.rig, "animate": a.animate, "splats": a.splats},
+            "abilities": {"generate": a.generate, "texture": a.texture, "views": a.views, "rig": a.rig, "animate": a.animate, "splats": a.splats,
+                          "refine": a.refine},
             "defaults": {"steps": d.steps, "cfg": f(d.cfg), "resolution": d.resolution, "faces": d.faces, "texture_size": d.texture_size,
                          "frames": d.frames, "fps": f(d.fps)},
             "options": e.options().iter().filter(|o| o.at != nextsycl_core::At::Load)
@@ -364,7 +366,7 @@ impl Model3dServer {
             .map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect();
         // what comes in, read before the engine is taken (a bad picture fails at once)
         let views = if rig { Vec::new() } else { Self::views(b).map_err(bad)? };
-        // a mesh given to model3d.generate is painted (the pictures say how), not made
+        // a mesh given to model3d.generate is painted (the pictures say how), not made - or refined (a model that refines)
         let paint_given = !rig && (b["mesh"].as_str().is_some_and(|m| !m.is_empty()) || b["file"].as_str().is_some_and(|m| !m.is_empty()));
         let mesh_in = if rig || paint_given {
             let bytes = match (b["mesh"].as_str().filter(|m| !m.is_empty()), b["file"].as_str().filter(|m| !m.is_empty())) {
@@ -431,10 +433,14 @@ impl Model3dServer {
             meta["frames"] = json!(req.frames.unwrap_or(d.frames));
             engine.rig(&req, &mut report).map(|m| Made::Mesh(Box::new(m)))
         } else {
-            if !a.generate && !(paint_given && a.texture) {
+            if a.refine && !paint_given {
+                return Err(bad(format!("{} refines a coarse mesh: mesh (a GLB or OBJ) or file (a GLB made here) and a picture of the same object \
+                                        (model3d.refine makes the coarse mesh first when none is given)", self.model)));
+            }
+            if !a.generate && !(paint_given && (a.texture || a.refine)) {
                 return Err(bad(format!("{} rigs meshes; it does not make them (model3d.rig)", self.model)));
             }
-            if paint_given && !a.texture {
+            if paint_given && !a.texture && !a.refine {
                 return Err(bad(format!("{} has no paint model: it cannot paint a mesh (texture)", self.model)));
             }
             if views.is_empty() {
@@ -444,7 +450,7 @@ impl Model3dServer {
                 return Err(bad(format!("{} pictures: {} takes {} at most", views.len(), self.model, a.views.max(1))));
             }
             let texture = b["texture"].as_bool().unwrap_or(a.texture);
-            if paint_given && !texture {
+            if paint_given && !texture && !a.refine {
                 return Err(bad("texture: false with a mesh given leaves nothing to do".into()));
             }
             if texture && !a.texture {

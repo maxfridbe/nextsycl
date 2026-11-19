@@ -408,7 +408,8 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
         }
         "audio" => (vec!["song", "lyrics", "instrumental"], vec!["audio.generate"]),
         "model3d" => {
-            // what its card says it does (`does`): generate (meshes from pictures), texture, views (several), rig, animate
+            // what its card says it does (`does`): generate (meshes from pictures), texture, views (several), rig, animate,
+            // refine (a coarse mesh made finer like its picture)
             let does = |c: &str| m["does"].as_array().is_some_and(|a| a.iter().any(|x| x == c));
             let mut c = Vec::new();
             let mut methods = Vec::new();
@@ -432,6 +433,11 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
                 // a paint-only model: model3d.generate with a mesh (or file) paints it
                 c.extend(["texture", "paint"]);
                 methods.push("model3d.generate");
+            }
+            if does("refine") {
+                // a coarse mesh and its picture to a finer mesh (Hi3D): model3d.refine, or model3d.generate naming it with a mesh
+                c.extend(["refine", "mesh", "glb"]);
+                methods.push("model3d.refine");
             }
             if does("rig") {
                 c.extend(["rig", "skeleton", "skin_weights"]);

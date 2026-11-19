@@ -486,7 +486,7 @@ impl Model3dEngine for Budget3d {
         ARCH
     }
     fn abilities(&self) -> Abilities {
-        Abilities { generate: true, texture: false, views: 1, rig: false, animate: false, splats: true }
+        Abilities { generate: true, texture: false, views: 1, rig: false, animate: false, splats: true, refine: false }
     }
     fn defaults(&self) -> Defaults {
         Defaults { steps: if self.dit.turbo { 5 } else { 50 }, cfg: if self.dit.turbo { 0.0 } else { 3.0 }, ..Default::default() }

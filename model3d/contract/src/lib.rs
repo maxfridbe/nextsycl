@@ -3,6 +3,8 @@
 //!
 //! - **generate**: a mesh from one or more pictures of an object (TRELLIS.2, Hunyuan3D, Pixal3D) - its shape, and
 //!   with `texture` its PBR textures - or 3D Gaussian splats (`splat`: Budget3D-Idol; a PLY, `Splats`);
+//! - **refine**: a coarse mesh and a picture of the same object to a high-resolution mesh (Hi3D; `generate` with the
+//!   request's `mesh`);
 //! - **rig**: a mesh given a skeleton and skin weights (UniRig, RigNet), or set in motion by a description
 //!   (AnimateAnyMesh: a morph animation).
 //!
@@ -37,7 +39,7 @@ pub struct MeshRequest {
     /// one picture, or several of the same object from different sides (an engine takes up to `Abilities::views`)
     pub views: Vec<View>,
     /// a mesh to paint (an engine that paints: `Abilities::texture`) instead of a shape made from the pictures: the
-    /// pictures are what it is painted like
+    /// pictures are what it is painted like; or to refine (`Abilities::refine`): the pictures are what it looks like
     pub mesh: Option<Mesh>,
     /// textures too (base colour, metallic-roughness), when the engine paints them; false: the shape alone
     pub texture: bool,
@@ -88,6 +90,9 @@ pub struct Abilities {
     pub animate: bool,
     /// 3D Gaussian splats from pictures (`splat`) rather than meshes (`generate` answers with them)
     pub splats: bool,
+    /// a coarse mesh refined (`generate` with `MeshRequest::mesh` and a picture of the same object: Hi3D) into a
+    /// finer one, geometry only
+    pub refine: bool,
 }
 
 /// The engine's own defaults, shown by `engines` and used for the request's `None` fields

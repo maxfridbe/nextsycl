@@ -40,7 +40,7 @@ const FEATURES: &[&str] = &[
     "video.failure", "video.gpu", "video.engines.ignored", "audio.speak.precheck.voice", "jobs.cancel.reentrant_id", "rpc.errors.body", "audio.transcribe", "image.upscale", "video.upscale", "image.vectorize", "image.remove_background",
     "rpc.http200", "result.run", "models.capabilities", "system.cards", "jobs.list", "jobs.status.one", "jobs.queue", "jobs.priority", "jobs.held",
     "jobs.stage", "uploads", "voices.owner", "voices.ready", "room.free_idle", "room.wait", "llm.no_room", "llm.keep_up_s",
-    "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh",
+    "system.maintenance", "errors.maintenance", "jobs.model3d", "model3d.generate", "model3d.rig", "model3d.upload.mesh", "model3d.refine",
     "video.slots.cards", "video.running_clips", "video.status.clip", "video.cancel.name", "video.reentry.before_limit", "video.reentry.label", "jobs.title", "video.speed",
     "system.drives", "system.move", "errors.cards_taken", "audio.voices.enroll", "drives.sidecars", "image.loras.request", "video.soundtrack", "video.exposure_fix",
     "backplane", "system.busy.engines", "models.profile", "system.pin", "system.eta", "rsvp_s", "max_willing_to_wait_s", "errors.wait_too_long", "jobs.eta", "video.on_demand", "video.multi_guide",
@@ -1045,7 +1045,9 @@ impl Home {
                             .ok_or_else(|| (409, format!("no enabled 3D model does {want} (system.models: capabilities)")))?
                     }
                 };
-                if !all.iter().any(|m| m["id"] == id.as_str() && able(m)) {
+                // (a model named that refines takes a given mesh too: model3d.refine's way, through generate)
+                let refines = |m: &Value| painting && m["does"].as_array().is_some_and(|a| a.iter().any(|x| x == "refine"));
+                if !all.iter().any(|m| m["id"] == id.as_str() && (able(m) || refines(m))) {
                     return Err((400, format!("{id} does not {want} (model3d.{})", if want == "rig" { "generate" } else { "rig" })));
                 }
                 let job = b["request_id"].as_str();
@@ -1061,6 +1063,70 @@ impl Home {
                     Err((503, why)) if self.room_for_request(&id, &why) => relay(&t, "POST", &path, Some(&body), 7200),
                     r => r,
                 }
+            }
+            ("model3d", "refine") => {
+                // the refining model: the one named, else the loaded or first enabled one whose card says refine
+                let refines = |m: &Value| m["does"].as_array().is_some_and(|a| a.iter().any(|x| x == "refine"));
+                let id = match b["model"].as_str().filter(|x| !x.is_empty()) {
+                    Some(_) => self.pick("model3d", b, &all)?,
+                    None => {
+                        let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "model3d" && m["enabled"] != false && refines(m)).collect();
+                        self.loaded_of("model3d").into_iter().find(|l| on.iter().any(|m| m["id"] == l.as_str())).or_else(|| on.first().map(|m| s(m, "id")))
+                            .ok_or_else(|| (409, "no enabled 3D model refines meshes (system.models: capabilities refine)".to_string()))?
+                    }
+                };
+                if !all.iter().any(|m| m["id"] == id.as_str() && refines(m)) {
+                    return Err((400, format!("{id} does not refine meshes (model3d.generate makes them)")));
+                }
+                if b["image"].as_str().is_none_or(str::is_empty) {
+                    return Err((400, "image (a picture of the object): required".into()));
+                }
+                let job = b["request_id"].as_str();
+                let mut body = b.clone();
+                let given = ["mesh", "file"].iter().any(|k| b[*k].as_str().is_some_and(|v| !v.is_empty()));
+                let mut coarse = Value::Null;
+                if !given {
+                    // the chain: the coarse mesh first, by a generator - coarse_model, else hunyuan3d-2mini-turbo when it
+                    // is enabled, else the loaded or first enabled mesh generator - from the same picture and seed; its GLB
+                    // (in the 3D output, which every 3D server shares) is what the refiner reads
+                    let gens = |m: &Value| registry::kind_of(m) == "model3d" && m["enabled"] != false
+                        && m["does"].as_array().is_some_and(|a| a.iter().any(|x| x == "generate") && !a.iter().any(|x| x == "splat"));
+                    let cid = match b["coarse_model"].as_str().filter(|x| !x.is_empty()) {
+                        Some(c) => all.iter().find(|m| m["id"] == c && gens(m)).map(|m| s(m, "id"))
+                            .ok_or_else(|| (400, format!("coarse_model {c}: no enabled 3D model of that name makes meshes")))?,
+                        None => {
+                            let on: Vec<&Value> = all.iter().filter(|m| gens(m)).collect();
+                            on.iter().find(|m| m["id"] == "hunyuan3d-2mini-turbo").map(|m| s(m, "id"))
+                                .or_else(|| self.loaded_of("model3d").into_iter().find(|l| on.iter().any(|m| m["id"] == l.as_str())))
+                                .or_else(|| on.first().map(|m| s(m, "id")))
+                                .ok_or_else(|| (409, "no mesh given and no enabled 3D model makes one (coarse_model)".to_string()))?
+                        }
+                    };
+                    let ct = self.ensure_for(&cid, job)?;
+                    self.sent(job);
+                    let cb = json!({"model": cid, "image": b["image"], "seed": b["seed"], "texture": false, "remove_background": b["remove_background"],
+                                    "response_format": "url", "request_id": b["request_id"]});
+                    coarse = relay(&ct, "POST", "/v1/model3d/generate", Some(&cb), 7200)?;
+                    let file = coarse["data"][0]["url"].as_str().and_then(|u| u.rsplit('/').next()).map(str::to_string)
+                        .ok_or_else(|| (502, format!("{cid} answered without a mesh file")))?;
+                    body["file"] = json!(file);
+                }
+                let t = self.ensure_for(&id, job)?;
+                self.sent(job);
+                body["model"] = json!(id);
+                body["response_format"] = json!("url");
+                body["texture"] = json!(false);
+                if let Some(o) = body.as_object_mut() {
+                    o.remove("coarse_model");
+                }
+                let mut r = match relay(&t, "POST", "/v1/model3d/generate", Some(&body), 7200) {
+                    Err((503, why)) if self.room_for_request(&id, &why) => relay(&t, "POST", "/v1/model3d/generate", Some(&body), 7200),
+                    r => r,
+                }?;
+                if !coarse.is_null() {
+                    r["coarse"] = coarse["data"][0].clone();
+                }
+                Ok(r)
             }
             ("image" | "audio" | "model3d", "info") => {
                 let id = self.pick(m.kind, b, &all)?;
@@ -1289,6 +1355,7 @@ impl Home {
             "model3d.generate" => ("model3d", &[("image", false), ("images", true)]),
             "image.upscale" | "image.vectorize" | "image.remove_background" | "image.describe" => ("image", &[("image", false)]),
             "model3d.rig" | "model3d.tool" => ("model3d", &[("mesh", false)]),
+            "model3d.refine" => ("model3d", &[("image", false), ("mesh", false)]),
             _ => ("", &[]),
         }
     }
@@ -1962,7 +2029,7 @@ mod tests {
     #[test]
     fn nextsycls_methods_are_all_declared() {
         let has = |n: &str| table::methods().iter().any(|m| m.full() == n);
-        for n in ["system.ping", "model3d.generate", "model3d.rig", "model3d.tool", "model3d.describePromptGuideMD", "system.drives", "system.move",
+        for n in ["system.ping", "model3d.generate", "model3d.rig", "model3d.refine", "model3d.tool", "model3d.describePromptGuideMD", "system.drives", "system.move",
                   "audio.speak", "audio.voices.enroll", "image.edit", "video.generate", "video.describePromptGuideMD"] {
             assert!(has(n), "{n} is declared");
         }
