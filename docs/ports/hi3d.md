@@ -101,9 +101,19 @@ Input: upstream's assets/example.png (a dragon bust, RGBA) and a coarse mesh fro
 | postprocess (reference's filled mesh) | | | 499,540 v / 999,999 f both; Chamfer 7.4e-3 in unit-radius units with each side's own centring, **4.7e-4 of the box side with both box-normalized** (the decimators differ: pyfqmr against the mesh crate's) |
 | whole run, 512 (picture + coarse mesh -> final) | | | Chamfer against the reference's final 4.7e-4 of the box side (box-normalized), the same as postprocess alone: the earlier stages add nothing visible |
 
-The second pass's reference (`--structure 128`: voxels 63,454 at 128³ from the reference's pass-1 mesh, identical
-to ours from the same mesh) runs ~6 min an update on the CPU; its transformer check is above; see "Unverified" for
-the rest.
+The second pass (`--structure 128`: the reference's own pass-1 mesh voxelized at 128³, 63,454 voxels - identical to
+ours from the same mesh; 25 updates ~6 min each on the CPU):
+
+| stage | rel RMS | cos | notes |
+|---|---:|---:|---|
+| 25 Heun updates (pass 2, 14,689 tokens) | after 1: 2.3e-4, 10: 5.7e-4, 20: 1.2e-3, 25: 5.4e-3; **latents 6.1e-3** | 0.99998 | |
+| decoder z_to_f / mid | 2.7e-4 / 3.2e-4 | 1.0 | |
+| unpooling logits (3 levels) | 1.7e-4 / 1.6e-4 / 1.7e-4 | 1.0 | otherwise decided: 6 of 507,632; 74 of 2,137,152; 361 of 8,810,536 |
+| final sign logits / attributes | 1.1e-3 / 1.6e-3 | 0.999999 | |
+| decoder on its own pruning | | | 4,418,593 voxels against 4,418,619 (728 only here, 754 only there) |
+| FlexiCubes / holes | | | **4,364,439 vertices, 8,623,968 faces; 8,728,156 filled: identical counts**; Chamfer 4.9e-7 |
+| postprocess | | | 999,992 faces against pyfqmr's 1,000,000; Chamfer 1.3e-2 with each side's own centring |
+| whole run, 1024 | | | box-normalized Chamfer against the reference's final 2.1e-3 (B70), 2.0e-3 (B65): pass 2 starts from each side's own pass-1 mesh, so its voxels and noise rows differ a little and the second sampling diverges more than the first |
 
 ## Speed and memory
 
@@ -151,8 +161,8 @@ B65): 51.6 s, the GLB and its settings in the output directory; `model3d.info` r
 
 ## Unverified / open
 
-- The second pass's reference sampler, decoder and mesh (`--structure 128` steps / vae / mesh / post) and a 1024 whole-
-  run Chamfer: PASS2_NOTE
+- The third pass (1536) has no reference run (upstream's own CPU run would take many hours); it runs the same code as
+  pass 2 with the rotary rescale for coordinates >= 64 (unit-tested, not checked against upstream).
 - The final decimation is not pyfqmr's (counts match on the example; geometry within the vertex spacing after
   box normalization, but the centroid / radius normalization of a differently decimated mesh shifts it by ~7e-3).
 - Only one picture / mesh pair was checked (the dragon bust). Opaque pictures through BiRefNet were not checked against
