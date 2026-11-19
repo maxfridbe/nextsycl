@@ -19,8 +19,8 @@ title: 'Sophon-Realtime 32B Flash (full-duplex voice conversation; a saved voice
 about: 'A live voice conversation over /v1/realtime (OpenAI Realtime events): the 32B brain hears your speech itself, decides when you have finished (DuplexJev''s turn question) and writes a reply; Qwen3-TTS-12Hz-1.7B-Base speaks it as it is written, in a saved voice cloned from its recording (the closest to it of the two Sophon entries) or a built-in one; barge-in, tool calls. The brain''s sound tags stay in its text but are not spoken (the -tags entry performs them). The brain q4 on the first card, the voice on the second'
 gpus: '0,1'
 spans: true                      # one copy over both cards (audio start --gpus 0,1): the brain on the first, the talker on the second
-vram_gib: 23.0                   # the brain's card (q4, 6K context)
-vram_gib_per_card: [23.0, 5.5]   # the brain's card, the talker's
+vram_gib: 25.5                   # the brain's card (q4, 16K context: +2.5 GiB over 6K, 2026-11-19)
+vram_gib_per_card: [25.5, 6.2]   # the brain's card, the talker's (its cache for 8,192 frames, ~0.9 GiB)
 speech:
 - clone                          # a saved voice in context (its recording and Whisper's transcript; NS_SOPHON_CLONE icl), or a recording (with ref_text: in context)
 - realtime                       # a live conversation: /v1/realtime

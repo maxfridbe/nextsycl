@@ -55,7 +55,7 @@ pub const ARCH: &str = "sophon-realtime";
 /// thinker-1..N: the thinker's shards; voice-1..N: the release's voices/<name>.pt
 pub const ROLES: &[&str] = &["thinker*", "thinker-config", "tokenizer", "talker", "talker-config", "codec", "voice*"];
 /// the context a conversation keeps (positions); the turn question's own
-pub const CTX: usize = 6144;
+pub const CTX: usize = 16384;
 const CHECK_CTX: usize = 1024;
 /// the brain's layers kept in q8 under q4 by default (NS_SOPHON_Q8_LAYERS)
 pub const Q8_LAYERS: &[usize] = &[62, 63];
@@ -68,7 +68,7 @@ pub const OPTIONS: &[EngineOption] = &[
                    help: "the brain's matrices: 4 (q4: ~19.5 GiB, one card) or 8 (q8: ~33 GiB, split over two cards - the close one, for checks)", at: At::Load },
     EngineOption { name: "split", env: "NS_SOPHON_SPLIT", value: "N",
                    help: "with two cards and bits 8: the brain's layers from N on the second card (default 30; the talker then shares the second)", at: At::Load },
-    EngineOption { name: "ctx", env: "NS_SOPHON_CTX", value: "6144", help: "positions a conversation's context holds", at: At::Load },
+    EngineOption { name: "ctx", env: "NS_SOPHON_CTX", value: "16384", help: "positions a conversation's context holds", at: At::Load },
     EngineOption { name: "q8-layers", env: "NS_SOPHON_Q8_LAYERS", value: "62,63|none",
                    help: "with bits 4: the brain's layers kept in q8 (where 4-bit codes cost the most; ~0.2 GiB each)", at: At::Load },
     EngineOption { name: "talker-int8", env: "NS_SOPHON_TALKER_INT8", value: "0|1", help: "the talker's matrices in int8 (less memory)", at: At::Load },
@@ -172,6 +172,8 @@ pub struct Inner {
     pub clone_icl: bool,
     pub icl_max_s: f64,
     pub icl_live: IclLayout,
+    /// the conversation's context (positions: NS_SOPHON_CTX)
+    pub ctx: usize,
 }
 
 pub struct Sophon {
@@ -329,7 +331,7 @@ impl Sophon {
         log(format!("{ARCH}: ready in {load_s:.0} s"));
         Ok(Sophon {
             inner: Arc::new(Inner { mind: Mutex::new(Mind { ear, brain, reply, check }), talk: Mutex::new(talk), tok, greedy, turn_checks, turn_thresholds, voices,
-                                    clone_icl, icl_max_s, icl_live }),
+                                    clone_icl, icl_max_s, icl_live, ctx }),
             load_s,
             loaded: Instant::now(),
             report,

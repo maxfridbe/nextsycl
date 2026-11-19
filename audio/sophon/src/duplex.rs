@@ -30,11 +30,23 @@ use crate::{ear, resample, speak, Inner, Mind};
 
 const AUDIO_ID: u32 = 151669;
 const STOP: [u32; 2] = [151645, 151643];
+/// A spoken answer's tokens at most by default (~11 minutes spoken: speak::MAX_FRAMES' worth)
+const MAX_ANSWER: usize = 2048;
 /// a key's tag for an audio position (clip << 20 | row)
 const AUDIO_KEY: u64 = 1 << 62;
 const MERGE_WINDOW: f64 = 2.0;
 const HIST_TURNS: usize = 8;
 const HIST_SEC: f64 = 120.0;
+/// the history's audio (the user's and the replies', 6.25 positions a second: ear.rs) keeps room for a whole answer
+/// and this much for the system, the text and the turns' framing besides
+const HIST_SLACK: usize = 1024;
+
+/// The positions the turns' audio takes in the prompt: the user's speech and the spoken replies kept as audio
+fn audio_positions(turns: &[Turn]) -> usize {
+    let secs: usize = turns.iter().map(|t| t.user.as_ref().map_or(0, |c| c.s16.len()) + t.replies.iter().filter_map(|r| r.audio.as_ref()).map(|c| c.s16.len()).sum::<usize>())
+        .sum();
+    (secs as f64 / ear::RATE as f64 * 6.25).ceil() as usize
+}
 /// talker.py / proc.py: text tokens in hand before the talker starts
 const LEAD: usize = 3;
 
@@ -635,9 +647,13 @@ fn start_reply(s: &Arc<Shared>, st: &mut State) {
     st.active = Some(Active { stop: stop.clone(), first: None, sent_s: 0.0 });
     st.playing = None;
     s.emit(RealtimeEvent::ResponseStarted { id: id.clone() });
-    // the history within its bounds (duplex.py: 8 turns, 120 s of the user's speech)
+    // the history within its bounds (duplex.py: 8 turns, 120 s of the user's speech), and its audio - the replies'
+    // too, which duplex.py's bound leaves out - leaving a whole answer room in the context (long spoken replies filled
+    // it and cut the next answers short)
+    let audio_budget = s.eng.ctx.saturating_sub(MAX_ANSWER + HIST_SLACK);
     while st.turns.len() > HIST_TURNS
-        || (st.turns.len() > 1 && st.turns.iter().filter_map(|t| t.user.as_ref()).map(|c| c.s16.len()).sum::<usize>() as f64 / ear::RATE as f64 > HIST_SEC) {
+        || (st.turns.len() > 1 && st.turns.iter().filter_map(|t| t.user.as_ref()).map(|c| c.s16.len()).sum::<usize>() as f64 / ear::RATE as f64 > HIST_SEC)
+        || (st.turns.len() > 1 && audio_positions(&st.turns) > audio_budget) {
         st.turns.remove(0);
     }
     let turns = st.turns.clone();
@@ -734,8 +750,10 @@ fn reply(s: &Arc<Shared>, id: &str, turns: &[Turn], cfg: &RealtimeSession, lang:
     let draw = eng.brain_draw(&cfg.extra, cfg.temperature);
     let tdraw = eng.talker_draw(&cfg.extra);
     // a spoken answer's tokens at most: the session's max_response_output_tokens ("inf": all the context has room for),
-    // else 1,024 - about three minutes spoken (120 cut answers off mid-sentence)
-    let max_tokens = cfg.max_tokens.map_or(1024, |m| m as usize);
+    // else MAX_ANSWER - about eleven minutes spoken, what the talker's frames hold (120 cut answers off mid-sentence,
+    // 1,024 at about five minutes, past the talker's old 3.2)
+    let asked = cfg.max_tokens.map_or(MAX_ANSWER, |m| m as usize);
+    let max_tokens = asked;
     let feed = Arc::new((Mutex::new(Feed { ids: Vec::new(), done: false, stopped: false }), Condvar::new()));
     // the talker, on its card
     let talker = {
@@ -801,12 +819,14 @@ fn reply(s: &Arc<Shared>, id: &str, turns: &[Turn], cfg: &RealtimeSession, lang:
         let (mut logits, _, computed) = mind.brain.prompt(&mut mind.reply, &keys, &Rows { ids: &ids, spans: &sp }, false)?;
         let pp = tp.elapsed().as_secs_f64();
         // never past the context: the answer ends where the cache is full (a step there is an error)
-        let max_tokens = max_tokens.min(mind.reply.t.saturating_sub(mind.reply.keys.len()));
+        let room = mind.reply.t.saturating_sub(mind.reply.keys.len());
+        let max_tokens = max_tokens.min(room);
         let mut rng = Rng::new(cfg.seed ^ 0x5eed);
         let mut out: Vec<u32> = Vec::new();
         let mut shown = String::new();
         let tg = Instant::now();
         let mut stopped = false;
+        let mut ended = false;
         for _ in 0..max_tokens {
             if stop.load(Ordering::SeqCst) {
                 stopped = true;
@@ -814,6 +834,7 @@ fn reply(s: &Arc<Shared>, id: &str, turns: &[Turn], cfg: &RealtimeSession, lang:
             }
             let t = sample::pick(&logits, draw, &mut rng) as u32;
             if STOP.contains(&t) {
+                ended = true;
                 break;
             }
             out.push(t);
@@ -837,6 +858,17 @@ fn reply(s: &Arc<Shared>, id: &str, turns: &[Turn], cfg: &RealtimeSession, lang:
         if vis.len() > shown.len() && vis.starts_with(&shown) {
             s.emit(RealtimeEvent::TextDelta { id: id.to_string(), delta: vis[shown.len()..].to_string() });
         }
+        // what ended the answer, every reply (a cut answer is otherwise invisible in the log)
+        let why = if ended {
+            "its end".to_string()
+        } else if stopped {
+            "the user (cut in or cancelled)".to_string()
+        } else if max_tokens == asked {
+            format!("the answer's {asked} tokens (max_response_output_tokens)")
+        } else {
+            format!("the context: {room} positions left of {} (NS_SOPHON_CTX; the conversation's {} positions)", mind.reply.t, ids.len())
+        };
+        eprintln!("sophon: reply {id}: {} tokens in {:.1} s, ended by {why}", out.len(), tg.elapsed().as_secs_f64());
         if std::env::var("NS_SOPHON_LOG").is_ok_and(|v| v == "1") {
             eprintln!("sophon: reply {id}: prompt {} positions ({computed} computed) pp {:.0} tok/s; {} tokens tg {:.1} tok/s: {raw:?}", ids.len(),
                       computed as f64 / pp.max(1e-6), out.len(), out.len() as f64 / tg.elapsed().as_secs_f64().max(1e-6));

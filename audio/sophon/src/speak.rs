@@ -218,6 +218,12 @@ pub struct Feed {
     pub done: bool,
 }
 
+/// A reply's spoken frames at most (12.5 a second: 8,192 is ~11 minutes; the talker's positions go to 32,768 and the
+/// standalone Qwen3-TTS engine stops at the same 8,192; 2,400 cut long answers at 3.2 minutes) and its text tokens
+/// at most (a frame reads one: never the one that binds). The talker's cache: ~0.11 MiB a frame, ~0.9 GiB in all.
+pub const MAX_FRAMES: usize = 8192;
+pub const MAX_TEXT: usize = 4096;
+
 /// How a speech went
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Spoken {
@@ -423,7 +429,7 @@ impl Talk {
                 feed = next(cl - i.ids.len());
             }
         }
-        let (max_tokens, max_frames) = (1024, 2400);
+        let (max_tokens, max_frames) = (MAX_TEXT, MAX_FRAMES);
         let ss = t.session(ops, 16 + cl, max_frames)?;
         let proj = |ids: &[u32]| -> Result<Vec<f32>> {
             let mut rows = Vec::with_capacity(ids.len() * self.talker.fc1.k);
@@ -594,6 +600,9 @@ impl Talk {
             out(&wav)?;
         }
         spoken.frames = codes.len();
+        if codes.len() >= max_frames {
+            eprintln!("sophon: the talker stopped at its {max_frames} frames ({:.0} s): the rest of the reply is not spoken", max_frames as f64 / 12.5);
+        }
         if let Some(p) = probe {
             p.codes = codes;
             p.misses = ss.misses.get();
