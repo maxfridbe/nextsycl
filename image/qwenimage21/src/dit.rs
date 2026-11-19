@@ -115,11 +115,16 @@ pub struct Dit {
     side: std::sync::Mutex<Option<Side>>,
 }
 
-/// The text's state every step reads: each layer's q | k | v rows of the text (k with its RoPE), half
+/// The text's state every step reads: each layer's k | v rows of the prefix (k with its RoPE; the steps never read
+/// its q), half - or 8-bit with a scale per head and row (`kv8`: a third of the bytes, for an edit whose half prefix
+/// would not fit beside the model)
 pub struct Prefix {
     /// rows: the text's, and the condition pictures' latents
     pub tokens: usize,
+    /// per block: [rows, 2 x 4096] half, or int8 with `scales`
     kv: Vec<DevBuf>,
+    /// per block, the 8-bit form's: float32 [rows, 2 x 32] (empty: half)
+    scales: Vec<DevBuf>,
     /// the frame position the target picture takes (after the text and the pictures)
     pub frame: i64,
 }
@@ -588,7 +593,7 @@ impl Dit {
 
     /// The text's pass through every block (once a prompt): `embeds` float32 [T, 3584 or 4096] -> each layer's q|k|v
     pub fn prefix(&self, nsd: &Nsd, embeds: &DevBuf, tokens: usize, context_dim: usize) -> Result<Prefix> {
-        self.prefix_with(nsd, embeds, tokens, context_dim, &[], &[])
+        self.prefix_with(nsd, embeds, tokens, context_dim, &[], &[], false)
     }
 
     /// The prefix of an edit: the text (`pads`: which of its tokens are `<|image_pad|>` slots - each stands for 2 x 2
@@ -596,8 +601,10 @@ impl Dit {
     /// slot runs) put in their slots. Block-causal: the text is causal, each picture's latents attend to everything
     /// before and to each other. Positions: text advances one on all three axes; a picture sits at the next frame
     /// with its rows and columns centred on zero, and the next text starts past its larger side. All at t = 0.
-    pub fn prefix_with(&self, nsd: &Nsd, embeds: &DevBuf, tokens: usize, context_dim: usize, pads: &[bool], conds: &[(&DevBuf, (usize, usize))])
-                       -> Result<Prefix> {
+    /// `kv8`: the rows kept in 8 bits (Prefix).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefix_with(&self, nsd: &Nsd, embeds: &DevBuf, tokens: usize, context_dim: usize, pads: &[bool], conds: &[(&DevBuf, (usize, usize))],
+                       kv8: bool) -> Result<Prefix> {
         let gpu = &self.gpu;
         let k = ffi::api()?;
         let t = tokens;
@@ -665,6 +672,7 @@ impl Dit {
         let (h, qkv, att, o) = (DevBuf::new(gpu, p * DIM * 2)?, DevBuf::new(gpu, p * 3 * DIM * 2)?, DevBuf::new(gpu, p * DIM * 2)?, DevBuf::new(gpu, p * DIM * 2)?);
         let (gp, act) = (DevBuf::new(gpu, p * 2 * FFN * 2)?, DevBuf::new(gpu, p * FFN * 2)?);
         let mut kv = Vec::with_capacity(self.blocks.len());
+        let mut scales = Vec::new();
         let off = |buf: &DevBuf| -> *const f32 { buf.fp().wrapping_add(DIM) }; // the t = 0 row
         let half_at = |buf: &DevBuf, n: usize| -> *mut std::ffi::c_void { buf.ptr().cast::<u16>().wrapping_add(n).cast() };
         let text_only = segs.len() == 1 && segs[0].2;
@@ -687,23 +695,32 @@ impl Dit {
                     }
                 }
             }
-            // the layer's prefix q|k|v, kept for every step
-            let keep = DevBuf::new(gpu, p * 3 * DIM * 2)?;
-            keep.copy_within(0, &qkv, 0, p * 3 * DIM * 2)?;
-            kv.push(keep);
+            // the layer's prefix k|v, kept for every step (in 8 bits: a scale per head and row)
+            if kv8 {
+                let (keep, sc) = (DevBuf::new(gpu, p * 2 * DIM)?, DevBuf::f32(gpu, p * 2 * HEADS)?);
+                // SAFETY: qkv holds p x 3 x 4096 halves; keep p x 2 x 4096 bytes; sc p x 64 floats.
+                ffi::check(unsafe { (k.kv_pack8)(gpu.raw(), qkv.ptr(), p as i64, DIM as i64, HEAD as i64, keep.ptr().cast(), sc.fp()) }, "prefix k|v to 8 bits")?;
+                kv.push(keep);
+                scales.push(sc);
+            } else {
+                let keep = DevBuf::new(gpu, p * 2 * DIM * 2)?;
+                // SAFETY: qkv holds p x 3 x 4096 halves, keep p x 2 x 4096.
+                ffi::check(unsafe { (k.kv_keep)(gpu.raw(), qkv.ptr(), p as i64, DIM as i64, keep.ptr()) }, "prefix k|v")?;
+                kv.push(keep);
+            }
             self.mat(nsd, bi, 1, &b.out, att.ptr(), p, DIM, o.ptr())?;
             nsd.gate_add(x.ptr(), Dt::F32, p, DIM, o.ptr(), Dt::F16, zeros.ptr(), off(&md[1]).cast())?;
             self.block_ffn(nsd, bi, b, &x, p, &md, 1, &zeros, &h, &gp, &act, &o)?;
         }
         nsd.wait()?;
-        Ok(Prefix { tokens: p, kv, frame: pos })
+        Ok(Prefix { tokens: p, kv, scales, frame: pos })
     }
 
     /// The bytes a request's denoise holds on the card over `n` latents after a prefix of `p` rows (the text and an
-    /// edit's pictures): the prefix's q|k|v for every block, and the larger of the prefix pass's and a step's
-    /// buffers (`step_bytes`)
-    pub fn denoise_bytes(&self, n: usize, p: usize) -> u64 {
-        (p * 3 * DIM * 2 * self.blocks.len()) as u64 + step_bytes(n, p).max(step_bytes(p, 0))
+    /// edit's pictures): the prefix's k|v for every block (half, or `kv8`: int8 and a float scale per head), and the
+    /// larger of the prefix pass's and a step's buffers (`step_bytes`)
+    pub fn denoise_bytes(&self, n: usize, p: usize, kv8: bool) -> u64 {
+        (p * prefix_row_bytes(kv8) * self.blocks.len()) as u64 + step_bytes(n, p).max(step_bytes(p, 0))
     }
 
     /// The velocity for latents `lat` (float32 [hw.0 * hw.1, 64]) at sigma `t`, after the text `pre`: float32 [N, 64].
@@ -733,7 +750,14 @@ impl Dit {
         let img = tt * 3 * DIM; // the image's first row in `all`, in halves
         prof::mark(nsd, "step setup")?;
         for (bi, b) in self.blocks.iter().enumerate() {
-            all.copy_within(0, &pre.kv[bi], 0, tt * 3 * DIM * 2)?;
+            if pre.scales.is_empty() {
+                // SAFETY: kv holds tt x 2 x 4096 halves; all's first tt rows of 3 x 4096.
+                ffi::check(unsafe { (k.kv_put)(gpu.raw(), pre.kv[bi].ptr(), tt as i64, DIM as i64, all.ptr()) }, "prefix k|v")?;
+            } else {
+                // SAFETY: kv holds tt x 2 x 4096 int8, scales tt x 64 floats; all's first tt rows of 3 x 4096 halves.
+                ffi::check(unsafe { (k.kv_unpack8)(gpu.raw(), pre.kv[bi].ptr().cast(), pre.scales[bi].fp(), tt as i64, DIM as i64, HEAD as i64, all.ptr()) },
+                           "prefix k|v from 8 bits")?;
+            }
             prof::mark(nsd, "prefix copy")?;
             // SAFETY: x holds n x 4096 floats, h as many halves; the scale row 4096 floats.
             ffi::check(unsafe { (k.ln_mod)(gpu.raw(), x.fp(), n as i64, DIM as i64, EPS, md[0].fp(), h.ptr()) }, "norm + modulate")?;
@@ -771,6 +795,11 @@ impl Dit {
         nsd.wait()?;
         Ok(v)
     }
+}
+
+/// A prefix row's bytes in one block: k|v in half, or int8 with a float32 scale per head of each
+pub fn prefix_row_bytes(kv8: bool) -> usize {
+    if kv8 { 2 * DIM + 2 * HEADS * 4 } else { 2 * DIM * 2 }
 }
 
 /// The buffers `velocity` holds over `n` latents after a prefix of `p` rows: x and the output norm's float32, h | att

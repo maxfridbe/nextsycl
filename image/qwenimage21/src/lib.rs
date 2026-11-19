@@ -82,6 +82,7 @@ const LATENT_STD: [f32; 64] = [
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "int8", env: "NS_QI_INT8", value: "0|1", help: "the DiT's block matrices in int8 ConvRot (~1.4x a step, half the VRAM)", at: At::Load },
     EngineOption { name: "sigmas", env: "NS_QI_SIGMAS", value: "1,X,...", help: "the noise levels from 1 down (a few-step model's own; its step count)", at: At::Both },
+    EngineOption { name: "kv8", env: "NS_QI_KV8", value: "auto|0|1", help: "the prompt's (and an edit's pictures') k|v kept for the steps in 8 bits: auto when half would not fit beside the model, 1 always, 0 never", at: At::Both },
     EngineOption { name: "sigma-shift", env: "NS_QI_SIGMA_SHIFT", value: "dynamic|none", help: "the size's shift on those levels, or as given", at: At::Both },
 ];
 
@@ -91,6 +92,16 @@ pub fn kind() -> ImageKind {
 }
 
 /// A sigma preset from its two settings (each `None`: not given)
+/// NS_QI_KV8 / a request's `kv8`: auto (None), 1, 0
+fn kv8_of(v: Option<&str>) -> Result<Option<bool>> {
+    match v.map(str::trim) {
+        None | Some("") | Some("auto") => Ok(None),
+        Some("1") | Some("true") => Ok(Some(true)),
+        Some("0") | Some("false") => Ok(Some(false)),
+        Some(x) => Err(Error(format!("kv8 {x:?}: auto, 0 or 1"))),
+    }
+}
+
 fn preset_of(sigmas: Option<String>, shift: Option<String>) -> Result<Option<Preset>> {
     let Some(v) = sigmas else { return Ok(None) };
     let bad = || Error(format!("sigmas {v}: numbers from 1 down, comma separated"));
@@ -129,6 +140,8 @@ pub struct QwenImage21 {
     load_s: f64,
     /// what the loaded model holds on its card (the load check's estimate)
     resident: u64,
+    /// NS_QI_KV8: the prefix's k|v in 8 bits - None: when half would not fit (auto), Some: always / never
+    kv8: Option<bool>,
     /// LoRA files read for requests (their updates at strength 1), the last few kept: a request's LoRAs are put on
     /// the GPU from here (dit::Side), not read again
     lora_cache: std::sync::Mutex<Vec<(PathBuf, Arc<Vec<Delta>>)>>,
@@ -202,6 +215,7 @@ impl QwenImage21 {
         let f = Gguf::open(role(files, "transformer")?).map_err(|e| Error(e.0))?;
         let size = |r: &str| -> Result<u64> { std::fs::metadata(role(files, r)?).map(|m| m.len()).map_err(|e| Error(format!("{r}: {e}"))) };
         let int8 = o.setting("NS_QI_INT8").is_some_and(|v| v == "1");
+        let kv8 = kv8_of(o.setting("NS_QI_KV8").as_deref())?;
         let dit_b: u64 = f.tensors.iter().map(|t| t.elements() * if int8 { 1 } else { 2 }).sum();
         let need = dit_b + size("text-encoder")? + size("vae")? + ACTIVATIONS;
         let (total, free) = gpu.memory()?;
@@ -219,21 +233,31 @@ impl QwenImage21 {
         }
         let dit = dit::Dit::load(&f, &nsd, int8, &deltas, log)?;
         let vae = vae::Vae::load(role(files, "vae")?, &nsd, (LATENT_MEAN.to_vec(), LATENT_STD.to_vec()), log)?;
-        Ok(QwenImage21 { nsd, preset, te, dit, vae, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64(), resident: need - ACTIVATIONS,
+        Ok(QwenImage21 { nsd, preset, te, dit, vae, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64(), resident: need - ACTIVATIONS, kv8,
                          lora_cache: std::sync::Mutex::new(Vec::new()) })
     }
 
     /// What a `w` x `h` picture after a prefix of `p` rows needs on the card at most (the denoise's or the decode's
     /// buffers, the kernels' scratch, and the VAE encodes of the pictures in `encodes`, W x H each: an edit's or an
     /// img2img's), and whether it has that now: a plain error when the card could never hold it beside the model, no
-    /// room when it could on an emptier card
-    pub fn room_for(&self, w: usize, h: usize, p: usize, encodes: &[(usize, usize)]) -> Result<()> {
+    /// room when it could on an emptier card. `kv8`: the prefix's k|v in 8 bits (None: only when half would not fit
+    /// now); answers whether they are
+    pub fn room_for(&self, w: usize, h: usize, p: usize, encodes: &[(usize, usize)], kv8: Option<bool>) -> Result<bool> {
         let (lh, lw) = (h / 16, w / 16);
         let enc = encodes.iter().map(|(ew, eh)| self.vae.encode_bytes(*eh, *ew)).max().unwrap_or(0);
-        let need = (self.dit.denoise_bytes(lh * lw, p) + SCRATCH).max(self.vae.min_bytes(lh, lw)).max(enc) + vae::MARGIN;
+        let need_of = |kv8: bool| (self.dit.denoise_bytes(lh * lw, p, kv8) + SCRATCH).max(self.vae.min_bytes(lh, lw)).max(enc) + vae::MARGIN;
         let gpu = &self.nsd.gpu;
         let (total, free) = gpu.memory()?;
         let mut free = free.unwrap_or(total);
+        let half = need_of(false);
+        if kv8.is_none() && half > free {
+            // the kernels' scratch and primitives from earlier requests: given back before choosing 8 bits
+            self.nsd.trim()?;
+            let (t, f) = gpu.memory()?;
+            free = f.unwrap_or(t);
+        }
+        let kv8 = kv8.unwrap_or(half > free || half + self.resident > total);
+        let need = need_of(kv8);
         if need > free {
             // the kernels' scratch and primitives from earlier requests (a 1024 edit's left 0.85 GiB): given back first
             self.nsd.trim()?;
@@ -248,7 +272,7 @@ impl QwenImage21 {
             return Err(Error::no_room(format!("{ARCH}: {w}x{h} needs {:.1} GiB more on {} ({:.1} GiB free)", (need - free) as f64 / GIB, gpu.name,
                                               free as f64 / GIB)));
         }
-        Ok(())
+        Ok(kv8)
     }
 
     /// A LoRA file's updates at strength 1: from the cache, else read (and kept, the oldest let go)
@@ -305,12 +329,12 @@ impl QwenImage21 {
     /// the starting noise [h * w, 64] (scaled to the first sigma here); returns the latents at the last sigma.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn denoise_sampled(&self, embeds: &DevBuf, tokens: usize, pads: &[bool], neg: Option<(&DevBuf, usize, &[bool], f32)>,
-                           conds: &[(&DevBuf, (usize, usize))], x: Vec<f32>, hw: (usize, usize), sigmas: &[f32], sampler: Sampler, seed: u64,
+                           conds: &[(&DevBuf, (usize, usize))], x: Vec<f32>, hw: (usize, usize), sigmas: &[f32], sampler: Sampler, seed: u64, kv8: bool,
                            each: &mut dyn FnMut(usize) -> Result<()>) -> Result<Vec<f32>> {
         let k = ffi::api()?;
         let gpu = &self.nsd.gpu;
-        let pre = self.dit.prefix_with(&self.nsd, embeds, tokens, self.te.hidden, pads, conds)?;
-        let npre = neg.map(|(e, t, np, s)| Ok::<_, Error>((self.dit.prefix_with(&self.nsd, e, t, self.te.hidden, np, conds)?, s))).transpose()?;
+        let pre = self.dit.prefix_with(&self.nsd, embeds, tokens, self.te.hidden, pads, conds, kv8)?;
+        let npre = neg.map(|(e, t, np, s)| Ok::<_, Error>((self.dit.prefix_with(&self.nsd, e, t, self.te.hidden, np, conds, kv8)?, s))).transpose()?;
         let n = hw.0 * hw.1 * dit::LATENT;
         let lat = DevBuf::f32(gpu, n)?;
         let mut failed: Option<Error> = None;
@@ -418,7 +442,7 @@ impl QwenImage21 {
     #[allow(clippy::too_many_arguments)]
     pub fn denoise(&self, embeds: &DevBuf, tokens: usize, lat: &DevBuf, hw: (usize, usize), sigmas: &[f32], each: &mut dyn FnMut(usize, &DevBuf) -> Result<()>)
                    -> Result<()> {
-        self.denoise_cfg(embeds, tokens, &[], None, &[], lat, hw, sigmas, each)
+        self.denoise_cfg(embeds, tokens, &[], None, &[], lat, hw, sigmas, false, each)
     }
 
     /// `denoise` with true classifier-free guidance when `neg` is given: (the negative prompt's embedding, its tokens,
@@ -427,10 +451,10 @@ impl QwenImage21 {
     /// latents and latent sizes)
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn denoise_cfg(&self, embeds: &DevBuf, tokens: usize, pads: &[bool], neg: Option<(&DevBuf, usize, &[bool], f32)>, conds: &[(&DevBuf, (usize, usize))],
-                       lat: &DevBuf, hw: (usize, usize), sigmas: &[f32], each: &mut dyn FnMut(usize, &DevBuf) -> Result<()>) -> Result<()> {
+                       lat: &DevBuf, hw: (usize, usize), sigmas: &[f32], kv8: bool, each: &mut dyn FnMut(usize, &DevBuf) -> Result<()>) -> Result<()> {
         let k = ffi::api()?;
-        let pre = self.dit.prefix_with(&self.nsd, embeds, tokens, self.te.hidden, pads, conds)?;
-        let npre = neg.map(|(e, t, np, s)| Ok::<_, Error>((self.dit.prefix_with(&self.nsd, e, t, self.te.hidden, np, conds)?, s))).transpose()?;
+        let pre = self.dit.prefix_with(&self.nsd, embeds, tokens, self.te.hidden, pads, conds, kv8)?;
+        let npre = neg.map(|(e, t, np, s)| Ok::<_, Error>((self.dit.prefix_with(&self.nsd, e, t, self.te.hidden, np, conds, kv8)?, s))).transpose()?;
         let n = hw.0 * hw.1 * dit::LATENT;
         for i in 0..sigmas.len() - 1 {
             prof::reset_clock(&self.nsd)?;
@@ -571,7 +595,11 @@ impl ImageEngine for QwenImage21 {
         let enc_sizes: Vec<(usize, usize)> = pics.iter().map(|p| dims(area as f64, p.width as f64 / p.height as f64))
             .chain((strength < 1.0 && req.edit.is_some()).then_some((w, h))).collect();
         let pics_rows: usize = pics.iter().map(|p| dims(area as f64, p.width as f64 / p.height as f64)).map(|(a, b)| (a / 16) * (b / 16)).sum();
-        self.room_for(w, h, pics_rows, &enc_sizes)?;
+        let kv8_asked = match req.extra.get("kv8") {
+            Some(v) => kv8_of(Some(v))?,
+            None => self.kv8,
+        };
+        self.room_for(w, h, pics_rows, &enc_sizes, kv8_asked)?;
         let start = match &req.edit {
             Some(e) if strength < 1.0 => {
                 let r = e.image.rgba().resize_lanczos(w as u32, h as u32);
@@ -597,7 +625,10 @@ impl ImageEngine for QwenImage21 {
         // the size's room, checked before the work: a prefix at most the prompt's tokens and the pictures' latents (the
         // negative prompt's kept beside it)
         let pics_rows: usize = lats.iter().map(|(_, (a, b))| a * b).sum();
-        self.room_for(w, h, tokens + pics_rows + negative.as_ref().map_or(0, |(_, t, _)| t + pics_rows), &[])?;
+        let kv8 = self.room_for(w, h, tokens + pics_rows + negative.as_ref().map_or(0, |(_, t, _)| t + pics_rows), &[], kv8_asked)?;
+        if kv8 {
+            eprintln!("{ARCH}: the prefix's k|v in 8 bits ({} rows{})", tokens + pics_rows, if kv8_asked.is_none() { ": half would not fit" } else { "" });
+        }
         if let Ok(dir) = std::env::var("NS_QI_DUMP") {
             // what the denoiser is given (a debugging aid): raw float32 files
             let raw = |name: &str, v: &[f32]| { let _ = std::fs::write(format!("{dir}/{name}"), v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()); };
@@ -628,12 +659,12 @@ impl ImageEngine for QwenImage21 {
             let lat = if sampler == Sampler::Euler && schedule == Schedule::Shift {
                 // the model's own path: Euler on the GPU
                 let lat = DevBuf::from_f32(&self.nsd.gpu, &nz)?;
-                self.denoise_cfg(&embeds, tokens, &pads, neg, &conds, &lat, hw, &sig, &mut |i, _| {
+                self.denoise_cfg(&embeds, tokens, &pads, neg, &conds, &lat, hw, &sig, kv8, &mut |i, _| {
                     progress(Step { picture: p, at: i as u32 + 1, of, seconds: t0.elapsed().as_secs_f64() })
                 })?;
                 lat
             } else {
-                let out = self.denoise_sampled(&embeds, tokens, &pads, neg, &conds, nz, hw, &sig, sampler, req.seed + p as u64, &mut |i| {
+                let out = self.denoise_sampled(&embeds, tokens, &pads, neg, &conds, nz, hw, &sig, sampler, req.seed + p as u64, kv8, &mut |i| {
                     progress(Step { picture: p, at: i as u32 + 1, of, seconds: t0.elapsed().as_secs_f64() })
                 })?;
                 DevBuf::from_f32(&self.nsd.gpu, &out)?

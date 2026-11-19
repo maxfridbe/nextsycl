@@ -126,6 +126,58 @@ int ns_image_qi21_to_half(ns_gpu* g, const float* x, void* out, int64_t n) {
     NS_CATCH
 }
 
+int ns_image_qi21_kv_keep(ns_gpu* g, const void* qkv, int64_t P, int64_t D, void* kv) {
+    NS_TRY
+    const uint16_t* x = (const uint16_t*) qkv;
+    uint16_t* o = (uint16_t*) kv;
+    g->q.parallel_for(sycl::range<2>((size_t) P, (size_t) (2 * D)), [=](sycl::id<2> i) {
+        o[i[0] * 2 * D + i[1]] = x[i[0] * 3 * D + D + i[1]];
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_image_qi21_kv_put(ns_gpu* g, const void* kv, int64_t P, int64_t D, void* qkv) {
+    NS_TRY
+    const uint16_t* x = (const uint16_t*) kv;
+    uint16_t* o = (uint16_t*) qkv;
+    g->q.parallel_for(sycl::range<2>((size_t) P, (size_t) (2 * D)), [=](sycl::id<2> i) {
+        o[i[0] * 3 * D + D + i[1]] = x[i[0] * 2 * D + i[1]];
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_image_qi21_kv_pack8(ns_gpu* g, const void* qkv, int64_t P, int64_t D, int64_t HD, int8_t* q, float* s) {
+    NS_TRY
+    if (HD <= 0 || HD > 256 || D % HD != 0) {
+        return ns_fail("ns_image_qi21_kv_pack8: the group must divide D and be at most 256");
+    }
+    const half* x = (const half*) qkv;
+    const int64_t G = 2 * D / HD;    // groups a row
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (P * G * HD)), sycl::range<1>((size_t) HD)), [=](sycl::nd_item<1> it) {
+        const int64_t grp = (int64_t) it.get_group(0), r = grp / G, c = (grp % G) * HD + (int64_t) it.get_local_id(0);
+        const float v = (float) x[r * 3 * D + D + c];
+        const float sc = sycl::fmax(sycl::reduce_over_group(it.get_group(), sycl::fabs(v), sycl::maximum<float>()) / 127.0f, 1e-30f);
+        q[r * 2 * D + c] = (int8_t) sycl::clamp(sycl::rint(v / sc), -127.0f, 127.0f);
+        if (it.get_local_id(0) == 0) s[grp] = sc;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_image_qi21_kv_unpack8(ns_gpu* g, const int8_t* q, const float* s, int64_t P, int64_t D, int64_t HD, void* qkv) {
+    NS_TRY
+    half* o = (half*) qkv;
+    const int64_t G = 2 * D / HD;
+    g->q.parallel_for(sycl::range<2>((size_t) P, (size_t) (2 * D)), [=](sycl::id<2> i) {
+        const int64_t r = (int64_t) i[0], c = (int64_t) i[1];
+        o[r * 3 * D + D + c] = (half) ((float) q[r * 2 * D + c] * s[r * G + c / HD]);
+    });
+    return 0;
+    NS_CATCH
+}
+
 int ns_image_qi21_to_float(ns_gpu* g, const void* x, float* out, int64_t n) {
     NS_TRY
     const half* p = (const half*) x;

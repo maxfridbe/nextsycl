@@ -41,6 +41,15 @@ int ns_image_qi21_pad_br(ns_gpu* g, const void* x, int64_t H, int64_t W, int64_t
  * the zero frame padded in front (one frame) */
 int ns_image_qi21_avg_down_add(ns_gpu* g, const void* x, int64_t H, int64_t W, int64_t Ci, int64_t Co, int ft, void* out);
 /* x float32 [H, W, 4] in [-1, 1] -> half (the encoder's input) is ns_image_qi21_to_half */
+/* The prefix's k | v kept for the denoise's steps (they never read its q). qkv [P, 3D] half holds q | k | v a row; the
+ * kept rows are its columns D..3D. kv_keep: kv [P, 2D] half = those columns; kv_put: back into qkv's columns D..3D (q
+ * left as it is). The 8-bit form: kv_pack8: per row and per group of HD values of k | v, s = max|x| / 127 (at least
+ * 1e-30), q = round(x / s) as int8 (clamped to [-127, 127]): q [P, 2D] int8, s [P, 2D / HD] float32; HD at most 256 and
+ * dividing D. kv_unpack8: qkv's columns D..3D = q * s, half. */
+int ns_image_qi21_kv_keep(ns_gpu* g, const void* qkv, int64_t P, int64_t D, void* kv);
+int ns_image_qi21_kv_put(ns_gpu* g, const void* kv, int64_t P, int64_t D, void* qkv);
+int ns_image_qi21_kv_pack8(ns_gpu* g, const void* qkv, int64_t P, int64_t D, int64_t HD, int8_t* q, float* s);
+int ns_image_qi21_kv_unpack8(ns_gpu* g, const int8_t* q, const float* s, int64_t P, int64_t D, int64_t HD, void* qkv);
 /* rgba [H, W, 4] uint8 from x [H, W, 4] half in [-1, 1]: clamped, (x / 2 + 0.5) * 255 rounded */
 int ns_image_qi21_to_rgba8(ns_gpu* g, const void* x, int64_t H, int64_t W, uint8_t* rgba);
 

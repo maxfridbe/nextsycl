@@ -186,14 +186,14 @@ pub fn run(m: &QwenImage21, dir: &Path, stages: &[&str], log: &mut dyn FnMut(Str
         log(format!("  here {:?}\n  ref  {:?}", &mine[..4.min(mine.len())], &sig_ref[..4.min(sig_ref.len())]));
         let lat = DevBuf::from_f32(gpu, &noise)?;
         let t0 = std::time::Instant::now();
-        let pre = m.dit.prefix_with(&m.nsd, &e, tokens, embeds.len() / tokens, &pads, &[(&cond, (h, w))])?;
+        let pre = m.dit.prefix_with(&m.nsd, &e, tokens, embeds.len() / tokens, &pads, &[(&cond, (h, w))], false)?;
         log(format!("dit: the prefix (text + the picture's {} latents: {} rows) in {:.0} ms", h * w, pre.tokens, t0.elapsed().as_secs_f64() * 1e3));
         let v = m.dit.velocity(&m.nsd, &pre, &lat, (h, w), sig_ref[0], None)?;
         let (_, v0) = read_npy(&dir.join("v0.npy"))?;
         worst = worst.max(line("edit velocity 0", &v.to_f32()?, &v0, log));
         let lat = DevBuf::from_f32(gpu, &noise)?;
         let t0 = std::time::Instant::now();
-        m.denoise_cfg(&e, tokens, &pads, None, &[(&cond, (h, w))], &lat, (h, w), &sig_ref, &mut |i, l| {
+        m.denoise_cfg(&e, tokens, &pads, None, &[(&cond, (h, w))], &lat, (h, w), &sig_ref, false, &mut |i, l| {
             let (_, want) = read_npy(&dir.join(format!("latents_{i}.npy")))?;
             worst = worst.max(line(&format!("edit latents {i}"), &l.to_f32()?, &want, log));
             Ok(())

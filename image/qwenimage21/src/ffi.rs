@@ -21,6 +21,10 @@ pub struct Api {
     pub to_rgba8: unsafe extern "C" fn(G, P, i64, i64, *mut u8) -> c_int,
     pub pad_br: unsafe extern "C" fn(G, P, i64, i64, i64, M) -> c_int,
     pub avg_down_add: unsafe extern "C" fn(G, P, i64, i64, i64, i64, c_int, M) -> c_int,
+    pub kv_keep: unsafe extern "C" fn(G, P, i64, i64, M) -> c_int,
+    pub kv_put: unsafe extern "C" fn(G, P, i64, i64, M) -> c_int,
+    pub kv_pack8: unsafe extern "C" fn(G, P, i64, i64, i64, *mut i8, *mut f32) -> c_int,
+    pub kv_unpack8: unsafe extern "C" fn(G, *const i8, *const f32, i64, i64, i64, M) -> c_int,
 }
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
@@ -58,6 +62,10 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
             to_rgba8: sym!("ns_image_qi21_to_rgba8"),
             pad_br: sym!("ns_image_qi21_pad_br"),
             avg_down_add: sym!("ns_image_qi21_avg_down_add"),
+            kv_keep: sym!("ns_image_qi21_kv_keep"),
+            kv_put: sym!("ns_image_qi21_kv_put"),
+            kv_pack8: sym!("ns_image_qi21_kv_pack8"),
+            kv_unpack8: sym!("ns_image_qi21_kv_unpack8"),
         })
     })
     .as_ref()
