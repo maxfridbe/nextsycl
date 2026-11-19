@@ -423,11 +423,13 @@ pub fn reason(status: u16) -> &'static str {
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         507 => "Insufficient Storage",
-        100..=199 => "Informational",
-        200..=299 => "Success",
-        300..=399 => "Redirection",
-        400..=499 => "Client Error",
-        _ => "Server Error",
+        _ => match status / 100 {
+            1 => "Informational",
+            2 => "Success",
+            3 => "Redirection",
+            4 => "Client Error",
+            _ => "Server Error",
+        },
     }
 }
 
