@@ -10,7 +10,7 @@ title: 'Hi3D v1.0 (refines a coarse mesh like its picture: geometry to 1024^3; H
 about: 'Hi3D v1.0 on Sparc3D: the coarse mesh voxelized at 64^3, DINOv2-large (756 px) and CLIP ViT-L/14 condition two 1.8B sparse flow transformers (24 blocks of 2112, 25 Heun updates a pass, guided above sigma 0.7), a self-pruning sparse decoder to signed distances 8x finer and FlexiCubes - 512^3 in one pass, 1024^3 in two (re-voxelized at 128^3), 1536^3 in three; pieces under 0.5 % dropped, decimated to a million faces, recentred to unit radius. Geometry only; give it the picture and a coarse mesh of the same object (hunyuan3d-2mini-turbo makes one in seconds)'
 does: [refine]
 gpus: '0'
-vram_gib: 14.0                   # its memory on the card when it runs (models load stage by stage)
+vram_gib: 10.0                   # its memory on the card when it runs: the 1024 peak measured 8.7 GiB on a B70 (1536: 14.3; models load stage by stage)
 env: {}
 files:
   index:

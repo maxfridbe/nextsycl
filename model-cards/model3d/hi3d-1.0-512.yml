@@ -10,7 +10,7 @@ title: 'Hi3D v1.0, 512 (refines a coarse mesh like its picture: one pass to 512^
 about: 'hi3d-1.0 without transformer_1024: the one-pass refinement (64^3 voxels -> 512^3 extraction, a million faces), 3.7 GB less to download and a lighter card'
 does: [refine]
 gpus: '0'
-vram_gib: 8.0                    # its memory on the card when it runs (models load stage by stage)
+vram_gib: 6.0                    # its memory on the card when it runs: the peak measured 5.1 GiB on a B70 (models load stage by stage)
 env: {}
 files:
   index: hi3d-index

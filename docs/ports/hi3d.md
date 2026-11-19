@@ -123,7 +123,16 @@ the zero condition above 0.7). On the B65 the same call is ~3.1 s. The padded fl
 self-attention against oneDNN's kernel at D = 96 (1.79 -> 1.61 s on the B65); the attention is compute-bound at these
 token counts.
 
-**1536**: SIZING_1536
+**1536** (B70, the same example): 673.5 s, peak **14.3 GiB** (of 32: room to spare with 1.5 GiB kept free). Pass 3's
+voxels did not fit 110,000 at 192³: the grid settled at 164³ (108,879 voxels, 25,583 tokens; upstream does the same
+and warns, keeping the 1536 label); its sampling 399 s, decode 7.46M voxels in 4.7 s, FlexiCubes + holes 14.7M faces
+in 21 s, postprocess to 2M faces 24 s. Sizing before the run: the third pass's transformer at ~27k tokens needs well
+under 2 GiB of activations; the decoder's finest level ~10M voxels x (128 float32 features + their half copy + a
+float32 conv output + the neighbour map) ~ 14 GiB worst case plus the 1024-wide unpooling projection of its parents
+(~5 GiB, freed before): measured 14.3 GiB at the peak.
+
+The 3D server path was run too (`model3d serve hi3d-1.0-512 --here`, POST /v1/model3d/generate with image + mesh,
+B65): 51.6 s, the GLB and its settings in the output directory; `model3d.info` reports `abilities.refine`.
 
 ## Licence
 
