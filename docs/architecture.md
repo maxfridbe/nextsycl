@@ -764,6 +764,8 @@ Since 2026-11-17 a run on some cards holds each card's own lock beside the box's
 runs on two cards go side by side. The box's lock (a run that names no card, or an old flock-only runner) still takes
 every card, and a run on some cards waits for it.
 
+Since 2026-11-18 a hung run frees its cards on its own. gpu-lock.sh's `gpu_lock GPUS [WAIT_S] [MAX_HOLD_S]` writes a deadline beside each lock it takes (`/tmp/ds2run.deadline`, `/tmp/ds2run.gpuN.deadline`: pid, deadline, `GPU_LOCK_OWNER`, cwd), MAX_HOLD_S (default 3 h) on. The host's user timer `gpu-lock-watchdog.timer` runs `~/src/gpu-lock-watchdog.py` every minute. For a lock past its deadline, it stops every process that has the lock open: SIGTERM, then SIGKILL 60 s later, plus `podman stop` for a named `podman run`. It never stops the front door's or the studio's processes or containers. A lock held with no deadline (an old flock-only runner) is only logged after 8 h. Log: `~/src/gpu-lock-watchdog.log`. Still wrap the run itself in `timeout --kill-after=60 <limit>`; the watchdog is the backstop.
+
 ## What stays shared on purpose
 
 - **One kernel library a kind**, not one an engine: one toolchain run builds them all, and an engine's code reaches
