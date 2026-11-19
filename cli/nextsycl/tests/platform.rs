@@ -56,7 +56,7 @@ fn engines() -> Vec<(&'static str, Vec<&'static str>)> {
     }
     for k in [nextsycl_model3d_trellis2::kind(), nextsycl_model3d_trellis2::kind_pixal(), nextsycl_model3d_hunyuan3d::kind(), nextsycl_model3d_unirig::kind(), nextsycl_model3d_skintokens::kind(),
               nextsycl_model3d_rignet::kind(), nextsycl_model3d_animateanymesh::kind(), nextsycl_model3d_unimate::kind(), nextsycl_model3d_budget3d::kind(),
-              nextsycl_model3d_example::kind()] {
+              nextsycl_model3d_hi3d::kind(), nextsycl_model3d_example::kind()] {
         v.push(("model3d", k.archs.to_vec()));
     }
     v
@@ -127,8 +127,8 @@ fn no_architecture_is_claimed_twice() {
 
 #[test]
 fn cards_say_only_what_the_door_routes() {
-    // model3d: what the front door routes by (api.rs: generate, rig; paint for a given mesh) and advertises (life.rs)
-    const DOES: &[&str] = &["generate", "texture", "paint", "views", "rig", "animate", "splat"];
+    // model3d: what the front door routes by (api.rs: generate, rig, refine; paint for a given mesh) and advertises (life.rs)
+    const DOES: &[&str] = &["generate", "texture", "paint", "views", "rig", "animate", "splat", "refine"];
     for c in cards().iter().filter(|c| s(c, "kind") == "model3d") {
         let does: Vec<&str> = c["does"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
         assert!(!does.is_empty(), "{}: a 3D card says what it does", s(c, "id"));
