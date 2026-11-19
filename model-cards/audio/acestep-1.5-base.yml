@@ -10,7 +10,7 @@ license_note: 'ACE-Step 1.5 MIT: the DiT, the 5 Hz LM, the VAE and the Qwen3-Emb
 title: 'ACE-Step 1.5 base (a track made in a recording''s context - the platform''s vocalize: vocals over an instrumental; 50 steps, real guidance; Apache-2.0)'
 about: 'ACE-Step''s 1.5 base DiT (not distilled: 50 steps, guidance 7 through APG) with the turbo''s text encoder and VAE, for lego: audio.generate task lego with audio (an instrumental), the track (vocals) sung to input over it; the planner LM not loaded'
 gpus: '1'
-vram_gib: 9.0                   # 6.2 GiB of weights; peak 8.8 GiB (60 s of vocals over an instrumental, the 5070)
+vram_gib: 10.0                   # 6.2 GiB of weights; peak 8.8 GiB (60 s of vocals over an instrumental, the 5070); +~1 GiB in a VAE pass with the silo (2026-11-18)
                                 # SYCL: the VAE silo's pass adds ~1 GiB at its peak (acestep-1.5.yml, docs/ports/acestep.md)
 defaults:
   seconds: 30.0

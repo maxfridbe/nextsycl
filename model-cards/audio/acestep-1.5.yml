@@ -10,7 +10,7 @@ license_note: 'ACE-Step 1.5 MIT: the DiT, the 5 Hz LM, the VAE and the Qwen3-Emb
 title: 'ACE-Step 1.5 turbo (songs in 50 languages from a description and lyrics; 48 kHz stereo, a 3-minute song in seconds; Apache-2.0)'
 about: 'ACE-Step''s 1.5 turbo: a 2B flow DiT (24 layers; 8 steps, guidance distilled) over the Oobleck VAE''s latents (25 a second, 48 kHz stereo), conditioned on Qwen3-Embedding-0.6B''s states of the caption and metas (BPM, key, time signature, length), the lyrics through their own encoder and a timbre reference - the checkpoint''s own safetensors, bfloat16 on the GPU (the VAE float32). audio.generate: instructions the caption, input the lyrics (structure tags on lines of their own), seconds the length (1 to 600), options bpm, key, time-signature, language'
 gpus: '1'
-vram_gib: 11.3                  # 9.7 GiB of weights (DiT 4.8 with its audio codes, planner LM 3.5, text encoder 0.8, VAE 0.6); peak 11.2-11.5 GiB
+vram_gib: 12.8                  # 9.7 GiB of weights (DiT 4.8 with its audio codes, planner LM 3.5, text encoder 0.8, VAE 0.6); peak 11.2-11.5 GiB; the VAE silo (2026-11-18) adds up to ~1.5 GiB in a pass: a cover's encode with the planner ~12.8 GiB on the B65
 headroom_gib: 1.6               #   measured on the 5070 and the 3060 (30 to 240 s, a cover of 90 s)
                                 #   SYCL (2026-11-18): the VAE's convolutions in the silo (docs/ports/acestep.md) hold, during
                                 #   a pass only, the VAE's weights in oneDNN's layouts (encoder 0.3, decoder 0.5 GiB) and a
