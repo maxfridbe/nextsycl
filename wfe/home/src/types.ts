@@ -56,6 +56,16 @@ export interface Model {
   pinned?: boolean;
   /** seconds a request's rsvp_s holds it for yet */
   held_s?: number;
+  /** when its longest-loaded copy finished loading (Unix seconds; null: not loaded) and whole seconds since */
+  loaded_at?: number | null;
+  loaded_s_ago?: number | null;
+  /** the last request on any copy (now while one runs; null: none since the load) and whole seconds since */
+  last_request_at?: number | null;
+  idle_s?: number | null;
+  /** seconds until its first copy idle-unloads (null: pinned, held, busy or idle unload off) */
+  unload_in_s?: number | null;
+  /** one per loaded copy */
+  instances?: { gpu: number | null; gpus?: number[]; port: number | null; busy: boolean; loaded_s_ago: number | null; idle_s: number | null; unload_in_s: number | null }[];
   vouch_mb: Record<string, number>;
   /** of vouch_mb, the headroom (Vouched) */
   headroom_mb: Record<string, number>;

@@ -564,14 +564,7 @@ impl Home {
         // a video engine making a clip is named by its clip below
         reasons.extend(working.iter().filter(|m| m["kind"] != "video").map(|m| format!("{} answering", m["id"].as_str().unwrap_or(""))));
         // the chat server's requests now, and how many it answers together (None: no chat server, or one before it said)
-        let chat = if self.kinds_on(all).contains(&"llm") {
-            let dir = self.o.cfg.get("NS_SOCKET_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
-                std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into())).join("nextsycl")
-            });
-            call_for(&crate::http::Target::Unix(dir.join("nextsycl.sock")), "GET", "/server/requests", None, 3).ok()
-        } else {
-            None
-        };
+        let chat = if self.kinds_on(all).contains(&"llm") { self.chat_requests() } else { None };
         let active = chat.as_ref().and_then(|v| v["active"].as_array().map(|a| a.len())).unwrap_or(0);
         let chat_parallel = chat.as_ref().and_then(|v| v["parallel"].as_u64());
         if active > 0 {
@@ -618,6 +611,18 @@ impl Home {
         // a chat server answering marks its slot busy
         for x in slots.iter_mut().filter(|x| x["kind"] == "llm") {
             x["busy"] = json!(active > 0);
+        }
+        // each slot's times, for what it holds: loaded X ago, last request Y ago (its model's copy there; timing.rs)
+        for x in slots.iter_mut() {
+            let row = states.iter().find(|m| !x["model"].is_null() && m["id"] == x["model"]);
+            let t = match row {
+                Some(m) if !x["port"].is_null() => super::timing::on_port(m, &x["port"]),
+                Some(m) => super::timing::on_card(m, &x["gpu"]),
+                None => super::timing::none(),
+            };
+            if let Some(o) = x.as_object_mut() {
+                o.extend(t);
+            }
         }
         let clips_now: Vec<Value> = video["clips"].as_array().cloned().unwrap_or_default();
         let mut cards = cards;

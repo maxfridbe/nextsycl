@@ -211,6 +211,19 @@ const MODEL_STATE: &str = r#"{"type": "object", "properties": {"id": {"type": "s
         "min": {"type": "number"}, "max": {"type": "number"}, "default": {}, "help": {"type": "string"}}}},
       "note": {"type": "string"}}},
   "page": {"type": "integer", "description": "the port of its own page"},
+  "loaded_at": {"type": "number", "nullable": true, "description": "when its longest-loaded copy finished loading, UTC Unix seconds; null: not loaded"},
+  "last_request_at": {"type": "number", "nullable": true, "description": "the last moment a request was on any copy: now while one runs, else when the last ended; null: none since the load. A request is anything that uses the copy (an RPC, an OpenAI call, its page through /open/<id>, a /v1/realtime session while it lasts, chat through the switcher, a clip on the video daemon); keep-alive touches and health probes are not"},
+  "loaded_s_ago": {"type": "integer", "nullable": true, "description": "whole seconds since loaded_at"},
+  "idle_s": {"type": "integer", "nullable": true, "description": "whole seconds since last_request_at, the smallest of its copies': 0 while a request runs; null: none since the load"},
+  "unload_in_s": {"type": "integer", "nullable": true, "description": "seconds until its first copy idle-unloads (counted from the last request, else from the load); null: pinned, held, busy, or idle unload off"},
+  "instances": {"type": "array", "description": "one per loaded copy (empty: not loaded); the model's times above are its copies': loaded_at the earliest, last_request_at the latest, idle_s the smallest, unload_in_s the soonest", "items": {"type": "object", "properties": {
+    "gpu": {"type": "integer", "nullable": true}, "gpus": {"type": "array", "items": {"type": "integer"}, "description": "a copy spanning cards: every card it is on"},
+    "port": {"type": "integer", "nullable": true, "description": "its server's port (null: a video engine, on the daemon)"}, "busy": {"type": "boolean"},
+    "loaded_at": {"type": "number", "nullable": true, "description": "when it finished loading, UTC Unix seconds; null: not loaded"},
+    "last_request_at": {"type": "number", "nullable": true, "description": "the last moment a request was on it: now while one runs, else when the last ended; null: none since the load"},
+    "loaded_s_ago": {"type": "integer", "nullable": true, "description": "whole seconds since loaded_at"},
+    "idle_s": {"type": "integer", "nullable": true, "description": "whole seconds since last_request_at: 0 while a request runs; null: none since the load"},
+    "unload_in_s": {"type": "integer", "nullable": true}}}},
   "capabilities": {"type": "array", "items": {"type": "string"}, "description": "what it does, in neutral words: chat, stream, tools, vision, describe; generate, edit, compose, img2img, loras, few_step, rgba (transparent pictures: rgba true); ocr, read_pages, pdf; song, lyrics, instrumental; speech, builtin_voices, clone, saved_voices, enrolled_voices, continue_from, voice_design, voice_direction, vocal_events; text_to_video, image_to_video, sound, chain, first_last_frame, voice_reference, controlnet, inpaint, reference_images, reference_videos"},
   "methods": {"type": "array", "items": {"type": "string"}, "description": "the /rpc methods that take it as model"}}}"#;
 
@@ -292,7 +305,11 @@ pub fn result(method: &str) -> Option<String> {
   "slots": {"type": "array", "description": "every place work runs: image and audio servers (two each: one per card), the video daemon's cards, the chat server", "items": {"type": "object", "properties": {
     "kind": {"type": "string", "enum": ["image", "audio", "video", "llm"]}, "slot": {}, "port": {"type": "integer"}, "gpu": {"type": "integer", "nullable": true, "description": "its card (null: not running)"},
     "gpus": {"type": "array", "items": {"type": "integer"}, "description": "llm, or a server whose one copy spans cards: every card it is on"}, "model": {"type": "string", "nullable": true},
-    "up": {"type": "boolean", "description": "a server or engine holds a model there"}, "loading": {"type": "boolean"}, "busy": {"type": "boolean"}}}},
+    "up": {"type": "boolean", "description": "a server or engine holds a model there"}, "loading": {"type": "boolean"}, "busy": {"type": "boolean"},
+    "loaded_at": {"type": "number", "nullable": true, "description": "when it finished loading, UTC Unix seconds; null: not loaded"},
+    "last_request_at": {"type": "number", "nullable": true, "description": "the last moment a request was on it: now while one runs, else when the last ended; null: none since the load"},
+    "loaded_s_ago": {"type": "integer", "nullable": true, "description": "whole seconds since loaded_at"},
+    "idle_s": {"type": "integer", "nullable": true, "description": "whole seconds since last_request_at: 0 while a request runs; null: none since the load"}}}},
   "cards": {"type": "array", "description": "each GPU and the work on it", "items": {"type": "object", "properties": {
     "gpu": {"type": "integer"}, "name": {"type": "string"}, "vram_total_mb": {"type": "integer"}, "vram_used_mb": {"type": "integer"}, "busy_pct": {"type": "number"}, "power_w": {"type": "number"},
     "models": {"type": "array", "items": {"type": "string"}, "description": "registered models whose processes hold memory there"}, "busy": {"type": "boolean"},
@@ -316,7 +333,7 @@ pub fn result(method: &str) -> Option<String> {
   "kind": {"type": "string"}, "markdown": {"type": "string", "description": "the model card's prompt guide: the form the model was trained on, with rules and an example"}}}"#.into(),
         "system.state" => format!(r#"{{"type": "object", "description": "the box, as the page shows it", "properties": {{"ts": {{"type": "number"}},
   "host": {{"type": "object", "description": "memory (meminfo)", "additionalProperties": true}},
-  "cards": {{"type": "array", "items": {{"type": "object", "description": "a GPU: memory, the processes on it with their models and what they are making (job_label, job_title)", "additionalProperties": true}}}},
+  "cards": {{"type": "array", "items": {{"type": "object", "description": "a GPU: memory, the processes on it with their models and what they are making (job_label, job_title); vouched[]: the enabled models counted on it, each with loaded_at, last_request_at, loaded_s_ago and idle_s for its copy on this card (null: not loaded here)", "additionalProperties": true}}}},
   "models": {{"type": "array", "items": {MODEL_STATE}}}, "services": {{"type": "object", "additionalProperties": true}},
   "runs": {{"type": "array", "items": {{"type": "object", "properties": {{"id": {{"type": "integer"}}, "label": {{"type": "string"}}, "started": {{"type": "number"}}, "rc": {{"type": "integer", "nullable": true}}, "out": {{"type": "string"}}}}}}}},
   "idle_minutes": {{"type": "integer"}}, "ports": {{"type": "object", "additionalProperties": {{"type": "integer"}}}}}}}}"#),

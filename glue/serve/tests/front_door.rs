@@ -2,7 +2,8 @@
 //! registry (an in-memory `Store`), called as a client calls it - /rpc/<method> with a bearer token, the OpenAI routes,
 //! /openapi.yml. What it checks is the platform's contract: the envelope, the token, maintenance, the methods and
 //! features a client can test for, the cards' models that are not downloaded, how 3D work is routed (a given mesh goes
-//! to a model that paints), and the specification against the methods. Nothing here starts a model server.
+//! to a model that paints), a loaded model's times (loaded X ago, last request Y ago: a stand-in image server), and
+//! the specification against the methods. Nothing here starts a model server.
 //!
 //! `cargo test -p nextsycl-serve --test front_door`; tests/run.sh runs it with the rest.
 
@@ -69,11 +70,15 @@ fn entry(id: &str, kind: &str, does: &[&str], enabled: bool) -> Value {
 
 /// A front door on a free port: the registry's entries and the cards' models, and its address
 fn door(tag: &str, models: Vec<Value>, cards: Vec<Value>) -> String {
+    door_with(tag, models, cards, Ports { llm: 0, switch: 0, image: 0, audio: 0, model3d: 0, image2: 0, audio2: 0, model3d2: 0, video: 0, chat_ui: 0 })
+}
+
+/// `door` with the model servers' ports given (a test's own stand-in servers)
+fn door_with(tag: &str, models: Vec<Value>, cards: Vec<Value>, ports: Ports) -> String {
     let dir = std::env::temp_dir().join(format!("nextsycl-front-door-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let ports = Ports { llm: 0, switch: 0, image: 0, audio: 0, model3d: 0, image2: 0, audio2: 0, model3d2: 0, video: 0, chat_ui: 0 };
     let cfg = Box::new(Mem { dir: dir.clone(), models: Mutex::new(models), cards });
     let home = Home::new(Options { wfe: dir.join("wfe"), exe: PathBuf::from("/nonexistent/nextsycl"), ports, serve_host: "127.0.0.1".into(), door: "127.0.0.1:1".into(), cfg, idle_minutes: 0 })
         .expect("the front door starts");
@@ -554,4 +559,87 @@ fn a_busy_door_keeps_answering_its_other_callers() {
     for h in hs {
         h.join().unwrap();
     }
+}
+
+/// A stand-in image server holding `model`, loaded at `loaded_at` with a 600 s idle exit: what the door asks of one
+/// (/api/info, /api/progress) and its page; the paths it was asked, in order
+fn fake_image_server(model: &'static str, loaded_at: f64) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            // the whole head (closing with some of it unread would reset the connection, the answer lost)
+            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 8192];
+            while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                match c.read(&mut buf) {
+                    Ok(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+            if raw.is_empty() {
+                continue;
+            }
+            let head = String::from_utf8_lossy(&raw).into_owned();
+            let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+            seen.lock().unwrap().push(path.clone());
+            let (ty, body) = match path.as_str() {
+                "/api/info" => ("application/json", json!({"model": model, "loaded_at": loaded_at, "idle_exit_s": 600, "idle_since": loaded_at}).to_string()),
+                "/api/progress" => ("application/json", json!({"busy": false, "waiting": 0}).to_string()),
+                _ => ("text/html", "<html>the page</html>".to_string()),
+            };
+            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    (port, asked)
+}
+
+#[test]
+fn a_loaded_model_says_when_it_loaded_and_when_it_was_last_asked() {
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+    let loaded_at = now() - 120.0;
+    let (port, asked) = fake_image_server("pic", loaded_at);
+    let ports = Ports { llm: 0, switch: 0, image: port, audio: 0, model3d: 0, image2: 0, audio2: 0, model3d2: 0, video: 0, chat_ui: 0 };
+    let a = door_with("timing", vec![entry("pic", "image", &[], true), entry("other", "image", &[], true)], vec![], ports);
+    let row = |id: &str| {
+        let all = ok(&a, "system.models", json!({}));
+        all["models"].as_array().unwrap().iter().find(|m| m["id"] == id).cloned().unwrap()
+    };
+    // loaded, nothing asked of it through here yet: its load from its server, no request, unloading 600 s after the load
+    let m = row("pic");
+    let near = |v: &Value| v.as_f64().is_some_and(|t| (t - loaded_at).abs() < 1e-3);
+    assert!(near(&m["loaded_at"]), "{m}");
+    assert!(m["loaded_s_ago"].as_u64().is_some_and(|s| (119..=125).contains(&s)), "{m}");
+    assert_eq!((m["last_request_at"].clone(), m["idle_s"].clone()), (Value::Null, Value::Null), "{m}");
+    assert!(m["unload_in_s"].as_u64().is_some_and(|s| (470..=481).contains(&s)), "{m}");
+    let inst = m["instances"].as_array().unwrap();
+    assert_eq!(inst.len(), 1, "{m}");
+    assert_eq!((inst[0]["port"].clone(), inst[0]["busy"].clone()), (json!(port), json!(false)), "{m}");
+    // a model not loaded: null times, no copies
+    let o = row("other");
+    assert_eq!((o["loaded_at"].clone(), o["unload_in_s"].clone(), o["instances"].clone()), (Value::Null, Value::Null, json!([])), "{o}");
+    // the page's polling through /open is no request
+    let (st, _) = http(&a, "GET", "/open/pic/api/progress", Some(TOKEN), None);
+    assert_eq!(st, 200);
+    assert_eq!(row("pic")["last_request_at"], Value::Null, "polling is not a request");
+    // the page opened through the door is
+    let t0 = now();
+    let (st, body) = http(&a, "GET", "/open/pic/", Some(TOKEN), None);
+    assert_eq!((st, body.as_str()), (200, "<html>the page</html>"));
+    assert!(asked.lock().unwrap().iter().any(|p| p == "/"), "the page went to its server");
+    let m = row("pic");
+    assert!(m["last_request_at"].as_f64().is_some_and(|t| t >= t0 - 1.0), "{m}");
+    assert!(m["idle_s"].as_u64().is_some_and(|s| s <= 2), "{m}");
+    assert_eq!(m["instances"][0]["idle_s"], m["idle_s"], "{m}");
+    // system.busy's slot for it carries the same times
+    let busy = ok(&a, "system.busy", json!({}));
+    let slot = busy["slots"].as_array().unwrap().iter().find(|x| x["port"] == port).cloned().unwrap();
+    assert!(near(&slot["loaded_at"]), "{slot}");
+    assert!(slot["idle_s"].as_u64().is_some_and(|s| s <= 2), "{slot}");
+    // pinned: no idle unload
+    ok(&a, "system.pin", json!({"model": "pic"}));
+    assert_eq!(row("pic")["unload_in_s"], Value::Null);
 }

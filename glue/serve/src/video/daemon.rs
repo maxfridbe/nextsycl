@@ -26,7 +26,8 @@
 //! The API (JSON over HTTP on the socket):
 //!
 //! ```text
-//!   GET  /engine/status              every GPU slot (engine state, process, memory, busy, its job), the queue
+//!   GET  /engine/status              every GPU slot (engine state, process, memory, busy, its job, idle and unload
+//!                                    seconds, when its engine loaded and the last clip: loaded_at, last_request_at), the queue
 //!   GET  /engine/gpus                the GPUs there are (served or not)
 //!   GET  /engine/jobs                every job, newest first, without logs
 //!   GET  /engine/jobs/<id>           one job with its log and result
@@ -256,6 +257,10 @@ struct Slot {
     engine: String, // unloaded, starting..., waiting for the GPU..., loading, loaded, unloading
     running: Option<u64>,
     last_active: Instant,
+    /// when its engine finished loading, and the last clip on it since (its start, then its end; Unix seconds): the
+    /// front door's timing fields
+    loaded_at: Option<f64>,
+    last_request_at: Option<f64>,
     /// its idle unload held off until then (POST /engine/keep)
     keep_until: Option<Instant>,
     unload_requested: bool,
@@ -449,7 +454,15 @@ impl Daemon {
                 }
             }
             Some("ready") => {
-                self.s.lock().unwrap().slots[k].info = ev["info"].clone();
+                {
+                    let mut s = self.s.lock().unwrap();
+                    let sl = &mut s.slots[k];
+                    sl.info = ev["info"].clone();
+                    // its idle countdown runs from the load (a clip running on it counts as a request from here)
+                    sl.loaded_at = Some(now());
+                    sl.last_request_at = None;
+                    sl.last_active = Instant::now();
+                }
                 self.set_engine(k, "loaded");
             }
             Some("stats") => self.s.lock().unwrap().slots[k].stats = ev.clone(),
@@ -473,6 +486,8 @@ impl Daemon {
             sl.info = Value::Null;
             sl.stats = Value::Null;
             sl.worker_pid = None;
+            sl.loaded_at = None;
+            sl.last_request_at = None;
         }
         self.set_engine(k, "unloaded");
         // the hooks last: the model switcher starts its model only once our status shows the card free (2026-10-05:
@@ -648,6 +663,7 @@ impl Daemon {
                         j.gpu = Some(gpu);
                         let (spec, cancel) = (j.spec.clone(), j.cancel.clone());
                         s.slots[k].running = Some(id);
+                        s.slots[k].last_request_at = Some(now());
                         break Next::Run(id, spec, cancel);
                     }
                     let idle = s.slots[k].last_active.elapsed();
@@ -681,6 +697,7 @@ impl Daemon {
                         s.queue.push_front(id);
                         s.slots[k].running = None;
                         s.slots[k].last_active = Instant::now();
+                        s.slots[k].last_request_at = Some(now());
                         self.cv.notify_all();
                         continue;
                     }
@@ -702,6 +719,7 @@ impl Daemon {
                     eprintln!("[job {id}] {}", j.state);
                     s.slots[k].running = None;
                     s.slots[k].last_active = Instant::now();
+                    s.slots[k].last_request_at = Some(now());
                     self.cv.notify_all();
                 }
             }
@@ -745,7 +763,8 @@ impl Daemon {
                         "worker": sl.worker_pid.map(|pid| json!({"pid": pid, "rss_gib": rss_gib(pid)})),
                         "busy_pct": busy, "engine_gib": sl.stats["gib_in_use"], "cap_gib": sl.stats["gib_cap"],
                         "card_free_gib": sl.stats["gib_free_card"], "running": running,
-                        "idle_seconds": if sl.running.is_some() { 0 } else { idle }, "unload_in_seconds": unload_in}));
+                        "idle_seconds": if sl.running.is_some() { 0 } else { idle }, "unload_in_seconds": unload_in,
+                        "loaded_at": sl.loaded_at, "last_request_at": if sl.running.is_some() { Some(now()) } else { sl.last_request_at }}));
                 }
                 (200, json!({"version": crate::VERSION, "model": self.opts.model, "engines": self.opts.engine_names().iter().filter_map(|n| self.opts.engine_path(Some(n))).map(|(n, p)| json!({
                                  "name": n, "path": p, "gib": std::fs::metadata(&p).map_or(0.0, |m| m.len() as f64 / (1u64 << 30) as f64),
@@ -926,6 +945,8 @@ pub fn serve(opts: Options) -> Result<()> {
             engine: "unloaded".into(),
             running: None,
             last_active: Instant::now(),
+            loaded_at: None,
+            last_request_at: None,
             keep_until: None,
             unload_requested: false,
             info: Value::Null,

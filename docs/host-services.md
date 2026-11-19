@@ -200,6 +200,27 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
       an owned voice must name it) and voices.list says whether each is **`ready`** and which enabled models speak it.
     - `continue_from` naming a file that is not here is 404 `not_found` (field continue_from), as the spec now says,
       the same as video's missing files and missing uploads.
+    **API change, 2026-11-18: loaded X ago, last request Y ago** (nextcuda's fields, the same shapes; the page shows
+    them under each loaded model). Times are UTC Unix seconds (float), ages whole seconds as of the answer, every
+    field nullable (glue/serve/src/home/timing.rs):
+    - Every row of `system.models` and `system.state` `models[]`: `loaded_at` (its longest-loaded copy: the earliest),
+      `last_request_at` (the latest moment a request was on any copy: now while one runs, else when the last ended;
+      null: none since the load), `loaded_s_ago`, `idle_s` (the smallest: 0 while a request runs), `unload_in_s` (the
+      soonest idle unload, counted from the last request, else from the load; null when pinned, held, busy, or idle
+      unload is off) and `instances[]`, one per loaded copy (empty: not loaded): `{gpu, gpus?, port, busy, loaded_at,
+      last_request_at, loaded_s_ago, idle_s, unload_in_s}` (`gpus` a copy spanning cards; `port` null for a video
+      engine, which is the daemon's).
+    - `system.state` `cards[].vouched[]` and `system.busy` `slots[]`: `loaded_at`, `last_request_at`, `loaded_s_ago`
+      and `idle_s` for the copy on that card / in that slot (null: none).
+    - A request is anything that uses the copy: an RPC or OpenAI call sent on to its server, its page through
+      `/open/<id>` (opened, or a POST - not the page's polling or files), a `/v1/realtime` session (busy while it
+      lasts), chat through the switcher or the door (the chat server's own requests), a clip on the video daemon.
+      `system.load`, the door's keep-alive touches for pins and holds, and health probes are not.
+    - Where they come from: an image, audio or 3D server's `/api/info` says `loaded_at` and its idle exit
+      (`idle_exit_s`, `idle_since`); the door counts the requests it sends on (a door restarted knows none until the
+      next); the chat server's `/server/requests` says `loaded_at` and `last_request_at`; the switcher's `GET /idle`
+      its idle unload's clock (without a switcher, the door's own `idle_minutes`); the video daemon's
+      `/engine/status` each card's `loaded_at`, `last_request_at` and `unload_in_seconds`.
     `/api/...` is the page's own.
   - **The settings** (the Config tab; `system.config`, `system.configSet {set: {NAME: value | null}} | {text}`,
     `system.restart {service}`): `nextsycl.conf` as every setting the program reads - what it does, its default,

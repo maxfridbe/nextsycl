@@ -13,7 +13,8 @@
 //! A request may carry `X-Keep-Up-S: <seconds>` (Open WebUI's connection sends it; empty or not a number: 300): the
 //! model is kept that long after the request ends - the front door does not stop it to make room for pictures,
 //! sound or clips meanwhile (`GET /keep` says which models are kept and for how long). A request without the header
-//! keeps nothing: once it is answered, the model may be preempted.
+//! keeps nothing: once it is answered, the model may be preempted. `GET /idle` says the idle unload's clock (the
+//! front door's `unload_in_s`).
 //!
 //! With `idle`, the loaded model is unloaded (the studio's llm.mode "none") once nothing has asked for it that long
 //! and it is not answering; the next request loads it again. A model pinned or held stays (the registry's `pinned`,
@@ -259,6 +260,18 @@ impl Switch {
                                                                                       "name": m["id"], "loaded": true, "kind": "image"})));
             }
             return http::respond(&mut s, 200, &json!({"object": "list", "data": data}));
+        }
+        // the idle unload's clock, for the front door's unload_in_s: the idle time (null: off) and each model's seconds
+        // since its last request here (the loaded one counted from when it was first seen, as unload_idle counts)
+        if req.method == "GET" && req.path == "/idle" {
+            let models = (self.models)();
+            let on = self.loaded().and_then(|c| self.served(&c, &models));
+            if let (Some(on), Some(_)) = (&on, self.idle) {
+                self.last_use.lock().unwrap().entry(on.clone()).or_insert_with(Instant::now);
+            }
+            let since: serde_json::Map<String, Value> = self.last_use.lock().unwrap().iter().map(|(m, t)| (m.clone(), json!(t.elapsed().as_secs_f64()))).collect();
+            let stays = on.as_deref().is_some_and(|m| self.stays(m, &models));
+            return http::respond(&mut s, 200, &json!({"idle_unload_s": self.idle.map(|d| d.as_secs()), "loaded": on, "stays": stays, "idle_s": since}));
         }
         if req.method == "GET" && req.path == "/keep" {
             let kept: serde_json::Map<String, Value> = self.keep.lock().unwrap().iter()

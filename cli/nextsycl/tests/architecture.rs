@@ -391,8 +391,11 @@ fn room_passes_over_pins_and_holds() {
 fn the_door_schedules_through_the_crate_and_the_crate_stands_alone() {
     // the only wait for a server is the crate's driver
     let life = std::fs::read_to_string(root().join("glue/serve/src/home/life.rs")).unwrap();
-    let ensure = life.split("fn ensure_for(").nth(1).unwrap().split("\n    }\n").next().unwrap();
-    assert!(ensure.contains("place::ensure(") && !ensure.contains("loop {"), "ensure_for must drive place::ensure, with no wait loop of its own");
+    // (ensure_for and ensure_quiet are ensure_with's: a request of the model or not, timing.rs)
+    let ensure_for = life.split("fn ensure_for(").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    assert!(ensure_for.contains("self.ensure_with(") && !ensure_for.contains("loop {"), "ensure_for must be ensure_with's");
+    let ensure = life.split("fn ensure_with(").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    assert!(ensure.contains("place::ensure(") && !ensure.contains("loop {"), "ensure_with must drive place::ensure, with no wait loop of its own");
     for gone in ["fn place(", "fn drain(", "fn idle_on(", "fn pick_plan("] {
         assert!(!life.contains(gone), "{gone}: the scheduler's, not life.rs's");
     }

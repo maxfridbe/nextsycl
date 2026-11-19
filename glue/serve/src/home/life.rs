@@ -45,6 +45,7 @@ use backplane_scheduler::room::{self, Card, Holder, Idleness, ModelInfo, Proc, S
 pub(super) use backplane_scheduler::room::{JOB_ROOM_WAIT_S, MARGIN_MB, ROOM_WAIT_S};
 use serde_json::{json, Value};
 
+use super::timing::{self, Copy};
 use super::{now, Home};
 use crate::http::{call_for, Target};
 use super::registry;
@@ -265,11 +266,14 @@ fn cards_of_port(cards: &Value, port: u16) -> Vec<usize> {
 /// One of the kind's servers (the scheduler's type): its slot, port, model, and whether it loads or has work
 pub(crate) type Slot = room::Server;
 
-/// A request's server, chosen by `ensure`: counted as having work until dropped (after the answer)
+/// A request's server, chosen by `ensure`: counted as having work until dropped (after the answer); a request (not
+/// `ensure_quiet`'s: a load, the page's polling) is the model's last request then (timing.rs)
 pub(crate) struct Lease<'a> {
     target: Target,
     pub(crate) port: u16,
     home: &'a Home,
+    /// the model, when this is a request
+    request: Option<String>,
 }
 
 impl std::ops::Deref for Lease<'_> {
@@ -283,6 +287,9 @@ impl Drop for Lease<'_> {
     fn drop(&mut self) {
         if let Some(n) = self.home.inflight.lock().unwrap().get_mut(&self.port) {
             *n = n.saturating_sub(1);
+        }
+        if let Some(id) = &self.request {
+            self.home.usage.lock().unwrap().entry(self.port).or_default().end(id, now());
         }
     }
 }
@@ -692,19 +699,97 @@ impl Home {
         let p = call_for(&t, "GET", "/api/progress", None, 3).unwrap_or(json!({}));
         let st = (s(&info, "model"), info["loading"] == true, p["busy"] == true || p["waiting"].as_u64().unwrap_or(0) > 0);
         self.answers.lock().unwrap().insert(port, st.clone());
+        // its times (a server that says none: the load from when this door first saw it loaded)
+        if !st.1 && !st.0.is_empty() {
+            self.usage.lock().unwrap().entry(port).or_default().holds(&st.0, now());
+            self.server_times.lock().unwrap().insert(port, json!({"model": st.0, "loaded_at": info["loaded_at"], "idle_exit_s": info["idle_exit_s"],
+                                                                  "idle_since": info["idle_since"]}));
+        }
         Some(st)
     }
 
     /// The video daemon's engines (their model ids) and the ones loaded on a GPU, when it runs
     pub(super) fn video_daemon(&self) -> Option<VideoDaemon> {
-        let v = call_for(&self.target("video"), "GET", "/engine/status", None, 4).ok()?;
-        let names = v["engines"].as_array()?.iter().filter_map(|e| e["name"].as_str().map(str::to_string)).collect();
-        // a slot's engine is "unloaded" or holds a denoiser (by its model id)
-        let loaded = v["gpus"].as_array().into_iter().flatten()
-            .filter(|g| g["engine"].as_str().is_some_and(|e| e != "unloaded"))
-            .filter_map(|g| Some((video_model(g)?.to_string(), g["gpu"].as_u64()? as usize, !g["running"].is_null())))
-            .collect();
-        Some((names, loaded))
+        video_daemon_of(&call_for(&self.target("video"), "GET", "/engine/status", None, 4).ok()?)
+    }
+}
+
+/// `video_daemon` from the daemon's /engine/status
+fn video_daemon_of(v: &Value) -> Option<VideoDaemon> {
+    let names = v["engines"].as_array()?.iter().filter_map(|e| e["name"].as_str().map(str::to_string)).collect();
+    // a slot's engine is "unloaded" or holds a denoiser (by its model id)
+    let loaded = video_loaded(v).filter_map(|g| Some((video_model(g)?.to_string(), g["gpu"].as_u64()? as usize, !g["running"].is_null())))
+        .collect();
+    Some((names, loaded))
+}
+
+/// The daemon's GPU slots with an engine (loading or loaded), from its /engine/status
+fn video_loaded(v: &Value) -> impl Iterator<Item = &Value> {
+    v["gpus"].as_array().into_iter().flatten().filter(|g| g["engine"].as_str().is_some_and(|e| e != "unloaded"))
+}
+
+/// A video model's loaded copies from the daemon's /engine/status: a GPU slot whose engine is loaded (it says when) or
+/// running a clip; its idle unload is the daemon's (`unload_in_seconds`)
+fn video_copies(v: &Value, id: &str, at: f64) -> Vec<Copy> {
+    video_loaded(v).filter(|g| video_model(g) == Some(id))
+        .filter(|g| !g["loaded_at"].is_null() || g["engine"] == "loaded" || !g["running"].is_null())
+        .map(|g| Copy { gpu: g["gpu"].as_u64().map(|x| x as usize), gpus: Vec::new(), port: None, busy: !g["running"].is_null(),
+                        loaded_at: g["loaded_at"].as_f64(), last_request_at: g["last_request_at"].as_f64(),
+                        unload_at: g["unload_in_seconds"].as_f64().map(|u| at + u) })
+        .collect()
+}
+
+/// The chat model's copy: the chat server's times (its /server/requests), its card(s), and when it idle-unloads - the
+/// switcher's clock when one runs (its GET /idle), else this door's (`idle_minutes` from the last chat request)
+struct ChatTimes {
+    requests: Option<Value>,
+    switcher: Option<Value>,
+}
+
+impl ChatTimes {
+    fn copy(&self, id: &str, gpus: Vec<usize>, port: u16, door_idle_s: Option<f64>, door_last: f64, at: f64) -> Copy {
+        let r = self.requests.as_ref();
+        let busy = r.and_then(|r| r["active"].as_array()).is_some_and(|a| !a.is_empty());
+        let loaded_at = r.and_then(|r| r["loaded_at"].as_f64());
+        // (a chat server before it said: its last request that ended)
+        let last = r.and_then(|r| r["last_request_at"].as_f64().or_else(|| r["done"][0]["ended"].as_f64()));
+        let unload_at = match &self.switcher {
+            Some(sw) if sw["loaded"] == id && sw["stays"] != true => {
+                sw["idle_unload_s"].as_f64().map(|after| at - sw["idle_s"][id].as_f64().unwrap_or(0.0) + after)
+            }
+            Some(_) => None,
+            None => timing::unload_at(door_idle_s, Some(last.map_or(door_last, |l| l.max(door_last))), loaded_at),
+        };
+        Copy { gpu: gpus.first().copied(), gpus: if gpus.len() > 1 { gpus } else { Vec::new() }, port: Some(port), busy, loaded_at, last_request_at: last, unload_at }
+    }
+}
+
+impl Home {
+    /// The chat server's /server/requests (the requests running and the last ones, its times)
+    pub(super) fn chat_requests(&self) -> Option<Value> {
+        let dir = self.o.cfg.get("NS_SOCKET_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into())).join("nextsycl")
+        });
+        call_for(&Target::Unix(dir.join("nextsycl.sock")), "GET", "/server/requests", None, 3).ok()
+    }
+
+    /// An image, audio or 3D server's copy of `id` on `slot` (one that holds it, loaded): its load (what the server
+    /// says, else when this door first saw it), the requests sent on from here, and its own idle exit
+    fn server_copy(&self, x: &Slot, id: &str, cards: &Value) -> Copy {
+        let use_ = self.usage.lock().unwrap().get(&x.port).filter(|u| u.model == id).cloned().unwrap_or_default();
+        let st = self.server_times.lock().unwrap().get(&x.port).filter(|t| t["model"] == id).cloned().unwrap_or(Value::Null);
+        let server_busy = self.answers.lock().unwrap().get(&x.port).is_some_and(|a| a.0 == id && a.2);
+        let on = cards_of_port(cards, x.port);
+        let loaded_at = st["loaded_at"].as_f64().or((use_.seen_at > 0.0).then_some(use_.seen_at));
+        let unload_at = match (st["idle_exit_s"].as_f64(), st["idle_since"].as_f64()) {
+            (Some(after), Some(since)) if after > 0.0 => Some(since + after),
+            _ => None,
+        };
+        // (a request this door saw before the server's load - the one that started it, or one before a restart of the
+        // same model on the same port - is not since the load)
+        let last = use_.last_request_at.filter(|t| st["loaded_at"].as_f64().is_none_or(|l| *t >= l));
+        Copy { gpu: card_of_port(cards, x.port), gpus: if on.len() > 1 { on } else { Vec::new() }, port: Some(x.port),
+               busy: server_busy || use_.working > 0, loaded_at, last_request_at: last, unload_at }
     }
 
     /// Every registered model (LoRAs aside): kind, enabled, cards, state, memory vouched for
@@ -717,7 +802,15 @@ impl Home {
         let audio = if need("audio") { self.servers("audio") } else { Vec::new() };
         let m3d = if need("model3d") { self.servers("model3d") } else { Vec::new() };
         let slots_of = |k: &str| -> &Vec<Slot> { match k { "image" => &image, "audio" => &audio, _ => &m3d } };
-        let video = if need("video") { self.video_daemon() } else { None };
+        let vstatus = if need("video") { call_for(&self.target("video"), "GET", "/engine/status", None, 4).ok() } else { None };
+        let video = vstatus.as_ref().and_then(video_daemon_of);
+        // the chat model's times: its server's, and the switcher's idle clock (asked only while one is loaded)
+        let chat_times = chat.0.as_ref().map(|_| ChatTimes {
+            requests: self.chat_requests(),
+            // (a switcher that does not say: no unload_in_s)
+            switcher: listening(self.o.ports.switch).then(|| call_for(&self.target("llm"), "GET", "/idle", None, 3).unwrap_or(json!({}))),
+        });
+        let at = now();
         // the model cards, read once: for the headroom of entries registered before cards carried it
         // and whether a chat model spans every card
         let mc = if all.iter().all(|m| m.get("headroom_gib").is_some()) && !need("llm") { Vec::new() } else { self.o.cfg.cards() };
@@ -792,6 +885,25 @@ impl Home {
             // (one copy over its cards: a card's worth of copies)
             let copy_cards = if registry::spans(m) { 1 } else { gpus.len() };
             let (max_copies, recommended_copies, at_once) = backplane_copies(&kind, copy_cards, servers, &prof, chat_parallel);
+            // its loaded copies' times: loaded X ago, last request Y ago, unloads in Z (timing.rs)
+            let copies: Vec<Copy> = match kind.as_str() {
+                "llm" if chat.0.as_deref() == Some(id.as_str()) => {
+                    let mut on = gpus.clone();
+                    if registry::one_of(m) {
+                        let here = held_on(cards, &id).into_iter().find(|g| on.contains(g)).or_else(|| registry::chat_gpu(&*self.o.cfg, &id));
+                        on = here.map_or(on, |g| vec![g]);
+                    }
+                    let door_idle = (self.o.idle_minutes > 0).then_some((self.o.idle_minutes * 60) as f64);
+                    chat_times.as_ref().map(|c| c.copy(&id, on, self.o.ports.llm, door_idle, *self.chat_last.lock().unwrap(), at)).into_iter().collect()
+                }
+                "image" | "audio" | "model3d" => slots_of(&kind).iter().filter(|x| x.model.as_deref() == Some(id.as_str()) && !x.loading)
+                    .map(|x| self.server_copy(x, &id, cards)).collect(),
+                "video" => vstatus.as_ref().map(|v| video_copies(v, &id, at)).unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let pinned = enabled && m["pinned"] == true;
+            let held_s = holds.get(s(m, "id").as_str()).map_or(0.0, |h| h.reserved(now()).round());
+            let times = timing::model_fields(&copies, at, pinned || held_s > 0.0);
             let mut concurrency = concurrency;
             if let Some(o) = concurrency.as_object_mut() {
                 // the card's figures are a copy's on one card: the backplane's are below
@@ -799,14 +911,14 @@ impl Home {
                 o.remove("recommended_copies");
                 o.remove("scaling");
             }
-            json!({"concurrency": concurrency, "coexistence": coexistence, "copies_now": copies_now,
+            let mut row = json!({"concurrency": concurrency, "coexistence": coexistence, "copies_now": copies_now,
                    "max_copies": max_copies, "recommended_copies": recommended_copies, "at_once": at_once,
                    "license": licence(m, lc, "license"), "commercial": licence(m, lc, "commercial"), "license_note": licence(m, lc, "license_note"),
                    "controls": controls(m, lc, &caps),
                    "annotations": from_card(m, lc, "annotations"), "annotations_note": from_card(m, lc, "annotations_note"),
                    "id": id, "kind": kind, "title": m["title"], "arch": m["arch"], "enabled": enabled, "gpus": gpus, "gpus_one_of": registry::one_of(m), "state": state,
                    "spans": spans_all(m, &mc) || registry::spans(m),
-                   "pinned": enabled && m["pinned"] == true, "held_s": holds.get(s(m, "id").as_str()).map_or(0.0, |h| h.reserved(now()).round()),
+                   "pinned": pinned, "held_s": held_s,
                    "capabilities": caps, "methods": methods,
                    "lockstep": m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == "lockstep")),
                    "max_pixels": limits.map(|l| l.0), "min_side": limits.map(|l| l.1), "max_side": limits.map(|l| l.2), "grid": limits.map(|l| l.3),
@@ -816,7 +928,11 @@ impl Home {
                    "headroom_given": headroom_given,
                    "page": match kind.as_str() { "image" | "audio" | "model3d" => json!(slots_of(&kind).iter()
                                                       .find(|x| x.model.as_deref() == Some(id.as_str())).map_or(self.port_of(&kind), |x| x.port)),
-                                                  "video" => json!(self.o.ports.video), _ => json!(self.o.ports.chat_ui) }})
+                                                  "video" => json!(self.o.ports.video), _ => json!(self.o.ports.chat_ui) }});
+            if let Some(o) = row.as_object_mut() {
+                o.extend(times);
+            }
+            row
         }).collect()
     }
 
@@ -993,7 +1109,7 @@ impl Home {
             return Err((409, why));
         }
         match registry::kind_of(&m) {
-            "image" | "audio" | "model3d" => self.ensure(id).map(|_| ()),
+            "image" | "audio" | "model3d" => self.ensure_quiet(id).map(|_| ()),
             "video" => self.video_apply(false).map_err(|e| (500, e)),
             _ => {
                 let all = self.models();
@@ -1057,9 +1173,18 @@ impl Home {
         self.ensure_for(id, None)
     }
 
+    /// `ensure` for what is not a request of the model (a load, the page's polling): not its last request (timing.rs)
+    pub(crate) fn ensure_quiet(&self, id: &str) -> Result<Lease<'_>, (u16, String)> {
+        self.ensure_with(id, None, false)
+    }
+
     /// `ensure` for a job (`job`: its id): what it waits for is noted for <kind>.status (stage, waiting_for), it waits
     /// for room up to JOB_ROOM_WAIT_S (a request without a job ROOM_WAIT_S), and a cancel ends the wait
     pub(crate) fn ensure_for(&self, id: &str, job: Option<&str>) -> Result<Lease<'_>, (u16, String)> {
+        self.ensure_with(id, job, true)
+    }
+
+    fn ensure_with(&self, id: &str, job: Option<&str>, request: bool) -> Result<Lease<'_>, (u16, String)> {
         let m = self.entry(id)?;
         let kind = registry::kind_of(&m);
         if !matches!(kind, "image" | "audio" | "model3d") {
@@ -1082,7 +1207,10 @@ impl Home {
         // the scheduler's driver is the only wait: cancel, files moving, cards taken, the limit, room
         let (_, port) = place::ensure(&Sched(self), &req, default, None, &Value::Null)?;
         self.request_on(id);
-        Ok(Lease { target: Target::Tcp(format!("127.0.0.1:{port}")), port, home: self })
+        if request {
+            self.usage.lock().unwrap().entry(port).or_default().start(id, now());
+        }
+        Ok(Lease { target: Target::Tcp(format!("127.0.0.1:{port}")), port, home: self, request: request.then(|| id.to_string()) })
     }
 
     /// One consistent view of the box for the scheduler: the cards (their free memory as `free_mb` counts it, loads under
@@ -1686,8 +1814,16 @@ impl Host for Sched<'_> {
 /// there at a time (the loaded one, else the largest); the others are listed as alternatives, `counted: false`.
 fn vouched_rows(on: &[&Value], gi: &str) -> Vec<Value> {
     let mb = |m: &Value| m["vouch_mb"][gi].as_u64().unwrap_or(0);
-    let row = |m: &Value, counted: bool| json!({"model": m["id"], "kind": m["kind"], "mb": mb(m), "headroom_mb": m["headroom_mb"][gi].as_u64().unwrap_or(0),
-                                                "headroom_given": m["headroom_given"], "measured": m["measured"], "state": m["state"], "counted": counted});
+    let card = gi.parse::<u64>().map_or(Value::Null, |g| json!(g));
+    let row = |m: &Value, counted: bool| {
+        let mut r = json!({"model": m["id"], "kind": m["kind"], "mb": mb(m), "headroom_mb": m["headroom_mb"][gi].as_u64().unwrap_or(0),
+                           "headroom_given": m["headroom_given"], "measured": m["measured"], "state": m["state"], "counted": counted});
+        // its copy on this card: loaded X ago, last request Y ago (null: none here)
+        if let Some(o) = r.as_object_mut() {
+            o.extend(timing::on_card(m, &card));
+        }
+        r
+    };
     let mut list: Vec<Value> = on.iter().filter(|m| !matches!(m["kind"].as_str(), Some("llm" | "video"))).map(|m| row(m, true)).collect();
     for kind in ["llm", "video"] {
         let group: Vec<&Value> = on.iter().filter(|m| m["kind"] == kind).copied().collect();

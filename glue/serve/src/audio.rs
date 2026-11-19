@@ -79,6 +79,8 @@ pub struct AudioServer {
     history: Mutex<VecDeque<Value>>,
     /// ends the process after an idle stretch (`--idle-exit`; none: never)
     pub idle: Option<&'static crate::idle::Idle>,
+    /// when its model finished loading (Unix seconds): /api/info's `loaded_at`
+    loaded_at: f64,
     /// this process's card memory once the model was loaded (MiB), and whether to end after the request in hand: a
     /// GPU error, or memory grown well past the loaded model's (caches that keep a piece of every request's shape) -
     /// the front door starts a fresh server for the next request, so a leak never fills the card
@@ -159,7 +161,7 @@ impl AudioServer {
         let tele = Telemetry::start(std::slice::from_ref(&gpu.pci));
         let history = Mutex::new(out_dir.as_deref().map(earlier).unwrap_or_default());
         Ok(AudioServer { model, out_dir, wfe, cors, gpu, tele, engine: RwLock::new(engine), slots: Default::default(), progress: Mutex::new(json!({"busy": false})),
-                         idle: None, waiting: AtomicUsize::new(0), cancel: Default::default(), history,
+                         idle: None, loaded_at: crate::idle::wall(), waiting: AtomicUsize::new(0), cancel: Default::default(), history,
                          vram_loaded: AtomicU64::new(own_vram_mb()), retire: AtomicBool::new(false), sessions: AtomicUsize::new(0) })
     }
 
@@ -167,6 +169,8 @@ impl AudioServer {
     pub fn run(self: Arc<Self>, addr: &str) -> Result<(), String> {
         let l = TcpListener::bind(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
         if let Some(i) = self.idle {
+            // (its countdown runs from the load, not from the start of the process)
+            i.touch();
             let me = self.clone();
             i.watch("nextsycl audio", Box::new(move || {
                 me.waiting.load(Ordering::Relaxed) > 0 || me.sessions.load(Ordering::Relaxed) > 0
@@ -206,7 +210,11 @@ impl AudioServer {
             ("GET", "/health") => http::respond_with(&mut s, 200, &json!({"status": "ok"}), &cors),
             ("GET", "/v1/models") | ("GET", "/models") => http::respond_with(&mut s, 200, &json!({"object": "list", "data": [
                 {"id": self.model, "object": "model", "owned_by": "nextsycl", "created": 0}]}), &cors),
-            ("GET", "/api/info") => http::respond_with(&mut s, 200, &self.info(), &cors),
+            ("GET", "/api/info") => {
+                let mut info = self.info();
+                crate::idle::stamp(&mut info, self.loaded_at, self.idle);
+                http::respond_with(&mut s, 200, &info, &cors)
+            }
             ("GET", "/v1/realtime") | ("GET", "/realtime") if http::is_upgrade(&req.head) => self.realtime(s, &req),
             ("GET", "/api/progress") => {
                 let mut p = self.progress.lock().unwrap().clone();

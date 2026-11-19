@@ -230,6 +230,22 @@ function GpuPicker(m: Model) {
   );
 }
 
+/** Whole seconds in words: "40 s", "12 min", "3.5 h", "2 d" */
+export function human(s: number): string {
+  if (s < 60) return `${Math.max(0, Math.floor(s))} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} min`;
+  if (s < 86400) return `${(s / 3600).toFixed(1).replace(/\.0$/, "")} h`;
+  return `${(s / 86400).toFixed(1).replace(/\.0$/, "")} d`;
+}
+
+/** A loaded model's times: "loaded X ago · last request Y ago" (now while it answers, none yet), and when it unloads */
+export function timesText(m: Pick<Model, "loaded_s_ago" | "idle_s" | "unload_in_s">): string | null {
+  if (m.loaded_s_ago == null) return null;
+  const last = m.idle_s == null ? "no request yet" : m.idle_s === 0 ? "last request now" : `last request ${human(m.idle_s)} ago`;
+  const unload = m.unload_in_s == null ? "" : ` · unloads in ${human(m.unload_in_s)}`;
+  return `loaded ${human(m.loaded_s_ago)} ago · ${last}${unload}`;
+}
+
 function ModelRow(m: Model) {
   const p = ui.pending[m.id];
   const spin = (what: string) => p?.what === what;
@@ -253,7 +269,8 @@ function ModelRow(m: Model) {
       </div>
       <div class="mstate"><span class={{ tag: true, [m.state]: true }}>{STATE_TEXT[m.state] ?? m.state}</span>
         {m.pinned ? <span class="hint" attrs={{ title: "never stopped for room" }}> · pinned</span> : null}
-        {m.held_s ? <span class="hint" attrs={{ title: "held by a request's rsvp_s: not stopped for room" }}> · held for {m.held_s} more s</span> : null}</div>
+        {m.held_s ? <span class="hint" attrs={{ title: "held by a request's rsvp_s: not stopped for room" }}> · held for {m.held_s} more s</span> : null}
+        {timesText(m) ? <div class="hint" attrs={{ title: (m.instances ?? []).length > 1 ? "its longest-loaded copy, its latest request, its soonest idle unload" : "since it loaded, since its last request" }}>{timesText(m)}</div> : null}</div>
       <div class="acts">
         <span class="onoff" attrs={{ title: m.enabled ? "enabled: it loads on its first request and unloads after the idle time" : "disabled: off the API (and Open WebUI's list)" }}>
           <label class={{ on: !m.enabled }}>

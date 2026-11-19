@@ -37,6 +37,7 @@ mod methods;
 mod precheck;
 mod pulls;
 mod spec;
+mod timing;
 mod transcribe;
 pub mod registry;
 
@@ -180,6 +181,10 @@ pub struct Home {
     pub(crate) inflight: Mutex<BTreeMap<u16, usize>>,
     /// what each image, audio and 3D server last said of itself (model, loading, busy), by its port
     answers: Mutex<BTreeMap<u16, (String, bool, bool)>>,
+    /// what each of those servers said of its times (its /api/info: loaded_at, idle_exit_s, idle_since), by its port
+    server_times: Mutex<BTreeMap<u16, Value>>,
+    /// the requests sent on to each of them and the model seen there (timing.rs), by its port
+    usage: Mutex<BTreeMap<u16, timing::PortUse>>,
     /// image and audio requests as jobs (jobs.json beside serve.json)
     jobs: jobs::Jobs,
     /// a job's stage while its server is chosen, and what it waits for: job id -> (stage, waiting_for)
@@ -345,7 +350,7 @@ impl Home {
             cards: Mutex::new(json!([])), runs: Mutex::new(Vec::new()), next: Mutex::new(1), loading: Mutex::new(BTreeMap::new()),
             kind_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
             hot_lock: ["llm", "image", "audio", "model3d", "video"].into_iter().map(|k| (k, Mutex::new(()))).collect(),
-            seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), answers: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()),
+            seen: Mutex::new(seen), inflight: Mutex::new(BTreeMap::new()), answers: Mutex::new(BTreeMap::new()), server_times: Mutex::new(BTreeMap::new()), usage: Mutex::new(BTreeMap::new()), stages: Mutex::new(BTreeMap::new()),
             holds_file, holds_mx: Mutex::new(()), history, history_dir, video_watch: Mutex::new(Vec::new()), withdrawn: Mutex::new(BTreeMap::new()),
             chat_last: Mutex::new(now()), cards_fixed: std::sync::atomic::AtomicBool::new(false),
             pending: Mutex::new(Vec::new()), admit: Mutex::new(()), asked: Mutex::new(BTreeMap::new()), lock_paused: Mutex::new(Some(json!({"by": "gpu run", "left": true}))), progress: Mutex::new(BTreeMap::new()),
@@ -602,7 +607,10 @@ impl Home {
                 if kind == "image" && sub.starts_with("api/describe") {
                     return self.open_describe(s, req, sub);
                 }
-                let lease = match self.ensure(id) {
+                // the page opened, its work (a POST) and its live conversation are requests of the model; the page's
+                // polling and its files are not (as the servers' own idle clocks count: crate::idle)
+                let work = req.method == "POST" || sub.is_empty() || sub == "index.html" || http::is_upgrade(&req.head);
+                let lease = match if work { self.ensure(id) } else { self.ensure_quiet(id) } {
                     Ok(l) => l,
                     Err((c, e)) => return http::respond(s, c, &err(e)),
                 };

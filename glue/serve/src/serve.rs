@@ -32,7 +32,8 @@
 //! ```text
 //! GET  /server/status          the model, its GPUs (memory, layers, expert slots), the request running, the cache
 //! GET  /server/requests        the requests: the running one and the last ones that ended (--keep-requests,
-//!                              100 by default)
+//!                              100 by default); when the model loaded (`loaded_at`) and the last request
+//!                              (`last_request_at`: now while one runs, else when the last ended; null: none yet)
 //! GET  /server/requests/<id>   one of them in full: its settings, messages, timings, previews of its prompt and
 //!                              answer
 //! GET  /server/cache           the prompt cache's checkpoints;  POST /server/cache/clear  drops them
@@ -102,6 +103,9 @@ pub struct Server {
     /// each session's tokens held, for status
     live_lens: Mutex<Vec<usize>>,
     started: Instant,
+    /// when the model finished loading (Unix seconds), and when the last request ended
+    loaded_at: f64,
+    last_end: Mutex<Option<f64>>,
     /// the requests running (their JSON rows, updated as they go) and the last `keep` that ended
     running: Mutex<std::collections::BTreeMap<u64, Value>>,
     done: Mutex<VecDeque<Value>>,
@@ -532,7 +536,7 @@ impl Server {
         let think_budget = std::env::var("NS_THINK_BUDGET").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0 && think_end.is_some());
         Ok(Server { engine, tok, chat, name, max_ctx, slot_ctx, default_effort, queue: Mutex::new(VecDeque::new()), wake: std::sync::Condvar::new(),
                     inflight: AtomicU64::new(0), parallel, default_max, think_budget, think_end, cache: Mutex::new(cache),
-                    live_lens: Mutex::new(vec![0; parallel]), started: Instant::now(), running: Mutex::new(Default::default()),
+                    live_lens: Mutex::new(vec![0; parallel]), started: Instant::now(), loaded_at: crate::idle::wall(), last_end: Mutex::new(None), running: Mutex::new(Default::default()),
                     done: Mutex::new(VecDeque::new()), next_id: AtomicU64::new(1), keep, tele, cors })
     }
 
@@ -679,7 +683,9 @@ impl Server {
             ("GET", "/server/requests") => {
                 let done: Vec<Value> = self.done.lock().unwrap().iter().rev().cloned().collect();
                 let running: Vec<Value> = self.running.lock().unwrap().values().cloned().collect();
-                respond(&mut s, 200, &json!({"running": running.first().cloned(), "active": running, "done": done, "keep": self.keep, "parallel": self.parallel}))
+                let last = if running.is_empty() { *self.last_end.lock().unwrap() } else { Some(crate::idle::wall()) };
+                respond(&mut s, 200, &json!({"running": running.first().cloned(), "active": running, "done": done, "keep": self.keep, "parallel": self.parallel,
+                                             "loaded_at": self.loaded_at, "last_request_at": last}))
             }
             ("GET", p) if p.starts_with("/server/requests/") => {
                 let id: Option<u64> = p["/server/requests/".len()..].trim_start_matches('#').parse().ok();
@@ -738,6 +744,7 @@ impl Server {
     }
 
     fn remember(&self, row: Value) {
+        *self.last_end.lock().unwrap() = Some(crate::idle::wall());
         let mut d = self.done.lock().unwrap();
         d.push_back(row);
         while d.len() > self.keep {
