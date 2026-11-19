@@ -552,12 +552,29 @@ impl Sophon {
         }
         progress(Step { phase: "tokens", at: 0, of: 1, seconds: 0.0 })?;
         let draw = self.inner.talker_draw(&req.extra);
-        let mut next = |_: usize| speak::Feed { ids: ids.clone(), done: true };
-        // the whole text in hand: upstream's in-context layout
-        let sp = talk.speak(&voice, IclLayout::Prompt, lang, draw, req.seed, &mut next, out, &|| false)?;
+        // the whole text in hand: upstream's in-context layout. An in-context voice fades over a long text, so it is
+        // read in runs cut at sentence ends (speak::seg_tokens), each a fresh pass with the recording at its head
+        let seg = speak::seg_tokens();
+        let mut cuts = vec![0usize];
+        if seg > 0 && voice.in_context() {
+            while let Some(e) = speak::run_end(&self.inner.tok, &ids, cuts[cuts.len() - 1] + seg, true) {
+                cuts.push(e);
+            }
+        }
+        cuts.push(ids.len());
+        let (mut frames, mut samples, mut first) = (0usize, 0usize, None);
+        for (r, w) in cuts.windows(2).enumerate() {
+            let run = ids[w[0]..w[1]].to_vec();
+            let mut next = |_: usize| speak::Feed { ids: run.clone(), done: true };
+            let sp = talk.speak(&voice, IclLayout::Prompt, lang, draw, req.seed.wrapping_add(r as u64), &mut next, out, &|| false)?;
+            frames += sp.frames;
+            samples += sp.samples;
+            first.get_or_insert(sp.first_audio);
+        }
         progress(Step { phase: "tokens", at: 1, of: 1, seconds: t0.elapsed().as_secs_f64() })?;
-        eprintln!("{ARCH}: {} frames ({:.1} s of speech) in {:.2} s, first audio {:.2} s{}", sp.frames, sp.samples as f64 / speak::RATE as f64, sp.seconds,
-                  sp.first_audio, if voice.in_context() { " (in context)" } else { "" });
+        eprintln!("{ARCH}: {frames} frames ({:.1} s of speech) in {:.2} s, first audio {:.2} s{}{}", samples as f64 / speak::RATE as f64,
+                  t0.elapsed().as_secs_f64(), first.unwrap_or(0.0), if voice.in_context() { " (in context)" } else { "" },
+                  if cuts.len() > 2 { format!(", in {} runs", cuts.len() - 1) } else { String::new() });
         Ok(())
     }
 }

@@ -27,7 +27,6 @@ use crate::brain::Rows;
 use crate::sample::{self, Rng};
 use crate::text::{self, Msg};
 use crate::{ear, resample, speak, Inner, Mind};
-use nextsycl_tok::Tokenizer;
 
 const AUDIO_ID: u32 = 151669;
 const STOP: [u32; 2] = [151645, 151643];
@@ -41,22 +40,6 @@ const HIST_SEC: f64 = 120.0;
 /// the history's audio (the user's and the replies', 6.25 positions a second: ear.rs) keeps room for a whole answer
 /// and this much for the system, the text and the turns' framing besides
 const HIST_SLACK: usize = 1024;
-
-/// A long reply's run in an in-context voice: at least this many tokens of text before it is cut at a sentence end
-/// (NS_SOPHON_SEG_TOKENS; 0: one run, the voice fading as it goes)
-fn seg_tokens() -> usize {
-    std::env::var("NS_SOPHON_SEG_TOKENS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100)
-}
-
-/// Where a run that may end from `min` on ends: just past the first token at or after it that ends a sentence (and
-/// is followed by another, or the reply is whole); None while there is none yet
-fn run_end(tok: &Tokenizer, ids: &[u32], min: usize, done: bool) -> Option<usize> {
-    if min == 0 || ids.len() <= min {
-        return None;
-    }
-    let ends = |t: &str| t.trim_end().ends_with(['.', '!', '?', '\u{3002}', '\u{FF01}', '\u{FF1F}']);
-    (min - 1..ids.len()).find(|&i| ends(&tok.decode(&ids[i..i + 1])) && (i + 1 < ids.len() || done)).map(|i| i + 1).filter(|&e| e < ids.len())
-}
 
 /// The positions the turns' audio takes in the prompt: the user's speech and the spoken replies kept as audio
 fn audio_positions(turns: &[Turn]) -> usize {
@@ -811,7 +794,7 @@ fn reply(s: &Arc<Shared>, id: &str, turns: &[Turn], cfg: &RealtimeSession, lang:
             // an in-context voice fades as a reply runs on from its recording (Meeseeks, a 214 s answer: cosine to the
             // recording 0.77 in its first 30 s, 0.62 by two minutes): a long reply is spoken in runs, each a fresh
             // talker pass with the recording at its head, cut at the first sentence end past SEG_TOKENS of text
-            let seg = seg_tokens();
+            let seg = speak::seg_tokens();
             if seg == 0 || !matches!(voice, speak::Voice::InContext(_)) {
                 talk.speak(&voice, layout, &lang, tdraw, seed, &mut next, &mut out, &|| stop.load(Ordering::SeqCst))?;
             } else {
@@ -825,7 +808,7 @@ fn reply(s: &Arc<Shared>, id: &str, turns: &[Turn], cfg: &RealtimeSession, lang:
                         let mut next_run = |want: usize| -> speak::Feed {
                             let f = next(from + want.max(1));
                             if end.is_none() {
-                                end = run_end(&s.eng.tok, &f.ids, from + seg, f.done);
+                                end = speak::run_end(&s.eng.tok, &f.ids, from + seg, f.done);
                             }
                             match end {
                                 Some(e) => speak::Feed { ids: f.ids[from.min(e)..e].to_vec(), done: true },

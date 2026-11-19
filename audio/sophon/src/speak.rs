@@ -37,6 +37,7 @@ use nextsycl_audio::{Error, Result};
 use nextsycl_codec12hz::{Codec, Encoder, Weights as CodecWeights};
 use nextsycl_core::{DevBuf, Gpu};
 use nextsycl_diffusion::kernels::Nsd;
+use nextsycl_tok::Tokenizer;
 
 use crate::ops::{fp, Ops, Shards};
 use crate::sample::{Draw, Rng};
@@ -210,6 +211,22 @@ pub fn fingerprint(x: &[f32], rate: u32, text: &str) -> u64 {
     }
     eat(text.as_bytes());
     h
+}
+
+/// A long text's run (a live reply's, or one read aloud) in an in-context voice: at least this many tokens of text before it is cut at a sentence end
+/// (NS_SOPHON_SEG_TOKENS; 0: one run, the voice fading as it goes)
+pub fn seg_tokens() -> usize {
+    std::env::var("NS_SOPHON_SEG_TOKENS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100)
+}
+
+/// Where a run that may end from `min` on ends: just past the first token at or after it that ends a sentence (and
+/// is followed by another, or the reply is whole); None while there is none yet
+pub fn run_end(tok: &Tokenizer, ids: &[u32], min: usize, done: bool) -> Option<usize> {
+    if min == 0 || ids.len() <= min {
+        return None;
+    }
+    let ends = |t: &str| t.trim_end().ends_with(['.', '!', '?', '\u{3002}', '\u{FF01}', '\u{FF1F}']);
+    (min - 1..ids.len()).find(|&i| ends(&tok.decode(&ids[i..i + 1])) && (i + 1 < ids.len() || done)).map(|i| i + 1).filter(|&e| e < ids.len())
 }
 
 /// What the brain hands the talker: the reply's speakable text ids so far, and whether it is whole
