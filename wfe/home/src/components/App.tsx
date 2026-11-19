@@ -68,6 +68,15 @@ interface AllocRow {
   measured: boolean;
   port?: string | null;
   tip: string;
+  /** this card's copy: "loaded X ago · last request Y ago · unloads in Z" (none: not loaded here) */
+  times?: string | null;
+}
+
+/** A model's copy on card `g` (its instance there, or one spanning it): its times as words; none when not loaded there */
+function cardTimes(model: string, g: number): string | null {
+  const m = (ui.state?.models ?? []).find((x) => x.id === model);
+  const i = (m?.instances ?? []).find((x) => x.gpu === g || (x.gpus ?? []).includes(g));
+  return i ? timesText(i) : null;
 }
 
 /** The card's processes and the memory vouched for it as one list, a line a model: the lines with a job on top (next to
@@ -84,6 +93,7 @@ function allocRows(c: Card): AllocRow[] {
       state: v.state, held: mine.reduce((n, p) => n + p.vram_mb, 0), vouched: v.mb, headroom: Math.min(v.headroom_mb ?? 0, v.mb),
       headroomGiven: v.headroom_given, counted: v.counted, of: v.of, measured: v.measured, port: mine[0]?.port ?? null,
       tip: mine.map((p) => p.args ?? `pid ${p.pid}`).join("\n"),
+      times: cardTimes(v.model, c.index),
     });
   }
   for (const p of c.procs.filter((q) => !used.has(q))) {
@@ -131,6 +141,7 @@ function AllocLine(total: number) {
         </span>
         {AllocBar(r, total)}
         <span class="mb">{live ? `${gib(r.held)} GiB` : Alloc(r.vouched, r.headroom, r.kind, r.headroomGiven)}</span>
+        {live && r.times ? <div class="hint timesline">{r.times}</div> : null}
         {r.job
           ? <div class="jobline" attrs={{ title: r.jobLabel }}><span class="i" props={{ innerHTML: "&#xf0da;" }} /> <b>{r.job}</b>{r.jobLabel ? <span class="hint"> {r.jobLabel}</span> : null}</div>
           : null}
