@@ -376,12 +376,30 @@ pub fn talker(files: &ModelFiles, gpu: &Arc<Gpu>, dir: &Path, stages: &[String],
         }
         log(format!("speak: clones {} ({layout:?} layout)", if icl { "in context where a transcript is given" } else { "by their x-vectors" }));
         let seeds: Vec<u64> = lj["seeds"].as_array().into_iter().flatten().filter_map(|v| v.as_u64()).collect();
-        let draw = match lj["temperature"].as_f64() {
+        // the draw: "temperature" for both, or "talker" / "predictor" objects ({temperature, top_k, top_p, greedy}) and
+        // "repetition_penalty" (the sampling A/B)
+        let base = match lj["temperature"].as_f64() {
             Some(t) => Draw { temperature: t as f32, ..Draw::DEFAULT },
             None => Draw::DEFAULT,
         };
-        log(format!("speak: the sound tags {} the talker (NS_SOPHON_TAGS); temperature {}", if crate::tags_spoken() { "handed to" } else { "kept from" },
-                    draw.temperature));
+        let one = |v: &serde_json::Value| -> Draw {
+            if v["greedy"].as_bool() == Some(true) {
+                return Draw::GREEDY;
+            }
+            Draw { sample: true, temperature: v["temperature"].as_f64().map_or(base.temperature, |x| x as f32),
+                   top_k: v["top_k"].as_u64().map_or(base.top_k, |x| x as usize), top_p: v["top_p"].as_f64().map_or(base.top_p, |x| x as f32) }
+        };
+        let mut draw = crate::speak::Sampling::from(base);
+        if lj["talker"].is_object() {
+            draw.talker = one(&lj["talker"]);
+        }
+        if lj["predictor"].is_object() {
+            draw.predictor = one(&lj["predictor"]);
+        }
+        if let Some(r) = lj["repetition_penalty"].as_f64() {
+            draw.repetition_penalty = r as f32;
+        }
+        log(format!("speak: the sound tags {} the talker (NS_SOPHON_TAGS); {draw:?}", if crate::tags_spoken() { "handed to" } else { "kept from" }));
         for (voice, xvec) in &voices {
             for line in lj["lines"].as_array().into_iter().flatten() {
                 let (name, text) = (line["name"].as_str().unwrap_or("line"), line["text"].as_str().unwrap_or_default());

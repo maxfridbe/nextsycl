@@ -229,6 +229,21 @@ pub fn run_end(tok: &Tokenizer, ids: &[u32], min: usize, done: bool) -> Option<u
     (min - 1..ids.len()).find(|&i| ends(&tok.decode(&ids[i..i + 1])) && (i + 1 < ids.len() || done)).map(|i| i + 1).filter(|&e| e < ids.len())
 }
 
+/// How a frame's codes are drawn: the first codebook's (the talker's) and the other fifteen's (the code predictor's),
+/// and the penalty on codes already said. A plain Draw is both, with Qwen3-TTS's 1.05 when sampled.
+#[derive(Clone, Copy, Debug)]
+pub struct Sampling {
+    pub talker: Draw,
+    pub predictor: Draw,
+    pub repetition_penalty: f32,
+}
+
+impl From<Draw> for Sampling {
+    fn from(d: Draw) -> Sampling {
+        Sampling { talker: d, predictor: d, repetition_penalty: if d.sample { 1.05 } else { 1.0 } }
+    }
+}
+
 /// What the brain hands the talker: the reply's speakable text ids so far, and whether it is whole
 pub struct Feed {
     pub ids: Vec<u32>,
@@ -404,15 +419,16 @@ impl Talk {
     /// Speak the text `next` hands out as it comes (it blocks until there is more, or the end), in `xvec`'s voice:
     /// samples to `out` as they are made; `stop` asked between frames (a cancel: true ends it)
     #[allow(clippy::too_many_arguments)]
-    pub fn speak(&self, voice: &Voice, layout: IclLayout, lang: &str, draw: Draw, seed: u64, next: &mut dyn FnMut(usize) -> Feed,
+    pub fn speak(&self, voice: &Voice, layout: IclLayout, lang: &str, draw: impl Into<Sampling>, seed: u64, next: &mut dyn FnMut(usize) -> Feed,
                  out: &mut dyn FnMut(&[f32]) -> Result<()>, stop: &dyn Fn() -> bool) -> Result<Spoken> {
-        self.speak_probed(voice, layout, lang, draw, seed, next, out, stop, None)
+        self.speak_probed(voice, layout, lang, draw.into(), seed, next, out, stop, None)
     }
 
     /// `speak`, `probe` catching the prompt, the first logits and the codes
     #[allow(clippy::too_many_arguments)]
-    pub fn speak_probed(&self, voice: &Voice, layout: IclLayout, lang: &str, draw: Draw, seed: u64, next: &mut dyn FnMut(usize) -> Feed,
+    pub fn speak_probed(&self, voice: &Voice, layout: IclLayout, lang: &str, draw: impl Into<Sampling>, seed: u64, next: &mut dyn FnMut(usize) -> Feed,
                         out: &mut dyn FnMut(&[f32]) -> Result<()>, stop: &dyn Fn() -> bool, mut probe: Option<&mut Probe>) -> Result<Spoken> {
+        let draw: Sampling = draw.into();
         let t0 = Instant::now();
         let (ops, nsd, t, c) = (&self.ops, &self.nsd, &self.talker, &self.conf);
         let h = t.lm.hidden;
@@ -572,9 +588,9 @@ impl Talk {
             }
             let at = if f < rows_in { f } else { pad_at };
             let d = Drawing {
-                talker: draw,
-                predictor: draw,
-                repetition_penalty: if draw.sample { 1.05 } else { 1.0 },
+                talker: draw.talker,
+                predictor: draw.predictor,
+                repetition_penalty: draw.repetition_penalty,
                 eos: c.eos,
                 suppress_from: c.vocab - 1024,
                 // the end of speech held back while text is still to come
