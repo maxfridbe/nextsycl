@@ -212,8 +212,8 @@ pub struct Fused {
                                               *const *mut f32, i64, i64, i64) -> c_int,
     /// (cur, msg, u, gain, forget, out, T, C, rank)
     pub ctrl_apply: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *const f32, *const f32, *mut f32, i64, i64, i64) -> c_int,
-    /// (x, w, bias, logits, ctr, ids, wts, T, E, C, K, scale)
-    pub router: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, *mut u32, *mut i32, *mut f32, i64, i64, i64, i64, f32) -> c_int,
+    /// (x, w, bias, logits, ids, wts, T, E, C, K, scale)
+    pub router: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, *mut i32, *mut f32, i64, i64, i64, i64, f32) -> c_int,
     pub attn_splits: unsafe extern "C" fn(i64, i64, i64) -> i64,
     /// (q, kc, vc, r, relb, E, R, part, T, Hq, Hkv, cap, p0, win, scale)
     pub attn_part: unsafe extern "C" fn(G, *const f32, P, P, *const f32, *const f32, i64, i64, *mut f32, i64, i64, i64, i64, i64, i64, f32) -> c_int,
@@ -256,11 +256,27 @@ unsafe impl Sync for Silo {}
 /// The silo's library (named after the engine's directory)
 pub const SILO: &str = "inkling2";
 
-/// The silo (None: this engine's own kernels for everything)
-pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
-    static S: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
-    S.get_or_init(|| {
-        let Some(lib) = nextsycl_core::silo(SILO).map_err(|e| e.0)? else { return Ok(None) };
+/// GPU `gpu`'s silo: the variant of it that GPU matches over the default one (None: this engine's own kernels for everything)
+pub fn silo_on(gpu: usize) -> nextsycl_core::Result<Option<&'static Silo>> {
+    bound(nextsycl_core::silo_for(SILO, gpu)?)
+}
+
+/// A silo library's kernels, bound once a library (the default silo, or a variant over it)
+fn bound(lib: Option<&'static nextsycl_core::SiloLib>) -> nextsycl_core::Result<Option<&'static Silo>> {
+    static BOUND: std::sync::Mutex<Vec<(usize, &'static Silo)>> = std::sync::Mutex::new(Vec::new());
+    let Some(lib) = lib else { return Ok(None) };
+    let key = lib as *const nextsycl_core::SiloLib as usize;
+    let mut m = BOUND.lock().unwrap();
+    if let Some((_, s)) = m.iter().find(|(k, _)| *k == key) {
+        return Ok(Some(*s));
+    }
+    let s: &'static Silo = Box::leak(Box::new(bind(lib).map_err(nextsycl_core::Error)?));
+    m.push((key, s));
+    Ok(Some(s))
+}
+
+fn bind(lib: &nextsycl_core::SiloLib) -> std::result::Result<Silo, String> {
+    {
         macro_rules! sym {
             ($name:literal) => {{
                 let p = lib.symbol($name);
@@ -274,7 +290,7 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
                 }
             }};
         }
-        Ok(Some(Silo {
+        Ok(Silo {
             path: lib.path.clone(),
             xq_bytes: sym!("ns_ink2s_xq_bytes"),
             xq: sym!("ns_ink2s_xq"),
@@ -319,11 +335,8 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
                 attn_splits: sym!("ns_ink2s_attn_splits"),
                 attn_part: sym!("ns_ink2s_attn_part"),
             },
-        }))
-    })
-    .as_ref()
-    .map(|s| s.as_ref())
-    .map_err(|e| nextsycl_core::Error(e.clone()))
+        })
+    }
 }
 
 /// A call's return code as a result (the reason from the library)

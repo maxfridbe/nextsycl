@@ -61,9 +61,21 @@
         "0": {
           "exact": "a918ec0ff036cd31",
           "pp": 182.7,
-          "tg": 57.50
+          "tg": 57.5
         }
       }
+    },
+    "llm/inkling2": {
+      "run": "dist/nextsycl llm generate /var/mnt/4TBSSD/nextsycl-models/inkling-2-mini/Inkling-2-Mini-UD-Q4_K_XL.gguf --ctx 4096 --max 128 --temp 0 --gpu {gpu} --prompt \"Explain, step by step and with a small worked example, how a hash map handles collisions with open addressing and with separate chaining, what load factor means for each, and when you would pick one over the other in a program that stores ten million short strings.\"",
+      "mounts": [
+        "/var/mnt/4TBSSD/nextsycl-models"
+      ],
+      "timeout_s": 600,
+      "gpus": [
+        "0",
+        "1"
+      ],
+      "cards": {}
     }
   }
 }

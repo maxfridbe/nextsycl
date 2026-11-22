@@ -572,7 +572,7 @@ int ns_ink2s_ctrl_apply(ns_gpu* g, const float* cur, const float* msg, const flo
     return ns_ink2s_ctrl_apply_many(g, 1, &cur, &msg, &u, &gain, &forget, &out, T, C, rank);
 }
 
-int ns_ink2s_router(ns_gpu* g, const float* x, const float* w, const float* bias, float* logits, uint32_t* ctr, int32_t* ids, float* wts, int64_t T, int64_t E,
+int ns_ink2s_router(ns_gpu* g, const float* x, const float* w, const float* bias, float* logits, int32_t* ids, float* wts, int64_t T, int64_t E,
                     int64_t C, int64_t K, float scale) {
     NS_TRY
     constexpr int EPW = 8;
@@ -580,38 +580,43 @@ int ns_ink2s_router(ns_gpu* g, const float* x, const float* w, const float* bias
     if (E > EPW * SG || E % EPW || K > 16 || C % 4) return ns_fail("ns_ink2s_router: at most 128 experts (a multiple of 8), 16 chosen, rows of a multiple of 4");
     const int64_t nwg = E / EPW;
     // a work-group a (row, 8 experts): a sub-group an expert's logit (lanes over the row, 16-byte loads, a fixed order);
-    // the row's last work-group to finish (a counter a row, reset by it) makes the choice as ns_ink2_route does
+    // then a work-group a row makes the choice as ns_ink2_route does (device-scope fences cost more than a launch)
+    // each expert's row in 4 quarters, a sub-group each (more loads in flight), the quarters added in order
+    constexpr int NQ = 4;
     g->q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<int, 1> last(sycl::range<1>(1), h);
-        sycl::local_accessor<float, 1> sv(sycl::range<1>(2 * EPW * SG + 16), h);
-        sycl::local_accessor<int, 1> si(sycl::range<1>(16), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * nwg) * EPW * SG), sycl::range<1>(EPW * SG)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        sycl::local_accessor<float, 1> qs(sycl::range<1>(EPW * NQ), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * nwg) * EPW * NQ * SG), sycl::range<1>(EPW * NQ * SG)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             auto sg = it.get_sub_group();
-            const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
+            const int lane = (int) sg.get_local_linear_id(), sgw = (int) sg.get_group_linear_id();
+            const int sgi = sgw / NQ, qi = sgw % NQ;
             const int64_t t = it.get_group(0) / nwg, e = (it.get_group(0) % nwg) * EPW + sgi;
+            const int64_t c4 = C / 4, qn = (c4 + NQ - 1) / NQ, q0 = qi * qn, q1 = sycl::min<int64_t>(c4, q0 + qn);
             const sycl::float4* xr = (const sycl::float4*) (x + t * C);
             const sycl::float4* wr = (const sycl::float4*) (w + e * C);
             float acc = 0.0f;
-            for (int64_t i = lane; i < C / 4; i += SG) {
+            for (int64_t i = q0 + lane; i < q1; i += SG) {
                 const sycl::float4 a = xr[i], b = wr[i];
                 acc = sycl::fma(a.x(), b.x(), acc);
                 acc = sycl::fma(a.y(), b.y(), acc);
                 acc = sycl::fma(a.z(), b.z(), acc);
                 acc = sycl::fma(a.w(), b.w(), acc);
             }
-            const float lg = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
-            if (lane == 0) logits[t * E + e] = lg;
+            const float part = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+            if (lane == 0) qs[sgw] = part;
             sycl::group_barrier(it.get_group());
-            if (it.get_local_id(0) == 0) {
-                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-                sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device, sycl::access::address_space::global_space> c(ctr[t]);
-                const uint32_t n = c.fetch_add(1u);
-                last[0] = n + 1 == (uint32_t) nwg;
-                if (last[0]) c.store(0u);
+            if (qi == 0 && lane == 0) {
+                float lg = 0.0f;
+                for (int k = 0; k < NQ; ++k) lg += qs[sgi * NQ + k];
+                logits[t * E + e] = lg;
             }
-            sycl::group_barrier(it.get_group());
-            if (!last[0]) return;
-            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+        });
+    });
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sv(sycl::range<1>(2 * EPW * SG + 16), h);
+        sycl::local_accessor<int, 1> si(sycl::range<1>(16), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) T * EPW * SG), sycl::range<1>(EPW * SG)), [=](sycl::nd_item<1> it) {
+            const int64_t t = it.get_group(0);
             // the choice, every expert a work-item: sigmoid, p + bias; an expert's rank the count of those larger (the
             // lower index first among equals); the K first by rank, their weights p / (sum in rank order + 1e-20) x scale
             const int e2 = (int) it.get_local_id(0);

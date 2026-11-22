@@ -97,7 +97,7 @@ pub fn draft_path(f: &Gguf) -> Option<std::path::PathBuf> {
 
 /// NS_INK2_DRAFT_PMIN: a draft (and those after it) dropped when the drafter gives it less than this probability
 pub fn draft_pmin() -> f32 {
-    std::env::var("NS_INK2_DRAFT_PMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)
+    std::env::var("NS_INK2_DRAFT_PMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.7)
 }
 
 /// NS_INK2_DRAFTS: tokens drafted a step (at most the block's less one; 0: none)
@@ -226,7 +226,15 @@ pub fn load(d: &Gguf, g: &Geometry, gpu: &Arc<Gpu>, k: &ffi::Api, s: &'static ff
         // SAFETY: rows r0.. of the repacked head -> half [rn, c]; y [rn, rank + 1] = xh . wt^T; the columns split into
         // the fold's BF16 rows and the bias.
         unsafe {
-            ffi::check((s.unpack_f16)(raw_g, output.ty.code() as c_int, output.buf.ptr(), vp as i64, r0 as i64, rn as i64, c as i64, xh.ptr().cast()), "fold unpack")?;
+            if output.packed {
+                ffi::check((s.unpack_f16)(raw_g, output.ty.code() as c_int, output.buf.ptr(), vp as i64, r0 as i64, rn as i64, c as i64, xh.ptr().cast()),
+                           "fold unpack")?;
+            } else {
+                // a head in its stored blocks (UD-Q8_K_XL's BF16): the chunk's rows from their offset
+                let row = output.ty.bytes(c as u64).ok_or_else(|| e("the head's row size"))? as usize;
+                let src = output.buf.view(r0 * row, rn * row)?;
+                ffi::check((k.dequant_f16)(raw_g, output.ty.code() as c_int, src.ptr(), (rn * c) as i64, xh.ptr().cast()), "fold expand")?;
+            }
             ffi::check((k.gemm_f16)(raw_g, rn as i64, (rank + 1) as i64, c as i64, xh.ptr().cast(), c as i64, wt_dev.ptr().cast(), y.fp(), (rank + 1) as i64, 0),
                        "fold gemm")?;
         }

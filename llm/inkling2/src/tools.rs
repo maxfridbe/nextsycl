@@ -70,7 +70,7 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
     let f = Gguf::open(model).map_err(|e| e.0)?;
     let g = nextsycl_core::Gpu::open(gpu).map_err(e)?;
     let k = ffi::api().map_err(e)?;
-    let silo = ffi::silo().map_err(e)?;
+    let silo = ffi::silo_on(gpu).map_err(e)?;
     let refdir = std::env::var("NS_INK2_DEQ_REF").ok();
     println!("gpu: {}{}", g.name, refdir.as_ref().map_or(String::new(), |d| format!("; ggml's rows from {d}")));
     // one matrix of each type the file has (an expert stack's first expert), the head

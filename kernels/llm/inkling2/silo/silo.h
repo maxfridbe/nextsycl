@@ -38,10 +38,10 @@ int ns_ink2s_rms_xq(ns_gpu* g, const float* x, const float* w, float* y, void* x
 /* the same for m (1..4) inputs in one launch: x[i], w[i], y[i] (nullable), xq[i] */
 int ns_ink2s_rms_xq_many(ns_gpu* g, int m, const float* const* x, const float* const* w, float* const* y, void* const* xq, int64_t T, int64_t n, float eps);
 
-/* the router of decode rows in one launch: logits [T, E] = x [T, C] . w [E, C] (float32) into the scratch logits, then
- * (the row's last work-group, by the counter ctr[t], zero before and after; at most 128 experts) the choice as ink.h's ns_ink2_route:
+/* the router of decode rows: logits [T, E] = x [T, C] . w [E, C] (float32) into the scratch logits, then (a work-item an
+ * expert, at most 128) the choice as ink.h's ns_ink2_route:
  * sigmoid, the K largest p + bias, weights p / (sum + 1e-20) x scale into ids, wts [T, K] */
-int ns_ink2s_router(ns_gpu* g, const float* x, const float* w, const float* bias, float* logits, uint32_t* ctr, int32_t* ids, float* wts, int64_t T, int64_t E,
+int ns_ink2s_router(ns_gpu* g, const float* x, const float* w, const float* bias, float* logits, int32_t* ids, float* wts, int64_t T, int64_t E,
                     int64_t C, int64_t K, float scale);
 
 /* ---- the DSpark drafter (draft.cpp) ---- */

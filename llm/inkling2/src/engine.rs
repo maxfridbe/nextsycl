@@ -391,8 +391,6 @@ pub struct Inkling2<'g> {
     drafts: usize,
     /// a pass's rows' drafter features [chunk, 4, C] (a drafter loaded)
     feats: Option<DevBuf>,
-    /// the fused router's counters (a row each; zero between launches)
-    route_ctr: DevBuf,
 }
 
 /// NS_INK2_CHUNK when set; otherwise chosen at load
@@ -439,7 +437,7 @@ impl<'g> Inkling2<'g> {
         }
         let g = Geometry::read(f).map_err(e)?;
         let k = ffi::api()?;
-        let silo = ffi::silo()?;
+        let silo = ffi::silo_on(gpu.index)?;
         log(match silo {
             Some(s) => format!("inkling2: decode kernels from its silo {}", s.path.display()),
             None => "inkling2: no silo - its own kernels throughout".into(),
@@ -600,11 +598,17 @@ impl<'g> Inkling2<'g> {
         let arena = Arena::new(&gpu, arena_bytes(&g, chunk))?;
         let w16 = DevBuf::new(&gpu, w16_bytes)?;
         let ds = match (&dfile, silo) {
-            (Some(d), Some(sl)) => {
-                let x = dspark::load(d, &g, &gpu, k, sl, &output, &arena)?;
-                loaded.set(loaded.get() + x.bytes);
-                Some(x)
-            }
+            // a drafter that does not load: the model without drafts
+            (Some(d), Some(sl)) => match dspark::load(d, &g, &gpu, k, sl, &output, &arena) {
+                Ok(x) => {
+                    loaded.set(loaded.get() + x.bytes);
+                    Some(x)
+                }
+                Err(x) => {
+                    log(format!("inkling2: the drafter does not load ({}) - no drafts", x.0));
+                    None
+                }
+            },
             _ => None,
         };
         let drafts = ds.as_ref().map_or(0, |d| dspark::draft_count().unwrap_or(3).min(d.block - 1));
@@ -615,8 +619,6 @@ impl<'g> Inkling2<'g> {
             Some(_) => Some(DevBuf::new(&gpu, chunk * dspark::FEATS * g.n_embd * 4)?),
             None => None,
         };
-        let route_ctr = DevBuf::new(&gpu, MAXV * 4)?;
-        route_ctr.fill(0)?;
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("inkling2: {} layers ({} applications a token: [{}, {}) x {}), {:.1} GiB on {} in {load_s:.0} s; prompt chunks of {chunk}", g.layers,
                     g.order().len(), g.core.0, g.core.1, g.passes, gib(loaded.get()), gpu.name));
@@ -624,8 +626,7 @@ impl<'g> Inkling2<'g> {
                       prof: std::env::var("NS_INK2_PROFILE").is_ok_and(|v| v == "1" || v == "gpu").then(|| Mutex::new(Default::default())), load_s, load_bytes: loaded.get(),
                       gpu_stamps: std::env::var("NS_INK2_PROFILE").is_ok_and(|v| v == "gpu"), stamps: Mutex::new(Vec::new()),
                       fused_on: std::env::var("NS_INK2_FUSED").map_or(true, |v| v != "0"),
-                      union: std::env::var("NS_INK2_UNION").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), ds, drafts, feats,
-                      route_ctr })
+                      union: std::env::var("NS_INK2_UNION").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), ds, drafts, feats })
     }
 
     /// A kernel call, its return code checked (NS_INK2_PROFILE=1: timed, the queue drained before and after)
@@ -947,7 +948,7 @@ impl<'g> Inkling2<'g> {
             // decode rows: the router's product and choice in one launch
             // SAFETY: h [t, c], the router [E, c] float32, the scratch logits and the counters; ids, weights [t, K].
             Some(sl) => self.op("router silo", || unsafe {
-                (sl.fused.router)(self.raw(), h.fp(), ly.router.buf.fp(), bias, logits.fp(), self.route_ctr.ptr().cast(), ids.ptr().cast(), wts.fp(), t as i64,
+                (sl.fused.router)(self.raw(), h.fp(), ly.router.buf.fp(), bias, logits.fp(), ids.ptr().cast(), wts.fp(), t as i64,
                                   g.experts as i64, c as i64, kk as i64, g.w_scale)
             })?,
             None => {

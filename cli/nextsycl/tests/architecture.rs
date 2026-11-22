@@ -330,10 +330,12 @@ fn silos_are_their_engines_own() {
         }
     }
     for (kind, arch) in &silos {
-        // its engine opens it (nextsycl_core::silo), so it runs without it on the shared kernels
+        // its engine opens it (nextsycl_core::silo, or silo_for a GPU's variant), so it runs without it on the shared kernels
         let src = root.join(kind).join(arch).join("src");
-        let opens = std::fs::read_dir(&src).into_iter().flatten().flatten()
-            .any(|f| std::fs::read_to_string(f.path()).unwrap_or_default().contains("nextsycl_core::silo("));
+        let opens = std::fs::read_dir(&src).into_iter().flatten().flatten().any(|f| {
+            let t = std::fs::read_to_string(f.path()).unwrap_or_default();
+            t.contains("nextsycl_core::silo(") || t.contains("nextsycl_core::silo_for(")
+        });
         if !opens {
             bad.push(format!("{kind}/{arch}: kernels/{kind}/{arch}/silo exists but {} never opens it (nextsycl_core::silo)", src.display()));
         }
