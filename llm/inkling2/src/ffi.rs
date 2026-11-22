@@ -116,6 +116,8 @@ pub struct Silo {
     pub xq: unsafe extern "C" fn(G, *const f32, M, i64, i64) -> c_int,
     /// (x, w, y nullable, xq, T, n, eps)
     pub rms_xq: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, M, i64, i64, f32) -> c_int,
+    /// (inputs, x[], w[], y[], xq[], T, n, eps)
+    pub rms_xq_many: unsafe extern "C" fn(G, c_int, *const *const f32, *const *const f32, *const *mut f32, *const M, i64, i64, f32) -> c_int,
     pub supported: unsafe extern "C" fn(c_int, i64) -> c_int,
     pub packed_bytes: unsafe extern "C" fn(c_int, i64, i64) -> usize,
     /// (type, raw, rows, n_in, dst)
@@ -131,9 +133,16 @@ pub struct Silo {
     pub fmv: unsafe extern "C" fn(G, c_int, P, *const f32, *mut f32, i64, i64, i64) -> c_int,
     /// (type, w, experts, scale, ids, xq, act_q, T, K, n_in, F, beta, lb)
     pub moe_gu: unsafe extern "C" fn(G, c_int, P, i64, *const f32, *const i32, P, M, i64, i64, i64, i64, f32, f32) -> c_int,
+    /// (ids, P, uni)
+    pub moe_union: unsafe extern "C" fn(G, *const i32, i64, *mut i32) -> c_int,
+    /// (type, w, experts, scale, uni, xq, act_q, T, K, n_in, F, beta, lb)
+    pub moe_gu_union: unsafe extern "C" fn(G, c_int, P, i64, *const f32, *const i32, P, M, i64, i64, i64, i64, f32, f32) -> c_int,
+    /// (type, w, experts, scale, uni, wts, act_q, part, y, T, K, F, n_out)
+    pub moe_down_union: unsafe extern "C" fn(G, c_int, P, i64, *const f32, *const i32, *const f32, P, *mut f32, *mut f32, i64, i64, i64, i64) -> c_int,
     /// (type, w, experts, scale, ids, wts, act_q, y, T, K, F, n_out)
     pub moe_down: unsafe extern "C" fn(G, c_int, P, i64, *const f32, *const i32, *const f32, P, *mut f32, i64, i64, i64, i64) -> c_int,
     pub fused: Fused,
+    pub draft: Draft,
     pub attn_prompt_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
     /// (q, kc, vc, r, relb, E, R, sink, out, T, Hq, Hkv, cap, p0, win)
     pub attn_prompt: unsafe extern "C" fn(G, *const f32, P, P, *const f32, *const f32, i64, i64, *const f32, *mut f32, i64, i64, i64, i64, i64, i64) -> c_int,
@@ -196,12 +205,45 @@ pub struct Fused {
     pub merge_gate_xq: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, M, i64, i64, i64) -> c_int,
     /// (cur, msg, down, u, T, C, rank, eps)
     pub ctrl_down: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, i64, i64, i64, f32) -> c_int,
+    /// (n, cur[], msg[], down[], u[], T, C, rank, eps)
+    pub ctrl_down_many: unsafe extern "C" fn(G, c_int, *const *const f32, *const *const f32, *const *const f32, *const *mut f32, i64, i64, i64, f32) -> c_int,
+    /// (n, cur[], msg[], u[], gain[], forget[], out[], T, C, rank)
+    pub ctrl_apply_many: unsafe extern "C" fn(G, c_int, *const *const f32, *const *const f32, *const *const f32, *const *const f32, *const *const f32,
+                                              *const *mut f32, i64, i64, i64) -> c_int,
     /// (cur, msg, u, gain, forget, out, T, C, rank)
     pub ctrl_apply: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *const f32, *const f32, *mut f32, i64, i64, i64) -> c_int,
+    /// (x, w, bias, logits, ctr, ids, wts, T, E, C, K, scale)
+    pub router: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, *mut u32, *mut i32, *mut f32, i64, i64, i64, i64, f32) -> c_int,
     pub attn_splits: unsafe extern "C" fn(i64, i64, i64) -> i64,
     /// (q, kc, vc, r, relb, E, R, part, T, Hq, Hkv, cap, p0, win, scale)
     pub attn_part: unsafe extern "C" fn(G, *const f32, P, P, *const f32, *const f32, i64, i64, *mut f32, i64, i64, i64, i64, i64, i64, f32) -> c_int,
 }
+
+/// The silo's DSpark drafter steps (draft.cpp; attn.cpp's block attention)
+#[allow(clippy::type_complexity)]
+pub struct Draft {
+    /// (src, feats, T, C, nf, k)
+    pub feat_put: unsafe extern "C" fn(G, *const f32, *mut f32, i64, i64, i64, i64) -> c_int,
+    /// (feats, nf, alpha, w, eps, y, xq, T, C)
+    pub feat_norm: unsafe extern "C" fn(G, *const f32, i64, *const f32, *const f32, f32, *mut f32, M, i64, i64) -> c_int,
+    /// (gate, up, xq, T, F)
+    pub swiglu_xq: unsafe extern "C" fn(G, *const f32, *const f32, M, i64, i64) -> c_int,
+    pub to_bf16: unsafe extern "C" fn(G, *const f32, *mut u16, i64) -> c_int,
+    /// (state, tok, w1, rank, hidden, f_rnn, C, out)
+    pub rnn_inputs: unsafe extern "C" fn(G, *const f32, *const i32, *const u16, i64, *const f32, *const f32, i64, *mut f32) -> c_int,
+    /// (proj, bias, state, latent, rank)
+    pub rnn_gates: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, *mut f32, i64) -> c_int,
+    /// (base, bias, fold_b, n, cap, logits, out, prob)
+    pub bias_argmax: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, i64, f32, *mut f32, *mut i32, *mut f32) -> c_int,
+    /// (x, T, H, w, eps, theta, p0)
+    pub qk_norm_rope: unsafe extern "C" fn(G, *mut f32, i64, i64, *const f32, f32, f32, i64) -> c_int,
+    /// (q, kc, vc, part, T, Hq, Hkv, cap, p0, win, scale)
+    pub attn_part_block: unsafe extern "C" fn(G, *const f32, P, P, *mut f32, i64, i64, i64, i64, i64, i64, f32) -> c_int,
+}
+
+// SAFETY: function pointers into the library, which stays loaded for the process.
+unsafe impl Send for Draft {}
+unsafe impl Sync for Draft {}
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
 unsafe impl Send for Fused {}
@@ -237,6 +279,7 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             xq_bytes: sym!("ns_ink2s_xq_bytes"),
             xq: sym!("ns_ink2s_xq"),
             rms_xq: sym!("ns_ink2s_rms_xq"),
+            rms_xq_many: sym!("ns_ink2s_rms_xq_many"),
             supported: sym!("ns_ink2s_supported"),
             packed_bytes: sym!("ns_ink2s_packed_bytes"),
             pack: sym!("ns_ink2s_pack"),
@@ -247,15 +290,32 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             fmv: sym!("ns_ink2s_fmv"),
             moe_gu: sym!("ns_ink2s_moe_gu"),
             moe_down: sym!("ns_ink2s_moe_down"),
+            moe_union: sym!("ns_ink2s_moe_union"),
+            moe_gu_union: sym!("ns_ink2s_moe_gu_union"),
+            moe_down_union: sym!("ns_ink2s_moe_down_union"),
             attn_prompt_supported: sym!("ns_ink2s_attn_prompt_supported"),
             attn_prompt: sym!("ns_ink2s_attn_prompt"),
+            draft: Draft {
+                feat_put: sym!("ns_ink2s_feat_put"),
+                feat_norm: sym!("ns_ink2s_feat_norm"),
+                swiglu_xq: sym!("ns_ink2s_swiglu_xq"),
+                to_bf16: sym!("ns_ink2s_to_bf16"),
+                rnn_inputs: sym!("ns_ink2s_rnn_inputs"),
+                rnn_gates: sym!("ns_ink2s_rnn_gates"),
+                bias_argmax: sym!("ns_ink2s_bias_argmax"),
+                qk_norm_rope: sym!("ns_ink2s_qk_norm_rope"),
+                attn_part_block: sym!("ns_ink2s_attn_part_block"),
+            },
             fused: Fused {
                 mix_norm: sym!("ns_ink2s_mix_norm"),
                 conv_res: sym!("ns_ink2s_conv_res"),
                 post_qkv: sym!("ns_ink2s_post_qkv"),
                 merge_gate_xq: sym!("ns_ink2s_merge_gate_xq"),
                 ctrl_down: sym!("ns_ink2s_ctrl_down"),
+                ctrl_down_many: sym!("ns_ink2s_ctrl_down_many"),
+                ctrl_apply_many: sym!("ns_ink2s_ctrl_apply_many"),
                 ctrl_apply: sym!("ns_ink2s_ctrl_apply"),
+                router: sym!("ns_ink2s_router"),
                 attn_splits: sym!("ns_ink2s_attn_splits"),
                 attn_part: sym!("ns_ink2s_attn_part"),
             },

@@ -50,11 +50,11 @@ inline void group_sums(sycl::nd_item<1> it, const float* part, float* slm, float
     if (tid < NV) {
         float s = 0.0f;
         for (int i = 0; i < nsg; ++i) s += slm[i * NV + tid];
-        slm[MIXW / SG * NV + tid] = s;
+        slm[nsg * NV + tid] = s;
     }
     sycl::group_barrier(it.get_group());
 #pragma unroll
-    for (int v = 0; v < NV; ++v) out[v] = slm[MIXW / SG * NV + v];
+    for (int v = 0; v < NV; ++v) out[v] = slm[nsg * NV + v];
     sycl::group_barrier(it.get_group());
 }
 
@@ -72,6 +72,117 @@ struct MixArgs {
 struct Ptr8 {
     const float* p[8];
 };
+
+// the depth attention's kernel for S states and Q queries (the sums and loops sized to them), W threads a row
+template <int S, int Q, int W>
+void mix_launch(sycl::queue& q, MixArgs a, int64_t T) {
+    q.submit([&](sycl::handler& h) {
+        constexpr int NV = S + Q * S;
+        sycl::local_accessor<float, 1> slm(sycl::range<1>(W / SG * NV + NV + 64), h);
+        sycl::local_accessor<float, 1> rowb(sycl::range<1>((size_t) Q * 2304), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) T * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const int64_t t = it.get_group(0);
+            const int tid = (int) it.get_local_id(0);
+            const int64_t C_ = a.C, c4 = C_ / 4;
+            float* sl = slm.get_multi_ptr<sycl::access::decorated::no>().get();
+            float* rb = rowb.get_multi_ptr<sycl::access::decorated::no>().get();
+            float part[NV];
+#pragma unroll
+            for (int v = 0; v < NV; ++v) part[v] = 0.0f;
+            for (int64_t i = tid; i < c4; i += W) {
+                sycl::float4 qv[Q];
+#pragma unroll
+                for (int qi = 0; qi < Q; ++qi)
+                    if (qi < a.nq) qv[qi] = ((const sycl::float4*) (a.query + qi * C_))[i];
+#pragma unroll
+                for (int s = 0; s < S; ++s) {
+                    if (s >= a.ns) break;
+                    const sycl::float4 x = ((const sycl::float4*) (a.st[s] + t * C_))[i];
+                    part[s] += x.x() * x.x() + x.y() * x.y() + x.z() * x.z() + x.w() * x.w();
+#pragma unroll
+                    for (int qi = 0; qi < Q; ++qi)
+                        if (qi < a.nq) part[S + qi * S + s] += x.x() * qv[qi].x() + x.y() * qv[qi].y() + x.z() * qv[qi].z() + x.w() * qv[qi].w();
+                }
+            }
+            float tot[NV];
+            group_sums<NV>(it, part, sl, tot);
+            float inv[S], pr[Q][S];
+#pragma unroll
+            for (int s = 0; s < S; ++s) inv[s] = s < a.ns ? sycl::rsqrt(tot[s] / (float) C_ + a.eps_mix) : 0.0f;
+            const float sc = 1.0f / sycl::sqrt((float) C_);
+#pragma unroll
+            for (int qi = 0; qi < Q; ++qi) {
+                if (qi >= a.nq) break;
+                float mx = -INFINITY;
+#pragma unroll
+                for (int s = 0; s < S; ++s)
+                    if (s < a.ns) {
+                        pr[qi][s] = tot[S + qi * S + s] * inv[s] * sc;
+                        mx = sycl::fmax(mx, pr[qi][s]);
+                    }
+                float sum = 0.0f;
+#pragma unroll
+                for (int s = 0; s < S; ++s)
+                    if (s < a.ns) {
+                        pr[qi][s] = sycl::exp(pr[qi][s] - mx);
+                        sum += pr[qi][s];
+                    }
+#pragma unroll
+                for (int s = 0; s < S; ++s)
+                    if (s < a.ns) pr[qi][s] = pr[qi][s] / sum * inv[s];
+            }
+            // every query's mix, and its sum of squares
+            float ssq[Q];
+#pragma unroll
+            for (int qi = 0; qi < Q; ++qi) ssq[qi] = 0.0f;
+            for (int64_t i = tid; i < c4; i += W) {
+                sycl::float4 y[Q];
+#pragma unroll
+                for (int qi = 0; qi < Q; ++qi) y[qi] = sycl::float4(0.0f);
+#pragma unroll
+                for (int s = 0; s < S; ++s) {
+                    if (s >= a.ns) break;
+                    const sycl::float4 x = ((const sycl::float4*) (a.st[s] + t * C_))[i];
+#pragma unroll
+                    for (int qi = 0; qi < Q; ++qi)
+                        if (qi < a.nq) y[qi] += pr[qi][s] * x;
+                }
+#pragma unroll
+                for (int qi = 0; qi < Q; ++qi)
+                    if (qi < a.nq) {
+                        ((sycl::float4*) (rb + qi * C_))[i] = y[qi];
+                        ssq[qi] += y[qi].x() * y[qi].x() + y[qi].y() * y[qi].y() + y[qi].z() * y[qi].z() + y[qi].w() * y[qi].w();
+                    }
+            }
+            float tq[Q];
+            group_sums<Q>(it, ssq, sl, tq);
+            for (int64_t i = tid; i < c4; i += W) {
+#pragma unroll
+                for (int qi = 0; qi < Q; ++qi) {
+                    if (qi >= a.nq) break;
+                    sycl::float4 y = ((const sycl::float4*) (rb + qi * C_))[i];
+                    if (a.nw[qi]) {
+                        const float ninv = sycl::rsqrt(tq[qi] / (float) C_ + a.eps_norm);
+                        y = y * ninv * ((const sycl::float4*) a.nw[qi])[i];
+                        ((sycl::float4*) (rb + qi * C_))[i] = y;
+                    }
+                    ((sycl::float4*) (a.out + (qi * a.T + t) * C_))[i] = y;
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            // the normed rows quantized: a sub-group a block of 32 in turn, over the queries
+            auto sg = it.get_sub_group();
+            const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
+            const int64_t nb = C_ / 32;
+            for (int64_t bq = sgi; bq < a.nq * nb; bq += W / SG) {
+                const int qi = (int) (bq / nb);
+                const int64_t b = bq % nb;
+                if (!a.nw[qi] || !a.xq[qi]) continue;
+                quant_block(sg, lane, rb + qi * C_ + b * 32, xqq(a.xq[qi]) + t * C_ + b * 32, xqd(a.xq[qi], a.T, C_) + t * nb + b);
+            }
+        });
+    });
+}
 
 }  // namespace
 
@@ -98,112 +209,15 @@ int ns_ink2s_mix_norm(ns_gpu* g, const float* const* states, int64_t ns, const f
     if (T <= 0) return 0;
     // a work-group a row: one pass over the channels (16-byte loads) for the states' sums of squares and the (query,
     // state) dots; every query's mix in a second, with its sum of squares; then each normed, written and quantized
-    g->q.submit([&](sycl::handler& h) {
-        constexpr int NV = MAXS + MAXQ * MAXS;
-        sycl::local_accessor<float, 1> slm(sycl::range<1>(MIXW / SG * NV + NV + 64), h);
-        sycl::local_accessor<float, 1> rowb(sycl::range<1>((size_t) MAXQ * 2304), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) T * MIXW), sycl::range<1>(MIXW)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
-            const int64_t t = it.get_group(0);
-            const int tid = (int) it.get_local_id(0);
-            const int64_t C_ = a.C, c4 = C_ / 4;
-            float* sl = slm.get_multi_ptr<sycl::access::decorated::no>().get();
-            float* rb = rowb.get_multi_ptr<sycl::access::decorated::no>().get();
-            float part[NV];
-#pragma unroll
-            for (int v = 0; v < NV; ++v) part[v] = 0.0f;
-            for (int64_t i = tid; i < c4; i += MIXW) {
-                sycl::float4 qv[MAXQ];
-#pragma unroll
-                for (int qi = 0; qi < MAXQ; ++qi)
-                    if (qi < a.nq) qv[qi] = ((const sycl::float4*) (a.query + qi * C_))[i];
-#pragma unroll
-                for (int s = 0; s < MAXS; ++s) {
-                    if (s >= a.ns) break;
-                    const sycl::float4 x = ((const sycl::float4*) (a.st[s] + t * C_))[i];
-                    part[s] += x.x() * x.x() + x.y() * x.y() + x.z() * x.z() + x.w() * x.w();
-#pragma unroll
-                    for (int qi = 0; qi < MAXQ; ++qi)
-                        if (qi < a.nq) part[MAXS + qi * MAXS + s] += x.x() * qv[qi].x() + x.y() * qv[qi].y() + x.z() * qv[qi].z() + x.w() * qv[qi].w();
-                }
-            }
-            float tot[NV];
-            group_sums<NV>(it, part, sl, tot);
-            float inv[MAXS], pr[MAXQ][MAXS];
-#pragma unroll
-            for (int s = 0; s < MAXS; ++s) inv[s] = s < a.ns ? sycl::rsqrt(tot[s] / (float) C_ + a.eps_mix) : 0.0f;
-            const float sc = 1.0f / sycl::sqrt((float) C_);
-#pragma unroll
-            for (int qi = 0; qi < MAXQ; ++qi) {
-                if (qi >= a.nq) break;
-                float mx = -INFINITY;
-#pragma unroll
-                for (int s = 0; s < MAXS; ++s)
-                    if (s < a.ns) {
-                        pr[qi][s] = tot[MAXS + qi * MAXS + s] * inv[s] * sc;
-                        mx = sycl::fmax(mx, pr[qi][s]);
-                    }
-                float sum = 0.0f;
-#pragma unroll
-                for (int s = 0; s < MAXS; ++s)
-                    if (s < a.ns) {
-                        pr[qi][s] = sycl::exp(pr[qi][s] - mx);
-                        sum += pr[qi][s];
-                    }
-#pragma unroll
-                for (int s = 0; s < MAXS; ++s)
-                    if (s < a.ns) pr[qi][s] = pr[qi][s] / sum * inv[s];
-            }
-            // every query's mix, and its sum of squares
-            float ssq[MAXQ];
-#pragma unroll
-            for (int qi = 0; qi < MAXQ; ++qi) ssq[qi] = 0.0f;
-            for (int64_t i = tid; i < c4; i += MIXW) {
-                sycl::float4 y[MAXQ];
-#pragma unroll
-                for (int qi = 0; qi < MAXQ; ++qi) y[qi] = sycl::float4(0.0f);
-#pragma unroll
-                for (int s = 0; s < MAXS; ++s) {
-                    if (s >= a.ns) break;
-                    const sycl::float4 x = ((const sycl::float4*) (a.st[s] + t * C_))[i];
-#pragma unroll
-                    for (int qi = 0; qi < MAXQ; ++qi)
-                        if (qi < a.nq) y[qi] += pr[qi][s] * x;
-                }
-#pragma unroll
-                for (int qi = 0; qi < MAXQ; ++qi)
-                    if (qi < a.nq) {
-                        ((sycl::float4*) (rb + qi * C_))[i] = y[qi];
-                        ssq[qi] += y[qi].x() * y[qi].x() + y[qi].y() * y[qi].y() + y[qi].z() * y[qi].z() + y[qi].w() * y[qi].w();
-                    }
-            }
-            float tq[MAXQ];
-            group_sums<MAXQ>(it, ssq, sl, tq);
-            for (int64_t i = tid; i < c4; i += MIXW) {
-#pragma unroll
-                for (int qi = 0; qi < MAXQ; ++qi) {
-                    if (qi >= a.nq) break;
-                    sycl::float4 y = ((const sycl::float4*) (rb + qi * C_))[i];
-                    if (a.nw[qi]) {
-                        const float ninv = sycl::rsqrt(tq[qi] / (float) C_ + a.eps_norm);
-                        y = y * ninv * ((const sycl::float4*) a.nw[qi])[i];
-                        ((sycl::float4*) (rb + qi * C_))[i] = y;
-                    }
-                    ((sycl::float4*) (a.out + (qi * a.T + t) * C_))[i] = y;
-                }
-            }
-            sycl::group_barrier(it.get_group());
-            // the normed rows quantized: a sub-group a block of 32 in turn, over the queries
-            auto sg = it.get_sub_group();
-            const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
-            const int64_t nb = C_ / 32;
-            for (int64_t bq = sgi; bq < a.nq * nb; bq += MIXW / SG) {
-                const int qi = (int) (bq / nb);
-                const int64_t b = bq % nb;
-                if (!a.nw[qi] || !a.xq[qi]) continue;
-                quant_block(sg, lane, rb + qi * C_ + b * 32, xqq(a.xq[qi]) + t * C_ + b * 32, xqd(a.xq[qi], a.T, C_) + t * nb + b);
-            }
-        });
-    });
+    // the kernel sized to the call: states and queries as template arguments, 576 threads (C / 4 for 2304)
+    switch (ns * 8 + nq) {
+#define MIXCASE(S_, Q_) case S_ * 8 + Q_: mix_launch<S_, Q_, 576>(g->q, a, T); break;
+        MIXCASE(1, 1) MIXCASE(2, 1) MIXCASE(3, 1) MIXCASE(4, 1) MIXCASE(5, 1) MIXCASE(6, 1) MIXCASE(7, 1) MIXCASE(8, 1)
+        MIXCASE(1, 3) MIXCASE(2, 3) MIXCASE(3, 3) MIXCASE(4, 3) MIXCASE(5, 3) MIXCASE(6, 3) MIXCASE(7, 3) MIXCASE(8, 3)
+        MIXCASE(1, 4) MIXCASE(2, 4) MIXCASE(3, 4) MIXCASE(4, 4) MIXCASE(5, 4) MIXCASE(6, 4) MIXCASE(7, 4) MIXCASE(8, 4)
+#undef MIXCASE
+        default: mix_launch<MAXS, MAXQ, MIXW>(g->q, a, T); break;
+    }
     return 0;
     NS_CATCH
 }
@@ -378,16 +392,17 @@ int ns_ink2s_merge_gate_xq(ns_gpu* g, const float* part, const float* sink, cons
             const int64_t rh = it.get_group(0), t = rh / Hq, hq = rh % Hq;
             const int dd = (int) it.get_local_id(0);
             const float* pp = part + rh * ns * (D + 2);
-            float M = sink[rh];
+            const float sk = sink ? sink[rh] : -INFINITY;
+            float M = sk;
             for (int64_t i = 0; i < ns; ++i) M = sycl::fmax(M, pp[i * (D + 2) + D]);
-            float S = sycl::exp(sink[rh] - M), A = 0.0f;
+            float S = sink ? sycl::exp(sk - M) : 0.0f, A = 0.0f;
             for (int64_t i = 0; i < ns; ++i) {
                 const float c = sycl::exp(pp[i * (D + 2) + D] - M);
                 S += pp[i * (D + 2) + D + 1] * c;
                 A += pp[i * (D + 2) + dd] * c;
             }
             const int64_t at = t * n + hq * D + dd;
-            const float y = A / S * (1.0f / (1.0f + sycl::exp(-gate[at])));
+            const float y = gate ? A / S * (1.0f / (1.0f + sycl::exp(-gate[at]))) : A / S;
             out[at] = y;
             vals[dd] = y;
             sycl::group_barrier(it.get_group());
@@ -403,25 +418,52 @@ int ns_ink2s_merge_gate_xq(ns_gpu* g, const float* part, const float* sink, cons
     NS_CATCH
 }
 
-int ns_ink2s_ctrl_down(ns_gpu* g, const float* cur, const float* msg, const float* down, float* u, int64_t T, int64_t C, int64_t rank, float eps) {
+// up to 4 controllers in one launch (the three attention inputs of a looped layer)
+struct CtrlJobs {
+    const float* cur[4];
+    const float* msg[4];
+    const float* down[4];
+    const float* gain[4];
+    const float* forget[4];
+    const float* u[4];
+    float* uo[4];
+    float* out[4];
+    int n;
+};
+
+int ns_ink2s_ctrl_down_many(ns_gpu* g, int n, const float* const* cur, const float* const* msg, const float* const* down, float* const* u, int64_t T,
+                            int64_t C, int64_t rank, float eps) {
     NS_TRY
-    constexpr int W = 256, RPW = 4;
+    constexpr int W = 256, RPW = 2;
     if (T <= 0) return 0;
-    if (C % 4 || 2 * C > 8192) return ns_fail("ns_ink2s_ctrl_down: rows of a multiple of 4, at most 4096");
+    if (n < 1 || n > 4 || C % 4 || 2 * C > 8192) return ns_fail("ns_ink2s_ctrl_down_many: 1..4 controllers, rows of a multiple of 4, at most 4096");
+    CtrlJobs jb{};
+    for (int k = 0; k < n; ++k) {
+        jb.cur[k] = cur[k];
+        jb.msg[k] = msg[k];
+        jb.down[k] = down[k];
+        jb.uo[k] = u[k];
+    }
+    jb.n = n;
     const int64_t blocks = (rank + RPW - 1) / RPW;
-    // a work-group a (row, 4 of the rank's rows): z = [rms(cur) | rms(msg)] into local memory once, then each rank row's
-    // dot over all the work-group's threads (16-byte loads), the sums added in a fixed order
+    // a work-group a (controller, row, 2 of the rank's rows): z = [rms(cur) | rms(msg)] into local memory once, then each
+    // rank row's dot over all the work-group's threads (16-byte loads), the sums added in a fixed order
     g->q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> z(sycl::range<1>(8192), h);
         sycl::local_accessor<float, 1> sl(sycl::range<1>(W / SG * RPW + 8), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * blocks) * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (n * T * blocks) * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             auto grp = it.get_group();
             auto sg = it.get_sub_group();
             const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
-            const int64_t t = it.get_group(0) / blocks, r0 = (it.get_group(0) % blocks) * RPW;
+            int64_t gi = it.get_group(0);
+            const int64_t r0 = (gi % blocks) * RPW;
+            gi /= blocks;
+            const int64_t t = gi % T;
+            const int k = (int) (gi / T);
+            const float* down = jb.down[k];
             const int tid = (int) it.get_local_id(0);
-            const sycl::float4* a = (const sycl::float4*) (cur + t * C);
-            const sycl::float4* b = (const sycl::float4*) (msg + t * C);
+            const sycl::float4* a = (const sycl::float4*) (jb.cur[k] + t * C);
+            const sycl::float4* b = (const sycl::float4*) (jb.msg[k] + t * C);
             float* zp = z.get_multi_ptr<sycl::access::decorated::no>().get();
             float* s = sl.get_multi_ptr<sycl::access::decorated::no>().get();
             const int64_t c4 = C / 4;
@@ -459,7 +501,7 @@ int ns_ink2s_ctrl_down(ns_gpu* g, const float* cur, const float* msg, const floa
             if (tid < RPW && r0 + tid < rank) {
                 float v = 0.0f;
                 for (int i = 0; i < W / SG; ++i) v += s[i * RPW + tid];
-                u[t * rank + r0 + tid] = v;
+                jb.uo[k][t * rank + r0 + tid] = v;
             }
         });
     });
@@ -467,21 +509,43 @@ int ns_ink2s_ctrl_down(ns_gpu* g, const float* cur, const float* msg, const floa
     NS_CATCH
 }
 
-int ns_ink2s_ctrl_apply(ns_gpu* g, const float* cur, const float* msg, const float* u, const float* gain, const float* forget, float* out, int64_t T, int64_t C,
-                        int64_t rank) {
+int ns_ink2s_ctrl_down(ns_gpu* g, const float* cur, const float* msg, const float* down, float* u, int64_t T, int64_t C, int64_t rank, float eps) {
+    return ns_ink2s_ctrl_down_many(g, 1, &cur, &msg, &down, &u, T, C, rank, eps);
+}
+
+int ns_ink2s_ctrl_apply_many(ns_gpu* g, int n, const float* const* cur, const float* const* msg, const float* const* u, const float* const* gain,
+                             const float* const* forget, float* const* out, int64_t T, int64_t C, int64_t rank) {
     NS_TRY
     constexpr int W = 128, CPW = W / SG * 4;
-    if (T <= 0 || rank > 64 || rank % SG) return ns_fail("ns_ink2s_ctrl_apply: a rank of at most 64, a multiple of 16");
+    if (T <= 0) return 0;
+    if (n < 1 || n > 4 || rank > 64 || rank % SG) return ns_fail("ns_ink2s_ctrl_apply_many: 1..4 controllers, a rank of at most 64, a multiple of 16");
+    CtrlJobs jb{};
+    for (int k = 0; k < n; ++k) {
+        jb.cur[k] = cur[k];
+        jb.msg[k] = msg[k];
+        jb.u[k] = u[k];
+        jb.gain[k] = gain[k];
+        jb.forget[k] = forget[k];
+        jb.out[k] = out[k];
+    }
+    jb.n = n;
     const int64_t blocks = (C + CPW - 1) / CPW;
     // a sub-group 4 channels: their gain and forget rows against u (the lanes over the rank)
-    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * blocks) * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (n * T * blocks) * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
         auto sg = it.get_sub_group();
         const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
-        const int64_t t = it.get_group(0) / blocks, c0 = (it.get_group(0) % blocks) * CPW + sgi * 4;
+        int64_t gi = it.get_group(0);
+        const int64_t c0 = (gi % blocks) * CPW + sgi * 4;
+        gi /= blocks;
+        const int64_t t = gi % T;
+        const int k = (int) (gi / T);
+        const float* u = jb.u[k];
+        const float* gain = jb.gain[k];
+        const float* forget = jb.forget[k];
         float uv[4];
         for (int i = 0; i < 4; ++i) uv[i] = lane + i * SG < rank ? u[t * rank + lane + i * SG] : 0.0f;
-        for (int k = 0; k < 4; ++k) {
-            const int64_t c = c0 + k;
+        for (int kk = 0; kk < 4; ++kk) {
+            const int64_t c = c0 + kk;
             if (c >= C) break;
             float gs = 0.0f, fs = 0.0f;
             for (int i = 0; i < 4; ++i) {
@@ -494,10 +558,92 @@ int ns_ink2s_ctrl_apply(ns_gpu* g, const float* cur, const float* msg, const flo
             gs = sycl::reduce_over_group(sg, gs, sycl::plus<float>());
             fs = sycl::reduce_over_group(sg, fs, sycl::plus<float>());
             if (lane == 0) {
-                const float x = cur[t * C + c];
-                out[t * C + c] = (x - sycl::tanh(fs) * x) + sycl::tanh(gs) * msg[t * C + c];
+                const float x = jb.cur[k][t * C + c];
+                jb.out[k][t * C + c] = (x - sycl::tanh(fs) * x) + sycl::tanh(gs) * jb.msg[k][t * C + c];
             }
         }
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_ink2s_ctrl_apply(ns_gpu* g, const float* cur, const float* msg, const float* u, const float* gain, const float* forget, float* out, int64_t T, int64_t C,
+                        int64_t rank) {
+    return ns_ink2s_ctrl_apply_many(g, 1, &cur, &msg, &u, &gain, &forget, &out, T, C, rank);
+}
+
+int ns_ink2s_router(ns_gpu* g, const float* x, const float* w, const float* bias, float* logits, uint32_t* ctr, int32_t* ids, float* wts, int64_t T, int64_t E,
+                    int64_t C, int64_t K, float scale) {
+    NS_TRY
+    constexpr int EPW = 8;
+    if (T <= 0) return 0;
+    if (E > EPW * SG || E % EPW || K > 16 || C % 4) return ns_fail("ns_ink2s_router: at most 128 experts (a multiple of 8), 16 chosen, rows of a multiple of 4");
+    const int64_t nwg = E / EPW;
+    // a work-group a (row, 8 experts): a sub-group an expert's logit (lanes over the row, 16-byte loads, a fixed order);
+    // the row's last work-group to finish (a counter a row, reset by it) makes the choice as ns_ink2_route does
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<int, 1> last(sycl::range<1>(1), h);
+        sycl::local_accessor<float, 1> sv(sycl::range<1>(2 * EPW * SG + 16), h);
+        sycl::local_accessor<int, 1> si(sycl::range<1>(16), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * nwg) * EPW * SG), sycl::range<1>(EPW * SG)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            auto sg = it.get_sub_group();
+            const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
+            const int64_t t = it.get_group(0) / nwg, e = (it.get_group(0) % nwg) * EPW + sgi;
+            const sycl::float4* xr = (const sycl::float4*) (x + t * C);
+            const sycl::float4* wr = (const sycl::float4*) (w + e * C);
+            float acc = 0.0f;
+            for (int64_t i = lane; i < C / 4; i += SG) {
+                const sycl::float4 a = xr[i], b = wr[i];
+                acc = sycl::fma(a.x(), b.x(), acc);
+                acc = sycl::fma(a.y(), b.y(), acc);
+                acc = sycl::fma(a.z(), b.z(), acc);
+                acc = sycl::fma(a.w(), b.w(), acc);
+            }
+            const float lg = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+            if (lane == 0) logits[t * E + e] = lg;
+            sycl::group_barrier(it.get_group());
+            if (it.get_local_id(0) == 0) {
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+                sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device, sycl::access::address_space::global_space> c(ctr[t]);
+                const uint32_t n = c.fetch_add(1u);
+                last[0] = n + 1 == (uint32_t) nwg;
+                if (last[0]) c.store(0u);
+            }
+            sycl::group_barrier(it.get_group());
+            if (!last[0]) return;
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+            // the choice, every expert a work-item: sigmoid, p + bias; an expert's rank the count of those larger (the
+            // lower index first among equals); the K first by rank, their weights p / (sum in rank order + 1e-20) x scale
+            const int e2 = (int) it.get_local_id(0);
+            float* vv = sv.get_multi_ptr<sycl::access::decorated::no>().get();
+            float* pp = sv.get_multi_ptr<sycl::access::decorated::no>().get() + EPW * SG;
+            float* selp = pp + EPW * SG;
+            int* seli = si.get_multi_ptr<sycl::access::decorated::no>().get();
+            float pe = 0.0f, ve = -INFINITY;
+            if (e2 < E) {
+                pe = 1.0f / (1.0f + sycl::exp(-logits[t * E + e2]));
+                ve = bias ? pe + bias[e2] : pe;
+            }
+            vv[e2] = ve;
+            pp[e2] = pe;
+            sycl::group_barrier(it.get_group());
+            if (e2 < E) {
+                int rank = 0;
+                for (int j = 0; j < E; ++j) rank += vv[j] > ve || (vv[j] == ve && j < e2);
+                if (rank < K) {
+                    seli[rank] = e2;
+                    selp[rank] = pe;
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            if (e2 < K) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; ++k) sum += selp[k];
+                sum += 1e-20f;
+                ids[t * K + e2] = seli[e2];
+                wts[t * K + e2] = selp[e2] / sum * scale;
+            }
+        });
     });
     return 0;
     NS_CATCH

@@ -720,13 +720,14 @@ int ns_ink2_argmax(ns_gpu* g, const float* x, int32_t* out, int64_t T, int64_t n
 // the museglimmer engine's GPU draw (mg.cpp), copied: the 256 largest, temperature, top-p, one uniform a row
 int ns_ink2_sample(ns_gpu* g, const float* x, int32_t* out, int64_t T, int64_t n, float temp, float top_p, uint64_t seed, int64_t pos0) {
     NS_TRY
-    constexpr int W = 1024, K = 256;
+    constexpr int W = 1024, K = 256, CAP = 4096;
     if (T <= 0) return 0;
     if (n < K) return ns_fail("ns_ink2_sample: fewer than 256 values a row");
     g->q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> cv(sycl::range<1>(K), h);
         sycl::local_accessor<int32_t, 1> ci(sycl::range<1>(K), h);
         sycl::local_accessor<int32_t, 1> cnt(sycl::range<1>(1), h);
+        sycl::local_accessor<uint32_t, 1> cand(sycl::range<1>(CAP), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) T * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) {
             auto grp = it.get_group();
             const int64_t r = it.get_group(0);
@@ -736,12 +737,57 @@ int ns_ink2_sample(ns_gpu* g, const float* x, int32_t* out, int64_t T, int64_t n
                 const uint32_t b = sycl::bit_cast<uint32_t>(v);
                 return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
             };
+            // the K-th largest key: the largest c with K keys at or above it. The row's values within d of its largest
+            // for the smallest d of 1, 2, 4, .. 64 that holds K of them hold every key at or above it, so the bit-by-bit
+            // search over them alone (in local memory) finds the same c; past CAP of them, over the whole row
+            float mx = -INFINITY;
+            for (int64_t i = tid; i < n; i += W) mx = sycl::fmax(mx, xr[i]);
+            mx = sycl::reduce_over_group(grp, mx, sycl::maximum<float>());
+            constexpr int ND = 7;
+            int64_t cd[ND];
+#pragma unroll
+            for (int j = 0; j < ND; ++j) cd[j] = 0;
+            for (int64_t i = tid; i < n; i += W) {
+                const float v = xr[i];
+#pragma unroll
+                for (int j = 0; j < ND; ++j) cd[j] += v >= mx - (float) (1 << j);
+            }
+            int dsel = -1;
+            int64_t csel = 0;
+#pragma unroll
+            for (int j = 0; j < ND; ++j) {
+                const int64_t c = sycl::reduce_over_group(grp, cd[j], sycl::plus<int64_t>());
+                if (dsel < 0 && c >= K) {
+                    dsel = j;
+                    csel = c;
+                }
+            }
             uint32_t kth = 0;
-            for (int bit = 31; bit >= 0; --bit) {
-                const uint32_t c = kth | (1u << bit);
-                int64_t m = 0;
-                for (int64_t i = tid; i < n; i += W) m += key(xr[i]) >= c;
-                if (sycl::reduce_over_group(grp, m, sycl::plus<int64_t>()) >= K) kth = c;
+            if (dsel >= 0 && csel <= CAP) {
+                const float lo = mx - (float) (1 << dsel);
+                if (tid == 0) cnt[0] = 0;
+                sycl::group_barrier(grp);
+                for (int64_t i = tid; i < n; i += W) {
+                    if (xr[i] >= lo) {
+                        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space> a(cnt[0]);
+                        cand[a.fetch_add(1)] = key(xr[i]);
+                    }
+                }
+                sycl::group_barrier(grp);
+                const int nc = (int) csel;
+                for (int bit = 31; bit >= 0; --bit) {
+                    const uint32_t c = kth | (1u << bit);
+                    int m = 0;
+                    for (int i = tid; i < nc; i += W) m += cand[i] >= c;
+                    if (sycl::reduce_over_group(grp, m, sycl::plus<int>()) >= K) kth = c;
+                }
+            } else {
+                for (int bit = 31; bit >= 0; --bit) {
+                    const uint32_t c = kth | (1u << bit);
+                    int64_t m = 0;
+                    for (int64_t i = tid; i < n; i += W) m += key(xr[i]) >= c;
+                    if (sycl::reduce_over_group(grp, m, sycl::plus<int64_t>()) >= K) kth = c;
+                }
             }
             if (tid == 0) cnt[0] = 0;
             sycl::group_barrier(grp);

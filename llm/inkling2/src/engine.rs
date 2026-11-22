@@ -30,6 +30,8 @@ use nextsycl_llm::{Error, GpuInfo, Result, Sampler, Tap};
 
 use crate::ffi;
 
+mod dspark;
+
 fn e(x: impl std::fmt::Display) -> Error {
     Error(x.to_string())
 }
@@ -258,6 +260,8 @@ pub struct Session {
     slots: Vec<SlotState>,
     /// rows of the last pass (a rollback keeps some of them; past MAXV it cannot)
     last_rows: usize,
+    /// the DSpark drafter's caches and f_rnn (a drafter loaded)
+    ds: Option<dspark::DsState>,
 }
 
 /// A conversation's state in host memory: per slot its keys / values still seen, then its convolution state
@@ -323,19 +327,30 @@ pub struct Decoder {
     next: Option<u32>,
     pub drafted: u64,
     pub accepted: u64,
+    /// drafts asked for; the drafter's tokens after `next`
+    draft: bool,
+    drafts: Vec<u32>,
 }
 
 impl Decoder {
-    pub fn new(logits: Vec<f32>, _draft: bool) -> Decoder {
-        Decoder { logits: Some(logits), next: None, drafted: 0, accepted: 0 }
+    pub fn new(logits: Vec<f32>, draft: bool) -> Decoder {
+        Decoder { logits: Some(logits), next: None, drafted: 0, accepted: 0, draft, drafts: Vec::new() }
     }
-    pub fn after(next: u32, _draft: bool) -> Decoder {
-        Decoder { logits: None, next: Some(next), drafted: 0, accepted: 0 }
+    pub fn after(next: u32, draft: bool) -> Decoder {
+        Decoder { logits: None, next: Some(next), drafted: 0, accepted: 0, draft, drafts: Vec::new() }
     }
     pub fn pending(&mut self) -> Option<u32> {
         self.next.take()
     }
 }
+
+/// NS_INK2_EXPERT_UNION=0: decode passes of several rows read an expert shared by rows once a row (A/B; on by default)
+fn union_on() -> bool {
+    std::env::var("NS_INK2_EXPERT_UNION").map_or(true, |v| v != "0")
+}
+
+/// NS_INK2_UNION: by rows a pass, (distinct experts summed, layer applications, the most)
+type UnionStats = std::collections::BTreeMap<usize, (u64, u64, u64)>;
 
 pub struct Inkling2<'g> {
     pub g: Geometry,
@@ -368,6 +383,16 @@ pub struct Inkling2<'g> {
     /// decode rows through the silo's fused steps (NS_INK2_FUSED=0: its products only, the steps as for a prompt)
     fused_on: bool,
     load_bytes: u64,
+    /// NS_INK2_UNION=1: a pass's rows' chosen experts read back each layer application (a sync each): by rows a pass,
+    /// the distinct experts' sum, the applications, the largest
+    union: Option<Mutex<UnionStats>>,
+    /// the DSpark drafter (LoadOptions.draft and its GGUF beside the model), tokens drafted a step
+    ds: Option<dspark::DSpark>,
+    drafts: usize,
+    /// a pass's rows' drafter features [chunk, 4, C] (a drafter loaded)
+    feats: Option<DevBuf>,
+    /// the fused router's counters (a row each; zero between launches)
+    route_ctr: DevBuf,
 }
 
 /// NS_INK2_CHUNK when set; otherwise chosen at load
@@ -406,7 +431,7 @@ fn gib(b: u64) -> f64 {
 impl<'g> Inkling2<'g> {
     /// Loads the model onto one GPU (the last of `gpus`: the server orders them weakest first). `kv`: the context the
     /// sessions reserve (tokens in all; 0: 32K).
-    pub fn load(f: &'g Gguf, gpus: &[Arc<Gpu>], kv: (usize, usize), _draft: bool, log: &mut dyn FnMut(String)) -> Result<Inkling2<'g>> {
+    pub fn load(f: &'g Gguf, gpus: &[Arc<Gpu>], kv: (usize, usize), draft: bool, log: &mut dyn FnMut(String)) -> Result<Inkling2<'g>> {
         let t0 = Instant::now();
         let gpu = gpus.last().ok_or_else(|| e("no GPU"))?.clone();
         if gpus.len() > 1 {
@@ -427,12 +452,28 @@ impl<'g> Inkling2<'g> {
         let margin: u64 = 1536 << 20;
         let w16_bytes = [g.heads * g.head * g.n_embd, 2 * g.n_ff * g.n_embd].into_iter().max().unwrap_or(0) * 2;
         let tries: Vec<usize> = chunk_setting().map_or_else(|| vec![2048, 1024, 512], |c| vec![c]);
+        // the drafter (its file beside the model), when asked for, there and the silo loaded
+        let dfile = match (draft && dspark::draft_count() != Some(0), silo, dspark::draft_path(f)) {
+            (true, Some(_), Some(p)) => match Gguf::open(&p) {
+                Ok(d) if d.architecture() == "dflash" => Some(d),
+                Ok(_) => None,
+                Err(x) => {
+                    log(format!("inkling2: the drafter {}: {} - no drafts", p.display(), x.0));
+                    None
+                }
+            },
+            _ => None,
+        };
+        // its weights, the fold through the head (vocab x 256 BF16), the features of a pass
+        let ds_fixed = dfile.as_ref().map_or(0u64, |d| d.tensors.iter().map(|t| t.bytes).sum::<u64>() + (g.vocab_pad * (256 * 2 + 4)) as u64);
         let mut chunk = 0;
         let mut need = 0u64;
         for &c in &tries {
             // the sessions: their contexts in all (kv.0), and the rings and states of each beyond the first
             let extra = kv.1.max(1).saturating_sub(1) as u64 * session_bytes(&g, (g.window + c).min(ctx), c) as u64;
-            need = weights + w16_bytes as u64 + arena_bytes(&g, c) as u64 + session_bytes(&g, ctx, c) as u64 + extra + margin;
+            let ds_c = dfile.as_ref().map_or(0, |_| (c * dspark::FEATS * g.n_embd * 4) as u64
+                + kv.1.max(1) as u64 * dspark::DSpark::session_bytes(&g, ctx, c, MAXV) as u64);
+            need = weights + w16_bytes as u64 + arena_bytes(&g, c) as u64 + session_bytes(&g, ctx, c) as u64 + extra + margin + ds_fixed + ds_c;
             if need <= free {
                 chunk = c;
                 break;
@@ -558,13 +599,33 @@ impl<'g> Inkling2<'g> {
         gpu.sync()?;
         let arena = Arena::new(&gpu, arena_bytes(&g, chunk))?;
         let w16 = DevBuf::new(&gpu, w16_bytes)?;
+        let ds = match (&dfile, silo) {
+            (Some(d), Some(sl)) => {
+                let x = dspark::load(d, &g, &gpu, k, sl, &output, &arena)?;
+                loaded.set(loaded.get() + x.bytes);
+                Some(x)
+            }
+            _ => None,
+        };
+        let drafts = ds.as_ref().map_or(0, |d| dspark::draft_count().unwrap_or(3).min(d.block - 1));
+        if let Some(d) = &ds {
+            log(format!("inkling2: the DSpark drafter ({} MB, block of {}), {drafts} drafts a step", d.bytes >> 20, d.block));
+        }
+        let feats = match &ds {
+            Some(_) => Some(DevBuf::new(&gpu, chunk * dspark::FEATS * g.n_embd * 4)?),
+            None => None,
+        };
+        let route_ctr = DevBuf::new(&gpu, MAXV * 4)?;
+        route_ctr.fill(0)?;
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("inkling2: {} layers ({} applications a token: [{}, {}) x {}), {:.1} GiB on {} in {load_s:.0} s; prompt chunks of {chunk}", g.layers,
                     g.order().len(), g.core.0, g.core.1, g.passes, gib(loaded.get()), gpu.name));
         Ok(Inkling2 { g, file: f, gpu, arena, w16, k, silo, layers, loops, tok_norm, output_norm, output_res, output, embd, chunk, work: Mutex::new(()),
                       prof: std::env::var("NS_INK2_PROFILE").is_ok_and(|v| v == "1" || v == "gpu").then(|| Mutex::new(Default::default())), load_s, load_bytes: loaded.get(),
                       gpu_stamps: std::env::var("NS_INK2_PROFILE").is_ok_and(|v| v == "gpu"), stamps: Mutex::new(Vec::new()),
-                      fused_on: std::env::var("NS_INK2_FUSED").map_or(true, |v| v != "0") })
+                      fused_on: std::env::var("NS_INK2_FUSED").map_or(true, |v| v != "0"),
+                      union: std::env::var("NS_INK2_UNION").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), ds, drafts, feats,
+                      route_ctr })
     }
 
     /// A kernel call, its return code checked (NS_INK2_PROFILE=1: timed, the queue drained before and after)
@@ -615,11 +676,19 @@ impl<'g> Inkling2<'g> {
 
     /// The profile's lines (`report`): each kernel's time in all and a token
     pub fn profile_lines(&self, tokens: usize) -> Vec<String> {
-        let Some(p) = &self.prof else { return Vec::new() };
+        let mut out = Vec::new();
+        if let Some(u) = &self.union {
+            for (rows, (sum, n, max)) in u.lock().unwrap().iter() {
+                out.push(format!("[experts of a {rows}-row pass: {:.2} distinct a layer application on average, {max} at most ({n} applications; {} a row)]",
+                                 *sum as f64 / (*n).max(1) as f64, self.g.used));
+            }
+        }
+        let Some(p) = &self.prof else { return out };
         let m = p.lock().unwrap();
         let mut v: Vec<_> = m.iter().collect();
         v.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
-        v.iter().map(|(n, (s, c))| format!("[profile {n:<16} {s:>8.3} s {c:>8} calls {:>8.3} ms/token]", s * 1000.0 / (tokens + 1) as f64)).collect()
+        out.extend(v.iter().map(|(n, (s, c))| format!("[profile {n:<16} {s:>8.3} s {c:>8} calls {:>8.3} ms/token]", s * 1000.0 / (tokens + 1) as f64)));
+        out
     }
 
     pub fn load_seconds(&self) -> f64 {
@@ -632,10 +701,10 @@ impl<'g> Inkling2<'g> {
         self.chunk
     }
     pub fn has_draft(&self) -> bool {
-        false
+        self.drafts > 0
     }
     pub fn max_verify(&self) -> usize {
-        1
+        self.drafts + 1
     }
 
     fn raw(&self) -> *mut std::ffi::c_void {
@@ -868,14 +937,37 @@ impl<'g> Inkling2<'g> {
     fn moe(&self, ly: &Layer, h: &DevBuf, hq: Option<&DevBuf>, t: usize) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
         let (c, kk, ff) = (g.n_embd, g.used, g.n_ff);
-        let logits = self.mm(&ly.router, h, t)?;
         let ids = self.ab(t * kk * 4)?;
         let wts = self.f32(t * kk)?;
         let out = self.f32(t * c)?;
         let (gu, dn) = (&ly.gu, &ly.down);
         let bias = ly.exp_bias.as_ref().map_or(std::ptr::null(), |b| b.fp() as *const f32);
-        // SAFETY: logits [t, E] -> ids, weights [t, K].
-        self.op("route", || unsafe { (k.route)(self.raw(), logits.fp(), bias, ids.ptr().cast(), wts.fp(), t as i64, g.experts as i64, kk as i64, g.w_scale) })?;
+        let logits = self.f32(t * g.experts)?;
+        match self.fused(t).filter(|_| ly.router.ty == GType::F32 && g.experts % 8 == 0 && g.experts <= 128) {
+            // decode rows: the router's product and choice in one launch
+            // SAFETY: h [t, c], the router [E, c] float32, the scratch logits and the counters; ids, weights [t, K].
+            Some(sl) => self.op("router silo", || unsafe {
+                (sl.fused.router)(self.raw(), h.fp(), ly.router.buf.fp(), bias, logits.fp(), self.route_ctr.ptr().cast(), ids.ptr().cast(), wts.fp(), t as i64,
+                                  g.experts as i64, c as i64, kk as i64, g.w_scale)
+            })?,
+            None => {
+                self.matmul(&ly.router, h, t, &logits)?;
+                // SAFETY: logits [t, E] -> ids, weights [t, K].
+                self.op("route", || unsafe { (k.route)(self.raw(), logits.fp(), bias, ids.ptr().cast(), wts.fp(), t as i64, g.experts as i64, kk as i64, g.w_scale) })?
+            }
+        }
+        if let (Some(u), true) = (&self.union, t <= MAXV) {
+            let mut b = vec![0u8; t * kk * 4];
+            ids.read(0, &mut b)?;
+            let mut set: Vec<u32> = b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            set.sort_unstable();
+            set.dedup();
+            let mut m = u.lock().unwrap();
+            let ent = m.entry(t).or_insert((0, 0, 0));
+            ent.0 += set.len() as u64;
+            ent.1 += 1;
+            ent.2 = ent.2.max(set.len() as u64);
+        }
         // the experts' work rewound after (the queue is in order)
         let mark = self.arena.mark();
         if let (Some(s), Some(q)) = (self.dec(t), hq) {
@@ -883,6 +975,22 @@ impl<'g> Inkling2<'g> {
                 // SAFETY: arithmetic only; then gate | up and SiTU into the act's quants, the down products weighted into out.
                 let aq = self.ab(unsafe { (s.xq_bytes)((t * kk) as i64, ff as i64) })?;
                 let sc = |e: &Experts| e.scale.as_ref().map_or(std::ptr::null(), |s| s.fp() as *const f32);
+                if t > 1 && union_on() {
+                    // rows that share experts: each distinct expert's weights read once for all its pairs
+                    let p = t * kk;
+                    let uni = self.ab((1 + 2 * p + 16 * p) * 4)?;
+                    let part = self.f32(p * dn.rows)?;
+                    // SAFETY: ids [p] -> uni; then the products as silo.h names them.
+                    unsafe {
+                        self.op("experts union", || (s.moe_union)(self.raw(), ids.ptr().cast(), p as i64, uni.ptr().cast()))?;
+                        self.op("experts gu silo", || (s.moe_gu_union)(self.raw(), gu.ty.code() as c_int, gu.buf.ptr(), g.experts as i64, sc(gu), uni.ptr().cast(), q.ptr(),
+                                                                       aq.ptr(), t as i64, kk as i64, gu.cols as i64, ff as i64, g.situ_beta, g.situ_lb))?;
+                        self.op("experts down silo", || (s.moe_down_union)(self.raw(), dn.ty.code() as c_int, dn.buf.ptr(), g.experts as i64, sc(dn), uni.ptr().cast(),
+                                                                           wts.fp(), aq.ptr(), part.fp(), out.fp(), t as i64, kk as i64, ff as i64, dn.rows as i64))?;
+                    }
+                    self.arena.rewind(mark);
+                    return Ok(out);
+                }
                 self.op("experts gu silo", || unsafe {
                     (s.moe_gu)(self.raw(), gu.ty.code() as c_int, gu.buf.ptr(), g.experts as i64, sc(gu), ids.ptr().cast(), q.ptr(), aq.ptr(), t as i64, kk as i64,
                                gu.cols as i64, ff as i64, g.situ_beta, g.situ_lb)
@@ -1142,6 +1250,46 @@ impl<'g> Inkling2<'g> {
         Ok(out)
     }
 
+    /// Loop controllers `which` of `lp` on their inputs and messages, in one launch for the down products and one for
+    /// the rest
+    fn control_many(&self, f: &ffi::Fused, lp: &Loop, which: &[usize], xs: &[&DevBuf], msgs: &[&DevBuf], t: usize) -> Result<Vec<DevBuf>> {
+        let (c, rank) = (self.g.n_embd, self.g.rank);
+        let n = which.len();
+        let us: Vec<DevBuf> = (0..n).map(|_| self.f32(t * rank)).collect::<Result<_>>()?;
+        let outs: Vec<DevBuf> = (0..n).map(|_| self.f32(t * c)).collect::<Result<_>>()?;
+        let xp: Vec<*const f32> = xs.iter().map(|x| x.fp() as *const f32).collect();
+        let mp: Vec<*const f32> = msgs.iter().map(|x| x.fp() as *const f32).collect();
+        let dp: Vec<*const f32> = which.iter().map(|&j| lp.down[j].buf.fp() as *const f32).collect();
+        let gp: Vec<*const f32> = which.iter().map(|&j| lp.gain[j].buf.fp() as *const f32).collect();
+        let fp: Vec<*const f32> = which.iter().map(|&j| lp.forget[j].buf.fp() as *const f32).collect();
+        let up: Vec<*mut f32> = us.iter().map(|u| u.fp()).collect();
+        let ucp: Vec<*const f32> = us.iter().map(|u| u.fp() as *const f32).collect();
+        let op: Vec<*mut f32> = outs.iter().map(|o| o.fp()).collect();
+        // SAFETY: each controller's x, msg, out [t, c]; down [rank, 2c], gain / forget [c, rank] float32; u [t, rank].
+        unsafe {
+            self.op("ctrl down silo", || (f.ctrl_down_many)(self.raw(), n as c_int, xp.as_ptr(), mp.as_ptr(), dp.as_ptr(), up.as_ptr(), t as i64, c as i64, rank as i64,
+                                                              1e-6))?;
+            self.op("ctrl apply silo", || (f.ctrl_apply_many)(self.raw(), n as c_int, xp.as_ptr(), mp.as_ptr(), ucp.as_ptr(), gp.as_ptr(), fp.as_ptr(), op.as_ptr(),
+                                                                t as i64, c as i64, rank as i64))?;
+        }
+        Ok(outs)
+    }
+
+    /// Rows normed (each input its weight) and quantized for the silo's products, in one launch
+    fn rms_q_many(&self, s: &ffi::Silo, xs: &[&DevBuf], ws: &[&DevBuf], t: usize) -> Result<(Vec<DevBuf>, Vec<DevBuf>)> {
+        let c = self.g.n_embd;
+        let ys: Vec<DevBuf> = xs.iter().map(|_| self.f32(t * c)).collect::<Result<_>>()?;
+        // SAFETY: arithmetic only.
+        let qs: Vec<DevBuf> = xs.iter().map(|_| self.ab(unsafe { (s.xq_bytes)(t as i64, c as i64) })).collect::<Result<_>>()?;
+        let xp: Vec<*const f32> = xs.iter().map(|x| x.fp() as *const f32).collect();
+        let wp: Vec<*const f32> = ws.iter().map(|w| w.fp() as *const f32).collect();
+        let yp: Vec<*mut f32> = ys.iter().map(|y| y.fp()).collect();
+        let qp: Vec<*mut std::ffi::c_void> = qs.iter().map(|q| q.ptr()).collect();
+        // SAFETY: each x [t, c] normed into its y and quantized into its q.
+        self.op("rms xq", || unsafe { (s.rms_xq_many)(self.raw(), xs.len() as c_int, xp.as_ptr(), wp.as_ptr(), yp.as_ptr(), qp.as_ptr(), t as i64, c as i64, self.g.eps) })?;
+        Ok((ys, qs))
+    }
+
     /// The depth attention of `states` by `nq` queries, each normed by its weight (None: left unnormed) and quantized:
     /// [nq, t, C] and each query's quantized rows
     fn mix_norm(&self, f: &ffi::Fused, states: &[&DevBuf], query: &DevBuf, nq: usize, norms: Option<&[&DevBuf]>, t: usize) -> Result<(DevBuf, Vec<Option<DevBuf>>)> {
@@ -1194,14 +1342,14 @@ impl<'g> Inkling2<'g> {
                 }
             }
             (Some((q, n)), Some((lp, m))) => {
+                // the three controllers in one launch each, their outputs normed and quantized in one more
                 let (out, _) = self.mix_norm(f, &st, q, *n, None, t)?;
-                for j in 0..3 {
-                    let inp = out.view(if *n > 1 { j * tc } else { 0 }, tc)?;
-                    let x = self.control_dec(f, lp, j, &inp, &m.view(j * tc, tc)?, t)?;
-                    let (y, q) = self.rms_q(&x, &ly.norm[j], t)?;
-                    normed.push(y);
-                    nq.push(q);
-                }
+                let inps: Vec<DevBuf> = (0..3).map(|j| out.view(if *n > 1 { j * tc } else { 0 }, tc)).collect::<Result<_>>()?;
+                let msgs: Vec<DevBuf> = (0..3).map(|j| m.view(j * tc, tc)).collect::<Result<_>>()?;
+                let xs = self.control_many(f, lp, &[0, 1, 2], &inps.iter().collect::<Vec<_>>(), &msgs.iter().collect::<Vec<_>>(), t)?;
+                let (ys, qs) = self.rms_q_many(sl, &xs.iter().collect::<Vec<_>>(), &[&ly.norm[0], &ly.norm[1], &ly.norm[2]], t)?;
+                normed = ys;
+                nq = qs.into_iter().map(Some).collect();
             }
             (None, _) => {
                 let (y, q) = self.rms_q(cur, &ly.norm[0], t)?;
@@ -1350,7 +1498,9 @@ impl<'g> Inkling2<'g> {
         let mut cur: DevBuf = x0.view(0, tc)?;
         let other = |cur: &DevBuf| -> Result<DevBuf> { if cur.ptr() == a.ptr() { b.view(0, tc) } else { a.view(0, tc) } };
         let mut prelude_blocks = 0;
-        for (slot, l, p) in g.order() {
+        let feats = self.feats.as_ref().filter(|_| s.ds.is_some());
+        let taps: &[usize] = self.ds.as_ref().map_or(&[], |d| &d.taps);
+        for (app, (slot, l, p)) in g.order().into_iter().enumerate() {
             if l == cs {
                 if p == 0 {
                     pre.copy_within(0, &cur, 0, tc)?;
@@ -1385,6 +1535,12 @@ impl<'g> Inkling2<'g> {
             } else {
                 None
             };
+            if let (Some(fb), Some(k)) = (feats, taps.iter().position(|&a| a == app)) {
+                // the drafter's feature k: the stream going into this application
+                let sl = self.silo.ok_or_else(|| e("drafts need the silo"))?;
+                // SAFETY: cur [t, c] -> feature k of fb [t, 4, c].
+                self.op("draft feature", || unsafe { (sl.draft.feat_put)(self.raw(), cur.fp(), fb.fp(), t as i64, c as i64, dspark::FEATS as i64, k as i64) })?;
+            }
             let dst = other(&cur)?;
             match self.fused(t) {
                 Some(sl) => self.layer_dec(sl, &s.slots[slot], slot, l, &cur, &dst, &mut blocks, lp, t, p0, &mut *tap)?,
@@ -1398,8 +1554,23 @@ impl<'g> Inkling2<'g> {
         let mut st: Vec<&DevBuf> = blocks.iter().collect();
         st.push(&cur);
         let fin = self.mix(&st, &self.output_res, 1, t)?;
-        let last = fin.view((t - n) * c * 4, n * c * 4)?;
-        let normed = self.rms(&last, &self.output_norm, n)?;
+        let normed = match feats {
+            Some(fb) => {
+                // every row's normed head input: the drafter's last feature, then its context and f_rnn
+                let all = self.rms(&fin, &self.output_norm, t)?;
+                let sl = self.silo.ok_or_else(|| e("drafts need the silo"))?;
+                // SAFETY: all [t, c] -> feature 3 of fb.
+                self.op("draft feature", || unsafe {
+                    (sl.draft.feat_put)(self.raw(), all.fp(), fb.fp(), t as i64, c as i64, dspark::FEATS as i64, (dspark::FEATS - 1) as i64)
+                })?;
+                self.ds_inject(s, t, p0)?;
+                all.view((t - n) * c * 4, n * c * 4)?
+            }
+            None => {
+                let last = fin.view((t - n) * c * 4, n * c * 4)?;
+                self.rms(&last, &self.output_norm, n)?
+            }
+        };
         tap("result_norm", &normed)?;
         let vp = self.output.rows;
         let v = g.vocab;
@@ -1442,7 +1613,7 @@ impl<'g> Inkling2<'g> {
         let g = &self.g;
         // checked against what is free first: past the card the xe driver spills into host memory and can take the
         // machine down
-        let need = session_bytes(g, max_ctx, self.chunk);
+        let need = session_bytes(g, max_ctx, self.chunk) + self.ds.as_ref().map_or(0, |_| dspark::DSpark::session_bytes(g, max_ctx, self.chunk, MAXV));
         let (total, free) = self.gpu.memory()?;
         let free = free.unwrap_or(total);
         if need as u64 + (1536 << 20) > free {
@@ -1458,8 +1629,9 @@ impl<'g> Inkling2<'g> {
             st.fill(0)?;
             slots.push(SlotState { kc: DevBuf::new(&self.gpu, n)?, vc: DevBuf::new(&self.gpu, n)?, cap, conv: st, snap: DevBuf::new(&self.gpu, (3 + MAXV) * conv * 4)? });
         }
+        let ds = self.ds_state(max_ctx)?;
         self.gpu.sync()?;
-        Ok(Session { pos: 0, max_ctx, slots, last_rows: 0 })
+        Ok(Session { pos: 0, max_ctx, slots, last_rows: 0, ds })
     }
 
     pub fn reset_session(&self, s: &mut Session) -> Result<()> {
@@ -1501,6 +1673,9 @@ impl<'g> Inkling2<'g> {
             self.copy_ring(&d.kc, d.cap, &sc.kc, sc.cap, self.g.heads_kv, from, src.pos)?;
             self.copy_ring(&d.vc, d.cap, &sc.vc, sc.cap, self.g.heads_kv, from, src.pos)?;
             d.conv.copy_within(0, &sc.conv, 0, d.conv.len)?;
+        }
+        if let (Some(dd), Some(sd)) = (dst.ds.as_mut(), src.ds.as_ref()) {
+            self.ds_copy(dd, sd, src.pos, src.last_rows)?;
         }
         dst.pos = src.pos;
         dst.last_rows = 0;
@@ -1568,20 +1743,50 @@ impl<'g> Inkling2<'g> {
     /// The next committed token
     pub fn step(&self, s: &mut Session, d: &mut Decoder, smp: &mut dyn Sampler, tap: Tap) -> Result<Vec<u32>> {
         let _w = self.work.lock().unwrap();
+        let drafting = d.draft && self.drafts > 0 && s.ds.is_some();
+        // the last pass's row whose features the drafts continue from
+        let mut last_row = s.last_rows.saturating_sub(1);
         let out = match (d.logits.take(), d.next.take()) {
-            (Some(l), _) => smp.sample(&l),
+            (Some(l), _) => vec![smp.sample(&l)],
             (None, Some(x)) => {
-                // the token from the GPU when nothing reads the logits (greedy: the argmax; sampled: its draw)
-                let pick = if smp.greedy() { Some(None) } else { smp.device().map(Some) };
-                match self.pass_out(s, &[x], 1, pick, tap)? {
-                    Out::Logits(mut l) => smp.sample(&l.pop().unwrap_or_default()),
-                    Out::Ids(v) => *v.first().ok_or_else(|| e("no token"))?,
+                let mut rows = vec![x];
+                if drafting {
+                    rows.extend(d.drafts.iter().take(s.max_ctx.saturating_sub(s.pos + 1)));
                 }
+                d.drafts.clear();
+                // the tokens from the GPU when nothing reads the logits (greedy: the argmaxes; sampled: the draws)
+                let pick = if smp.greedy() { Some(None) } else { smp.device().map(Some) };
+                let picks: Vec<u32> = match self.pass_out(s, &rows, rows.len(), pick, tap)? {
+                    Out::Logits(l) => l.iter().map(|r| smp.sample(r)).collect(),
+                    Out::Ids(v) => v,
+                };
+                let mut out = Vec::with_capacity(rows.len());
+                for (i, &y) in picks.iter().enumerate() {
+                    out.push(y);
+                    if i + 1 < rows.len() {
+                        d.drafted += 1;
+                        if y == rows[i + 1] {
+                            d.accepted += 1;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                // the rejected rows undone (their caches written again later, the convolutions' states as after the kept)
+                if out.len() < rows.len() {
+                    self.rollback(s, out.len())?;
+                }
+                last_row = out.len() - 1;
+                out
             }
             (None, None) => return Err(e("a decoder with nothing to draw from")),
         };
-        d.next = Some(out);
-        Ok(vec![out])
+        let tail = *out.last().unwrap_or(&0);
+        d.next = Some(tail);
+        if drafting {
+            d.drafts = self.ds_draft(s, tail, last_row, self.drafts)?;
+        }
+        Ok(out)
     }
 
     pub fn save(&self, s: &Session) -> Result<Checkpoint> {
@@ -1609,6 +1814,9 @@ impl<'g> Inkling2<'g> {
             st.conv.read(0, &mut cb)?;
             bufs.push(cb);
         }
+        if let Some(ds) = &s.ds {
+            bufs.extend(self.ds_save(ds, s.pos, s.last_rows)?);
+        }
         let bytes = bufs.iter().map(|b| b.len()).sum();
         Ok(Checkpoint { pos: s.pos, bufs, bytes })
     }
@@ -1619,7 +1827,8 @@ impl<'g> Inkling2<'g> {
         if ck.pos > s.max_ctx {
             return Err(e(format!("a checkpoint of {} tokens into a session of {}", ck.pos, s.max_ctx)));
         }
-        if ck.bufs.len() != 3 * s.slots.len() {
+        let ds_bufs = self.ds.as_ref().map_or(0, |d| d.save_bufs());
+        if ck.bufs.len() != 3 * s.slots.len() + if s.ds.is_some() { ds_bufs } else { 0 } {
             return Err(e("a checkpoint of another shape"));
         }
         let mut it = ck.bufs.iter();
@@ -1647,6 +1856,10 @@ impl<'g> Inkling2<'g> {
                 return Err(e("a checkpoint of another shape"));
             }
             st.conv.write(0, cb)?;
+        }
+        if let Some(ds) = s.ds.as_mut() {
+            let rest: Vec<&Vec<u8>> = it.collect();
+            self.ds_restore(ds, ck.pos, &rest)?;
         }
         s.pos = ck.pos;
         s.last_rows = 0;

@@ -383,18 +383,34 @@ int ns_ink2s_xq(ns_gpu* g, const float* x, void* xq, int64_t T, int64_t n) {
     NS_CATCH
 }
 
-int ns_ink2s_rms_xq(ns_gpu* g, const float* x, const float* w, float* y, void* xq, int64_t T, int64_t n, float eps) {
+int ns_ink2s_rms_xq_many(ns_gpu* g, int m, const float* const* xs, const float* const* ws, float* const* ys, void* const* xqs, int64_t T, int64_t n,
+                         float eps) {
     NS_TRY
-    if (n % 32 || n > 4096) return ns_fail("ns_ink2s_rms_xq: rows of whole blocks of 32, at most 4096");
+    if (n % 32 || n > 4096 || m < 1 || m > 4) return ns_fail("ns_ink2s_rms_xq_many: 1..4 inputs, rows of whole blocks of 32, at most 4096");
     constexpr int W = 256;
-    int8_t* q = (int8_t*) xq;
-    float* d = (float*) ((uint8_t*) xq + ns_ink2s_xq_scales_at(T, n));
+    struct Jb {
+        const float* x[4];
+        const float* w[4];
+        float* y[4];
+        int8_t* q[4];
+        float* d[4];
+    } jb{};
+    for (int k = 0; k < m; ++k) {
+        jb.x[k] = xs[k];
+        jb.w[k] = ws[k];
+        jb.y[k] = ys ? ys[k] : nullptr;
+        jb.q[k] = (int8_t*) xqs[k];
+        jb.d[k] = (float*) ((uint8_t*) xqs[k] + ns_ink2s_xq_scales_at(T, n));
+    }
     if (T > 0) g->q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> row(sycl::range<1>(4096), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) T * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
-            const int64_t t = it.get_group(0);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (m * T) * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const int64_t t = it.get_group(0) % T;
+            const int k = (int) (it.get_group(0) / T);
             const int tid = (int) it.get_local_id(0);
-            const float* xr = x + t * n;
+            const float* xr = jb.x[k] + t * n;
+            const float* w = jb.w[k];
+            float* y = jb.y[k];
             float ss = 0.0f;
             for (int64_t i = tid; i < n; i += W) ss += xr[i] * xr[i];
             const float inv = sycl::rsqrt(sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>()) / (float) n + eps);
@@ -407,11 +423,15 @@ int ns_ink2s_rms_xq(ns_gpu* g, const float* x, const float* w, float* y, void* x
             auto sg = it.get_sub_group();
             const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
             float* rp = row.get_multi_ptr<sycl::access::decorated::no>().get();
-            for (int64_t b = sgi; b < n / 32; b += W / SG) quant_block(sg, lane, rp + b * 32, q + t * n + b * 32, d + t * (n / 32) + b);
+            for (int64_t b = sgi; b < n / 32; b += W / SG) quant_block(sg, lane, rp + b * 32, jb.q[k] + t * n + b * 32, jb.d[k] + t * (n / 32) + b);
         });
     });
     return 0;
     NS_CATCH
+}
+
+int ns_ink2s_rms_xq(ns_gpu* g, const float* x, const float* w, float* y, void* xq, int64_t T, int64_t n, float eps) {
+    return ns_ink2s_rms_xq_many(g, 1, &x, &w, y ? &y : nullptr, &xq, T, n, eps);
 }
 
 int ns_ink2s_mv_many(ns_gpu* g, int n, const int* ty, const void* const* w, const void* const* xq, float* const* y, const int64_t* rows,
@@ -563,6 +583,234 @@ int ns_ink2s_moe_down(ns_gpu* g, int type, const void* w, int64_t E, const float
                     y[t * n_out + r0 + lane] = v;
                 }
             });
+        });
+    };
+    if (type == 8) run(std::integral_constant<int, 8>{});
+    else run(std::integral_constant<int, 40>{});
+    return 0;
+    NS_CATCH
+}
+
+int ns_ink2s_moe_union(ns_gpu* g, const int32_t* ids, int64_t P, int32_t* uni) {
+    NS_TRY
+    if (P < 1 || P > 256) return ns_fail("ns_ink2s_moe_union: 1..256 pairs");
+    // uni: [0] the distinct experts' count n, then their experts [P] (in order of first use), each one's pair count [P],
+    // its pairs [P][16] (in pair order); a work-item a pair
+    g->q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<int32_t, 1> fp(sycl::range<1>(256), h);
+        sycl::local_accessor<int32_t, 1> isf(sycl::range<1>(256), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)), [=](sycl::nd_item<1> it) {
+            const int p = (int) it.get_local_id(0);
+            int32_t* ue = uni + 1;
+            int32_t* un = ue + P;
+            int32_t* up = un + P;
+            int f = p, slot = 0;
+            if (p < P) {
+                const int32_t e = ids[p];
+                for (int q = p - 1; q >= 0; --q)
+                    if (ids[q] == e) {
+                        f = q;
+                        ++slot;
+                    }
+            }
+            fp[p] = f;
+            isf[p] = p < P && f == p;
+            sycl::group_barrier(it.get_group());
+            if (p < P) {
+                // the expert's distinct index: the first uses before its first pair
+                int u = 0;
+                for (int q = 0; q < f; ++q) u += isf[q];
+                up[u * 16 + slot] = p;
+                if (f == p) ue[u] = ids[p];
+                bool last = true;
+                for (int q = p + 1; q < P; ++q)
+                    if (fp[q] == f) {
+                        last = false;
+                        break;
+                    }
+                if (last) un[u] = slot + 1;
+                if (p == 0) {
+                    int c = 0;
+                    for (int q = 0; q < P; ++q) c += isf[q];
+                    uni[0] = c;
+                }
+            }
+        });
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_ink2s_moe_gu_union(ns_gpu* g, int type, const void* w, int64_t E, const float* scale, const int32_t* uni, const void* xq, void* act_q, int64_t T,
+                          int64_t K, int64_t n_in, int64_t F, float beta, float lb) {
+    NS_TRY
+    if (!ns_ink2s_supported(type, n_in) || F % 32 || T * K > 256 || T > 16) return ns_fail("ns_ink2s_moe_gu_union: a type or shape it does not take");
+    // a work-group a (distinct expert, 32 act values): 8 sub-groups of 4 values, each 4 gate and 4 up rows, its lines
+    // read once for every pair of the expert (up to 4 at a time) - each pair's sums as ns_ink2s_moe_gu's
+    constexpr int NS8 = 8, RV = 4, MP = 4;
+    const int64_t P = T * K, nblk = F / 32, nl = type == 8 ? n_in / 16 : n_in / 32, nbx = n_in / 32;
+    const int64_t rows = E * 2 * F, qr = qrow(type, n_in), sr = srow(type, n_in);
+    const int8_t* wq = (const int8_t*) w;
+    const uint8_t* ws = (const uint8_t*) w + ns_ink2s_scales_at(type, rows, n_in);
+    const int8_t* xqq = xq_q(xq);
+    const float* xqd = xq_d(xq, T, n_in);
+    int8_t* aq = (int8_t*) act_q;
+    float* ad = (float*) ((uint8_t*) act_q + ns_ink2s_xq_scales_at(P, F));
+    auto run = [&](auto tyc) {
+        constexpr int TY = decltype(tyc)::value;
+        g->q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> av(sycl::range<1>(MP * 32), h);
+            sycl::local_accessor<uint32_t, 1> lutm(sycl::range<1>(512), h);
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (P * nblk) * NS8 * SG), sycl::range<1>(NS8 * SG)),
+                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                const int64_t u = it.get_group(0) / nblk, ab = it.get_group(0) % nblk;
+                if (u >= uni[0]) return;
+                uint32_t* lut = lutm.get_multi_ptr<sycl::access::decorated::no>().get();
+                if constexpr (TY == 40) fill_lut(it, lut);
+                auto sg = it.get_sub_group();
+                const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
+                const int32_t* ue = uni + 1;
+                const int32_t* un = ue + P;
+                const int32_t* up = un + P;
+                const int64_t e = ue[u];
+                const int m = un[u];
+                const int64_t base = e * 2 * F, i0 = ab * 32 + sgi * RV;
+                const float s = scale ? scale[e] : 1.0f;
+                for (int g0 = 0; g0 < m; g0 += MP) {
+                    const int mg = sycl::min(MP, m - g0);
+                    int64_t pt[MP];
+#pragma unroll
+                    for (int j = 0; j < MP; ++j) pt[j] = up[u * 16 + g0 + sycl::min(j, mg - 1)] / K;
+                    float acc[MP][2 * RV];
+#pragma unroll
+                    for (int j = 0; j < MP; ++j)
+#pragma unroll
+                        for (int r = 0; r < 2 * RV; ++r) acc[j][r] = 0.0f;
+                    for (int64_t li = lane; li < nl; li += SG) {
+                        XLine<TY> x[MP];
+#pragma unroll
+                        for (int j = 0; j < MP; ++j)
+                            if (j < mg) x[j] = load_x<TY>(xqq + pt[j] * n_in, xqd + pt[j] * nbx, li);
+#pragma unroll
+                        for (int r = 0; r < 2 * RV; ++r) {
+                            const int64_t row = base + (r < RV ? i0 + r : F + i0 + (r - RV));
+                            const Line<TY> wl = load_line<TY>(wq + row * qr, ws + row * sr, li, lut);
+#pragma unroll
+                            for (int j = 0; j < MP; ++j)
+                                if (j < mg) acc[j][r] = ldot<TY>(acc[j][r], wl, x[j]);
+                        }
+                    }
+#pragma unroll
+                    for (int j = 0; j < MP; ++j) {
+                        if (j >= mg) break;
+#pragma unroll
+                        for (int r = 0; r < RV; ++r) {
+                            const float gt = sycl::reduce_over_group(sg, acc[j][r], sycl::plus<float>()) * s;
+                            const float upv = sycl::reduce_over_group(sg, acc[j][RV + r], sycl::plus<float>()) * s;
+                            const float a = beta * sycl::tanh(gt / beta) * (1.0f / (1.0f + sycl::exp(-gt)));
+                            const float uu = lb > 0.0f ? lb * sycl::tanh(upv / lb) : upv;
+                            if (lane == 0) av[j * 32 + sgi * RV + r] = a * uu;
+                        }
+                    }
+                    sycl::group_barrier(it.get_group());
+                    if (sgi < mg) {
+                        const int64_t p = up[u * 16 + g0 + sgi];
+                        float* ap = av.get_multi_ptr<sycl::access::decorated::no>().get() + sgi * 32;
+                        quant_block(sg, lane, ap, aq + p * F + ab * 32, ad + p * nblk + ab);
+                    }
+                    sycl::group_barrier(it.get_group());
+                }
+            });
+        });
+    };
+    if (type == 8) run(std::integral_constant<int, 8>{});
+    else run(std::integral_constant<int, 40>{});
+    return 0;
+    NS_CATCH
+}
+
+int ns_ink2s_moe_down_union(ns_gpu* g, int type, const void* w, int64_t E, const float* scale, const int32_t* uni, const float* wts, const void* act_q,
+                            float* part, float* y, int64_t T, int64_t K, int64_t F, int64_t n_out) {
+    NS_TRY
+    if (!ns_ink2s_supported(type, F) || K > 16 || K < 1 || T * K > 256) return ns_fail("ns_ink2s_moe_down_union: a type or shape it does not take");
+    // a work-group a (distinct expert, 16 output rows): a sub-group 4 rows, its lines read once for every pair of the
+    // expert (up to 4 at a time), each pair's weighted sums into part [P, n_out]; then each row's K sums in order
+    constexpr int RD = 4, NSG = 4, MP = 4;
+    const int64_t P = T * K, nrb = (n_out + RD * NSG - 1) / (RD * NSG), nl = type == 8 ? F / 16 : F / 32, nbx = F / 32;
+    const int64_t rows = E * n_out, qr = qrow(type, F), sr = srow(type, F);
+    const int8_t* wq = (const int8_t*) w;
+    const uint8_t* ws = (const uint8_t*) w + ns_ink2s_scales_at(type, rows, F);
+    const int8_t* aq = xq_q(act_q);
+    const float* ad = xq_d(act_q, P, F);
+    auto run = [&](auto tyc) {
+        constexpr int TY = decltype(tyc)::value;
+        g->q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<uint32_t, 1> lutm(sycl::range<1>(512), h);
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (P * nrb) * NSG * SG), sycl::range<1>(NSG * SG)),
+                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                const int64_t u = it.get_group(0) / nrb, rb = it.get_group(0) % nrb;
+                if (u >= uni[0]) return;
+                uint32_t* lut = lutm.get_multi_ptr<sycl::access::decorated::no>().get();
+                if constexpr (TY == 40) fill_lut(it, lut);
+                auto sg = it.get_sub_group();
+                const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
+                const int32_t* ue = uni + 1;
+                const int32_t* un = ue + P;
+                const int32_t* up = un + P;
+                const int64_t e = ue[u];
+                const int m = un[u];
+                const int64_t r0 = (rb * NSG + sgi) * RD;
+                if (r0 >= n_out) return;
+                const int nr = (int) sycl::min<int64_t>(RD, n_out - r0);
+                const float s = scale ? scale[e] : 1.0f;
+                for (int g0 = 0; g0 < m; g0 += MP) {
+                    const int mg = sycl::min(MP, m - g0);
+                    int64_t pp[MP];
+#pragma unroll
+                    for (int j = 0; j < MP; ++j) pp[j] = up[u * 16 + g0 + sycl::min(j, mg - 1)];
+                    float acc[MP][RD];
+#pragma unroll
+                    for (int j = 0; j < MP; ++j)
+#pragma unroll
+                        for (int r = 0; r < RD; ++r) acc[j][r] = 0.0f;
+                    for (int64_t li = lane; li < nl; li += SG) {
+                        Raw raw[RD];
+#pragma unroll
+                        for (int r = 0; r < RD; ++r) {
+                            const int64_t row = e * n_out + r0 + sycl::min(r, nr - 1);
+                            raw[r] = load_raw<TY>(wq + row * qr, ws + row * sr, li);
+                        }
+                        XLine<TY> x[MP];
+#pragma unroll
+                        for (int j = 0; j < MP; ++j)
+                            if (j < mg) x[j] = load_x<TY>(aq + pp[j] * F, ad + pp[j] * nbx, li);
+#pragma unroll
+                        for (int r = 0; r < RD; ++r) {
+                            const Line<TY> wl = decode_line<TY>(raw[r], lut);
+#pragma unroll
+                            for (int j = 0; j < MP; ++j)
+                                if (j < mg) acc[j][r] = ldot<TY>(acc[j][r], wl, x[j]);
+                        }
+                    }
+#pragma unroll
+                    for (int j = 0; j < MP; ++j) {
+                        if (j >= mg) break;
+                        const float sw = s * wts[pp[j]];
+#pragma unroll
+                        for (int r = 0; r < RD; ++r) {
+                            const float v = sycl::reduce_over_group(sg, acc[j][r], sycl::plus<float>());
+                            if (lane == 0 && r < nr) part[pp[j] * n_out + r0 + r] = v * sw;
+                        }
+                    }
+                }
+            });
+        });
+        // each row's sums over its K experts, in order (ns_ink2s_moe_down's)
+        g->q.parallel_for(sycl::range<1>((size_t) (T * n_out)), [=](sycl::id<1> id) {
+            const int64_t t = id[0] / n_out, r = id[0] % n_out;
+            float v = 0.0f;
+            for (int64_t k = 0; k < K; ++k) v += part[(t * K + k) * n_out + r];
+            y[t * n_out + r] = v;
         });
     };
     if (type == 8) run(std::integral_constant<int, 8>{});

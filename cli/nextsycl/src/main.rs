@@ -677,7 +677,9 @@ fn generate(args: &[String]) -> Result<(), String> {
         // row i: the distribution that predicts sc[i] (row 0 the prompt's last logits)
         let mut rows = vec![logits];
         let mut at = 0;
+        let (t_score, mut passes) = (std::time::Instant::now(), 0usize);
         while at + 1 < sc.len() {
+            passes += 1;
             // 8 rows a pass: the head reads every row (decode-width products; a wider pass would expand it to half);
             // NS_SCORE_ROWS=1: one row a pass, as decode runs (up to 64: above 8 the prompt path)
             let end = (at + std::env::var("NS_SCORE_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).clamp(1, 64)).min(sc.len() - 1);
@@ -696,8 +698,12 @@ fn generate(args: &[String]) -> Result<(), String> {
         let argmax = |v: &[f32]| v.iter().enumerate().fold(0, |b, (i, x)| if *x > v[b] { i } else { b });
         let same: Vec<bool> = rows.iter().zip(&sc).map(|(r, &y)| argmax(r) == y as usize).collect();
         let first = same.iter().position(|s| !s).map_or("none".to_string(), |i| i.to_string());
-        eprintln!("[score: {} tokens, perplexity {:.4}, the likeliest token the text's at {:.2}% (first not at row {first})]", rows.len(), nll.exp(),
-                  100.0 * same.iter().filter(|s| **s).count() as f64 / m);
+        let el = t_score.elapsed().as_secs_f64();
+        eprintln!("[score: {} tokens, perplexity {:.4}, the likeliest token the text's at {:.2}% (first not at row {first}); {passes} passes in {el:.2} s, \
+                   {:.2} ms a pass]", rows.len(), nll.exp(), 100.0 * same.iter().filter(|s| **s).count() as f64 / m, el * 1000.0 / passes.max(1) as f64);
+        for line in eng.report(rows.len()) {
+            eprintln!("{line}");
+        }
         if let Some(out) = opt("--dump") {
             let b: Vec<u8> = rows.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
             std::fs::write(&out, b).map_err(|x| format!("{out}: {x}"))?;

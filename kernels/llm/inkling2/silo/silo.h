@@ -35,6 +35,35 @@ size_t ns_ink2s_xq_scales_at(int64_t T, int64_t n);
 int ns_ink2s_xq(ns_gpu* g, const float* x, void* xq, int64_t T, int64_t n);
 /* RMS norm (eps, weight w) straight to that layout: y (nullable) [T, n] the normed rows too */
 int ns_ink2s_rms_xq(ns_gpu* g, const float* x, const float* w, float* y, void* xq, int64_t T, int64_t n, float eps);
+/* the same for m (1..4) inputs in one launch: x[i], w[i], y[i] (nullable), xq[i] */
+int ns_ink2s_rms_xq_many(ns_gpu* g, int m, const float* const* x, const float* const* w, float* const* y, void* const* xq, int64_t T, int64_t n, float eps);
+
+/* the router of decode rows in one launch: logits [T, E] = x [T, C] . w [E, C] (float32) into the scratch logits, then
+ * (the row's last work-group, by the counter ctr[t], zero before and after; at most 128 experts) the choice as ink.h's ns_ink2_route:
+ * sigmoid, the K largest p + bias, weights p / (sum + 1e-20) x scale into ids, wts [T, K] */
+int ns_ink2s_router(ns_gpu* g, const float* x, const float* w, const float* bias, float* logits, uint32_t* ctr, int32_t* ids, float* wts, int64_t T, int64_t E,
+                    int64_t C, int64_t K, float scale);
+
+/* ---- the DSpark drafter (draft.cpp) ---- */
+/* src [T, C] rounded to BF16 into feature k of feats [T, nf, C] */
+int ns_ink2s_feat_put(ns_gpu* g, const float* src, float* feats, int64_t T, int64_t C, int64_t nf, int64_t k);
+/* each row's features mixed by alpha [nf], RMS-normed (eps, weight w) into y (nullable) and its quantized rows xq (nullable) */
+int ns_ink2s_feat_norm(ns_gpu* g, const float* feats, int64_t nf, const float* alpha, const float* w, float eps, float* y, void* xq, int64_t T, int64_t C);
+/* silu(gate) up [T, F] quantized (ns_ink2s_xq's layout) */
+int ns_ink2s_swiglu_xq(ns_gpu* g, const float* gate, const float* up, void* xq, int64_t T, int64_t F);
+/* rows x [T, H x 128] in place: each head RMS-normed with w [128] (null: not), then NEOX-rotated at position p0 + t */
+int ns_ink2s_qk_norm_rope(ns_gpu* g, float* x, int64_t T, int64_t H, const float* w, float eps, float theta, int64_t p0);
+/* float32 to BF16 bits (round to nearest even) */
+int ns_ink2s_to_bf16(ns_gpu* g, const float* x, uint16_t* y, int64_t n);
+/* the Markov head's input row [state (rank) | w1[*tok] (BF16 [vocab, rank]) | hidden (C) | f_rnn (C)], BF16-rounded */
+int ns_ink2s_rnn_inputs(ns_gpu* g, const float* state, const int32_t* tok, const uint16_t* w1, int64_t rank, const float* hidden, const float* f_rnn,
+                        int64_t C, float* out);
+/* its gates from the projection proj [3 rank] + bias: state [rank] updated in place, latent [rank] */
+int ns_ink2s_rnn_gates(ns_gpu* g, const float* proj, const float* bias, float* state, float* latent, int64_t rank);
+/* softcap(base + BF16(fold_b + bias)) over the first n (cap <= 0: none) into logits (nullable); its argmax into out[0],
+ * the argmax's probability (softmax at temperature 1) into prob[0] (nullable) */
+int ns_ink2s_bias_argmax(ns_gpu* g, const float* base, const float* bias, const float* fold_b, int64_t n, float cap, float* logits, int32_t* out,
+                         float* prob);
 
 /* ---- the products (repacked matrices) ---- */
 /* y [T, rows] = W [rows, n_in] . x (xq: ns_ink2s_xq's layout of x [T, n_in]), T 1..16 */
@@ -54,6 +83,15 @@ int ns_ink2s_fmv(ns_gpu* g, int type, const void* w, const float* x, float* y, i
  * scale, through SiTU (beta, lb): act [T K, F] quantized straight into ns_ink2s_xq's layout (F a multiple of 32) */
 int ns_ink2s_moe_gu(ns_gpu* g, int type, const void* w, int64_t E, const float* scale, const int32_t* ids, const void* xq, void* act_q, int64_t T,
                     int64_t K, int64_t n_in, int64_t F, float beta, float lb);
+/* a pass's distinct experts (T rows of K, P = T K pairs, at most 256): uni [1 + P + P + 16 P] int32 - their count, their
+ * experts in order of first use, each one's pair count and pairs (pair order) */
+int ns_ink2s_moe_union(ns_gpu* g, const int32_t* ids, int64_t P, int32_t* uni);
+/* ns_ink2s_moe_gu with each distinct expert's lines read once for all its pairs (T at most 16): the same values */
+int ns_ink2s_moe_gu_union(ns_gpu* g, int type, const void* w, int64_t E, const float* scale, const int32_t* uni, const void* xq, void* act_q, int64_t T,
+                          int64_t K, int64_t n_in, int64_t F, float beta, float lb);
+/* ns_ink2s_moe_down the same way: each pair's weighted sums into part [P, n_out], then each row's in order into y */
+int ns_ink2s_moe_down_union(ns_gpu* g, int type, const void* w, int64_t E, const float* scale, const int32_t* uni, const float* wts, const void* act_q,
+                            float* part, float* y, int64_t T, int64_t K, int64_t F, int64_t n_out);
 /* the down products of the pairs (act_q [T K, F]; the stack's rows [n_out, F] an expert) weighted and summed: y [T,
  * n_out] = sum_k wts[t K + k] scale[e] (W_e . act) */
 int ns_ink2s_moe_down(ns_gpu* g, int type, const void* w, int64_t E, const float* scale, const int32_t* ids, const float* wts, const void* act_q,
@@ -108,14 +146,24 @@ int ns_ink2s_post_qkv(ns_gpu* g, const Ink2sQkv* p);
 /* the decode attention's splits (part: the base kernel's layout) merged in order with the sink, times sigmoid(gate),
  * into out [T, Hq x 128] and its quantized rows xq */
 int ns_ink2s_merge_gate_xq(ns_gpu* g, const float* part, const float* sink, const float* gate, float* out, void* xq, int64_t T, int64_t Hq, int64_t ns);
+/* (sink null: none; gate null: not gated) */
 /* a loop controller: u [T, rank] = down [rank, 2C] . [rms(cur) | rms(msg)] (eps), then out [T, C] = cur - tanh(forget .
  * u) cur + tanh(gain . u) msg (gain, forget [C, rank]; rank at most 64) */
 int ns_ink2s_ctrl_down(ns_gpu* g, const float* cur, const float* msg, const float* down, float* u, int64_t T, int64_t C, int64_t rank, float eps);
 int ns_ink2s_ctrl_apply(ns_gpu* g, const float* cur, const float* msg, const float* u, const float* gain, const float* forget, float* out, int64_t T, int64_t C,
                         int64_t rank);
+/* the same for n (1..4) controllers in one launch each (arrays of their buffers) */
+int ns_ink2s_ctrl_down_many(ns_gpu* g, int n, const float* const* cur, const float* const* msg, const float* const* down, float* const* u, int64_t T,
+                            int64_t C, int64_t rank, float eps);
+int ns_ink2s_ctrl_apply_many(ns_gpu* g, int n, const float* const* cur, const float* const* msg, const float* const* u, const float* const* gain,
+                             const float* const* forget, float* const* out, int64_t T, int64_t C, int64_t rank);
 /* the decode attention split at absolute key positions (the base kernel's, ink.h ns_ink2_attn, without its merge):
  * part [T, Hq, ns, 130]; ns from ns_ink2s_attn_splits */
 int64_t ns_ink2s_attn_splits(int64_t T, int64_t p0, int64_t win);
+/* the same for a block (the drafter's): no bias, every row seeing from p0 + 1 - win (win <= 0: from 0) through the
+ * whole block p0 .. p0 + T - 1 (not causal); merged by ns_ink2s_merge_gate_xq with sink and gate null */
+int ns_ink2s_attn_part_block(ns_gpu* g, const float* q, const void* kc, const void* vc, float* part, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap, int64_t p0,
+                             int64_t win, float scale);
 int ns_ink2s_attn_part(ns_gpu* g, const float* q, const void* kc, const void* vc, const float* r, const float* relb, int64_t E, int64_t R, float* part,
                        int64_t T, int64_t Hq, int64_t Hkv, int64_t cap, int64_t p0, int64_t win, float scale);
 
