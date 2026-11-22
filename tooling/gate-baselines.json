@@ -1,0 +1,26 @@
+{
+  "about": "tooling/gate.sh's baselines on hardac1 (card 0 the Arc Pro B70, card 1 the B65): each engine's quick run - the prompt's logits and greedy tokens hashed (exact), pp and tg in tok/s (best of two) - and the shared parts' engines. Recorded with NS_GATE_RECORD=1 on the commit named; a change that moves a number on purpose records it again in its pull request.",
+  "recorded": "a8139b8 (2026-11-22)",
+  "tolerance": 0.03,
+  "shared": {
+    "crates/": ["*"],
+    "kernels/ns/": ["*"],
+    "kernels/llm/common/": ["llm/*"],
+    "kernels/strata/": ["llm/qwen4exp"],
+    "kernels/diffusion/": ["image/*", "video/*", "audio/*", "model3d/*"],
+    "llm/contract/": ["llm/*"],
+    "image/contract/": ["image/*"],
+    "video/contract/": ["video/*"],
+    "audio/contract/": ["audio/*"],
+    "model3d/contract/": ["model3d/*"],
+    "kernels/llm/glm5next/": ["llm/qwen35", "llm/glm5next"]
+  },
+  "engines": {
+    "llm/qwen35": {
+      "run": "dist/nextsycl llm generate /var/mnt/2TBSSD/qwen38-27b/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_M.gguf --ctx 4096 --max 128 --temp 0 --gpu {gpu} --prompt \"Explain, step by step and with a small worked example, how a hash map handles collisions with open addressing and with separate chaining, what load factor means for each, and when you would pick one over the other in a program that stores ten million short strings.\"",
+      "mounts": ["/var/mnt/2TBSSD/qwen38-27b"],
+      "timeout_s": 600,
+      "cards": {}
+    }
+  }
+}

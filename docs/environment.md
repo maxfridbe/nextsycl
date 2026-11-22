@@ -878,6 +878,10 @@ Inputs of the checks and unit tests that need files outside the repository (unse
 |---|---|---|---|
 | `NS_CHECK_COND` | the reference's cond_latents.npy | edit-dit check: a raw float32 file of condition latents to use instead | image qwenimage21 (check) |
 | `NS_CHECK_EMBEDS` | the reference's embeddings | edit-dit check: a raw float32 file of embeddings to use instead (the engine's own, to see their effect) | image qwenimage21 (check) |
+| `NS_GATE_HOST` | this machine | the merge gate's GPU box, over ssh | tooling/gate.sh |
+| `NS_GATE_DIR` | src/nextsycl-gate | the gate's build copy on that box (its own nextsycl.conf: NS_IMAGE, a registry of its own, no NS_STUDIO_MODES) - never the production checkout | tooling/gate.sh |
+| `NS_GATE_LOCK` | ~/src/gpu-lock.sh | the GPU lock script the gate sources there (gpu_lock CARD WAIT MAX_HOLD / gpu_unlock) | tooling/gate.sh |
+| `NS_GATE_RECORD` | 0 | 1: write the measured values into tooling/gate-baselines.json instead of comparing | tooling/gate.sh |
 | `NS_CHECK_LATENTS` | the reference's last latents_N.npy | vae check (HunyuanImage 2.1): a .npy of latents [h * w, 64] to decode instead | image hunyuanimage21 (check) |
 | `NS_CHECK_NOISE` | the reference's noise.npy | edit-dit check: a raw float32 noise file to use instead | image qwenimage21 (check) |
 | `NS_CHECK_PICTURE` | edit-pre check fails | edit-pre check: the original picture (PNG) resized and compared with the reference's | image qwenimage21 (check) |

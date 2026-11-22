@@ -132,3 +132,10 @@ clear message where the port begins: `llm/example`, `image/example`, `video/exam
 - One change a pull request, with what it does, why, and how it was checked (the commands and their output).
 - Speed changes: the numbers before and after, on which GPU, with which command.
 - Correctness changes: the check that failed before and passes after.
+- **The merge gate**: `tooling/gate.sh <base> <head>` works out from the paths changed which engines they touch (an
+  engine's own code, kernels or silo: that engine; a silo variant: that engine on the cards it matches; a shared part:
+  the engines `tooling/gate-baselines.json` maps it to), builds `<head>` in a build copy on the GPU box
+  (`NS_GATE_HOST`, `NS_GATE_DIR`), runs each engine's quick run on each card under the GPU lock, and compares with
+  the baselines: the logits and greedy tokens exactly, pp and tg within 3%. Paste its table into the pull request; a
+  change that moves a number on purpose records new baselines (`NS_GATE_RECORD=1`) and says why. An engine with no
+  baseline is listed as such - add its run to the file when you port one.
