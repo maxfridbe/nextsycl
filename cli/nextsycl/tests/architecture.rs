@@ -11,7 +11,9 @@
 //!    foundation, an engine on the foundation and its own kind's contract, the glue never on an engine).
 //! 5. Exact before fast: a review rule (the pull request's parity check and measurements), not a test.
 //! 6. Tuning in silos: `silos_are_their_engines_own` (a silo is opened by its engine, included by nothing outside
-//!    its arch, and gates its ops with `_supported` checks).
+//!    its arch, and gates its ops with `_supported` checks), `silo_variants_are_deltas_off_their_silo` (a variant for
+//!    other cards has a manifest that reads and only ops its silo has) and
+//!    `engines_plan_from_the_device_not_a_cards_name_or_size` (no GPU name, no card size as a number, but a short list).
 //! 7. A front-door method is its handler: `home::api_files_tests` (the client and the document agree with the table).
 //! 8. One backplane: `every_model_method_takes_the_backplanes_fields`, `the_page_has_no_start_or_stop`,
 //!    `room_passes_over_pins_and_holds`, `the_door_schedules_through_the_crate_and_the_crate_stands_alone` (and the
@@ -423,4 +425,176 @@ fn clips_run_per_card_and_a_re_entry_is_asked_before_the_limit() {
     let slots = read("glue/serve/src/video/studio/slots.rs");
     assert!(slots.contains("WORKER_RAM_MB: u64 = 15 * 1024") && slots.contains("RAM_FLOOR_MB: u64 = 8 * 1024"), "the host memory rule");
     assert!(read("docs/host-services.md").contains("Re-entry before the limit"));
+}
+
+/// The Rust sources of the engines and the glue (llm/, image/, video/, audio/, model3d/, glue/), each with its lines
+/// up to its test module (`#[cfg(test)]` then `mod`), comments cut: (path relative to the root, [(line number, code)])
+fn engine_and_glue_code() -> Vec<(String, Vec<(usize, String)>)> {
+    let root = root();
+    let mut out = Vec::new();
+    let mut stack: Vec<PathBuf> = ["llm", "image", "video", "audio", "model3d", "glue"].iter().map(|d| root.join(d)).collect();
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if p.is_dir() {
+                // (tests/ and examples/ are not engine code; benches and parity tools print what they measure)
+                if !matches!(name.as_str(), "target" | "tests" | "examples" | "node_modules") && !name.starts_with('.') {
+                    stack.push(p);
+                }
+                continue;
+            }
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            let mut code = Vec::new();
+            for (n, l) in lines.iter().enumerate() {
+                if l.trim() == "#[cfg(test)]" && lines.get(n + 1).is_some_and(|x| x.trim_start().starts_with("mod ")) {
+                    break;
+                }
+                // the line without its comment: `//` outside a string literal
+                let (mut in_str, mut cut) = (false, l.len());
+                let b = l.as_bytes();
+                for i in 0..b.len() {
+                    match b[i] {
+                        b'"' if i == 0 || b[i - 1] != b'\\' => in_str = !in_str,
+                        b'/' if !in_str && b.get(i + 1) == Some(&b'/') => {
+                            cut = i;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                code.push((n + 1, l[..cut].to_string()));
+            }
+            out.push((p.strip_prefix(&root).unwrap().display().to_string(), code));
+        }
+    }
+    out
+}
+
+/// The string literals of a line of code
+fn literals(code: &str) -> Vec<&str> {
+    code.split('"').skip(1).step_by(2).collect()
+}
+
+/// What the device reports, not a card's name or size: no GPU name in a string literal of the engines' and the glue's
+/// code, and no VRAM size written as a number, outside comments, tests and this list (each with why)
+const CARD_ALLOWED: &[(&str, &str)] = &[
+    // the GPU monitor names a card by its PCI device id (sysfs has no marketing name; lspci's database is the fallback):
+    // a display table, read by nothing that plans
+    ("glue/serve/src/gpustat.rs", "NAMES"),
+    // an offline estimate the inspect tool prints ("estimate, no GPU read") for the two cards the port was made on; the
+    // engine's own load sizes from what the driver reports
+    ("llm/deepseek41/src/tools.rs", "32u64 << 30"),
+    ("llm/deepseek41/src/tools.rs", "two 32 GiB cards"),
+];
+
+#[test]
+fn engines_plan_from_the_device_not_a_cards_name_or_size() {
+    const NAMES: &[&str] = &["B70", "B65", "B60", "B580", "B570", "A770", "A750", "A380", "Arc(TM)", "Arc Pro", "Battlemage", "Alchemist"];
+    // a card's size as a number: MiB on a line of card memory (`vram`, `_mb`), GiB shifted or multiplied on a line that
+    // reads the card's memory (a model's own need, or a host-memory figure, is on neither)
+    const MIB: &[&str] = &["12288", "16384", "20480", "24576", "32768", "49152"];
+    let mib_line = |l: &str| { let l = l.to_lowercase(); l.contains("vram") || l.contains("_mb") };
+    let gib_line = |l: &str| { let l = l.to_lowercase(); ["vram", ".memory()", "card_mb", "total_mb", "mem_gib", "free_or_guess"].iter().any(|h| l.contains(h)) };
+    let gib = |code: &str| -> bool {
+        let c = code.replace(' ', "");
+        (8..=96).any(|n: u32| ["<<30", "*GIB", "u64<<30", "usize<<30"].iter().any(|op| {
+            c.match_indices(&format!("{n}{op}")).any(|(i, _)| i == 0 || !c.as_bytes()[i - 1].is_ascii_alphanumeric())
+        })) || c.contains("31.9")
+    };
+    let allowed = |path: &str, code: &str| CARD_ALLOWED.iter().any(|(p, what)| *p == path && code.contains(what));
+    let mut bad = Vec::new();
+    for (path, lines) in engine_and_glue_code() {
+        for (n, code) in &lines {
+            if allowed(&path, code) {
+                continue;
+            }
+            if let Some(name) = literals(code).iter().find_map(|s| NAMES.iter().find(|x| s.contains(*x))) {
+                bad.push(format!("{path}:{n}: the card name {name:?} (plan from gpu_units / gpu.memory(), not a name)"));
+            }
+            let mib = MIB.iter().find(|m| code.match_indices(*m).any(|(i, _)| {
+                let b = code.as_bytes();
+                (i == 0 || !b[i - 1].is_ascii_alphanumeric()) && b.get(i + m.len()).is_none_or(|c| !c.is_ascii_digit())
+            }));
+            if (mib.is_some() && mib_line(code)) || (gib(code) && gib_line(code)) {
+                bad.push(format!("{path}:{n}: a card's memory as a number: {}", code.trim()));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "engines and the glue plan from what the device reports (CONTRIBUTING rule 6, docs/architecture.md); \
+                             a needed exception goes in CARD_ALLOWED with why:\n  {}", bad.join("\n  "));
+}
+
+/// Rule 6: a silo variant is a delta off its silo - a manifest that reads, a name of [a-z0-9-], and only ops its silo has
+/// (each `extern "C"` on its own line, kernels in a namespace of its own)
+#[test]
+fn silo_variants_are_deltas_off_their_silo() {
+    let root = root();
+    let mut bad = Vec::new();
+    let mut seen = 0;
+    for kind in ["llm", "image", "video", "audio", "model3d"] {
+        for e in std::fs::read_dir(root.join("kernels").join(kind)).into_iter().flatten().flatten() {
+            let silo = e.path().join("silo");
+            let arch = e.file_name().to_string_lossy().to_string();
+            // the silo's ops: every ns_* its headers declare or its sources define
+            let mut ops = std::collections::BTreeSet::new();
+            for f in std::fs::read_dir(&silo).into_iter().flatten().flatten() {
+                let t = std::fs::read_to_string(f.path()).unwrap_or_default();
+                for (i, _) in t.match_indices("ns_") {
+                    let id: String = t[i..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                    if t[i + id.len()..].starts_with('(') {
+                        ops.insert(id);
+                    }
+                }
+            }
+            for v in std::fs::read_dir(silo.join("variants")).into_iter().flatten().flatten() {
+                seen += 1;
+                let name = v.file_name().to_string_lossy().to_string();
+                let at = format!("kernels/{kind}/{arch}/silo/variants/{name}");
+                if name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+                    bad.push(format!("{at}: a variant's name is [a-z0-9-] (it is part of the library's file name)"));
+                }
+                match std::fs::read_to_string(v.path().join("variant.yml")) {
+                    Ok(t) => {
+                        if let Err(x) = nextsycl_core::variant::parse_manifest(&t) {
+                            bad.push(format!("{at}/variant.yml: {x}"));
+                        }
+                    }
+                    Err(_) => bad.push(format!("{at}: no variant.yml")),
+                }
+                let mut exports = 0;
+                for f in std::fs::read_dir(v.path()).into_iter().flatten().flatten() {
+                    let p = f.path();
+                    if !matches!(p.extension().and_then(|x| x.to_str()), Some("cpp" | "hpp" | "h")) {
+                        continue;
+                    }
+                    let t = std::fs::read_to_string(&p).unwrap_or_default();
+                    let file = format!("{at}/{}", f.file_name().to_string_lossy());
+                    if t.lines().any(|l| l.trim_start().starts_with("extern \"C\" {")) {
+                        bad.push(format!("{file}: each export as `extern \"C\" <type> ns_...(` on its own line (no extern \"C\" block)"));
+                    }
+                    if t.contains("parallel_for") && !t.lines().any(|l| l.starts_with("namespace ") && !l.starts_with("namespace {")) {
+                        bad.push(format!("{file}: its kernels in a namespace of its own (the silo's op of the same name has a kernel of the same name)"));
+                    }
+                    for l in t.lines().filter(|l| l.starts_with("extern \"C\"")) {
+                        let Some(i) = l.find("ns_") else { continue };
+                        let id: String = l[i..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                        exports += 1;
+                        if !ops.contains(&id) {
+                            bad.push(format!("{file}: {id} is not an op of the {arch} silo (a variant is a delta, not a fork)"));
+                        }
+                    }
+                }
+                if exports == 0 {
+                    bad.push(format!("{at}: no op (an empty variant)"));
+                }
+            }
+        }
+    }
+    assert!(seen > 0, "no silo variant found: is the scan broken? (kernels/llm/qwen35/silo/variants/b65 is the example)");
+    assert!(bad.is_empty(), "silo variants broken (rule 6, CONTRIBUTING.md):\n  {}", bad.join("\n  "));
 }
