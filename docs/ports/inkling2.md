@@ -193,6 +193,62 @@ the drafts verified (the gate verifies about half as many prose drafts).
 GPU sampling (`ns_ink2_sample`): the 256 likeliest are now found among the values within 1 .. 64 of the largest
 (6 scans of the vocabulary, not 34); the same draws (a 200-token sampled run identical before and after).
 
+## Round 3: the NVFP4 products without a table, the drafter retuned
+
+**The expert products.** The decode table in local memory was the cost, not the reads: 18 gathers a 32-code line
+(16 code bytes, 2 scales) per row. Filling it per work-group was only 2.5% (B65: 283 against 276 GB/s without the
+fill); a register table read by sub-group shuffles was 4x slower (66 GB/s). The codes are now decoded in the word's
+arithmetic - four codes a 32-bit word: magnitude c = code & 7 is the value up to 4, and from 4 on c + (c & 3) +
+2 b0 b1 gives 4 6 8 12; the sign by a borrow-free subtraction ((m | 0x80) - 2m when negative, ^ 0x80) - and the UE4M3
+scales by their bits; the same bytes and floats as ggml's table (all 65,536 code quads and 256 scales checked), so
+every product is bit for bit what it was (spec-check 0, the silo-against-own-kernels KL unchanged to the digit).
+
+| | B70 before | B70 after | B65 before | B65 after |
+|---|---|---|---|---|
+| 8 experts' gate / up + down, streamed (GB/s) | 329 | 382 | 276 | 314 |
+| without any decode (the bound of this kernel shape) | 465 | - | - | 446 |
+| experts, device ms a token | 5.50 | 5.05 | 6.35 | 5.82 |
+
+What else was tried: rows a sub-group (2 / 4 / 8 values of gate | up, 2 / 4 / 8 down rows: within 4%); unrolling the
+line loop by 2 or 4 (no change); a two-way split of the lines (slower). Dense products of few rows (under 16K a
+launch: q k v r gate, the output projection) now take a row a sub-group - the attention output (2,304 rows of 3,072)
+still streams at ~220 GB/s alone, latency-bound; mv-many 2.2 -> 2.06 ms, mv 1.86 -> 1.77.
+
+GPU sampling: the windows are now 1/8 .. 22.6 by factors of sqrt 2 and up to 8K candidates (the K-th largest is the
+same for any window): temperature 1.0 plain tg on the B70 65.3 -> 67.4.
+
+**The drafter.** A draft below p_min now stops its block on the GPU: the later steps' fold products and picks do
+nothing (a 103 MB read each). That made longer blocks nearly free when unsure; retuned at temperature 1.0 (B70 /
+B65, tg, 400 tokens):
+
+| drafts, p_min | prose B70 | code B70 | prose B65 | code B65 |
+|---|---|---|---|---|
+| plain | 67.2 | 65.1 | 59.6 | 57.3 |
+| 3, 0.7 (round 2) | 71.7 | 102.0 | 59.2 | 84.6 |
+| 4, 0.8 | 71.9 | 107.7 | 60.0 | 87.9 |
+| **5, 0.8 (default)** | 71.7 | 110.7 | 59.7 | 89.4 |
+| 5, 0.6 | 70.4 | 108.1 | 57.4 | 85.4 |
+
+A first version left the stopped picks' tokens unwritten, and the next Markov step indexed w1 by arena garbage: a GPU
+page fault on both cards (15:14, the runs stopped by name). The stopped pick now writes token 0 and the Markov input
+clamps its token to w1's rows.
+
+What a 4-row verify costs (28 ms against 16): the experts the rows choose (19 distinct a layer application against 8)
+- the union kernels decode each expert's lines once for all its rows, so the cheaper decode helps there in full.
+
+**Round 3 tables** (400 tokens, the chat template, plain / drafted with the defaults):
+
+| card, quant | prose, 0 | code, 0 | prose, 1.0 | code, 1.0 | pp 512 / 4K / 32K |
+|---|---|---|---|---|---|
+| B70 Q4 | 68.7 / 69.3 | 68.7 / 91.3 | 67.4 / 71.8 | 65.1 / 110.8 | 1,135 / 2,056 / 1,648 |
+| B65 Q4 | 61.3 / 61.5 | 61.2 / 83.5 | 59.7 / 59.8 | 57.3 / 89.5 | 836 / 1,477 / 1,084 |
+| B70 Q8 | 52.9 / 54.9 | 52.1 / 95.1 | 51.6 / 54.0 | 50.3 / 95.4 | 859 / 1,851 / - |
+| B65 Q8 | 47.5 / 49.9 | 47.7 / 66.2 | 46.7 / 47.7 | 45.1 / 71.8 | 719 / 1,362 / - |
+
+Short chat tg (256 tokens, greedy): B70 66.1 -> 70.0, B65 59.4 -> 62.0. The greedy references unchanged (short 48 / 48,
+medium the near tie at 35, long 32 / 32), spec-check 0 on both cards and quants, drafted text = plain text greedy and
+sampled.
+
 ## Quantization choice
 
 - **UD-Q4_K_XL** (17.6 GB, the fast card): the experts in their native NVFP4 (the checkpoint's own format: no loss),
