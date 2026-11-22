@@ -70,6 +70,7 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
     let f = Gguf::open(model).map_err(|e| e.0)?;
     let g = nextsycl_core::Gpu::open(gpu).map_err(e)?;
     let k = ffi::api().map_err(e)?;
+    let silo = ffi::silo().map_err(e)?;
     let refdir = std::env::var("NS_INK2_DEQ_REF").ok();
     println!("gpu: {}{}", g.name, refdir.as_ref().map_or(String::new(), |d| format!("; ggml's rows from {d}")));
     // one matrix of each type the file has (an expert stack's first expert), the head
@@ -171,9 +172,156 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
         let (s1, s16) = (speed(1)?, speed(16)?);
         println!("{name:<34} {:>6} {:>12} {expand:>10} {vs:>10} {worst:>12.2e} {s1:>9.0} {s16:>9.0}{}", ty.name(), format!("{rows}x{cols}"),
                  if same { "" } else { "  (16-column pass's first column differs from the one-column pass)" });
+        // the silo's products on the matrix repacked: against the same host dot (the activations quantized as Q8_0: a
+        // larger error), a 16-row pass's first row against the one-row pass's, and the speed
+        let Some(s) = silo else { continue };
+        let code = ty.code() as c_int;
+        // SAFETY: arithmetic only.
+        let fl = unsafe { (s.fmv_supported)(code, cols as i64) } != 0;
+        if unsafe { (s.supported)(code, cols as i64) } == 0 && !fl {
+            continue;
+        }
+        let (w, xq) = if fl {
+            (src.view(0, src.len).map_err(e)?, None)
+        } else {
+            // SAFETY: arithmetic only; then the repacking and the activations' quantization.
+            let p = DevBuf::new(&g, unsafe { (s.packed_bytes)(code, rows as i64, cols as i64) }).map_err(e)?;
+            let q = DevBuf::new(&g, unsafe { (s.xq_bytes)(tt as i64, cols as i64) }).map_err(e)?;
+            let q1 = DevBuf::new(&g, unsafe { (s.xq_bytes)(1, cols as i64) }).map_err(e)?;
+            unsafe {
+                ffi::check((s.pack)(g.raw(), code, src.ptr(), rows as i64, cols as i64, p.ptr()), "pack").map_err(e)?;
+                ffi::check((s.xq)(g.raw(), xd.fp(), q.ptr(), tt as i64, cols as i64), "xq").map_err(e)?;
+                ffi::check((s.xq)(g.raw(), xd.fp(), q1.ptr(), 1, cols as i64), "xq").map_err(e)?;
+            }
+            // the repacked rows expanded to half against the host's decode rounded to half
+            let h16 = DevBuf::new(&g, rows * cols * 2).map_err(e)?;
+            // SAFETY: all rows of the repacked matrix -> half.
+            ffi::check(unsafe { (s.unpack_f16)(g.raw(), code, p.ptr(), rows as i64, 0, rows as i64, cols as i64, h16.ptr().cast()) }, "unpack").map_err(e)?;
+            let mut hb = vec![0u8; rows * cols * 2];
+            h16.read(0, &mut hb).map_err(e)?;
+            // half's rounding: within 2^-11 of the value (3e-8 near zero)
+            let hd = hb.chunks_exact(2).zip(&host).filter(|(c, v)| (f16(u16::from_le_bytes([c[0], c[1]])) - **v).abs() > v.abs() / 2048.0 + 3e-8).count();
+            if hd > 0 {
+                println!("{name:<34} silo unpack: {hd} values further than half's rounding from the host's decode");
+                bad += hd;
+            }
+            (p, Some((q, q1)))
+        };
+        let run = |n: usize, y: &DevBuf| -> Result<(), String> {
+            // SAFETY: the matrix (repacked, or float), the activations, y [n, rows].
+            ffi::check(unsafe {
+                match &xq {
+                    Some((q, q1)) => (s.mv)(g.raw(), code, w.ptr(), if n == 1 { q1.ptr() } else { q.ptr() }, y.fp(), cols as i64, rows as i64, n as i64),
+                    None => (s.fmv)(g.raw(), code, w.ptr(), xd.fp(), y.fp(), cols as i64, rows as i64, n as i64),
+                }
+            }, "silo product").map_err(e)
+        };
+        run(tt, &y16)?;
+        run(1, &y1)?;
+        let (b16, b1) = (y16.to_f32().map_err(e)?, y1.to_f32().map_err(e)?);
+        let same = b1.iter().zip(&b16[..rows]).all(|(a, b)| a.to_bits() == b.to_bits());
+        if !same {
+            bad += 1;
+        }
+        let mut worst = 0f64;
+        for c in 0..tt {
+            for r in 0..rows.min(256) {
+                let want: f64 = host[r * cols..(r + 1) * cols].iter().zip(&x[c * cols..(c + 1) * cols]).map(|(a, b)| *a as f64 * *b as f64).sum();
+                let scale: f64 = host[r * cols..(r + 1) * cols].iter().zip(&x[c * cols..(c + 1) * cols]).map(|(a, b)| (*a as f64 * *b as f64).abs()).sum();
+                worst = worst.max((b16[c * rows + r] as f64 - want).abs() / scale.max(1e-30));
+            }
+        }
+        let speed = |n: usize| -> Result<f64, String> {
+            let reps = 20;
+            g.sync().map_err(e)?;
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                run(n, &y16)?;
+            }
+            g.sync().map_err(e)?;
+            Ok(raw.len() as f64 * reps as f64 / t0.elapsed().as_secs_f64() / 1e9)
+        };
+        let (s1, s16) = (speed(1)?, speed(16)?);
+        println!("{:<34} {:>6} {:>12} {:>10} {:>10} {worst:>12.2e} {s1:>9.0} {s16:>9.0}{}", "  silo", ty.name(), "", if xq.is_some() { "repacked" } else { "float" }, "",
+                 if same { "" } else { "  (16-row pass's first row differs from the one-row pass)" });
+    }
+    if let Some(s) = silo {
+        stream(&f, &g, s)?;
     }
     if bad > 0 {
         return Err(format!("{bad} values differ"));
     }
+    Ok(())
+}
+
+/// The silo's decode products at the size they run, out of DRAM: the whole head (one row), and a layer's routed experts
+/// (gate | up with SiTU, then the down products and their sum) for one row's 8 experts, drawn anew each call
+fn stream(f: &Gguf, g: &std::sync::Arc<nextsycl_core::Gpu>, s: &ffi::Silo) -> Result<(), String> {
+    let e = |x: nextsycl_core::Error| x.0;
+    let up = |name: &str| -> Result<(DevBuf, GType, usize, usize), String> {
+        let t = f.tensor(name).ok_or(format!("no {name}"))?;
+        let cols = t.shape[t.shape.len() - 1] as usize;
+        let rows = t.shape[..t.shape.len() - 1].iter().product::<u64>() as usize;
+        let raw = f.read(t).map_err(|x| x.0)?;
+        let src = DevBuf::new(g, raw.len()).map_err(e)?;
+        src.write(0, &raw).map_err(e)?;
+        let code = t.ty.code() as c_int;
+        // SAFETY: arithmetic only; then the repacking.
+        let p = DevBuf::new(g, unsafe { (s.packed_bytes)(code, rows as i64, cols as i64) }).map_err(e)?;
+        ffi::check(unsafe { (s.pack)(g.raw(), code, src.ptr(), rows as i64, cols as i64, p.ptr()) }, "pack").map_err(e)?;
+        g.sync().map_err(e)?;
+        Ok((p, t.ty, rows, cols))
+    };
+    let reps = 50;
+    let (head, hty, hrows, hcols) = up("output.weight")?;
+    let x = DevBuf::from_f32(g, &(0..hcols).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect::<Vec<f32>>()).map_err(e)?;
+    // SAFETY: arithmetic only; x quantized.
+    let xq = DevBuf::new(g, unsafe { (s.xq_bytes)(1, hcols as i64) }).map_err(e)?;
+    ffi::check(unsafe { (s.xq)(g.raw(), x.fp(), xq.ptr(), 1, hcols as i64) }, "xq").map_err(e)?;
+    let y = DevBuf::f32(g, hrows).map_err(e)?;
+    g.sync().map_err(e)?;
+    let t0 = Instant::now();
+    for _ in 0..reps {
+        // SAFETY: the repacked head, x's quants, y [rows].
+        ffi::check(unsafe { (s.mv)(g.raw(), hty.code() as c_int, head.ptr(), xq.ptr(), y.fp(), hcols as i64, hrows as i64, 1) }, "mv").map_err(e)?;
+    }
+    g.sync().map_err(e)?;
+    println!("silo head {}x{hcols} {}, one row: {:.0} GB/s", hrows, hty.name(), head.len as f64 * reps as f64 / t0.elapsed().as_secs_f64() / 1e9);
+    drop(head);
+    let (gu, gty, gr, gc) = up("blk.0.ffn_gate_up_exps.weight")?;
+    let (dn, dty, dr, dc) = up("blk.0.ffn_down_exps.weight")?;
+    let n_exp = f.arch_meta("expert_count").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+    let (k8, ff) = (8usize, gr / n_exp / 2);
+    // 50 sets of 8 experts (a fixed pseudo-random draw), weights 1/8
+    let mut st = 12345u64;
+    let ids: Vec<i32> = (0..reps * k8).map(|_| {
+        st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((st >> 33) % n_exp as u64) as i32
+    }).collect();
+    let idb = DevBuf::new(g, ids.len() * 4).map_err(e)?;
+    idb.write(0, &ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).map_err(e)?;
+    let wts = DevBuf::from_f32(g, &vec![0.125f32; k8]).map_err(e)?;
+    // SAFETY: arithmetic only.
+    let aq = DevBuf::new(g, unsafe { (s.xq_bytes)(k8 as i64, ff as i64) }).map_err(e)?;
+    let xd = DevBuf::f32(g, dr / n_exp).map_err(e)?;
+    let xq2 = DevBuf::new(g, unsafe { (s.xq_bytes)(1, gc as i64) }).map_err(e)?;
+    ffi::check(unsafe { (s.xq)(g.raw(), x.fp(), xq2.ptr(), 1, gc as i64) }, "xq").map_err(e)?;
+    g.sync().map_err(e)?;
+    let t0 = Instant::now();
+    for r in 0..reps {
+        let ip: *const i32 = unsafe { idb.ptr().cast::<i32>().add(r * k8) };
+        // SAFETY: the stacks, 8 ids, the row's quants, the act's, the output row.
+        unsafe {
+            ffi::check((s.moe_gu)(g.raw(), gty.code() as c_int, gu.ptr(), n_exp as i64, std::ptr::null(), ip, xq2.ptr(), aq.ptr(), 1, k8 as i64, gc as i64, ff as i64,
+                                  4.0, 25.0), "moe gu").map_err(e)?;
+            ffi::check((s.moe_down)(g.raw(), dty.code() as c_int, dn.ptr(), n_exp as i64, std::ptr::null(), ip, wts.fp(), aq.ptr(), xd.fp(), 1, k8 as i64, dc as i64,
+                                    (dr / n_exp) as i64), "moe down").map_err(e)?;
+        }
+    }
+    g.sync().map_err(e)?;
+    let dt = t0.elapsed().as_secs_f64() / reps as f64;
+    let bytes = k8 * (gu.len / n_exp + dn.len / n_exp);
+    println!("silo experts {} (8 of {n_exp}: gate|up {}x{gc}, down {}x{dc}): {:.1} us a row, {:.0} GB/s", gty.name(), gr / n_exp, dr / n_exp, dt * 1e6,
+             bytes as f64 / dt / 1e9);
     Ok(())
 }

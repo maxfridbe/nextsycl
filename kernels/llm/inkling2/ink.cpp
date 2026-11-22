@@ -340,31 +340,55 @@ int ns_ink2_moe_mv(ns_gpu* g, int type, const void* w, size_t stride, const floa
 int ns_ink2_route(ns_gpu* g, const float* logits, const float* bias, int32_t* ids, float* w, int64_t T, int64_t E, int64_t K, float scale) {
     NS_TRY
     if (E > 256 || K > 16) return ns_fail("ns_ink2_route: at most 256 experts, 16 chosen");
-    if (T > 0) g->q.parallel_for(sycl::range<1>((size_t) T), [=](sycl::id<1> id) {
-        const int64_t t = id[0];
+    // a sub-group a row: lane l holds experts l, l + 16, ...; K rounds of the largest p + bias (the lowest index of equals)
+    constexpr int PER = 256 / SG;
+    if (T > 0) g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) T * SG), sycl::range<1>(SG)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        auto sg = it.get_sub_group();
+        const int lane = (int) sg.get_local_linear_id();
+        const int64_t t = it.get_group(0);
         const float* l = logits + t * E;
-        uint32_t taken[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        float pk[16];
+        float p[PER], v[PER];
+        uint32_t used = 0;
+#pragma unroll
+        for (int i = 0; i < PER; ++i) {
+            const int e = lane + i * SG;
+            p[i] = e < E ? 1.0f / (1.0f + sycl::exp(-l[e])) : 0.0f;
+            v[i] = e < E ? (bias ? p[i] + bias[e] : p[i]) : -INFINITY;
+        }
         float sum = 0.0f;
         for (int k = 0; k < K; ++k) {
-            int best = -1;
             float bv = -INFINITY;
-            for (int e = 0; e < E; ++e) {
-                if (taken[e >> 5] >> (e & 31) & 1) continue;
-                const float p = 1.0f / (1.0f + sycl::exp(-l[e]));
-                const float v = bias ? p + bias[e] : p;
-                if (best < 0 || v > bv) {
-                    best = e;
-                    bv = v;
+            int bi = 1 << 30;
+#pragma unroll
+            for (int i = 0; i < PER; ++i) {
+                const int e = lane + i * SG;
+                if (!(used >> i & 1) && e < E && (v[i] > bv || (v[i] == bv && e < bi))) {
+                    bv = v[i];
+                    bi = e;
                 }
             }
-            taken[best >> 5] |= 1u << (best & 31);
-            ids[t * K + k] = best;
-            pk[k] = 1.0f / (1.0f + sycl::exp(-l[best]));
-            sum += pk[k];
+            const float m = sycl::reduce_over_group(sg, bv, sycl::maximum<float>());
+            const int best = sycl::reduce_over_group(sg, bv == m ? bi : (1 << 30), sycl::minimum<int>());
+            float pb = 0.0f;
+            if (best % SG == lane) {
+                const int i = best / SG;
+#pragma unroll
+                for (int j = 0; j < PER; ++j)
+                    if (j == i) {
+                        used |= 1u << j;
+                        pb = p[j];
+                    }
+            }
+            pb = sycl::reduce_over_group(sg, pb, sycl::plus<float>());
+            if (lane == 0) {
+                ids[t * K + k] = best;
+                w[t * K + k] = pb;
+            }
+            sum += pb;
         }
+        sycl::group_barrier(sg);
         sum += 1e-20f;
-        for (int k = 0; k < K; ++k) w[t * K + k] = pk[k] / sum * scale;
+        if (lane < K) w[t * K + lane] = w[t * K + lane] / sum * scale;
     });
     return 0;
     NS_CATCH

@@ -186,15 +186,19 @@ pub struct Mat {
     pub ty: GType,
     pub rows: usize,
     pub cols: usize,
+    /// repacked by the silo (silo.h: the quants apart from the scales); only the silo's kernels read it
+    pub packed: bool,
 }
 
-/// A layer's routed experts: [experts][rows][cols] stored blocks, an expert `stride` bytes; scale: a float an expert
+/// A layer's routed experts: [experts][rows][cols] stored blocks (an expert `stride` bytes), or the silo's repacking
+/// of the stack as one matrix of experts x rows; scale: a float an expert
 pub struct Experts {
     pub buf: DevBuf,
     pub ty: GType,
     pub rows: usize,
     pub cols: usize,
     pub stride: usize,
+    pub packed: bool,
     pub scale: Option<DevBuf>,
     /// the scales on the host (the prompt path's per-row factors)
     pub scale_h: Vec<f32>,
@@ -358,6 +362,8 @@ pub struct Inkling2<'g> {
     /// NS_INK2_PROFILE=1: each kernel's time and calls
     prof: Option<Mutex<std::collections::BTreeMap<&'static str, (f64, u64)>>>,
     load_s: f64,
+    /// decode rows through the silo's fused steps (NS_INK2_FUSED=0: its products only, the steps as for a prompt)
+    fused_on: bool,
     load_bytes: u64,
 }
 
@@ -432,7 +438,7 @@ impl<'g> Inkling2<'g> {
                                               gib(weights), gib(need), gpu.name, gib(free))));
         }
         let loaded = std::cell::Cell::new(0u64);
-        let read = |name: &str| -> Result<Mat> { mat(f, &gpu, name, &loaded) };
+        let read = |name: &str| -> Result<Mat> { mat(f, &gpu, silo, name, &loaded) };
         let mut layers = Vec::with_capacity(g.layers);
         for l in 0..g.layers {
             let n = |s: &str| format!("blk.{l}.{s}.weight");
@@ -453,7 +459,7 @@ impl<'g> Inkling2<'g> {
             };
             let exp = |which: &str, loaded: &std::cell::Cell<u64>| -> Result<Experts> {
                 let name = format!("blk.{l}.ffn_{which}_exps.weight");
-                let m = mat(f, &gpu, &name, loaded)?;
+                let m = mat(f, &gpu, silo, &name, loaded)?;
                 let t = f.tensor(&name).ok_or_else(|| e(format!("no {name}")))?;
                 if t.shape.len() != 3 || t.shape[0] as usize != g.experts {
                     return Err(e(format!("{name}: {:?}, not [{} experts, rows, cols]", t.shape, g.experts)));
@@ -468,11 +474,11 @@ impl<'g> Inkling2<'g> {
                     }
                     None => (None, vec![1.0; g.experts]),
                 };
-                Ok(Experts { buf: m.buf, ty: m.ty, rows, cols, stride, scale, scale_h })
+                Ok(Experts { buf: m.buf, ty: m.ty, rows, cols, stride, packed: m.packed, scale, scale_h })
             };
             let gu = exp("gate_up", &loaded)?;
             let down = exp("down", &loaded)?;
-            let read = |name: &str| -> Result<Mat> { mat(f, &gpu, name, &loaded) };
+            let read = |name: &str| -> Result<Mat> { mat(f, &gpu, silo, name, &loaded) };
             let ly = Layer {
                 swa,
                 norm,
@@ -508,7 +514,7 @@ impl<'g> Inkling2<'g> {
                 log(format!("inkling2: layer {} of {} ({:.1} GiB, {:.0} s)", l + 1, g.layers, gib(loaded.get()), t0.elapsed().as_secs_f64()));
             }
         }
-        let read = |name: &str| -> Result<Mat> { mat(f, &gpu, name, &loaded) };
+        let read = |name: &str| -> Result<Mat> { mat(f, &gpu, silo, name, &loaded) };
         let mut loops = Vec::new();
         for l in g.core.0..g.core.1 {
             let n = |s: &str| format!("blk.{l}.loop_{s}.weight");
@@ -536,7 +542,8 @@ impl<'g> Inkling2<'g> {
         log(format!("inkling2: {} layers ({} applications a token: [{}, {}) x {}), {:.1} GiB on {} in {load_s:.0} s; prompt chunks of {chunk}", g.layers,
                     g.order().len(), g.core.0, g.core.1, g.passes, gib(loaded.get()), gpu.name));
         Ok(Inkling2 { g, file: f, gpu, arena, w16, k, silo, layers, loops, tok_norm, output_norm, output_res, output, embd, chunk, work: Mutex::new(()),
-                      prof: std::env::var("NS_INK2_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), load_s, load_bytes: loaded.get() })
+                      prof: std::env::var("NS_INK2_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), load_s, load_bytes: loaded.get(),
+                      fused_on: std::env::var("NS_INK2_FUSED").map_or(true, |v| v != "0") })
     }
 
     /// A kernel call, its return code checked (NS_INK2_PROFILE=1: timed, the queue drained before and after)
@@ -603,6 +610,20 @@ impl<'g> Inkling2<'g> {
         let (n, kk) = (w.rows as i64, w.cols as i64);
         let ty = w.ty.code() as c_int;
         if t <= MAXV {
+            if let (true, Some(s)) = (w.packed, self.silo) {
+                // a repacked matrix: the silo's product on x quantized (its work rewound after)
+                let mark = self.arena.mark();
+                let q = self.xq(x, w.cols, t)?.ok_or_else(|| e("decode rows without the silo's activations"))?;
+                // SAFETY: the repacked matrix, x's quants, y [t, rows].
+                self.op("mv silo", || unsafe { (s.mv)(self.raw(), ty, w.buf.ptr(), q.ptr(), y.fp(), kk, n, t as i64) })?;
+                self.arena.rewind(mark);
+                return Ok(());
+            }
+            // SAFETY: arithmetic only.
+            if let Some(s) = self.silo.filter(|s| unsafe { (s.fmv_supported)(ty, kk) } != 0) {
+                // SAFETY: the float32 / BF16 matrix, x [t, cols], y [t, rows].
+                return self.op("fmv silo", || unsafe { (s.fmv)(self.raw(), ty, w.buf.ptr(), x.fp(), y.fp(), kk, n, t as i64) });
+            }
             // SAFETY: the matrix's blocks, x [t, cols], y [t, rows].
             return self.op("mv", || unsafe { (k.mv)(self.raw(), ty, w.buf.ptr(), x.fp(), y.fp(), kk, n, t as i64) });
         }
@@ -614,8 +635,11 @@ impl<'g> Inkling2<'g> {
         if elems * 2 > self.w16.len {
             return Err(e(format!("a {}x{} matrix past the half buffer", w.rows, w.cols)));
         }
-        // SAFETY: the blocks -> rows x cols halfs in w16; x [t, cols] -> half; y [t, rows] = xh . w16^T.
-        self.op("expand", || unsafe { (k.dequant_f16)(self.raw(), ty, w.buf.ptr(), elems as i64, self.w16.ptr().cast()) })?;
+        // SAFETY: the blocks (or the silo's repacking) -> rows x cols halfs in w16; x [t, cols] -> half; y [t, rows] = xh . w16^T.
+        match (w.packed, self.silo) {
+            (true, Some(s)) => self.op("expand silo", || unsafe { (s.unpack_f16)(self.raw(), ty, w.buf.ptr(), n, 0, n, kk, self.w16.ptr().cast()) })?,
+            _ => self.op("expand", || unsafe { (k.dequant_f16)(self.raw(), ty, w.buf.ptr(), elems as i64, self.w16.ptr().cast()) })?,
+        }
         // x in half only for this product (the arena's later work reuses it: the queue is in order)
         let mark = self.arena.mark();
         let xh = self.ab(t * w.cols * 2)?;
@@ -670,7 +694,7 @@ impl<'g> Inkling2<'g> {
     fn mm_many(&self, jobs: &[(&Mat, &DevBuf, Option<&DevBuf>)], t: usize) -> Result<Vec<DevBuf>> {
         if let Some(s) = self.dec(t) {
             // SAFETY: arithmetic only.
-            let all = jobs.len() <= 8 && jobs.iter().all(|(w, _, q)| q.is_some() && unsafe { (s.mv_supported)(w.ty.code() as c_int, w.cols as i64) } != 0);
+            let all = jobs.len() <= 8 && jobs.iter().all(|(w, _, q)| q.is_some() && unsafe { (s.supported)(w.ty.code() as c_int, w.cols as i64) } != 0);
             if all {
                 let ys: Vec<DevBuf> = jobs.iter().map(|(w, _, _)| self.f32(t * w.rows)).collect::<Result<_>>()?;
                 let ty: Vec<c_int> = jobs.iter().map(|(w, _, _)| w.ty.code() as c_int).collect();
@@ -693,7 +717,7 @@ impl<'g> Inkling2<'g> {
     fn mmq(&self, w: &Mat, x: &DevBuf, xq: Option<&DevBuf>, t: usize) -> Result<DevBuf> {
         if let (Some(s), Some(q)) = (self.dec(t), xq) {
             // SAFETY: arithmetic only.
-            if unsafe { (s.mv_supported)(w.ty.code() as c_int, w.cols as i64) } != 0 {
+            if unsafe { (s.supported)(w.ty.code() as c_int, w.cols as i64) } != 0 {
                 let y = self.f32(t * w.rows)?;
                 // SAFETY: the matrix's blocks, x's quants, y [t, rows].
                 self.op("mv silo", || unsafe { (s.mv)(self.raw(), w.ty.code() as c_int, w.buf.ptr(), q.ptr(), y.fp(), w.cols as i64, w.rows as i64, t as i64) })?;
@@ -770,6 +794,23 @@ impl<'g> Inkling2<'g> {
         Ok(x)
     }
 
+    /// Expert x of a stack expanded to half into w16 (from its GGUF blocks, or the silo's repacked stack of `experts`)
+    fn expand_expert(&self, st: &Experts, x: usize, experts: usize) -> Result<()> {
+        let ty = st.ty.code() as c_int;
+        let (rows, cols) = (st.rows as i64, st.cols as i64);
+        match (st.packed, self.silo) {
+            // SAFETY: rows [x rows, (x + 1) rows) of the repacked stack -> rows x cols halfs in w16.
+            (true, Some(s)) => self.op("expand silo", || unsafe {
+                (s.unpack_f16)(self.raw(), ty, st.buf.ptr(), experts as i64 * rows, x as i64 * rows, rows, cols, self.w16.ptr().cast())
+            }),
+            _ => {
+                let w = st.buf.view(x * st.stride, st.stride)?;
+                // SAFETY: the expert's blocks -> rows x cols halfs in w16.
+                self.op("expand", || unsafe { (self.k.dequant_f16)(self.raw(), ty, w.ptr(), rows * cols, self.w16.ptr().cast()) })
+            }
+        }
+    }
+
     /// The routed experts on h [t, C] (normed): their weighted sum [t, C]
     fn moe(&self, ly: &Layer, h: &DevBuf, hq: Option<&DevBuf>, t: usize) -> Result<DevBuf> {
         let (g, k) = (&self.g, self.k);
@@ -787,24 +828,25 @@ impl<'g> Inkling2<'g> {
         let mark = self.arena.mark();
         let (gu, dn) = (&ly.gu, &ly.down);
         if let (Some(s), Some(q)) = (self.dec(t), hq) {
-            // SAFETY: arithmetic only.
-            let takes = unsafe { (s.mv_supported)(gu.ty.code() as c_int, gu.cols as i64) != 0 && (s.mv_supported)(dn.ty.code() as c_int, dn.cols as i64) != 0 };
-            if takes {
+            if gu.packed && dn.packed {
                 // SAFETY: arithmetic only; then gate | up and SiTU into the act's quants, the down products weighted into out.
                 let aq = self.ab(unsafe { (s.xq_bytes)((t * kk) as i64, ff as i64) })?;
                 let sc = |e: &Experts| e.scale.as_ref().map_or(std::ptr::null(), |s| s.fp() as *const f32);
                 self.op("experts gu silo", || unsafe {
-                    (s.moe_gu)(self.raw(), gu.ty.code() as c_int, gu.buf.ptr(), gu.stride, sc(gu), ids.ptr().cast(), q.ptr(), aq.ptr(), t as i64, kk as i64,
+                    (s.moe_gu)(self.raw(), gu.ty.code() as c_int, gu.buf.ptr(), g.experts as i64, sc(gu), ids.ptr().cast(), q.ptr(), aq.ptr(), t as i64, kk as i64,
                                gu.cols as i64, ff as i64, g.situ_beta, g.situ_lb)
                 })?;
                 self.op("experts down silo", || unsafe {
-                    (s.moe_down)(self.raw(), dn.ty.code() as c_int, dn.buf.ptr(), dn.stride, sc(dn), ids.ptr().cast(), wts.fp(), aq.ptr(), out.fp(), t as i64,
+                    (s.moe_down)(self.raw(), dn.ty.code() as c_int, dn.buf.ptr(), g.experts as i64, sc(dn), ids.ptr().cast(), wts.fp(), aq.ptr(), out.fp(), t as i64,
                                  kk as i64, ff as i64, dn.rows as i64)
                 })?;
                 return Ok(out);
             }
         }
         if t <= MAXV {
+            if gu.packed || dn.packed {
+                return Err(e("the silo's repacked experts without its quantized activations"));
+            }
             let y = self.f32(t * kk * gu.rows)?;
             let act = self.f32(t * kk * ff)?;
             let d = self.f32(t * kk * c)?;
@@ -881,9 +923,8 @@ impl<'g> Inkling2<'g> {
         self.op("gather", || unsafe { (k.gather_f16)(self.raw(), h.fp(), tok_d.ptr().cast(), xh.ptr().cast(), m as i64, c as i64) })?;
         let (gn, gk) = (gu.rows as i64, gu.cols as i64);
         for &(x, r0, n) in &runs {
-            let w = gu.buf.view(x * gu.stride, gu.stride)?;
-            // SAFETY: expert x's gate|up -> half in w16; its rows' product.
-            self.op("expand", || unsafe { (k.dequant_f16)(self.raw(), gu.ty.code() as c_int, w.ptr(), gn * gk, self.w16.ptr().cast()) })?;
+            // SAFETY: expert x's gate|up -> half in w16 (from its blocks, or the silo's repacked stack); its rows' product.
+            self.expand_expert(gu, x, g.experts)?;
             self.op("gemm f16", || unsafe {
                 (k.gemm_f16)(self.raw(), n as i64, gn, gk, xh.ptr().cast::<u16>().add(r0 * c), gk, self.w16.ptr().cast(), y.fp().add(r0 * gu.rows), gn, 0)
             })?;
@@ -892,9 +933,8 @@ impl<'g> Inkling2<'g> {
         self.op("situ", || unsafe { (k.situ)(self.raw(), y.fp(), rs_d.fp(), std::ptr::null_mut(), act.ptr().cast(), m as i64, ff as i64, g.situ_beta, g.situ_lb) })?;
         let (dn_n, dn_k) = (dn.rows as i64, dn.cols as i64);
         for &(x, r0, n) in &runs {
-            let w = dn.buf.view(x * dn.stride, dn.stride)?;
             // SAFETY: expert x's down -> half in w16; its rows' product.
-            self.op("expand", || unsafe { (k.dequant_f16)(self.raw(), dn.ty.code() as c_int, w.ptr(), dn_n * dn_k, self.w16.ptr().cast()) })?;
+            self.expand_expert(dn, x, g.experts)?;
             self.op("gemm f16", || unsafe {
                 (k.gemm_f16)(self.raw(), n as i64, dn_n, dn_k, act.ptr().cast::<u16>().add(r0 * ff), dn_k, self.w16.ptr().cast(), d.fp().add(r0 * c), dn_n, 0)
             })?;
@@ -1015,6 +1055,190 @@ impl<'g> Inkling2<'g> {
         Ok(())
     }
 
+    /// The silo's fused decode steps for a pass of `t` rows (decode rows, the silo there, NS_INK2_FUSED not 0)
+    fn fused(&self, t: usize) -> Option<&'static ffi::Silo> {
+        self.dec(t).filter(|_| self.fused_on)
+    }
+
+    /// A slot's convolution state group `grp` ([3, ch]) and, for decode rows, its snapshot ([3 + t, ch])
+    fn conv_bufs(&self, ss: &SlotState, grp: usize, t: usize) -> Result<(DevBuf, Option<DevBuf>)> {
+        let groups = self.g.conv_groups();
+        let ch = groups[grp];
+        let off: usize = groups[..grp].iter().sum();
+        let snap = if t <= MAXV { Some(ss.snap.view((3 + MAXV) * off * 4, (3 + t) * ch * 4)?) } else { None };
+        Ok((ss.conv.view(3 * off * 4, 3 * ch * 4)?, snap))
+    }
+
+    /// A loop controller at decode width, the silo's two launches
+    fn control_dec(&self, f: &ffi::Fused, lp: &Loop, which: usize, x: &DevBuf, msg: &DevBuf, t: usize) -> Result<DevBuf> {
+        let (c, rank) = (self.g.n_embd, self.g.rank);
+        let u = self.f32(t * rank)?;
+        let out = self.f32(t * c)?;
+        // SAFETY: x, msg, out [t, c]; down [rank, 2c], gain / forget [c, rank] float32; u [t, rank].
+        unsafe {
+            self.op("ctrl down silo", || (f.ctrl_down)(self.raw(), x.fp(), msg.fp(), lp.down[which].buf.fp(), u.fp(), t as i64, c as i64, rank as i64, 1e-6))?;
+            self.op("ctrl apply silo", || (f.ctrl_apply)(self.raw(), x.fp(), msg.fp(), u.fp(), lp.gain[which].buf.fp(), lp.forget[which].buf.fp(), out.fp(), t as i64,
+                                                         c as i64, rank as i64))?;
+        }
+        Ok(out)
+    }
+
+    /// The depth attention of `states` by `nq` queries, each normed by its weight (None: left unnormed) and quantized:
+    /// [nq, t, C] and each query's quantized rows
+    fn mix_norm(&self, f: &ffi::Fused, states: &[&DevBuf], query: &DevBuf, nq: usize, norms: Option<&[&DevBuf]>, t: usize) -> Result<(DevBuf, Vec<Option<DevBuf>>)> {
+        let c = self.g.n_embd;
+        let out = self.f32(nq * t * c)?;
+        let xqs: Vec<Option<DevBuf>> = (0..nq).map(|_| -> Result<Option<DevBuf>> {
+            match (norms, self.silo) {
+                // SAFETY: arithmetic only.
+                (Some(_), Some(s)) => Ok(Some(self.ab(unsafe { (s.xq_bytes)(t as i64, c as i64) })?)),
+                _ => Ok(None),
+            }
+        }).collect::<Result<_>>()?;
+        let sp: Vec<*const f32> = states.iter().map(|s| s.fp() as *const f32).collect();
+        let nw: Vec<*const f32> = match norms {
+            Some(n) => n.iter().map(|w| w.fp() as *const f32).collect(),
+            None => vec![std::ptr::null(); nq],
+        };
+        let qp: Vec<*mut std::ffi::c_void> = xqs.iter().map(|q| q.as_ref().map_or(std::ptr::null_mut(), |q| q.ptr())).collect();
+        // SAFETY: the states [t, c], the queries [nq, c], the norm weights [c], out [nq, t, c], each xq for [t, c].
+        self.op("mix norm silo", || unsafe {
+            (f.mix_norm)(self.raw(), sp.as_ptr(), sp.len() as i64, query.fp(), nq as i64, nw.as_ptr(), out.fp(), qp.as_ptr(), t as i64, c as i64, 1e-6, self.g.eps)
+        })?;
+        Ok((out, xqs))
+    }
+
+    /// `layer` for decode rows with the silo: the same steps in fused launches
+    #[allow(clippy::too_many_arguments)]
+    fn layer_dec(&self, sl: &ffi::Silo, ss: &SlotState, slot: usize, l: usize, cur: &DevBuf, dst: &DevBuf, blocks: &mut Vec<DevBuf>, msgs: Option<(&Loop, &DevBuf)>,
+                 t: usize, p0: usize, tap: Tap) -> Result<()> {
+        let (g, f) = (&self.g, &sl.fused);
+        let ly = &self.layers[l];
+        let c = g.n_embd;
+        let tc = t * c * 4;
+        let (hq, hk, hd) = (g.heads, g.heads_kv, g.head);
+        let (qd, kd) = (hq * hd, hk * hd);
+        let mark = self.arena.mark();
+        let mut st: Vec<&DevBuf> = blocks.iter().collect();
+        st.push(cur);
+        // the attention's normed (and quantized) inputs: q, k, v
+        let mut normed: Vec<DevBuf> = Vec::with_capacity(3);
+        let mut nq: Vec<Option<DevBuf>> = Vec::with_capacity(3);
+        let norms: Vec<&DevBuf> = ly.norm.iter().collect();
+        match (&ly.attn_res, msgs) {
+            (Some((q, n)), None) => {
+                let (out, xs) = self.mix_norm(f, &st, q, *n, Some(&norms[..*n]), t)?;
+                for j in 0..3 {
+                    let k = if *n > 1 { j } else { 0 };
+                    normed.push(out.view(k * tc, tc)?);
+                    nq.push(xs[k].as_ref().map(|q| q.view(0, q.len)).transpose()?);
+                }
+            }
+            (Some((q, n)), Some((lp, m))) => {
+                let (out, _) = self.mix_norm(f, &st, q, *n, None, t)?;
+                for j in 0..3 {
+                    let inp = out.view(if *n > 1 { j * tc } else { 0 }, tc)?;
+                    let x = self.control_dec(f, lp, j, &inp, &m.view(j * tc, tc)?, t)?;
+                    let (y, q) = self.rms_q(&x, &ly.norm[j], t)?;
+                    normed.push(y);
+                    nq.push(q);
+                }
+            }
+            (None, _) => {
+                let (y, q) = self.rms_q(cur, &ly.norm[0], t)?;
+                for _ in 0..3 {
+                    normed.push(y.view(0, tc)?);
+                    nq.push(q.as_ref().map(|q| q.view(0, q.len)).transpose()?);
+                }
+            }
+        }
+        let [q, kr, vr, r, gate]: [DevBuf; 5] = self.mm_many(&[(&ly.q, &normed[0], nq[0].as_ref()), (&ly.k, &normed[1], nq[1].as_ref()),
+                                                               (&ly.v, &normed[2], nq[2].as_ref()), (&ly.rel, &normed[0], nq[0].as_ref()),
+                                                               (&ly.gate, &normed[0], nq[0].as_ref())], t)?
+            .try_into().map_err(|_| e("five products"))?;
+        let sink = self.mm(&ly.sink, &normed[0], t)?;
+        let kdyn = ly.k_dyn.as_ref().map(|m| self.mm(m, &normed[1], t)).transpose()?;
+        let vdyn = ly.v_dyn.as_ref().map(|m| self.mm(m, &normed[2], t)).transpose()?;
+        // k and v through their convolutions into the caches, q and r clipped
+        let (kst, ksn) = self.conv_bufs(ss, 0, t)?;
+        let (vst, vsn) = self.conv_bufs(ss, 1, t)?;
+        let kout = self.f32(t * kd)?;
+        let vout = self.f32(t * kd)?;
+        let alpha = if ly.swa { 0.0 } else { g.log_alpha };
+        let p = ffi::Qkv {
+            t: t as i64, p0: p0 as i64, cap: ss.cap as i64, hq: hq as i64, hkv: hk as i64, d: hd as i64, r_len: g.rel_len as i64, kraw: kr.fp(), vraw: vr.fp(),
+            kdyn: kdyn.as_ref().map_or(std::ptr::null(), |d| d.fp()), vdyn: vdyn.as_ref().map_or(std::ptr::null(), |d| d.fp()), kstate: kst.fp(), vstate: vst.fp(),
+            ksnap: ksn.as_ref().map_or(std::ptr::null_mut(), |s| s.fp()), vsnap: vsn.as_ref().map_or(std::ptr::null_mut(), |s| s.fp()), kw: ly.convs[0].fp(),
+            vw: ly.convs[1].fp(), inv: 1.0 / ((g.conv + 1) as f32).sqrt(), inv_dyn: 1.0 / ((2 * g.conv + 1) as f32).sqrt(), kout: kout.fp(), vout: vout.fp(),
+            kc: ss.kc.ptr(), vc: ss.vc.ptr(), q: q.fp(), r: r.fp(), qscale: ly.q_clip.fp(), rscale: ly.rel_clip.fp(), thr: g.qk_clip, rthr: g.rel_clip, alpha,
+            floor: g.log_floor, eps: g.eps,
+        };
+        // SAFETY: every buffer as Ink2sQkv describes it.
+        self.op("post qkv silo", || unsafe { (f.post_qkv)(self.raw(), &p) })?;
+        tap(&format!("Qcur-{slot}"), &q)?;
+        tap(&format!("Kcur-{slot}"), &kout)?;
+        tap(&format!("Vcur-{slot}"), &vout)?;
+        tap(&format!("Rcur-{slot}"), &r)?;
+        // the attention split by key positions, merged with the sink, gated and quantized for the output product
+        let win = g.win(slot) as i64;
+        let extent = if ly.swa { g.window } else { g.rel_extent } as i64;
+        // SAFETY: arithmetic only.
+        let ns = unsafe { (f.attn_splits)(t as i64, p0 as i64, win) } as usize;
+        let part = self.f32(t * hq * ns * (hd + 2))?;
+        let att = self.f32(t * qd)?;
+        // SAFETY: arithmetic only.
+        let aq = self.ab(unsafe { (sl.xq_bytes)(t as i64, qd as i64) })?;
+        // SAFETY: the rows and caches as silo.h names them.
+        unsafe {
+            self.op("attention silo", || (f.attn_part)(self.raw(), q.fp(), ss.kc.ptr(), ss.vc.ptr(), r.fp(), ly.rel_bias.fp(), extent, g.rel_len as i64, part.fp(),
+                                                       t as i64, hq as i64, hk as i64, ss.cap as i64, p0 as i64, win, 1.0 / (hd as f32).sqrt()))?;
+            self.op("merge silo", || (f.merge_gate_xq)(self.raw(), part.fp(), sink.fp(), gate.fp(), att.fp(), aq.ptr(), t as i64, hq as i64, ns as i64))?;
+        }
+        let o = self.mmq(&ly.o, &att, Some(&aq), t)?;
+        // its convolution and the residual (a block's first layer: the stream starts again, the old one joins the blocks)
+        let (ast, asn) = self.conv_bufs(ss, 2, t)?;
+        let o2 = self.f32(t * c)?;
+        let start = l.is_multiple_of(g.block);
+        let inv = 1.0 / ((g.conv + 1) as f32).sqrt();
+        // SAFETY: o, o2, dst, cur [t, c]; the state, its weights, the snapshot.
+        self.op("conv res silo", || unsafe {
+            (f.conv_res)(self.raw(), o.fp(), ast.fp(), ly.convs[2].fp(), asn.as_ref().map_or(std::ptr::null_mut(), |s| s.fp()),
+                         if start { std::ptr::null() } else { cur.fp() }, dst.fp(), o2.fp(), t as i64, c as i64, inv)
+        })?;
+        if start {
+            blocks.push(cur.view(0, tc)?);
+        }
+        tap(&format!("attn_out-{slot}"), &o2)?;
+        tap(&format!("ffn_inp-{slot}"), dst)?;
+        self.arena.rewind(mark);
+        // the FFN's normed input
+        let mut st: Vec<&DevBuf> = blocks.iter().collect();
+        st.push(dst);
+        let (h, hq_) = match msgs {
+            None => {
+                let (out, mut xs) = self.mix_norm(f, &st, &ly.ffn_res, 1, Some(&[&ly.ffn_norm]), t)?;
+                (out, xs.pop().flatten())
+            }
+            Some((lp, msg)) => {
+                let (m, _) = self.mix_norm(f, &st, &ly.ffn_res, 1, None, t)?;
+                let x = self.control_dec(f, lp, 3, &m, &msg.view(3 * tc, tc)?, t)?;
+                self.rms_q(&x, &ly.ffn_norm, t)?
+            }
+        };
+        let fo = self.moe(ly, &h, hq_.as_ref(), t)?;
+        let (fst, fsn) = self.conv_bufs(ss, 3, t)?;
+        let f2 = self.f32(t * c)?;
+        // SAFETY: fo, f2, dst [t, c] (dst += the convolved FFN output); the state, its weights, the snapshot.
+        self.op("conv res silo", || unsafe {
+            (f.conv_res)(self.raw(), fo.fp(), fst.fp(), ly.convs[3].fp(), fsn.as_ref().map_or(std::ptr::null_mut(), |s| s.fp()), dst.fp(), dst.fp(), f2.fp(),
+                         t as i64, c as i64, inv)
+        })?;
+        tap(&format!("ffn_out-{slot}"), &f2)?;
+        tap(&format!("l_out-{slot}"), dst)?;
+        self.arena.rewind(mark);
+        Ok(())
+    }
+
     fn pass(&self, s: &mut Session, tokens: &[u32], n_out: usize, tap: Tap) -> Result<Vec<Vec<f32>>> {
         let _w = self.work.lock().unwrap();
         match self.pass_out(s, tokens, n_out, None, tap)? {
@@ -1093,7 +1317,10 @@ impl<'g> Inkling2<'g> {
                 None
             };
             let dst = other(&cur)?;
-            self.layer(&s.slots[slot], slot, l, &cur, &dst, &mut blocks, lp, t, p0, &mut *tap)?;
+            match self.fused(t) {
+                Some(sl) => self.layer_dec(sl, &s.slots[slot], slot, l, &cur, &dst, &mut blocks, lp, t, p0, &mut *tap)?,
+                None => self.layer(&s.slots[slot], slot, l, &cur, &dst, &mut blocks, lp, t, p0, &mut *tap)?,
+            }
             cur = dst;
         }
         s.pos += t;
@@ -1363,8 +1590,8 @@ impl<'g> Inkling2<'g> {
 }
 
 /// A tensor read onto the GPU in its stored type: [rows (outputs), cols (inputs)] (a vector one row; an expert stack
-/// [experts x rows, cols])
-pub fn mat(f: &Gguf, gpu: &Arc<Gpu>, name: &str, loaded: &std::cell::Cell<u64>) -> Result<Mat> {
+/// [experts x rows, cols]); a Q8_0 or NVFP4 matrix repacked by the silo when there is one
+pub fn mat(f: &Gguf, gpu: &Arc<Gpu>, silo: Option<&ffi::Silo>, name: &str, loaded: &std::cell::Cell<u64>) -> Result<Mat> {
     let t = f.tensor(name).ok_or_else(|| e(format!("no {name}")))?;
     let (rows, cols) = match t.shape.len() {
         1 => (1, t.shape[0] as usize),
@@ -1381,5 +1608,14 @@ pub fn mat(f: &Gguf, gpu: &Arc<Gpu>, name: &str, loaded: &std::cell::Cell<u64>) 
     loaded.set(loaded.get() + raw.len() as u64);
     let buf = DevBuf::new(gpu, raw.len())?;
     buf.write(0, &raw)?;
-    Ok(Mat { buf, ty: t.ty, rows, cols })
+    let code = t.ty.code() as c_int;
+    // SAFETY: arithmetic only.
+    if let Some(s) = silo.filter(|s| t.shape.len() > 1 && unsafe { (s.supported)(code, cols as i64) } != 0) {
+        // SAFETY: arithmetic only; then the blocks repacked into their own buffer (the raw one freed after the sync).
+        let packed = DevBuf::new(gpu, unsafe { (s.packed_bytes)(code, rows as i64, cols as i64) })?;
+        ffi::check(unsafe { (s.pack)(gpu.raw(), code, buf.ptr(), rows as i64, cols as i64, packed.ptr()) }, name)?;
+        gpu.sync()?;
+        return Ok(Mat { buf: packed, ty: t.ty, rows, cols, packed: true });
+    }
+    Ok(Mat { buf, ty: t.ty, rows, cols, packed: false })
 }

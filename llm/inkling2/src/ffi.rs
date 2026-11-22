@@ -116,16 +116,85 @@ pub struct Silo {
     pub xq: unsafe extern "C" fn(G, *const f32, M, i64, i64) -> c_int,
     /// (x, w, y nullable, xq, T, n, eps)
     pub rms_xq: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, M, i64, i64, f32) -> c_int,
-    pub mv_supported: unsafe extern "C" fn(c_int, i64) -> c_int,
+    pub supported: unsafe extern "C" fn(c_int, i64) -> c_int,
+    pub packed_bytes: unsafe extern "C" fn(c_int, i64, i64) -> usize,
+    /// (type, raw, rows, n_in, dst)
+    pub pack: unsafe extern "C" fn(G, c_int, P, i64, i64, M) -> c_int,
+    /// (type, w, rows, row0, n, n_in, dst)
+    pub unpack_f16: unsafe extern "C" fn(G, c_int, P, i64, i64, i64, i64, *mut u16) -> c_int,
     /// (type, w, xq, y, n_in, n_out, T)
     pub mv: unsafe extern "C" fn(G, c_int, P, P, *mut f32, i64, i64, i64) -> c_int,
     /// (n, types, ws, xqs, ys, rows, n_ins, T)
     pub mv_many: unsafe extern "C" fn(G, c_int, *const c_int, *const P, *const P, *const *mut f32, *const i64, *const i64, i64) -> c_int,
-    /// (type, w, stride, scale, ids, xq, act_q, T, K, n_in, F, beta, lb)
-    pub moe_gu: unsafe extern "C" fn(G, c_int, P, usize, *const f32, *const i32, P, M, i64, i64, i64, i64, f32, f32) -> c_int,
-    /// (type, w, stride, scale, ids, wts, act_q, y, T, K, F, n_out)
-    pub moe_down: unsafe extern "C" fn(G, c_int, P, usize, *const f32, *const i32, *const f32, P, *mut f32, i64, i64, i64, i64) -> c_int,
+    pub fmv_supported: unsafe extern "C" fn(c_int, i64) -> c_int,
+    /// (type, w, x, y, n_in, rows, T)
+    pub fmv: unsafe extern "C" fn(G, c_int, P, *const f32, *mut f32, i64, i64, i64) -> c_int,
+    /// (type, w, experts, scale, ids, xq, act_q, T, K, n_in, F, beta, lb)
+    pub moe_gu: unsafe extern "C" fn(G, c_int, P, i64, *const f32, *const i32, P, M, i64, i64, i64, i64, f32, f32) -> c_int,
+    /// (type, w, experts, scale, ids, wts, act_q, y, T, K, F, n_out)
+    pub moe_down: unsafe extern "C" fn(G, c_int, P, i64, *const f32, *const i32, *const f32, P, *mut f32, i64, i64, i64, i64) -> c_int,
+    pub fused: Fused,
 }
+
+/// silo.h's Ink2sQkv: the attention's inputs after their projections (ns_ink2s_post_qkv)
+#[repr(C)]
+pub struct Qkv {
+    pub t: i64,
+    pub p0: i64,
+    pub cap: i64,
+    pub hq: i64,
+    pub hkv: i64,
+    pub d: i64,
+    pub r_len: i64,
+    pub kraw: *const f32,
+    pub vraw: *const f32,
+    pub kdyn: *const f32,
+    pub vdyn: *const f32,
+    pub kstate: *mut f32,
+    pub vstate: *mut f32,
+    pub ksnap: *mut f32,
+    pub vsnap: *mut f32,
+    pub kw: *const f32,
+    pub vw: *const f32,
+    pub inv: f32,
+    pub inv_dyn: f32,
+    pub kout: *mut f32,
+    pub vout: *mut f32,
+    pub kc: M,
+    pub vc: M,
+    pub q: *mut f32,
+    pub r: *mut f32,
+    pub qscale: *const f32,
+    pub rscale: *const f32,
+    pub thr: f32,
+    pub rthr: f32,
+    pub alpha: f32,
+    pub floor: f32,
+    pub eps: f32,
+}
+
+/// The silo's fused decode steps (dec.cpp, attn.cpp)
+#[allow(clippy::type_complexity)]
+pub struct Fused {
+    /// (states, ns, query, nq, norm weights, out, xqs, T, C, eps_mix, eps_norm)
+    pub mix_norm: unsafe extern "C" fn(G, *const *const f32, i64, *const f32, i64, *const *const f32, *mut f32, *const M, i64, i64, f32, f32) -> c_int,
+    /// (x, state, w, snap, base, dst, out, T, C, inv)
+    pub conv_res: unsafe extern "C" fn(G, *const f32, *mut f32, *const f32, *mut f32, *const f32, *mut f32, *mut f32, i64, i64, f32) -> c_int,
+    pub post_qkv: unsafe extern "C" fn(G, *const Qkv) -> c_int,
+    /// (part, sink, gate, out, xq, T, Hq, ns)
+    pub merge_gate_xq: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, M, i64, i64, i64) -> c_int,
+    /// (cur, msg, down, u, T, C, rank, eps)
+    pub ctrl_down: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, i64, i64, i64, f32) -> c_int,
+    /// (cur, msg, u, gain, forget, out, T, C, rank)
+    pub ctrl_apply: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *const f32, *const f32, *mut f32, i64, i64, i64) -> c_int,
+    pub attn_splits: unsafe extern "C" fn(i64, i64, i64) -> i64,
+    /// (q, kc, vc, r, relb, E, R, part, T, Hq, Hkv, cap, p0, win, scale)
+    pub attn_part: unsafe extern "C" fn(G, *const f32, P, P, *const f32, *const f32, i64, i64, *mut f32, i64, i64, i64, i64, i64, i64, f32) -> c_int,
+}
+
+// SAFETY: function pointers into the library, which stays loaded for the process.
+unsafe impl Send for Fused {}
+unsafe impl Sync for Fused {}
 
 // SAFETY: function pointers into the library, which stays loaded for the process.
 unsafe impl Send for Silo {}
@@ -157,11 +226,26 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             xq_bytes: sym!("ns_ink2s_xq_bytes"),
             xq: sym!("ns_ink2s_xq"),
             rms_xq: sym!("ns_ink2s_rms_xq"),
-            mv_supported: sym!("ns_ink2s_mv_supported"),
+            supported: sym!("ns_ink2s_supported"),
+            packed_bytes: sym!("ns_ink2s_packed_bytes"),
+            pack: sym!("ns_ink2s_pack"),
+            unpack_f16: sym!("ns_ink2s_unpack_f16"),
             mv: sym!("ns_ink2s_mv"),
             mv_many: sym!("ns_ink2s_mv_many"),
+            fmv_supported: sym!("ns_ink2s_fmv_supported"),
+            fmv: sym!("ns_ink2s_fmv"),
             moe_gu: sym!("ns_ink2s_moe_gu"),
             moe_down: sym!("ns_ink2s_moe_down"),
+            fused: Fused {
+                mix_norm: sym!("ns_ink2s_mix_norm"),
+                conv_res: sym!("ns_ink2s_conv_res"),
+                post_qkv: sym!("ns_ink2s_post_qkv"),
+                merge_gate_xq: sym!("ns_ink2s_merge_gate_xq"),
+                ctrl_down: sym!("ns_ink2s_ctrl_down"),
+                ctrl_apply: sym!("ns_ink2s_ctrl_apply"),
+                attn_splits: sym!("ns_ink2s_attn_splits"),
+                attn_part: sym!("ns_ink2s_attn_part"),
+            },
         }))
     })
     .as_ref()

@@ -845,6 +845,7 @@ Muse Glimmer 30B (`llm/museglimmer`, its kernels `kernels/llm/museglimmer`).
 | `NS_MG_KQ_SHAPE` | 0 | Experiment: the silo's K-quant (Q4_K, Q6_K) decode products' shape (tiles of 16 rows a sub-group, sub-groups a work-group, groups of 64 a step) - 0: by the width (16, 13 or 8 sub-groups splitting a row's groups evenly, 2 a step); 1: 1, 8, 2; 2: 1, 4, 2; 3: 1, 8, 4; 4: 2, 8, 2; 5: 1, 16, 2; 6: 1, 13, 2; 7: 1, 13, 4 (`llm kernels` times them) | kernels:llm museglimmer (silo) |
 | `NS_MG_PROFILE` | off | Debug: 1 times every kernel (the queue drained before and after each) and lists them after the run | llm museglimmer |
 | `NS_INK2_CHUNK` | 2048 rows when they fit beside the weights and a session, else 1024 or 512 | a prompt pass's rows (more than 16) (--opt-chunk) | llm inkling2 |
+| `NS_INK2_FUSED` | on (with the silo) | Experiment: 0 runs decode rows through the silo's products only, each small step its own launch as for a prompt (A/B of the fused decode steps) | llm inkling2 |
 | `NS_INK2_PROFILE` | off | Debug: 1 times every kernel (the queue drained before and after each) and lists them after the run | llm inkling2 |
 | `NS_INK2_DEQ_REF` | unset | Debug: a directory of ggml's dequantized rows (`reference/inkling2/deq-ref.cpp`, `<tensor>.f32`): `llm kernels` checks the expansions against them bit for bit | llm inkling2 |
 
