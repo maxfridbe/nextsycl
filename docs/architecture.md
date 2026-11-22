@@ -136,6 +136,8 @@ kernels/                   SYCL ONLY - one library a kind (dist/libnextsycl-<kin
                           (ns_<kind>_<arch>_* symbols)
   <kind>/<arch>/silo/     the engine's silo: kernels tuned for that model alone, replacing shared ones for what they
                           cover - their own library, dist/silo/libnextsycl-<arch>.so, opened by the engine at load
+  <kind>/<arch>/silo/variants/<name>/   a variant of the silo: its ops tuned for other cards (variant.yml says which),
+                          only the ops that differ - dist/silo/libnextsycl-<arch>@<name>.so and its manifest beside it
 ```
 
 ### The rules (checked by `cli/nextsycl/tests/architecture.rs` on every `cargo test`)
@@ -157,6 +159,23 @@ kernels/                   SYCL ONLY - one library a kind (dist/libnextsycl-<kin
   it at load (`nextsycl_core::silo(ARCH)`, once a process; `NS_SILO=0` or `NS_SILO_DIR` to change where), binds its
   symbols by name, asks each op's `_supported` per call and falls back to the shared kernel otherwise - with no
   silo file it runs on the shared kernels alone, just slower. Its load log says which.
+- **Tuning for other cards lives in a silo's variants** (rule 6). A silo is per model, not per card: a model tuned for
+  a 16 GB card, or a card of fewer units, goes in `kernels/<kind>/<arch>/silo/variants/<name>/` - a manifest
+  (`variant.yml`: a one-line `description`, who `measured` it on what, and a `match` rule on what the device reports:
+  `vram_mb_min` / `_max`, `units_min` / `_max`, `mhz_min` / `_max`, `sub_group`, and a `name` substring as the last
+  resort) and only the ops that differ, with the silo's C names and its header (a delta, not a fork: the architecture
+  test refuses an op the default silo does not have; its kernels in a namespace of its own, so two kernels of one name
+  never share a process). `kernels/build.sh` links it as `dist/silo/libnextsycl-<arch>@<name>.so` (-Bsymbolic) and
+  copies its manifest beside it; the binary embeds no silo, so variants travel as silos do, files in `dist/silo/`
+  (or `NS_SILO_DIR`). Resolution is per op and per GPU, once at load: `nextsycl_core::silo_for(ARCH, gpu)` is the
+  default silo with the variant that GPU matches over it (`Silo::symbol`: the variant's op when it has one, else the
+  default's; a variant op that covers less than the default's hands the rest to it, `kernels/ns/ns_variant.hpp`),
+  and an engine binds each GPU's ops when it opens the GPU (qwen35: `Dev::silo`). `nextsycl_core::silo(ARCH)` - an
+  engine that binds once a process - takes a variant only when every GPU of the process matches it, so a mixed box
+  (the B70 beside the B65) runs such an engine on the default silo. `NS_SILO_VARIANT=<name>|none` (a model card's
+  `silo.variant`) forces one or none. A variant gives the same outputs as its silo (`NS_SILO_VARIANT=none` against
+  it: the silo's own check), comes with its before / after numbers on its cards, and never changes a memory plan:
+  memory is planned from what the device reports (`gpu.memory()`, `gpu_units`), not from a card's name.
 
 ## The kinds' contracts
 

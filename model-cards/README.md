@@ -47,6 +47,8 @@ env: {}                         # settings its engine reads; '{role}' is that fi
 silo:                           # its tuned kernels (CONTRIBUTING rule 6): kernels/<kind>/<name>/silo, built as
   name: qwen35                  #   dist/silo/libnextsycl-<name>.so (default: the architecture's own, when built)
   required: true                # no load without it (default false: the shared kernels for what it lacks)
+  variant: b65                  # optional: that variant of the silo (silo/variants/<name>) on every card, or none;
+                                #   default: each card the variant whose manifest matches it, else the silo alone
 files:                          # by role: a file defined here, or another card's file by its key
   model:
     key: q27-q4                 # the file's id among all cards (a file is downloaded once, defined once)
@@ -60,7 +62,9 @@ guide: guides/chat.md           # how to prompt it (Markdown, relative to this f
 
 `silo` also takes a name alone (`silo: qwen35`) or `none` (the shared kernels only); without it a model runs on its
 architecture's silo when one is built. `nextsycl models search` shows each model's (`-`: the shared kernels). The
-registry entry carries it as the loader's settings (`NS_SILO_NAME`, `NS_SILO_REQUIRED`, `NS_SILO=0`).
+registry entry carries it as the loader's settings (`NS_SILO_NAME`, `NS_SILO_REQUIRED`, `NS_SILO=0`,
+`NS_SILO_VARIANT`). A silo's variants are its ops tuned for other cards (CONTRIBUTING rule 6): a card pins one only to
+measure it; left alone, each GPU takes the variant made for it.
 
 A file on a gated Hugging Face repository names the page whose terms its account must accept under `gated` (`gated:
 https://huggingface.co/<repo>`): `pull` downloads it with the account's token (`HF_TOKEN`, else huggingface_hub's token

@@ -34,6 +34,7 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_SILO_NAME` | the architecture's own | another silo of the engine's ABI to load (dist/silo/libnextsycl-<name>.so) - a model card's `silo.name` | runtime (every kind) |
 | `NS_SILO_REQUIRED` | 0 | 1: refuse to load when the silo is not built (no fall back to the shared kernels) - a model card's `silo.required` | runtime (every kind) |
 | `NS_SILO_DIR` | silo/ beside the kind's kernel library | directory holding the silos (`libnextsycl-<arch>.so`) | runtime (every kind) |
+| `NS_SILO_VARIANT` | by the card | a silo variant (`kernels/<kind>/<arch>/silo/variants/<name>`, built as dist/silo/libnextsycl-<arch>@<name>.so with its manifest beside it) on every GPU, or `none`: the default silo's ops alone. Unset: each GPU takes the variant its manifest's `match` rule fits (an engine that binds per GPU), or the one every GPU of the process fits - a model card's `silo.variant` | runtime (every kind) |
 | `NS_SOCKET_DIR` | $XDG_RUNTIME_DIR/nextsycl (serve's pid and marker files: /tmp) | where the control sockets live (mounted into the containers) | cli, serve, llm, video, studio |
 
 ## Front door and services

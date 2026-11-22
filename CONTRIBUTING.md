@@ -36,6 +36,15 @@ guide is how to port one, and the few rules every change follows.
    the shared kernel for everything else; without the file (or with `NS_SILO=0`) the engine runs on the shared
    kernels alone. Start a silo kernel as a copy of the shared one, then change the copy. A change to a shared kernel
    itself (a bug fix, a new type) re-runs every engine that calls it - its check and its bench - before it lands.
+   **Tuning for other hardware goes in a variant** of the silo, never in the default silo or the shared kernels:
+   `kernels/<kind>/<arch>/silo/variants/<name>/` holds a `variant.yml` (a one-line `description`, who `measured` it on
+   what, and a `match` rule on what the device reports - `vram_mb_min` / `_max`, `units_min` / `_max`, `mhz_min` /
+   `_max`, `sub_group`, a `name` substring only as the last resort) and only the ops that differ, under the silo's C
+   names (copy the op, then change the copy; its kernels in a namespace of its own). It builds to
+   `dist/silo/libnextsycl-<arch>@<name>.so`; each GPU then takes its variant's op where it has one, else the default
+   silo's, else the shared kernel (`docs/architecture.md`). A variant gives the same outputs as its silo
+   (`NS_SILO_VARIANT=none` against it, with the silo's own check), its pull request quotes before / after numbers on
+   its hardware, and it never changes a memory plan (memory is planned from what the device reports).
 
 7. **A front-door method is its handler.** `glue/serve/src/home/methods.rs`: `#[rpc(name = "image.generate", tags
    = "image", example = r#"{...}"#)]` on a fn with a doc comment (its summary), and a request struct with

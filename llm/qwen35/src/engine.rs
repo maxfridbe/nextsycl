@@ -388,6 +388,9 @@ struct Dev {
     w16: DevBuf,
     lb: usize,
     le: usize,
+    /// this GPU's silo: a variant it matches over the default silo (silo/variants), else the default; None: the shared
+    /// kernels throughout
+    silo: Option<&'static ffi::Silo>,
 }
 
 pub struct Qwen35<'g> {
@@ -402,8 +405,6 @@ pub struct Qwen35<'g> {
     /// host memory a pass's rows cross between GPUs through
     staging: Mutex<Vec<u8>>,
     k: &'static ffi::Api,
-    /// the silo's tuned kernels (kernels/llm/qwen35/silo), None: the shared ones throughout
-    silo: Option<&'static ffi::Silo>,
     layers: Vec<Layer>,
     output_norm: DevBuf,
     output: Mat,
@@ -884,7 +885,12 @@ impl<'g> Qwen35<'g> {
         let mut devs = Vec::with_capacity(gpus.len());
         for (gpu, &(lb, le)) in gpus.iter().zip(&bounds) {
             gpu.sync()?;
-            devs.push(Dev { gpu: gpu.clone(), w16: DevBuf::new(gpu, w16_bytes)?, arena: Arena::new(gpu, arena_of(chunk))?, lb, le });
+            // each GPU's own silo ops (a variant for its card, silo/variants), bound once here
+            let dsilo = if silo.is_some() { ffi::silo_on(gpu.index)? } else { None };
+            if let Some(v) = dsilo.and_then(|s| s.variant.as_ref()) {
+                log(format!("qwen35: {}: the silo's variant {v}", gpu.name));
+            }
+            devs.push(Dev { gpu: gpu.clone(), w16: DevBuf::new(gpu, w16_bytes)?, arena: Arena::new(gpu, arena_of(chunk))?, lb, le, silo: dsilo });
         }
         let load_s = t0.elapsed().as_secs_f64();
         let wh = devs.iter().map(|d| if d.lb == 0 && d.le == g.layers { d.gpu.name.clone() } else { format!("{} (layers {}-{})", d.gpu.name, d.lb, d.le - 1) })
@@ -919,7 +925,7 @@ impl<'g> Qwen35<'g> {
             }
             None => None,
         };
-        Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, silo, layers, output_norm, output, embd, chunk,
+        Ok(Qwen35 { g, file: f, devs, layer_dev, cur: 0.into(), staging: Mutex::new(Vec::new()), k, layers, output_norm, output, embd, chunk,
                     work: Mutex::new(()), mtp, eagle, dspine, drafts, snaps: Mutex::new(Snaps { layers: snap_layers, second: None, of: Vec::new() }), vh, next_id: 0.into(), vision, capture: Mutex::new(None), kv_rot: kv_rot() && kv_tys.iter().any(|t| *t != KvTy::F16), kv_tys, graphs: Mutex::new(Graphs::default()), skip: false.into(), graphs_off: false.into(),
                     probe,
                     load_s, load_bytes: loaded })
@@ -986,6 +992,12 @@ impl<'g> Qwen35<'g> {
         self.dev().gpu.raw()
     }
 
+    /// The silo's tuned kernels on the GPU the kernels go to now (kernels/llm/qwen35/silo, or a variant of it for
+    /// that card); None: the shared ones throughout
+    fn silo(&self) -> Option<&'static ffi::Silo> {
+        self.dev().silo
+    }
+
     /// x (rows of the GPU it is on) onto GPU `to`: a buffer of that GPU's arena
     fn hop(&self, x: &DevBuf, to: usize) -> Result<DevBuf> {
         self.on(to);
@@ -1018,7 +1030,7 @@ impl<'g> Qwen35<'g> {
         // the silo's product for the types it covers (kernels/llm/qwen35/silo; it reads the split layout too), the
         // shared one otherwise - a type only the silo covers (Q3_K: the MTP file's head) is still a decode product
         // SAFETY: arithmetic only.
-        let silo = self.silo.filter(|s| {
+        let silo = self.silo().filter(|s| {
             // SAFETY: arithmetic only.
             unsafe { (s.mmvq_supported)(w.ty.code() as i32, kk) != 0 || s.xmx_covers.is_some_and(|f| f(w.ty.code() as i32, kk, n, t as i64) != 0) }
         });
@@ -1052,7 +1064,7 @@ impl<'g> Qwen35<'g> {
         }
         // SAFETY: the matrix's blocks -> rows x cols halfs in w16 (non-zero: a type it does not expand directly) - the
         // silo's expansion for the types it covers
-        let rc = match self.silo {
+        let rc = match self.silo() {
             Some(s) if unsafe { (s.dequant_f16_supported)(w.ty.code() as i32) } != 0 => self.op_rc("dequant f16 silo", key, wb + 2 * elems, 0, || unsafe {
                 (s.dequant_f16)(self.raw(), w.ty.code() as i32, w.buf.ptr(), elems as i64, self.dev().w16.ptr().cast())
             })?,
@@ -1074,7 +1086,7 @@ impl<'g> Qwen35<'g> {
 
     /// The RMS norm into y; for decode rows with the silo also y's Q8_1 forms (the products after it read them)
     fn norm(&self, x: &DevBuf, w: &DevBuf, y: &DevBuf, rows: usize, c: usize) -> Result<Option<Q8>> {
-        let Some(s) = self.silo.filter(|_| rows <= 8 && c.is_multiple_of(256)) else {
+        let Some(s) = self.silo().filter(|_| rows <= 8 && c.is_multiple_of(256)) else {
             self.rms(x, w, y, rows, c)?;
             return Ok(None);
         };
@@ -1093,7 +1105,7 @@ impl<'g> Qwen35<'g> {
         // SAFETY: arithmetic only.
         let q8 = unsafe { (k.q8_1_bytes)(cols as i64, t as i64) };
         let std = self.arena().bytes(q8)?;
-        if let Some(s) = self.silo.filter(|_| split) {
+        if let Some(s) = self.silo().filter(|_| split) {
             // SAFETY: arithmetic only.
             let sb = unsafe { (s.q8_split_bytes)(cols as i64, t as i64) };
             let sp = self.arena().bytes(sb)?;
@@ -1583,7 +1595,7 @@ impl<'g> Qwen35<'g> {
                             || (k.kv_store_q)(self.raw(), ty.code(), kn.fp(), (hk * d) as i64, vr.fp(), (hk * d) as i64, t as i64, hk as i64, d as i64,
                                               cap as i64, p0 as i64, kc.ptr(), vc.ptr()))?;
                 }
-                if let Some(s) = self.silo.filter(|s| (s.attn_prompt_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
+                if let Some(s) = self.silo().filter(|s| (s.attn_prompt_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
                     // the silo's flash attention (prompt rows): each key read once a work-group of 8 rows x 6 heads
                     // each block of 8 rows reads K and V (half) up to its last row's key, once for the 6 heads
                     let nb = t.div_ceil(8);
@@ -1591,7 +1603,7 @@ impl<'g> Qwen35<'g> {
                     self.op("attention silo", none, block_keys * hk * d * 4 + 8 * t * hq * d, 4 * keys * hq * d,
                             || (s.attn_prompt_kv)(self.raw(), ty.code(), q.fp(), (hq * d) as i64, kc.ptr(), vc.ptr(), t as i64, hq as i64, hk as i64, d as i64,
                                                   cap as i64, p0 as i64, att.fp()))?;
-                } else if let Some(s) = self.silo.filter(|s| (s.attn_decode_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
+                } else if let Some(s) = self.silo().filter(|s| (s.attn_decode_supported)(t as i64, hq as i64, hk as i64, d as i64) != 0) {
                     // the silo's decode attention: a lane a key for the scores, the keys over ~512 work-groups
                     let sc = (s.attn_decode_scratch)(t as i64, hq as i64, hk as i64, d as i64, p_sz as i64) as usize;
                     let part = if sc > 0 { Some(self.arena().f32(sc)?) } else { None };
@@ -2191,7 +2203,7 @@ impl<'g> Qwen35<'g> {
         let ne = self.g.n_embd;
         let row = self.output.ty.bytes(ne as u64).ok_or_else(|| e("the head's row is not whole blocks"))? as usize;
         let code = self.output.ty.code() as i32;
-        let silo = self.silo.filter(|s| unsafe { (s.dequant_f16_supported)(code) } != 0);
+        let silo = self.silo().filter(|s| unsafe { (s.dequant_f16_supported)(code) } != 0);
         for (i, id) in ids.iter().enumerate() {
             // SAFETY: row `id` of the head's blocks (a row of ne values) -> half into dst's row i.
             let rc = unsafe {
@@ -2217,7 +2229,7 @@ impl<'g> Qwen35<'g> {
             return Ok(Vec::new());
         }
         let ring = ms.ring.ok_or_else(|| e("dspine: a session without its ring"))?;
-        let dsp = self.silo.and_then(|x| x.dsp.as_ref()).ok_or_else(|| e("the DSpine draft needs the silo's dspine kernels (rebuild the silo)"))?;
+        let dsp = self.silo().and_then(|x| x.dsp.as_ref()).ok_or_else(|| e("the DSpine draft needs the silo's dspine kernels (rebuild the silo)"))?;
         let (ne, k, cfg) = (self.g.n_embd, self.k, &ds.cfg);
         let (kvh, hq, d, rk, c) = (cfg.kv_heads, cfg.heads, cfg.head_dim, cfg.rank, cfg.code);
         let (qd, kw, rb) = (hq * d, kvh * d, d * 2);

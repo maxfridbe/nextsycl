@@ -147,6 +147,8 @@ pub fn check(rc: c_int, what: &str) -> nextsycl_core::Result<()> {
 /// The silo's kernels (kernels/llm/qwen35/silo/silo.h, dist/silo/libnextsycl-qwen35.so), when it is there
 pub struct Silo {
     pub path: std::path::PathBuf,
+    /// the variant over the default silo (silo/variants/<name>), when the GPU matched one
+    pub variant: Option<String>,
     pub mmvq_supported: unsafe extern "C" fn(c_int, i64) -> c_int,
     /// (w, x as Q8_1 blocks, x in the split layout, y, ...)
     pub mmvq: unsafe extern "C" fn(G, c_int, P, P, P, *mut f32, i64, i64, i64) -> c_int,
@@ -179,57 +181,75 @@ pub struct Dsp {
 
 /// The silo (None: the shared kernels for everything)
 pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
-    static SILO: OnceLock<std::result::Result<Option<Silo>, String>> = OnceLock::new();
-    SILO.get_or_init(|| {
-        let Some(lib) = nextsycl_core::silo(crate::ARCH).map_err(|e| e.0)? else { return Ok(None) };
-        macro_rules! sym {
-            ($name:literal) => {{
-                let p = lib.symbol($name);
-                if p.is_null() {
-                    return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
-                }
-                // SAFETY: the symbol is declared in silo.h with the field's signature.
-                #[allow(clippy::missing_transmute_annotations)]
-                unsafe {
-                    std::mem::transmute::<*mut c_void, _>(p)
-                }
-            }};
-        }
-        Ok(Some(Silo {
-            path: lib.path.clone(),
-            mmvq_supported: sym!("ns_q35_mmvq_supported"),
-            mmvq: sym!("ns_q35_mmvq"),
-            q8_split_bytes: sym!("ns_q35_q8_split_bytes"),
-            quantize_q8: sym!("ns_q35_quantize_q8"),
-            attn_prompt_supported: sym!("ns_q35_attn_prompt_supported"),
-            attn_decode_supported: sym!("ns_q35_attn_decode_supported"),
-            attn_decode_scratch: sym!("ns_q35_attn_decode_scratch"),
-            attn_prompt_kv: sym!("ns_q35_attn_prompt_kv"),
-            attn_decode_kv: sym!("ns_q35_attn_decode_kv"),
-            dequant_f16_supported: sym!("ns_q35_dequant_f16_supported"),
-            dequant_f16: sym!("ns_q35_dequant_f16"),
-            rms_q8: sym!("ns_q35_rms_q8"),
-            xmx_covers: if lib.symbol("ns_q35_xmx_covers").is_null() {
-                None
-            } else {
-                // SAFETY: declared in silo.h with this signature.
-                Some(unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(c_int, i64, i64, i64) -> c_int>(lib.symbol("ns_q35_xmx_covers")) })
-            },
-            dsp: if lib.symbol("ns_q35_dsp_pick").is_null() {
-                None
-            } else {
-                Some(Dsp {
-                    bridge_norm: sym!("ns_q35_dsp_bridge_norm"),
-                    codes: sym!("ns_q35_dsp_codes"),
-                    message: sym!("ns_q35_dsp_message"),
-                    write: sym!("ns_q35_dsp_write"),
-                    base: sym!("ns_q35_dsp_base"),
-                    pick: sym!("ns_q35_dsp_pick"),
-                })
-            },
-        }))
+    bound(nextsycl_core::silo(crate::ARCH)?)
+}
+
+/// GPU `gpu`'s silo: a variant of the silo that GPU matches over the default one (`nextsycl_core::silo_for`), bound
+/// once a library
+pub fn silo_on(gpu: usize) -> nextsycl_core::Result<Option<&'static Silo>> {
+    bound(nextsycl_core::silo_for(crate::ARCH, gpu)?)
+}
+
+/// A silo library's ops, bound once (by the library: the default silo, or a variant over it)
+fn bound(lib: Option<&'static nextsycl_core::SiloLib>) -> nextsycl_core::Result<Option<&'static Silo>> {
+    static BOUND: std::sync::Mutex<Vec<(usize, &'static Silo)>> = std::sync::Mutex::new(Vec::new());
+    let Some(lib) = lib else { return Ok(None) };
+    let key = lib as *const nextsycl_core::SiloLib as usize;
+    let mut m = BOUND.lock().unwrap();
+    if let Some((_, s)) = m.iter().find(|(k, _)| *k == key) {
+        return Ok(Some(*s));
+    }
+    let s: &'static Silo = Box::leak(Box::new(bind(lib).map_err(nextsycl_core::Error)?));
+    m.push((key, s));
+    Ok(Some(s))
+}
+
+fn bind(lib: &nextsycl_core::SiloLib) -> std::result::Result<Silo, String> {
+    macro_rules! sym {
+        ($name:literal) => {{
+            let p = lib.symbol($name);
+            if p.is_null() {
+                return Err(format!("{}: no {} (rebuild it: ./build.sh kernels)", lib.path.display(), $name));
+            }
+            // SAFETY: the symbol is declared in silo.h with the field's signature.
+            #[allow(clippy::missing_transmute_annotations)]
+            unsafe {
+                std::mem::transmute::<*mut c_void, _>(p)
+            }
+        }};
+    }
+    Ok(Silo {
+        path: lib.path.clone(),
+        variant: lib.variant().map(|v| v.0.to_string()),
+        mmvq_supported: sym!("ns_q35_mmvq_supported"),
+        mmvq: sym!("ns_q35_mmvq"),
+        q8_split_bytes: sym!("ns_q35_q8_split_bytes"),
+        quantize_q8: sym!("ns_q35_quantize_q8"),
+        attn_prompt_supported: sym!("ns_q35_attn_prompt_supported"),
+        attn_decode_supported: sym!("ns_q35_attn_decode_supported"),
+        attn_decode_scratch: sym!("ns_q35_attn_decode_scratch"),
+        attn_prompt_kv: sym!("ns_q35_attn_prompt_kv"),
+        attn_decode_kv: sym!("ns_q35_attn_decode_kv"),
+        dequant_f16_supported: sym!("ns_q35_dequant_f16_supported"),
+        dequant_f16: sym!("ns_q35_dequant_f16"),
+        rms_q8: sym!("ns_q35_rms_q8"),
+        xmx_covers: if lib.symbol("ns_q35_xmx_covers").is_null() {
+            None
+        } else {
+            // SAFETY: declared in silo.h with this signature.
+            Some(unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(c_int, i64, i64, i64) -> c_int>(lib.symbol("ns_q35_xmx_covers")) })
+        },
+        dsp: if lib.symbol("ns_q35_dsp_pick").is_null() {
+            None
+        } else {
+            Some(Dsp {
+                bridge_norm: sym!("ns_q35_dsp_bridge_norm"),
+                codes: sym!("ns_q35_dsp_codes"),
+                message: sym!("ns_q35_dsp_message"),
+                write: sym!("ns_q35_dsp_write"),
+                base: sym!("ns_q35_dsp_base"),
+                pick: sym!("ns_q35_dsp_pick"),
+            })
+        },
     })
-    .as_ref()
-    .map(|s| s.as_ref())
-    .map_err(|e| nextsycl_core::Error(e.clone()))
 }

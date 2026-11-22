@@ -534,7 +534,7 @@ pub(crate) fn entry(m: &Value, paths: &BTreeMap<String, PathBuf>, local: &BTreeM
         }
     }
     // the card's silo as the settings the kernel loader reads: `none` the shared kernels only, another name that silo,
-    // `required` no load without it
+    // `required` no load without it, `variant` that variant of it on every card (`none`: the default silo's ops alone)
     if m["silo"] == "none" {
         env.insert("NS_SILO".into(), json!("0"));
     } else {
@@ -543,6 +543,9 @@ pub(crate) fn entry(m: &Value, paths: &BTreeMap<String, PathBuf>, local: &BTreeM
         }
         if m["silo"]["required"] == true {
             env.insert("NS_SILO_REQUIRED".into(), json!("1"));
+        }
+        if let Some(v) = m["silo"]["variant"].as_str().filter(|v| !v.is_empty()) {
+            env.insert("NS_SILO_VARIANT".into(), json!(v));
         }
     }
     let main = ["model", "transformer", "denoiser", "lora"].iter().find_map(|r| paths.get(*r)).or_else(|| paths.values().next());
@@ -676,6 +679,11 @@ mod tests {
                 let kind = if s(m, "kind") == "lora" { "image".to_string() } else { s(m, "kind") };
                 assert!(cat.dir.join(format!("../kernels/{kind}/{n}/silo")).is_dir(), "{id}: no silo kernels/{kind}/{n}/silo");
             }
+            // a variant it pins is a variant of that silo (its own architecture's when it names none)
+            if let Some(v) = m["silo"]["variant"].as_str().filter(|v| *v != "none") {
+                let n = m["silo"]["name"].as_str().map_or_else(|| s(m, "arch"), str::to_string);
+                assert!(cat.dir.join(format!("../kernels/{}/{n}/silo/variants/{v}/variant.yml", s(m, "kind"))).is_file(), "{id}: no silo variant {n}/{v}");
+            }
             // every {role} in a setting is a file or a local part of the model
             for v in m["env"].as_object().into_iter().flatten().filter_map(|(_, v)| v.as_str()) {
                 if let (Some(a), Some(b)) = (v.find('{'), v.find('}')) {
@@ -787,6 +795,7 @@ mod tests {
         assert_eq!(e(json!({"name": "a", "required": true}))["env"], json!({"NS_SILO_REQUIRED": "1"}));
         assert_eq!(e(json!("b"))["env"], json!({"NS_SILO_NAME": "b"}));
         assert_eq!(e(json!("none"))["env"], json!({"NS_SILO": "0"}));
+        assert_eq!(e(json!({"variant": "b65"}))["env"], json!({"NS_SILO_VARIANT": "b65"}));
         assert_eq!(e(Value::Null)["env"], json!({}));
     }
 

@@ -64,6 +64,21 @@ int ns_gpu_units(int index, int* units, int* mhz) {
     NS_CATCH
 }
 
+// GPU `index`'s memory and sub-group sizes (ns.h), read without a context: a silo variant's match rule
+int ns_gpu_props(int index, uint64_t* vram_bytes, uint32_t* sub_group_mask) {
+    NS_TRY
+    auto v = gpus();
+    if (index < 0 || index >= (int) v.size()) return fail("no GPU " + std::to_string(index));
+    *vram_bytes = v[index].get_info<sycl::info::device::global_mem_size>();
+    uint32_t m = 0;
+    for (size_t s : v[index].get_info<sycl::info::device::sub_group_sizes>())
+        for (int b = 0; b < 32; ++b)
+            if ((size_t) 1 << b == s) m |= 1u << b;
+    *sub_group_mask = m;
+    return 0;
+    NS_CATCH
+}
+
 // the PCI address of GPU `index` ("0000:03:00.0") into buf; an empty string when the driver does not say
 int ns_gpu_pci(int index, char* buf, size_t len) {
     NS_TRY

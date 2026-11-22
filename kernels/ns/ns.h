@@ -25,6 +25,9 @@ int ns_gpu_count(void);
 int ns_gpu_name(int index, char* buf, size_t len);
 int ns_gpu_pci(int index, char* buf, size_t len);
 int ns_gpu_units(int index, int* units, int* mhz);
+/* GPU `index`'s memory (bytes) and the sub-group sizes it runs (bit b set: size 1 << b), without opening it - what a
+   silo variant's match rule reads (crates/sys: DeviceInfo) */
+int ns_gpu_props(int index, uint64_t* vram_bytes, uint32_t* sub_group_mask);
 /* opens GPU `index` with its own context and one in-order queue */
 int ns_gpu_open(int index, ns_gpu** out);
 void ns_gpu_close(ns_gpu* g);

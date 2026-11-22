@@ -43,7 +43,7 @@ DIFFFLAGS=(-fsycl -std=c++20 -O3 -fPIC -Wno-unused-parameter -Wno-unused-variabl
 KINDS="llm image video audio model3d"
 all_sources() {
   ls $S/src/kernels/*.dp.cpp $S/src/prefill/*.dp.cpp ns/*.cpp diffusion/*.cpp 2>/dev/null
-  for k in $KINDS; do ls $k/*/*.cpp $k/*/silo/*.cpp 2>/dev/null || true; done   # a kind may have no silo
+  for k in $KINDS; do ls $k/*/*.cpp $k/*/silo/*.cpp $k/*/silo/variants/*/*.cpp 2>/dev/null || true; done   # a kind may have no silo
 }
 SRCS=${ONLY:-$(all_sources)}
 echo "==> compiling $(echo $SRCS | wc -w) sources (AOT ${AOT:-none}, $JOBS at a time)"
@@ -96,13 +96,28 @@ fi
 mkdir -p "$OUT/silo"
 for d in $(ls -d */*/silo 2>/dev/null); do
   arch=$(basename "$(dirname "$d")")
-  objs=$(ls "$OBJ"/$(echo "$d" | tr / _)_*.o 2>/dev/null || true)
+  objs=$(ls "$OBJ"/$(echo "$d" | tr / _)_*.o 2>/dev/null | grep -v '_silo_variants_' || true)
   [ -n "$objs" ] || continue
   # a silo of a kind that links oneDNN (image, video, audio, 3D) may call it too: the copy in dist/, one level up
   extra=()
   case "$d" in llm/*) ;; *) extra=(-L"$DNNL/lib" -ldnnl -Wl,-rpath,'$ORIGIN/..') ;; esac
   echo "==> linking silo/libnextsycl-$arch.so"
   icpx "${LINK[@]}" $objs "${extra[@]}" -o "$OUT/silo/.libnextsycl-$arch.so.new" && mv -f "$OUT/silo/.libnextsycl-$arch.so.new" "$OUT/silo/libnextsycl-$arch.so"
+done
+# a silo's variants (kernels/<kind>/<arch>/silo/variants/<name>/: its ops tuned for other cards, a delta off the silo):
+# dist/silo/libnextsycl-<arch>@<name>.so - only the ops that differ, the silo's ABI - and its manifest beside it
+# (libnextsycl-<arch>@<name>.yml: the cards it is for), which the loader reads to pick it a GPU (crates/sys variant.rs).
+# -Bsymbolic: its ops have the silo's names, and within it they must call its own
+for d in $(ls -d */*/silo/variants/*/ 2>/dev/null); do
+  d=${d%/}
+  arch=$(basename "$(dirname "$(dirname "$(dirname "$d")")")"); name=$(basename "$d")
+  objs=$(ls "$OBJ"/$(echo "$d" | tr / _)_*.o 2>/dev/null || true)
+  [ -n "$objs" ] && [ -f "$d/variant.yml" ] || continue
+  extra=()
+  case "$d" in llm/*) ;; *) extra=(-L"$DNNL/lib" -ldnnl -Wl,-rpath,'$ORIGIN/..') ;; esac
+  echo "==> linking silo/libnextsycl-$arch@$name.so"
+  icpx "${LINK[@]}" $objs "${extra[@]}" -Wl,-Bsymbolic -o "$OUT/silo/.libnextsycl-$arch@$name.so.new" \
+    && cp "$d/variant.yml" "$OUT/silo/libnextsycl-$arch@$name.yml" && mv -f "$OUT/silo/.libnextsycl-$arch@$name.so.new" "$OUT/silo/libnextsycl-$arch@$name.so"
 done
 # flash attention (diffusion/flash/flash.cpp -> libnextsycl-flash.so, loaded by the diffusion kernels on first use):
 # ARK's kernel on sycl-tla, with the flags sycl-tla wants; skipped when the build image lacks the headers or the

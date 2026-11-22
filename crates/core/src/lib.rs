@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 pub mod options;
 
-pub use nextsycl_sys::Api;
+pub use nextsycl_sys::{variant, Api, Silo as SiloLib};
 pub use options::{At, EngineOption};
 
 #[derive(Debug)]
@@ -60,8 +60,22 @@ pub fn api() -> Result<&'static Api> {
 }
 
 /// A model's silo (`kernels/<kind>/<arch>/silo/`: its tuned kernels, `dist/silo/libnextsycl-<arch>.so`), opened on
-/// the first ask and kept: None when there is none (or NS_SILO=0) - the engine then uses the shared kernels
+/// the first ask and kept: None when there is none (or NS_SILO=0) - the engine then uses the shared kernels. With a
+/// variant every GPU of the process matches (`silo/variants/<name>`: a box of one kind of card), that variant's ops
+/// over it; an engine that runs on several GPUs takes each GPU's with `silo_for`.
 pub fn silo(arch: &str) -> Result<Option<&'static nextsycl_sys::Silo>> {
+    silo_over(arch, None)
+}
+
+/// The silo for GPU `gpu`: the variant that GPU matches over the default silo (`silo/variants/<name>/variant.yml`'s
+/// rule; NS_SILO_VARIANT=<name> forces one, `none` none), else the default silo; resolved once and kept, so an engine
+/// binds each GPU's ops at load and calls them without a lookup
+pub fn silo_for(arch: &str, gpu: usize) -> Result<Option<&'static nextsycl_sys::Silo>> {
+    silo_over(arch, Some(gpu))
+}
+
+/// The default silo of `arch`, opened once
+fn base_silo(arch: &str) -> Result<Option<&'static nextsycl_sys::Silo>> {
     static SILOS: std::sync::Mutex<Vec<(String, Option<&'static nextsycl_sys::Silo>)>> = std::sync::Mutex::new(Vec::new());
     let mut m = SILOS.lock().unwrap();
     if let Some((_, s)) = m.iter().find(|(a, _)| a == arch) {
@@ -70,6 +84,56 @@ pub fn silo(arch: &str) -> Result<Option<&'static nextsycl_sys::Silo>> {
     let s = api()?.silo(arch).map_err(Error)?.map(|s| &*Box::leak(Box::new(s)));
     m.push((arch.to_string(), s));
     Ok(s)
+}
+
+/// The silo of `arch` for GPU `gpu`, or every GPU of the process (`silo`, `silo_for`): a variant all of them match,
+/// else the default
+fn silo_over(arch: &str, gpu: Option<usize>) -> Result<Option<&'static nextsycl_sys::Silo>> {
+    type Variants = Vec<(String, std::result::Result<Vec<nextsycl_sys::variant::VariantFile>, String>)>;
+    static VARIANTS: std::sync::Mutex<Variants> = std::sync::Mutex::new(Vec::new());
+    static OVER: std::sync::Mutex<Vec<(String, String, &'static nextsycl_sys::Silo)>> = std::sync::Mutex::new(Vec::new());
+    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let Some(base) = base_silo(arch)? else { return Ok(None) };
+    let a = api()?;
+    let force = std::env::var("NS_SILO_VARIANT").ok().filter(|v| !v.trim().is_empty());
+    if force.as_deref() == Some("none") {
+        return Ok(Some(base));
+    }
+    let variants = {
+        let mut m = VARIANTS.lock().unwrap();
+        if !m.iter().any(|(x, _)| x == arch) {
+            m.push((arch.to_string(), a.silo_variants(&a.silo_name(arch))));
+        }
+        m.iter().find(|(x, _)| x == arch).map(|(_, v)| v.clone()).unwrap_or_else(|| Ok(Vec::new())).map_err(Error)?
+    };
+    if variants.is_empty() && force.is_none() {
+        return Ok(Some(base));
+    }
+    let gpus: Vec<usize> = match gpu {
+        Some(g) => vec![g],
+        None => gpus()?.into_iter().map(|g| g.0).collect(),
+    };
+    let devices: Vec<nextsycl_sys::variant::DeviceInfo> = gpus.iter().map(|g| a.device_info(*g).map_err(Error)).collect::<Result<_>>()?;
+    let Some(v) = nextsycl_sys::variant::choose(&variants, &devices, force.as_deref()).map_err(Error)? else { return Ok(Some(base)) };
+    let s = {
+        let mut m = OVER.lock().unwrap();
+        match m.iter().find(|(x, n, _)| x == arch && *n == v.name) {
+            Some((_, _, s)) => *s,
+            None => {
+                let s: &'static nextsycl_sys::Silo = Box::leak(Box::new(a.with_variant(base, v).map_err(Error)?));
+                m.push((arch.to_string(), v.name.clone(), s));
+                s
+            }
+        }
+    };
+    let said = format!("{arch} {gpus:?} {}", v.name);
+    let mut sd = SAID.lock().unwrap();
+    if !sd.contains(&said) {
+        let on: Vec<String> = devices.iter().map(|d| format!("GPU {} ({})", d.index, d.name)).collect();
+        eprintln!("silo {arch}: variant {} on {} - {} ({})", v.name, on.join(", "), v.manifest.description, v.path.display());
+        sd.push(said);
+    }
+    Ok(Some(s))
 }
 
 /// An engine's own kernel library (`libnextsycl-<name>.so`, beside the kind's: `nextsycl_sys::Api::engine_lib`), opened

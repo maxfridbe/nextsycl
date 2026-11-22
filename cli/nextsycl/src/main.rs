@@ -63,6 +63,8 @@ every kind:
   nextsycl drives [--json]      the drives the models are on: device, PCIe link, mount, size, free, models, read speed
   nextsycl drives measure <drive>   its read speed: 4 GiB of model files past the page cache (O_DIRECT), kept
   nextsycl gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected
+  nextsycl silo [ARCH]          what each GPU reports (units, clock, memory, sub-groups) and the silo variant it takes
+                                for each silo that has variants (NS_SILO_VARIANT forces one; no GPU is opened)
   nextsycl switch [--port 8001] [--upstream 127.0.0.1:8085] [--studio URL] [--alias OLD=NEW]...
                                 the chat front end's model switcher: every registered chat model on one endpoint,
                                 a swap (through the studio's llm.mode) when a request names another
@@ -208,6 +210,43 @@ fn host_available() -> u64 {
     std::fs::read_to_string("/proc/meminfo").ok()
         .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:"))?.split_whitespace().nth(1)?.parse::<u64>().ok())
         .map_or(0, |kb| kb * 1024)
+}
+
+/// `nextsycl silo [ARCH]`: each GPU as a variant's match rule reads it, and per silo with variants (or ARCH's) the one
+/// each GPU takes - `silo ARCH GPU N: NAME` / `default` lines (tooling/gate.sh reads them)
+fn silo_cmd(args: &[String]) -> Result<(), String> {
+    let e = |x: nextsycl_core::Error| x.0;
+    let api = nextsycl_core::api().map_err(e)?;
+    let n = nextsycl_core::gpus().map_err(e)?.len();
+    let devs: Vec<nextsycl_core::variant::DeviceInfo> = (0..n).map(|i| api.device_info(i)).collect::<Result<_, _>>()?;
+    for d in &devs {
+        let sg: Vec<String> = d.sub_groups.iter().map(|s| s.to_string()).collect();
+        println!("GPU {}: {}, {} units at {} MHz, {}, sub-groups {}", d.index, d.name, d.units, d.mhz,
+                 d.vram_mb.map_or("memory not reported".into(), |m| format!("{m} MiB")), if sg.is_empty() { "?".into() } else { sg.join(",") });
+    }
+    // the silos with variants: libnextsycl-<arch>@<name>.so beside the silos
+    let mut archs: Vec<String> = match args.first() {
+        Some(a) => vec![a.clone()],
+        None => {
+            let dir = api.silo_dir();
+            std::fs::read_dir(&dir).into_iter().flatten().flatten().filter_map(|f| {
+                f.file_name().to_string_lossy().strip_prefix("libnextsycl-").and_then(|r| r.split_once('@')).map(|(a, _)| a.to_string())
+            }).collect()
+        }
+    };
+    archs.sort();
+    archs.dedup();
+    let force = std::env::var("NS_SILO_VARIANT").ok();
+    for arch in archs {
+        let vs = api.silo_variants(&api.silo_name(&arch))?;
+        for d in &devs {
+            match nextsycl_core::variant::choose(&vs, std::slice::from_ref(d), force.as_deref())? {
+                Some(v) => println!("silo {arch} GPU {}: {} - {}", d.index, v.name, v.manifest.description),
+                None => println!("silo {arch} GPU {}: default", d.index),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn gpus() -> Result<(), String> {
@@ -1233,6 +1272,7 @@ fn main() -> ExitCode {
         }
         Some("info") if args.len() == 2 => info(Path::new(&args[1])),
         Some("gpus") => gpus(),
+        Some("silo") => silo_cmd(rest),
         Some("switch") => host::switch(rest),
         Some("gpustat") => host::gpustat(rest),
         Some("maintenance") => host::maintenance(&cfg, rest),
