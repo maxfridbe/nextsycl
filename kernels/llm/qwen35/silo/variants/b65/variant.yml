@@ -1,0 +1,6 @@
+# kernels/llm/qwen35/silo/variants/b65: the qwen35 silo's ops for cards of 200 compute units or fewer (the Arc Pro
+# B65's 160; the B70 has 256) - a delta off the default silo: only the ops here differ (crates/sys/src/variant.rs)
+description: the decode-row RMS norm (ns_q35_rms_q8) as a copy of the default silo's - the variant path's demonstration, identical results
+measured: maxfridbe, hardac1 Arc Pro B65 (llm spec-check, llm bench; NS_SILO_VARIANT=none against the variant) 2026-11-22
+match:
+  units_max: 200
