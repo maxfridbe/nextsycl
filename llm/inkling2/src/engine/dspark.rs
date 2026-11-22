@@ -97,7 +97,7 @@ pub fn draft_path(f: &Gguf) -> Option<std::path::PathBuf> {
 
 /// NS_INK2_DRAFT_PMIN: a draft (and those after it) dropped when the drafter gives it less than this probability
 pub fn draft_pmin() -> f32 {
-    std::env::var("NS_INK2_DRAFT_PMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.7)
+    std::env::var("NS_INK2_DRAFT_PMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.8)
 }
 
 /// NS_INK2_DRAFTS: tokens drafted a step (at most the block's less one; 0: none)
@@ -487,7 +487,7 @@ impl Inkling2<'_> {
             let hj = hid.view(j * c * 4, c * 4)?;
             // SAFETY: the buffers as silo.h names them.
             unsafe {
-                self.op("draft rnn in", || (dk.rnn_inputs)(self.raw(), state.fp(), tj.ptr().cast(), d.w1.ptr().cast(), d.rank as i64, hj.fp(), fr.fp(), c as i64, inp.fp()))?;
+                self.op("draft rnn in", || (dk.rnn_inputs)(self.raw(), state.fp(), tj.ptr().cast(), d.w1.ptr().cast(), (d.w1.len / (2 * d.rank)) as i64, d.rank as i64, hj.fp(), fr.fp(), c as i64, inp.fp()))?;
             }
             self.matmul(&d.joint, &inp, 1, &proj)?;
             // SAFETY: as above.

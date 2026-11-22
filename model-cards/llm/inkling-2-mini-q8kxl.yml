@@ -24,7 +24,7 @@ files:
     size: 22867452896
     sha256: 2da51788d43a17e1f033bec420fa83ba9cb87ac1f0130dc9135a4d2ed2678b68
     path: inkling-2-mini/Inkling-2-Mini-UD-Q8_K_XL.gguf
-  draft:                # the DSpark drafter (found beside the model): up to 3 drafts a step (p 0.7 gate), verified exactly
+  draft:                # the DSpark drafter (found beside the model): up to 5 drafts a step (p 0.8 gate), verified exactly
     key: ink2-mini-dspark-q8
     url: https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/45fd08764f2b0bf16b03a5483a80e5c7aaec8772/dspark-Inkling-2-Mini-Q8_0.gguf
     size: 402278560

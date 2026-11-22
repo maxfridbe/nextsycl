@@ -611,7 +611,7 @@ impl<'g> Inkling2<'g> {
             },
             _ => None,
         };
-        let drafts = ds.as_ref().map_or(0, |d| dspark::draft_count().unwrap_or(3).min(d.block - 1));
+        let drafts = ds.as_ref().map_or(0, |d| dspark::draft_count().unwrap_or(5).min(d.block - 1));
         if let Some(d) = &ds {
             log(format!("inkling2: the DSpark drafter ({} MB, block of {}), {drafts} drafts a step", d.bytes >> 20, d.block));
         }

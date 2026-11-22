@@ -229,8 +229,8 @@ pub struct Draft {
     /// (gate, up, xq, T, F)
     pub swiglu_xq: unsafe extern "C" fn(G, *const f32, *const f32, M, i64, i64) -> c_int,
     pub to_bf16: unsafe extern "C" fn(G, *const f32, *mut u16, i64) -> c_int,
-    /// (state, tok, w1, rank, hidden, f_rnn, C, out)
-    pub rnn_inputs: unsafe extern "C" fn(G, *const f32, *const i32, *const u16, i64, *const f32, *const f32, i64, *mut f32) -> c_int,
+    /// (state, tok, w1, vocab, rank, hidden, f_rnn, C, out)
+    pub rnn_inputs: unsafe extern "C" fn(G, *const f32, *const i32, *const u16, i64, i64, *const f32, *const f32, i64, *mut f32) -> c_int,
     /// (proj, bias, state, latent, rank)
     pub rnn_gates: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, *mut f32, i64) -> c_int,
     /// (base, bias, fold_b, n, cap, logits, out, prob, stop, pmin)

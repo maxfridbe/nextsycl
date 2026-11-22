@@ -55,9 +55,9 @@ int ns_ink2s_swiglu_xq(ns_gpu* g, const float* gate, const float* up, void* xq, 
 int ns_ink2s_qk_norm_rope(ns_gpu* g, float* x, int64_t T, int64_t H, const float* w, float eps, float theta, int64_t p0);
 /* float32 to BF16 bits (round to nearest even) */
 int ns_ink2s_to_bf16(ns_gpu* g, const float* x, uint16_t* y, int64_t n);
-/* the Markov head's input row [state (rank) | w1[*tok] (BF16 [vocab, rank]) | hidden (C) | f_rnn (C)], BF16-rounded */
-int ns_ink2s_rnn_inputs(ns_gpu* g, const float* state, const int32_t* tok, const uint16_t* w1, int64_t rank, const float* hidden, const float* f_rnn,
-                        int64_t C, float* out);
+/* the Markov head's input row [state (rank) | w1[*tok] (BF16 [vocab, rank]; a token outside it row 0) | hidden (C) | f_rnn (C)], BF16-rounded */
+int ns_ink2s_rnn_inputs(ns_gpu* g, const float* state, const int32_t* tok, const uint16_t* w1, int64_t vocab, int64_t rank, const float* hidden,
+                        const float* f_rnn, int64_t C, float* out);
 /* its gates from the projection proj [3 rank] + bias: state [rank] updated in place, latent [rank] */
 int ns_ink2s_rnn_gates(ns_gpu* g, const float* proj, const float* bias, float* state, float* latent, int64_t rank);
 /* softcap(base + BF16(fold_b + bias)) over the first n (cap <= 0: none) into logits (nullable); its argmax into out[0],

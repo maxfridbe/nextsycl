@@ -385,7 +385,7 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   model; `llm/inkling2/src/engine/dspark.rs`, the silo's `draft.cpp`): the target's features at applications 5 / 23
   / 41 and its head's input feed each drafter layer's context k / v; a block pass of [token, MASK x n], the target's
   head, then the Markov head's RNN a position at a time with its latent folded through the head; drafts below
-  p 0.7 dropped. The chat template's messages come back as `reasoning_content` and `content`, its JSON calls as
+  p 0.8 dropped. The chat template's messages come back as `reasoning_content` and `content`, its JSON calls as
   `tool_calls` (nextsycl_tok::inkling_channels). Notes and numbers: docs/ports/inkling2.md.
 
 - **ricursive** (`llm/ricursive`) - Ricursive Ripple-65B-Preview (Apache-2.0; AtomicChat's AD-Q4_K_M, 37.7 GiB: Q4_K /

@@ -122,8 +122,8 @@ int ns_ink2s_to_bf16(ns_gpu* g, const float* x, uint16_t* y, int64_t n) {
     NS_CATCH
 }
 
-int ns_ink2s_rnn_inputs(ns_gpu* g, const float* state, const int32_t* tok, const uint16_t* w1, int64_t rank, const float* hidden, const float* f_rnn,
-                        int64_t C, float* out) {
+int ns_ink2s_rnn_inputs(ns_gpu* g, const float* state, const int32_t* tok, const uint16_t* w1, int64_t vocab, int64_t rank, const float* hidden,
+                        const float* f_rnn, int64_t C, float* out) {
     NS_TRY
     // [state | w1[token] | hidden | f_rnn], each rounded to BF16 (the reference's inputs are BF16)
     const int64_t n = 2 * rank + 2 * C;
@@ -131,7 +131,11 @@ int ns_ink2s_rnn_inputs(ns_gpu* g, const float* state, const int32_t* tok, const
         const int64_t i = id[0];
         float v;
         if (i < rank) v = state[i];
-        else if (i < 2 * rank) v = bf16f(w1[(int64_t) tok[0] * rank + (i - rank)]);
+        else if (i < 2 * rank) {
+            // a token past w1's rows (never written: a stopped block) reads row 0
+            const int64_t tk = tok[0] >= 0 && tok[0] < vocab ? tok[0] : 0;
+            v = bf16f(w1[tk * rank + (i - rank)]);
+        }
         else if (i < 2 * rank + C) v = hidden[i - 2 * rank];
         else v = f_rnn[i - 2 * rank - C];
         out[i] = rbf(v);
@@ -169,8 +173,12 @@ int ns_ink2s_bias_argmax(ns_gpu* g, const float* base, const float* bias, const 
         sycl::local_accessor<int, 1> bi(sycl::range<1>(W / SG), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             const int tid = (int) it.get_local_id(0);
-            // a block already ended (an earlier draft below p_min): nothing to do
-            if (stop && stop[0]) return;
+            // a block already ended (an earlier draft below p_min): nothing to do but leave a valid token for the next
+            // step's Markov input (it indexes w1 by it)
+            if (stop && stop[0]) {
+                if (tid == 0) out[0] = 0;
+                return;
+            }
             float best = -INFINITY, se = 0.0f;
             int at = 0x7FFFFFFF;
             for (int64_t i = tid; i < n; i += W) {

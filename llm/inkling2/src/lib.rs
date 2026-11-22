@@ -21,8 +21,8 @@ pub const ARCH: &str = "inkling2_loop";
 pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "chunk", env: "NS_INK2_CHUNK", value: "TOKENS", help: "a prompt pass's rows (default 2048 when it fits beside the weights and a session, else 1024 or 512)", at: nextsycl_llm::At::Load },
     EngineOption { name: "draft", env: "NS_INK2_DRAFT", value: "FILE", help: "the DSpark drafter's GGUF (default: the smallest dspark-*.gguf beside the model)", at: nextsycl_llm::At::Load },
-    EngineOption { name: "drafts", env: "NS_INK2_DRAFTS", value: "N", help: "tokens drafted a step (default 3; at most 7; 0: none)", at: nextsycl_llm::At::Load },
-    EngineOption { name: "draft-pmin", env: "NS_INK2_DRAFT_PMIN", value: "P", help: "drop a draft (and those after it) the drafter gives less than this probability", at: nextsycl_llm::At::Load },
+    EngineOption { name: "drafts", env: "NS_INK2_DRAFTS", value: "N", help: "tokens drafted a step (default 5; at most 7; 0: none)", at: nextsycl_llm::At::Load },
+    EngineOption { name: "draft-pmin", env: "NS_INK2_DRAFT_PMIN", value: "P", help: "drop a draft (and those after it) the drafter gives less than this probability (default 0.8)", at: nextsycl_llm::At::Load },
 ];
 
 pub fn kind() -> EngineKind {

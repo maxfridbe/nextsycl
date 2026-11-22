@@ -850,8 +850,8 @@ Muse Glimmer 30B (`llm/museglimmer`, its kernels `kernels/llm/museglimmer`).
 | `NS_INK2_PROFILE` | off | Debug: 1 times every kernel (the queue drained before and after each) and lists them after the run; gpu (with NS_PROFILE=gpu) its device time from timestamps, no drains | llm inkling2 |
 | `NS_INK2_DEQ_REF` | unset | Debug: a directory of ggml's dequantized rows (`reference/inkling2/deq-ref.cpp`, `<tensor>.f32`): `llm kernels` checks the expansions against them bit for bit | llm inkling2 |
 | `NS_INK2_DRAFT` | the smallest `dspark-*.gguf` beside the model | the DSpark drafter's GGUF (Unsloth's `dspark-Inkling-2-Mini-Q8_0.gguf`); loaded when drafts are asked for (`--no-mtp` / LoadOptions.draft off: not) | llm inkling2 |
-| `NS_INK2_DRAFTS` | 3 | tokens drafted a step (at most the drafter's block less one: 7; 0: no drafter) | llm inkling2 |
-| `NS_INK2_DRAFT_PMIN` | 0.7 | a draft (and those after it) dropped when the drafter gives it less than this probability (fewer rows to verify) | llm inkling2 |
+| `NS_INK2_DRAFTS` | 5 | tokens drafted a step (at most the drafter's block less one: 7; 0: no drafter) | llm inkling2 |
+| `NS_INK2_DRAFT_PMIN` | 0.8 | a draft (and those after it) dropped when the drafter gives it less than this probability (fewer rows to verify) | llm inkling2 |
 | `NS_INK2_EXPERT_UNION` | on | 0: a decode pass of several rows (a verify) reads an expert the rows share once a row instead of once (A/B) | llm inkling2 |
 | `NS_INK2_UNION` | off | Debug: 1 reads a pass's chosen experts back each layer application (a sync each) and reports the distinct experts a pass by its rows | llm inkling2 |
 
