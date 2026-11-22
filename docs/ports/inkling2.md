@@ -215,6 +215,47 @@ GPU sampling (`ns_ink2_sample`): the 256 likeliest are now found among the value
 - **Vision** (the mmproj ViT): TODO.md.
 - **llama.cpp on the GPU**: not built for SYCL here (its NVFP4 support there unchecked); only the CPU numbers above.
 
+## Porting it to another backend (nextcuda and the like)
+
+Everything above the kernels is backend-neutral and can be copied or read as the spec; only the kernels are SYCL.
+
+**Reuse as is (Rust, no SYCL):**
+- `crates/gguf` - the NVFP4 type (ggml code 40, blocks of 64 values in 36 bytes: four UE4M3 scales, then 32 bytes
+  of E2M1 codes; see "The model" for the nibble order and ggml's halved scales).
+- `crates/tok` - `inkling_chat` (the template, the effort's system message, tool calls) and `inkling_channels` (raw
+  text to reasoning / content / tool calls); `<|message_user|>` goes in the prompt cache's user-turn markers.
+- `glue/serve/src/serve.rs` - the `ink` channel detection (how a reply is split into `reasoning_content`, `content`
+  and `tool_calls`).
+- `model-cards/llm/inkling-2-mini-q4kxl.yml` / `-q8kxl.yml` - the files (Mainline_Support, pinned revision), the
+  drafter key, the measured VRAM.
+
+**Read as the spec:**
+- `llm/inkling2/src/engine.rs` - the whole forward pass in order: the loop's slot numbering (0-23, 24-35, 36-47),
+  where the stream restarts, the depth mixes, the controllers, the router, the coda and the head. Every kernel call is
+  one step, so it is the checklist for a new backend.
+- `llm/inkling2/src/engine/dspark.rs` - the drafter: the four kept features, the non-causal draft pass, the Markov
+  RNN, the head bias folded at load, and the p_min gate.
+- `kernels/llm/inkling2/ink.cpp` - plain float32 kernels for every op (the slow path, but the semantics to match).
+
+**Rewrite for the backend:** the silo (`mv.cpp` repacked NVFP4 / Q8_0 products, `fmv.cpp`, `dec.cpp` fused decode
+steps, `attn.cpp` / `pattn.cpp` decode and prompt attention, `draft.cpp`). NVFP4 is the checkpoint's native expert
+format. On a GPU with FP4 tensor cores, the expert products can run on them directly; elsewhere, decode the codes in
+registers. Read "Where a token's time goes": experts plus dense products are ~2/3 of a token.
+
+**Order that worked here:**
+1. Load the Mainline_Support file and check every expansion bit for bit against ggml (`reference/inkling2/deq-ref.cpp`).
+2. Run one prompt through float32 kernels and compare each layer's output with llama.cpp
+   (`reference/inkling2/ink-dump.cpp` dumps the named tensors; `gguf_np.py` reads them). Expect the long-prompt drift
+   described in "Parity". It is the model's sensitivity, so judge by the next token and greedy runs, not by a cosine
+   alone.
+3. Then the fast products and fused steps, each scored against the float32 path, on **each quant** (Q8_K_XL keeps
+   the controllers in BF16).
+4. Then the drafter. A verify must keep greedy text identical to plain text.
+
+**Gotchas:** layer 0 pushes no stream (`l > cs`); 48 applications a token means 48 KV / convolution-state slots, not
+24; the logits are soft-capped at 30, and the padded vocabulary (201,024) is cut to 200,058; the full layers' q and r
+scale with position (the log term); an arena that spills must refuse, not free buffers the queue still reads.
+
 ## Lessons
 
 - An arena that spills into owned buffers frees them while the queue still reads them: a GPU page fault on the
