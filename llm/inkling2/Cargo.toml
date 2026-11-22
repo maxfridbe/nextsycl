@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-llm-inkling2"
+description = "Inkling-2-Mini (inkling2_loop): a looped MoE with depth attention, relative-bias attention with sinks, short convolutions and NVFP4 experts - its model description and its engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-llm.workspace = true
+nextsycl-tok.workspace = true

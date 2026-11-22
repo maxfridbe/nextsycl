@@ -21,6 +21,7 @@ nextsycl-llm-qwen35.workspace = true
 nextsycl-llm-nemotronh.workspace = true
 nextsycl-llm-ricursive.workspace = true
 nextsycl-llm-museglimmer.workspace = true
+nextsycl-llm-inkling2.workspace = true
 nextsycl-tok.workspace = true
 nextsycl-llm-example.workspace = true
 nextsycl-image.workspace = true

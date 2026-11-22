@@ -70,6 +70,9 @@ pub enum GType {
     TQ1_0,
     TQ2_0,
     MXFP4,
+    /// NVFP4 (code 40; Inkling-2-Mini's experts): blocks of 64 - four UE4M3 scales (one a 16 values), then 32 bytes of
+    /// E2M1 codes
+    NVFP4,
     /// OCP MXFP8 (code 43; Unsloth's DeepSeek-V4.1 Engram table): blocks of 32 - an E8M0 scale byte, then 32 E4M3 codes
     MXFP8,
     /// GSQ-RCO's 2-bit type (Qwen3.8-Flash-Next's files): 64 values, an f16 scale and 2-bit codes
@@ -121,6 +124,7 @@ impl GType {
             34 => TQ1_0,
             35 => TQ2_0,
             39 => MXFP4,
+            40 => NVFP4,
             43 => MXFP8,
             42 => Q2_0,
             44 => Fp8B32,
@@ -165,6 +169,7 @@ impl GType {
             TQ1_0 => 34,
             TQ2_0 => 35,
             MXFP4 => 39,
+            NVFP4 => 40,
             MXFP8 => 43,
             Q2_0 | VqBlob => 42,
             Fp8B32 => 44,
@@ -188,6 +193,7 @@ impl GType {
             Q8_1 => (32, 36),
             IQ4NL => (32, 18),
             MXFP4 => (32, 17),
+            NVFP4 => (64, 36),
             MXFP8 => (32, 33),
             Q2_0 => (64, 18),
             Ptq1_0 => (128, 28),
@@ -259,6 +265,7 @@ impl GType {
             TQ1_0 => "TQ1_0",
             TQ2_0 => "TQ2_0",
             MXFP4 => "MXFP4",
+            NVFP4 => "NVFP4",
             MXFP8 => "MXFP8",
             Q2_0 => "Q2_0",
             VqBlob => "VQ_BLOB",

@@ -171,7 +171,7 @@ fn gib(b: u64) -> f64 {
 
 /// The llm engines this program has, one a model architecture (llm/<arch>)
 pub(crate) fn engines() -> Vec<EngineKind> {
-    vec![nextsycl_llm_glm5next::kind(), nextsycl_llm_qwen4exp::kind(), nextsycl_llm_qwen35::kind(), nextsycl_llm_deepseek2::kind(), nextsycl_llm_deepseek4::kind(), nextsycl_llm_deepseek41::kind(), nextsycl_llm_museglimmer::kind(), nextsycl_llm_nemotronh::kind(), nextsycl_llm_minimaxm3::kind(), nextsycl_llm_ricursive::kind(), nextsycl_llm_example::kind()]
+    vec![nextsycl_llm_glm5next::kind(), nextsycl_llm_qwen4exp::kind(), nextsycl_llm_qwen35::kind(), nextsycl_llm_deepseek2::kind(), nextsycl_llm_deepseek4::kind(), nextsycl_llm_deepseek41::kind(), nextsycl_llm_museglimmer::kind(), nextsycl_llm_inkling2::kind(), nextsycl_llm_nemotronh::kind(), nextsycl_llm_minimaxm3::kind(), nextsycl_llm_ricursive::kind(), nextsycl_llm_example::kind()]
 }
 
 /// The engine for `f`'s architecture, loaded on `gpus`
@@ -703,12 +703,14 @@ fn generate(args: &[String]) -> Result<(), String> {
     print!("<think>");
     let t1 = std::time::Instant::now();
     let mut n = 0;
+    let mut gen: Vec<u32> = Vec::new();
     'gen: while n < max {
         for next in eng.step(&mut sess, &mut dec, &mut draw, &mut none).map_err(e)? {
             if (!ignore_eos && tok.stop.contains(&next)) || n >= max {
                 break 'gen;
             }
             n += 1;
+            gen.push(next);
             pending.extend(tok.decode_bytes(&[next]));
             // print what is valid UTF-8 so far; keep a cut character for the next token
             let valid = match std::str::from_utf8(&pending) {
@@ -721,6 +723,10 @@ fn generate(args: &[String]) -> Result<(), String> {
         }
     }
     println!("{}", String::from_utf8_lossy(&pending));
+    // --gen-out PATH: the generated ids, one a line (a token-by-token comparison with another run)
+    if let Some(p) = opt("--gen-out") {
+        std::fs::write(&p, gen.iter().map(|t| format!("{t}\n")).collect::<String>()).map_err(|x| format!("{p}: {x}"))?;
+    }
     let dt = t1.elapsed().as_secs_f64();
     for line in eng.report(n) {
         eprintln!("{line}");

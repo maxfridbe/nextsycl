@@ -236,7 +236,8 @@ impl Tokenizer {
             "dbrx" => (DBRX_SPLIT, &[]),
             // llama.cpp's QWEN2: the contractions either case, letters, single digits
             "qwen2" => (QWEN2_SPLIT, &[]),
-            "gpt-4o" | "llama4" => (GPT4O_SPLIT, &[]),
+            // Inkling 2's is GPT-4o's (llama.cpp: LLAMA_VOCAB_PRE_TYPE_GPT4O)
+            "gpt-4o" | "llama4" | "inkling2" => (GPT4O_SPLIT, &[]),
             "minimax-m2" => (MINIMAX2_SPLIT, &[]),
             // Nemotron 3.5's
             "tekken" => (TEKKEN_SPLIT, &[]),
@@ -524,9 +525,9 @@ impl Effort {
 /// Where a user turn begins in each chat template's prompt (GLM; DeepSeek R1 and V4; ChatML: Qwen, Nemotron; Muse):
 /// the server checkpoints a prompt there, since a template rewrites what follows the last user turn's start for the
 /// next turn (CONTRIBUTING.md rule 1). A template whose user turns begin otherwise adds its marker here.
-pub const USER_TURNS: &[&str] = &["<|user|>", "<\u{ff5c}User\u{ff5c}>", "<|im_start|>user", "<|start|>user", "]~b]user"];
+pub const USER_TURNS: &[&str] = &["<|user|>", "<\u{ff5c}User\u{ff5c}>", "<|im_start|>user", "<|start|>user", "]~b]user", "<|message_user|>"];
 /// The same for the assistant's turns (where the reply a prompt asks for begins)
-pub const ASSISTANT_TURNS: &[&str] = &["<|assistant|>", "<\u{ff5c}Assistant\u{ff5c}>", "<|im_start|>assistant", "<|start|>assistant", "]~b]ai"];
+pub const ASSISTANT_TURNS: &[&str] = &["<|assistant|>", "<\u{ff5c}Assistant\u{ff5c}>", "<|im_start|>assistant", "<|start|>assistant", "]~b]ai", "<|message_model|>"];
 
 /// One message of a conversation.
 #[derive(Default)]
@@ -960,6 +961,201 @@ pub fn muse_channels(raw: &str) -> (String, String, bool) {
     }
     let r = body[..keep].strip_suffix("<|eom|>").unwrap_or(&body[..keep]);
     (r.to_string(), String::new(), false)
+}
+
+/// Inkling 2's chat template (the file's `tokenizer.chat_template`): with tools a system message declaring them (each
+/// function's description, name, parameters and type, keys sorted, as compact JSON), the thinking effort as a system
+/// message before the first message that is not one (low 0.2, medium 0.7, high 0.9 - the template's default -, max
+/// 0.99), then the messages as `<|message_ROLE|><|content_text|>...<|end_message|>` - an assistant turn's kept thinking as
+/// `<|content_thinking|>`, its calls as `<|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}`, the
+/// turn closed by `<|content_model_end_sampling|>`; a tool message is headed by its call's name. The template adds no
+/// generation prompt: the model opens its turn itself (`inkling_channels` reads what it writes).
+pub fn inkling_chat(messages: &[Message], effort: Effort, tools: &[String]) -> String {
+    let level = match effort {
+        Effort::Low => "0.2",
+        Effort::Medium => "0.7",
+        Effort::High => "0.9",
+        Effort::Max => "0.99",
+    };
+    let effort_msg = format!("<|message_system|><|content_text|>Thinking effort level: {level}<|end_message|>");
+    let mut s = String::new();
+    if !tools.is_empty() {
+        let specs: Vec<serde_json::Value> = tools.iter().filter_map(|t| serde_json::from_str::<serde_json::Value>(t).ok()).map(|t| {
+            let f = if t.get("function").is_some() { t["function"].clone() } else { t.clone() };
+            let desc = f.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
+            let params = match f.get("parameters") {
+                Some(p) if !p.is_null() && p.as_object().is_none_or(|o| !o.is_empty()) => p.clone(),
+                _ => serde_json::json!({}),
+            };
+            let ty = t.get("type").and_then(|v| v.as_str()).filter(|v| !v.is_empty()).unwrap_or("function").to_string();
+            serde_json::json!({"description": desc, "name": f.get("name").cloned().unwrap_or(serde_json::Value::Null), "parameters": params, "type": ty})
+        }).collect();
+        s += "<|message_system|>tool_declare<|content_xml|>";
+        s += &sorted_json(&serde_json::Value::Array(specs));
+        s += "<|end_message|>";
+    }
+    let mut effort_done = false;
+    // the names of the last assistant turn's calls, for the tool messages after it
+    let mut called: Vec<String> = Vec::new();
+    let mut answered = 0usize;
+    for m in messages {
+        let role = match m.role {
+            "user" => "<|message_user|>",
+            "assistant" => "<|message_model|>",
+            "system" => "<|message_system|>",
+            "tool" => "<|message_tool|>",
+            _ => continue,
+        };
+        if !effort_done && m.role != "system" {
+            s += &effort_msg;
+            effort_done = true;
+        }
+        let mut head = role.to_string();
+        if m.role == "tool" {
+            if let Some(n) = called.get(answered) {
+                head += n;
+            }
+            answered += 1;
+        }
+        if m.role == "assistant" {
+            if let Some(r) = m.reasoning.filter(|r| !r.is_empty()) {
+                s += &head;
+                s += "<|content_thinking|>";
+                s += r;
+                s += "<|end_message|>";
+            }
+        }
+        let has_more = m.role == "assistant" && (!m.calls.is_empty() || m.reasoning.is_some_and(|r| !r.is_empty()));
+        if !m.content.is_empty() || !has_more {
+            s += &head;
+            s += "<|content_text|>";
+            s += m.content;
+            s += "<|end_message|>";
+        }
+        if m.role == "assistant" {
+            for c in m.calls {
+                s += "<|message_model|>";
+                s += &c.name;
+                s += "<|content_invoke_tool_json|>";
+                s += "{\"name\":";
+                s += &serde_json::Value::String(c.name.clone()).to_string();
+                s += ",\"args\":{";
+                let mut args: Vec<&(String, String)> = c.args.iter().collect();
+                args.sort_by(|a, b| a.0.cmp(&b.0));
+                for (i, (k, v)) in args.iter().enumerate() {
+                    if i > 0 {
+                        s += ",";
+                    }
+                    s += &serde_json::Value::String(k.clone()).to_string();
+                    s += ":";
+                    // a value as JSON (a string argument as a JSON string)
+                    s += &match serde_json::from_str::<serde_json::Value>(v) {
+                        Ok(j) if !j.is_string() => sorted_json(&j),
+                        _ => serde_json::Value::String(v.clone()).to_string(),
+                    };
+                }
+                s += "}}<|end_message|>";
+            }
+            s += "<|content_model_end_sampling|>";
+            called = m.calls.iter().map(|c| c.name.clone()).collect();
+            answered = 0;
+        }
+    }
+    if !effort_done {
+        s += &effort_msg;
+    }
+    s
+}
+
+/// JSON with every object's keys sorted, compact (Jinja's `tojson(sort_keys=true, separators=(",", ":"))`)
+fn sorted_json(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(o) => {
+            let mut keys: Vec<&String> = o.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys.iter().map(|k| format!("{}:{}", serde_json::Value::String((*k).clone()), sorted_json(&o[*k]))).collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        serde_json::Value::Array(a) => format!("[{}]", a.iter().map(sorted_json).collect::<Vec<_>>().join(",")),
+        _ => v.to_string(),
+    }
+}
+
+/// Inkling 2's answer as it streams: its messages (`<|message_model|>[NAME]<|content_KIND|>...<|end_message|>`) read
+/// as thinking (`<|content_thinking|>`), answer (`<|content_text|>`) and tool calls (`<|content_invoke_tool_json|>`,
+/// written into the answer as `<tool_call>{"name": .., "arguments": {..}}</tool_call>` once complete); and whether the
+/// answer has begun. A tail that could be the start of a marker is held back.
+pub fn inkling_channels(raw: &str) -> (String, String, bool) {
+    const MARKS: [&str; 6] = ["<|message_model|>", "<|content_thinking|>", "<|content_text|>", "<|content_invoke_tool_json|>", "<|end_message|>",
+                              "<|content_model_end_sampling|>"];
+    #[derive(PartialEq)]
+    enum K {
+        Start,
+        Head,
+        Think,
+        Text,
+        Tool,
+    }
+    let (mut reasoning, mut content, mut answering) = (String::new(), String::new(), false);
+    let mut kind = K::Start;
+    let mut tool = String::new();
+    let mut rest = raw;
+    loop {
+        let next = MARKS.iter().filter_map(|m| rest.find(m).map(|i| (i, *m))).min_by_key(|x| x.0);
+        let (body, mark) = match next {
+            Some((i, m)) => (&rest[..i], Some(m)),
+            None => {
+                // hold back a tail that may begin a marker
+                let mut keep = rest.len();
+                for m in MARKS {
+                    for k in (1..m.len()).rev() {
+                        if rest.ends_with(&m[..k]) {
+                            keep = keep.min(rest.len() - k);
+                            break;
+                        }
+                    }
+                }
+                (&rest[..keep], None)
+            }
+        };
+        match kind {
+            K::Think => reasoning.push_str(body),
+            K::Text | K::Start => {
+                content.push_str(body);
+                if !body.trim().is_empty() {
+                    answering = true;
+                }
+            }
+            K::Tool => tool.push_str(body),
+            K::Head => {}
+        }
+        let Some(m) = mark else { break };
+        rest = &rest[body.len() + m.len()..];
+        match m {
+            "<|message_model|>" => kind = K::Head,
+            "<|content_thinking|>" => kind = K::Think,
+            "<|content_text|>" => {
+                kind = K::Text;
+                answering = true;
+            }
+            "<|content_invoke_tool_json|>" => {
+                kind = K::Tool;
+                answering = true;
+            }
+            _ => {
+                if kind == K::Tool {
+                    let call = match serde_json::from_str::<serde_json::Value>(tool.trim()) {
+                        Ok(v) => serde_json::json!({"name": v["name"], "arguments": v.get("args").cloned().unwrap_or_else(|| serde_json::json!({}))}).to_string(),
+                        Err(_) => tool.trim().to_string(),
+                    };
+                    content += &format!("<tool_call>{call}</tool_call>");
+                    tool.clear();
+                }
+                kind = K::Head;
+            }
+        }
+    }
+    (reasoning, content, answering)
 }
 
 /// Qwen3.8-Flash-Next's chat template (ChatML): an optional system turn, the turns (an assistant turn without its old
@@ -1491,6 +1687,24 @@ mod hf_json_tests {
         let text = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n<|im_start|>user\nA red fox sitting in fresh snow, morning light, photograph<|im_end|>\n<|im_start|>assistant\n";
         assert_eq!(t.encode(text), want);
     }
+    #[test]
+    fn inkling_template_and_channels() {
+        let m = |role, content| crate::Message { role, content, ..Default::default() };
+        let p = crate::inkling_chat(&[m("system", "Be brief."), m("user", "Hi")], crate::Effort::High, &[]);
+        assert_eq!(p, "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>\
+                       <|message_user|><|content_text|>Hi<|end_message|>");
+        let raw = "<|message_model|><|content_thinking|>Greet.<|end_message|><|message_model|><|content_text|>Hello!<|end_message|>";
+        assert_eq!(crate::inkling_channels(raw), ("Greet.".into(), "Hello!".into(), true));
+        assert_eq!(crate::inkling_channels("<|message_model|><|content_thinking|>Gre"), ("Gre".into(), String::new(), false));
+        assert_eq!(crate::inkling_channels("<|message_model|><|content_thinking|>Greet.<|end_mes"), ("Greet.".into(), String::new(), false));
+        let call = "<|message_model|>weather<|content_invoke_tool_json|>{\"name\":\"weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>";
+        let (_, c, _) = crate::inkling_channels(call);
+        assert_eq!(crate::tool_calls(&c).1, vec![crate::ToolCall { name: "weather".into(), args: vec![("city".into(), "Paris".into())] }]);
+        let tool = r#"{"type": "function", "function": {"name": "weather", "description": "Now.", "parameters": {"type": "object"}}}"#.to_string();
+        let p = crate::inkling_chat(&[m("user", "Hi")], crate::Effort::Low, &[tool]);
+        assert!(p.starts_with("<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Now.\",\"name\":\"weather\",\"parameters\":{\"type\":\"object\"},\"type\":\"function\"}]<|end_message|>"));
+    }
+
     #[test]
     fn muse_channels_split() {
         let raw = " to=self<|message|>We need Paris.<|eom|><|start|>assistant to=user<|message|>Paris";
