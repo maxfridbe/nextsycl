@@ -124,6 +124,63 @@ Tried and dropped: the router's choice made inside the experts' gate | up launch
 gate | up 3.6 -> 4.8 ms for 0.6 saved); loading an NVFP4 line's raw bytes before the row loop (3.6 -> 4.0 ms); a
 512-wide depth mix (no change).
 
+## Round 2: decode toward the bound, and the drafter
+
+**Where a token's time goes** (B70, UD-Q4_K_XL, `NS_INK2_PROFILE=gpu NS_PROFILE=gpu`, 256 tokens; device ms a token).
+The device time adds up to the wall time (17.3 ms against 1 / 58.0 tok/s): the host stays ahead and the launches run
+back to back, so SYCL graphs or fewer launches alone buy nothing here (the kernels' own time is the cost).
+
+| kernel | before | after | what changed |
+|---|---|---|---|
+| experts gate / up | 3.66 | 3.69 | (unchanged; a two-way split of the lines was slower: 4.9 on the B65) |
+| experts down | 1.80 | 1.82 | |
+| dense products (q k v r gate in one launch / the rest) | 2.14 + 1.84 | 2.22 + 1.86 | |
+| depth mixes (117 a token) | 1.83 | 1.18 | templated on its states and queries, 576 threads |
+| decode attention | 1.39 | 0.99 | a lane a key, the split's softmax at once (no reduction a key) |
+| router product + choice | 0.44 + 0.65 | ~0.6 | rows in quarters; the K largest by a parallel rank (B65: 1.27 -> 0.86) |
+| controllers (down, apply, norms) | 0.94 + 0.63 + 0.61 | 0.44 + 0.40 + 0.43 | three controllers a launch each |
+| post-projection step | 0.84 | 0.84 | (the sink and tap projections folded in) |
+| B70 tg, short chat | 58.0 | 64.2 | |
+
+B65 the same way: tg 52.4 -> 59.4. The bound is unchanged (4.0 GB a token, 7.3 ms on the B70): tg 64 is ~47% of it.
+The rest is in the expert products (~330 GB/s of the ~550 the dense ones reach): with the NVFP4 decoding table
+removed (a wrong-answer experiment) they stream at 465 GB/s, so the code decode costs ~30%; the rest is latency.
+
+**The DSpark drafter** (`dspark-Inkling-2-Mini-Q8_0.gguf` beside the model, 470 MB with the fold). Reference: SGLang's
+`models/inkling2_mtp.py`, `dspark.py`, `dflash.py`, `kernels/ops/speculative/inkling2_mtp.py` (llama.cpp's mainline
+and Unsloth's fork b12588 have DSpark, but neither captures Inkling's looped features); the original repository
+ships only the weights. The target keeps four BF16-rounded features a position (the stream going into applications 5,
+23, 41 and the head's normed input); each drafter layer's context is their softmax(`dspark_fuse`) mix normed, its k
+(normed, NEOX at theta 1e6) and v cached; a draft is one non-causal pass of [last token, MASK x n] (layers 0 and 2
+over a 1,024 window), the drafter's norm, the target's head; the Markov head's RNN then runs a position at a time
+(state, w1[previous token], hidden row, f_rnn) and its latent goes through `dspark_hidden_out` folded into the head at
+load (vocab x 256 BF16) as a bias; drafts are the argmaxes of softcap(base + bias). A draft the drafter gives less
+than `NS_INK2_DRAFT_PMIN` (default 0.7) ends the block. Verify passes keep the engine's identity: greedy text drafted
+= plain (short / medium / long the same tokens), sampled text drafted = plain (the same seed, the same 200 tokens),
+spec-check 0.
+
+What a verify costs (B70, `--score` passes of the model's own text): 1 row 16.4 ms, 2 rows 21.3, 3 rows 24.9, 4 rows
+28.4, 5 rows 32.2, 8 rows 42.0 - ~4 ms a row. The experts the rows choose (`NS_INK2_UNION=1`, distinct experts a
+layer application; prose and code alike): 8.0 / 12.6 / 16.2 / 19.2 / 22.0 / 28.5 for 1 / 2 / 3 / 4 / 5 / 8 rows. A
+verify reads each distinct expert once for all its rows (`moe_union`, `moe_gu_union`, `moe_down_union`; bit for bit
+the per-pair kernels' sums) - little faster in practice (the pairs of a shared expert already met in L2).
+
+tg on the B65 (400 tokens, the chat template; `drafts` 3 and p_min 0.7 the defaults):
+
+| text | temperature | plain | 2 drafts | 3 drafts | 5 drafts | 3 drafts, no p_min |
+|---|---|---|---|---|---|---|
+| prose | 0 | 58.5 | 60.1 | 59.6 | 57.7 | 49.8 |
+| code | 0 | 58.7 | 78.0 | 80.1 | 80.8 | 76.0 |
+| prose | 1.0 | 55.8 | 56.8 | 56.6 | 55.0 | 45.9 |
+| code | 1.0 | 55.6 | 77.7 | 83.8 | 85.7 | 79.6 |
+
+UD-Q8_K_XL on the B65: plain 46.8 / 45.4 (prose, greedy / 1.0), drafted 49.3 / 45.9; code 46.8 -> 65.4 greedy, 44.9 ->
+68.9 at 1.0; pp 725 / 1,374 at 512 / 4K. Acceptance at temperature 1.0 with the defaults: code 90%, prose 65% of
+the drafts verified (the gate verifies about half as many prose drafts).
+
+GPU sampling (`ns_ink2_sample`): the 256 likeliest are now found among the values within 1 .. 64 of the largest
+(6 scans of the vocabulary, not 34); the same draws (a 200-token sampled run identical before and after).
+
 ## Quantization choice
 
 - **UD-Q4_K_XL** (17.6 GB, the fast card): the experts in their native NVFP4 (the checkpoint's own format: no loss),
@@ -140,9 +197,9 @@ gate | up 3.6 -> 4.8 ms for 0.6 saved); loading an NVFP4 line's raw bytes before
 
 ## Not done
 
-- **DSpark drafter** (`dspark-Inkling-2-Mini-Q8_0.gguf`, 402 MB, beside the model): not ported - mainline llama.cpp
-  does not run it, so there is no reference but SGLang's code; and for this MoE a k-row verify reads up to 8k experts
-  a layer application (deepseek41's DSpark lost: tg 5.5 against 10). The 2-row verify already passes spec-check. TODO.md.
+- **The drafter against a reference**: no runnable reference produces its tokens for this model (see round 2); its
+  acceptance (90% of code drafts at temperature 1.0) is the check. The checkpoint's drafter state is saved and
+  restored with the session's.
 - **Vision** (the mmproj ViT): TODO.md.
 - **llama.cpp on the GPU**: not built for SYCL here (its NVFP4 support there unchecked); only the CPU numbers above.
 

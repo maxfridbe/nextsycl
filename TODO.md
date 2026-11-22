@@ -12,19 +12,15 @@ Engine `llm/inkling2` (`inkling2_loop`), cards `inkling-2-mini-q4kxl` / `-q8kxl`
   tokens (2,410), spec-check 0; NVFP4 / Q8_0 / BF16 decoding bit for bit ggml's
 - [x] Silo: repacked products, fused decode steps, XMX prompt attention
 - [ ] Register `inkling-2-mini-q4kxl` (and `-q8kxl`) in production (the user's call)
-- [ ] The DSpark drafter (`dspark-Inkling-2-Mini-Q8_0.gguf`, arch `dflash`): a 3-layer block drafter fed the target's
-  hidden states at applications 5 / 23 / 41 / 48, mixed a layer by `dspark_fuse` (softmax) into its context k / v
-  (`attn_{k,v}_ctx`, `attn_k_ctx_norm`, NEOX RoPE 1e6, windows on layers 0 and 2), a block of [last token, mask x 7]
-  non-causal, the target's embedding and head (soft cap 30), plus a Markov head (an RNN over the block's positions:
-  `markov_w1` [vocab, 256] by the previous token, `joint_proj` [5120 -> 768] gates, `dspark_hidden_out` folded through
-  the head) - reference SGLang's `models/inkling2_mtp.py`, `dspark.py`, `dflash.py`, `kernels/ops/speculative/
-  inkling2_mtp.py` (mainline llama.cpp does not run it; Unsloth's fork b12588 carries it in its binaries only). For
-  an MoE a k-row verify reads up to 8k experts a layer: deepseek41's DSpark lost (tg 5.5 against 10); measure the
-  2-row verify's cost first (spec-check passes already) before porting it.
+- [x] The DSpark drafter (2026-11-22, round 2): features at applications 5 / 23 / 41 + the head's input, the
+  Markov head folded through the head, drafts gated at p 0.7; B65 temperature 1.0: code 55.6 -> 83.8, prose 55.8 ->
+  56.6; drafted text = plain text (greedy and sampled)
+- [ ] The drafter's cost: its base logits read the whole head (0.49 GB) a draft; a smaller copy of the head for
+  drafting only (drafts need not be exact) would cut ~0.7 ms a step
 - [ ] Vision: the 23-layer ViT (`mmproj-*.gguf`, patch 20, merge 2) through `image_tokens`, parity against llama.cpp
   mtmd (`reference/llama-dump/ns-mtmd-dump.cpp`), as deepseek41's sidecar
-- [ ] Decode toward the bound (~7.3 ms a token on the B70 at 548 GB/s: 4.0 GB read a token): the experts' products
-  (~330 GB/s), the depth mix (one work-group a row: ~17 us a call, 117 calls a token), the remaining small launches
+- [ ] Decode toward the bound (B70 tg 64 of ~137): the experts' NVFP4 products (~330 GB/s; the code table alone costs
+  ~30%: 465 GB/s without it), the dense products at ~460 GB/s, the post-projection step (0.84 ms)
 - [ ] Prompt: the experts expanded to half one at a time (an XMX int8 grouped GEMM on the repacked blocks instead)
 
 ## Review another DeepSeek engine: Promethevs (2026-11-02)

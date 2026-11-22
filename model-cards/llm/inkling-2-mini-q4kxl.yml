@@ -9,7 +9,7 @@ license_note: 'Thinking Machines'' Inkling 2 Mini (Apache-2.0); Unsloth''s GGUF 
 title: Inkling-2-Mini UD-Q4_K_XL (native NVFP4 experts; one card, 256K + 32K)
 about: 'Thinking Machines'' Inkling 2 Mini (2026-11-20): a looped MoE of 26.2B (3.4B active) - 24 layers of 2,304, the middle twelve run three times (48 applications a token), 128 experts (8 a token, SiTU), attention with a relative-position bias and per-row sinks (20 layers over a 1,024 window, 4 full), short convolutions, attention over the depth; it thinks in its own message before the answer (reasoning effort low / medium / high / max). Its experts in their native NVFP4 (lossless against the checkpoint), the rest Q8_0: Unsloth''s KLD against UD-Q8_K_XL 0.0107, the same top token 98.0%. Text only here (the vision tower is not ported). 17.6 GB.'
 gpus: '0|1'                     # one of the cards, the B70 preferred: the whole model on whichever has the room
-vram_gib: 27.5                  # measured on the B70 (docs/ports/inkling2.md): 18.7 GiB at 32K, 25.7 at 256K (32 KiB a token), + the 32K session
+vram_gib: 29.0                  # measured on the B70 (docs/ports/inkling2.md): 18.7 GiB at 32K, 25.7 at 256K (32 KiB a token), with the drafter 27.4 at 256K (B65), + the 32K session
 ctx: '262144,32768'
 tools: true
 tasks: true
@@ -24,4 +24,10 @@ files:
     size: 17629760736
     sha256: e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3
     path: inkling-2-mini/Inkling-2-Mini-UD-Q4_K_XL.gguf
+  draft:                # the DSpark drafter (found beside the model): up to 3 drafts a step (p 0.7 gate), verified exactly
+    key: ink2-mini-dspark-q8
+    url: https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/45fd08764f2b0bf16b03a5483a80e5c7aaec8772/dspark-Inkling-2-Mini-Q8_0.gguf
+    size: 402278560
+    sha256: 2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773
+    path: inkling-2-mini/dspark-Inkling-2-Mini-Q8_0.gguf
 guide: guides/inkling2.md
