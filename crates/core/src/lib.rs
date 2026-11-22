@@ -170,8 +170,10 @@ pub fn variant_settings(archs: &[&str], gpus: &[usize], declared: &[EngineOption
     if API.get().is_none() {
         return Ok(None);
     }
+    let a = api()?;
     for arch in archs {
-        if base_silo(arch)?.is_none() {
+        // an architecture's other names have no silo file: never asked to open one (NS_SILO_REQUIRED would refuse it)
+        if !a.silo_dir().join(format!("libnextsycl-{}.so", a.silo_name(arch))).exists() || base_silo(arch)?.is_none() {
             continue;
         }
         let Some((v, _)) = chosen_variant(arch, gpus)? else { return Ok(None) };
