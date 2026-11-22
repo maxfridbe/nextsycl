@@ -82,7 +82,7 @@ for eng in $(printf '%s\n' "${!want[@]}" | sort); do
     # a variant's change: only the cards it matches (what the program says each GPU takes)
     if [[ "${want[$eng]}" == variant:* ]]; then
       arch=${want[$eng]#variant:}
-      took=$(on "podman run --rm --security-opt label=disable --device /dev/dri -v \$PWD:/src -w /src $image bash -c 'source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; dist/nextsycl silo $arch'" | sed -n "s/^silo $arch GPU $card: \([^ ]*\).*/\1/p")
+      took=$(on "podman run --rm --security-opt label=disable --device /dev/dri -e ONEAPI_DEVICE_SELECTOR=level_zero:\* -v \$PWD:/src -w /src $image bash -c 'source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; dist/nextsycl silo $arch'" | sed -n "s/^silo $arch GPU $card: \([^ ]*\).*/\1/p")
       if [ "$took" = default ] || [ -z "$took" ]; then rows+=("| $eng | $card | its variant does not match this card | - | - | skip |"); continue; fi
     fi
     run="mkdir -p gate-out; . $LOCK; GPU_LOCK_OWNER=gate gpu_lock $card 1800 $((lim * 2 + 600)) || exit 1
