@@ -758,6 +758,18 @@ already wrote comes out near-certain because the model copies it, not because it
 
 - [ ] IQ3 variants of GLM (NOTES.md)
 
+- [ ] Maybe (2026-11-22, the user: on hold): **embed the silos and their variants in the binary.** It is a
+  convenience for people who install a single file. It changes nothing for a contributor who writes code (they
+  build anyway), so it is not needed for the variant workflow. Today 38 files, 170 MB in `dist/silo/` (about 14 MB
+  compressed, against a 698 MB binary).
+  - Build: `build.sh` packs each `libnextsycl-<arch>[@<variant>].so` plus its `variant.yml` into a compressed archive
+    inside the binary, with an index (arch, variant, match, settings). This is the same mechanism that already embeds
+    the kind libraries and the wfe pages.
+  - Load: choosing a variant reads only the index. Only the silo an engine actually loads, plus its matching variant,
+    is unpacked into a memfd and dlopened (`crates/sys` already does this for the kind libraries).
+  - Override: files in `dist/silo/` beside the binary win over the embedded ones (`NS_SILO_FROM_DISK=1` forces disk),
+    so a new variant can be tried without a rebuild.
+
 - ACE-Step base checkpoint (acestep-1.5-base: lego, base text-to-music) makes noise on SYCL; turbo is fine (2026-10-24).
   - Symptom: 50 steps, any guidance (1, 3, 7): rms 0.6 (turbo 0.13), Whisper hears no speech. Lego is the base model with a source, so it fails too.
   - Ruled out: guidance / the null pass (cfg 1 is noise too); the latents' scale (final rms 1.055 base vs 1.031 turbo, velocities 1.1-1.6 throughout); the planner
