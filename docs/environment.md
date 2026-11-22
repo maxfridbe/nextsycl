@@ -846,7 +846,7 @@ Muse Glimmer 30B (`llm/museglimmer`, its kernels `kernels/llm/museglimmer`).
 | `NS_MG_PROFILE` | off | Debug: 1 times every kernel (the queue drained before and after each) and lists them after the run | llm museglimmer |
 | `NS_INK2_CHUNK` | 2048 rows when they fit beside the weights and a session, else 1024 or 512 | a prompt pass's rows (more than 16) (--opt-chunk) | llm inkling2 |
 | `NS_INK2_FUSED` | on (with the silo) | Experiment: 0 runs decode rows through the silo's products only, each small step its own launch as for a prompt (A/B of the fused decode steps) | llm inkling2 |
-| `NS_INK2_PROFILE` | off | Debug: 1 times every kernel (the queue drained before and after each) and lists them after the run | llm inkling2 |
+| `NS_INK2_PROFILE` | off | Debug: 1 times every kernel (the queue drained before and after each) and lists them after the run; gpu (with NS_PROFILE=gpu) its device time from timestamps, no drains | llm inkling2 |
 | `NS_INK2_DEQ_REF` | unset | Debug: a directory of ggml's dequantized rows (`reference/inkling2/deq-ref.cpp`, `<tensor>.f32`): `llm kernels` checks the expansions against them bit for bit | llm inkling2 |
 
 ### ricursive

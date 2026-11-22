@@ -42,7 +42,7 @@ int ns_ink2s_attn_part(ns_gpu* g, const float* qp, const void* kcv, const void* 
         sycl::local_accessor<half, 1> vs(sycl::range<1>((size_t) KB * D), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * Hkv * ns) * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             auto sg = it.get_sub_group();
-            const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id(), tid = (int) it.get_local_id(0);
+            const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
             int64_t gi = it.get_group(0);
             const int64_t sp = gi % ns;
             gi /= ns;
@@ -57,24 +57,35 @@ int ns_ink2s_attn_part(ns_gpu* g, const float* qp, const void* kcv, const void* 
 #pragma unroll
             for (int i = 0; i < DL; ++i) acc[i] = 0.0f;
             const int64_t nk = hi - lo;
-            for (int i = tid; i < nk * D; i += WG) {
-                const int64_t slot = (lo + i / D) % cap;
-                ks[i] = kc[(hk * cap + slot) * D + i % D];
-                vs[i] = vc[(hk * cap + slot) * D + i % D];
+            // a sub-group a key at a time, its lanes 8 dims each (16-byte loads); the ring's slot once a key, the split's
+            // keys contiguous in it but for one wrap
+            {
+                const int64_t s0k = lo % cap;
+                const int nki = (int) nk;
+                for (int jj = sgi; jj < nki; jj += G) {
+                    int64_t slot = s0k + jj;
+                    if (slot >= cap) slot -= cap;
+                    const sycl::uint4* ksrc = (const sycl::uint4*) (kc + (hk * cap + slot) * D) + lane;
+                    const sycl::uint4* vsrc = (const sycl::uint4*) (vc + (hk * cap + slot) * D) + lane;
+                    ((sycl::uint4*) (ks.get_multi_ptr<sycl::access::decorated::no>().get() + jj * D))[lane] = *ksrc;
+                    ((sycl::uint4*) (vs.get_multi_ptr<sycl::access::decorated::no>().get() + jj * D))[lane] = *vsrc;
+                }
             }
             sycl::group_barrier(it.get_group());
+            const half* kp = ks.get_multi_ptr<sycl::access::decorated::no>().get();
+            const half* vp = vs.get_multi_ptr<sycl::access::decorated::no>().get();
             for (int64_t jj = 0; jj < nk; ++jj) {
                 const int64_t d = pos - (lo + jj);
                 float pl = 0.0f;
 #pragma unroll
-                for (int i = 0; i < DL; ++i) pl += qv[i] * (float) ks[jj * D + lane * DL + i];
+                for (int i = 0; i < DL; ++i) pl += qv[i] * (float) kp[jj * D + lane * DL + i];
                 if (d < E && lane < R) pl += rv * relb[d * R + lane];
                 const float lg = sycl::reduce_over_group(sg, pl, sycl::plus<float>());
                 const float mn = sycl::fmax(m, lg);
                 const float c = sycl::exp(m - mn), p = sycl::exp(lg - mn);
                 s = s * c + p;
 #pragma unroll
-                for (int i = 0; i < DL; ++i) acc[i] = acc[i] * c + p * (float) vs[jj * D + lane * DL + i];
+                for (int i = 0; i < DL; ++i) acc[i] = acc[i] * c + p * (float) vp[jj * D + lane * DL + i];
                 m = mn;
             }
             float* pp = part + ((rr * Hq + hq) * ns + sp) * (D + 2);

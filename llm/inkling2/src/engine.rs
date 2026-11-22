@@ -361,6 +361,9 @@ pub struct Inkling2<'g> {
     work: Mutex<()>,
     /// NS_INK2_PROFILE=1: each kernel's time and calls
     prof: Option<Mutex<std::collections::BTreeMap<&'static str, (f64, u64)>>>,
+    /// NS_INK2_PROFILE=gpu (with NS_PROFILE=gpu: the queue keeps timestamps): device times, no syncs
+    gpu_stamps: bool,
+    stamps: Mutex<Vec<(&'static str, i64, i64)>>,
     load_s: f64,
     /// decode rows through the silo's fused steps (NS_INK2_FUSED=0: its products only, the steps as for a prompt)
     fused_on: bool,
@@ -542,13 +545,26 @@ impl<'g> Inkling2<'g> {
         log(format!("inkling2: {} layers ({} applications a token: [{}, {}) x {}), {:.1} GiB on {} in {load_s:.0} s; prompt chunks of {chunk}", g.layers,
                     g.order().len(), g.core.0, g.core.1, g.passes, gib(loaded.get()), gpu.name));
         Ok(Inkling2 { g, file: f, gpu, arena, w16, k, silo, layers, loops, tok_norm, output_norm, output_res, output, embd, chunk, work: Mutex::new(()),
-                      prof: std::env::var("NS_INK2_PROFILE").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), load_s, load_bytes: loaded.get(),
+                      prof: std::env::var("NS_INK2_PROFILE").is_ok_and(|v| v == "1" || v == "gpu").then(|| Mutex::new(Default::default())), load_s, load_bytes: loaded.get(),
+                      gpu_stamps: std::env::var("NS_INK2_PROFILE").is_ok_and(|v| v == "gpu"), stamps: Mutex::new(Vec::new()),
                       fused_on: std::env::var("NS_INK2_FUSED").map_or(true, |v| v != "0") })
     }
 
     /// A kernel call, its return code checked (NS_INK2_PROFILE=1: timed, the queue drained before and after)
     fn op(&self, name: &'static str, f: impl FnOnce() -> c_int) -> Result<()> {
         let Some(p) = &self.prof else { return ffi::check(f(), name) };
+        if self.gpu_stamps {
+            // device timestamps around the launch, read at the pass's end (no syncs: the GPU's own time)
+            let a = nextsycl_core::api()?;
+            let (mut t0, mut t1) = (0i64, 0i64);
+            // SAFETY: out pointers to locals.
+            unsafe { (a.stamp)(self.raw(), &mut t0) };
+            ffi::check(f(), name)?;
+            // SAFETY: as above.
+            unsafe { (a.stamp)(self.raw(), &mut t1) };
+            self.stamps.lock().unwrap().push((name, t0, t1));
+            return Ok(());
+        }
         self.gpu.sync()?;
         let t0 = Instant::now();
         ffi::check(f(), name)?;
@@ -557,6 +573,26 @@ impl<'g> Inkling2<'g> {
         let ent = m.entry(name).or_insert((0.0, 0));
         ent.0 += t0.elapsed().as_secs_f64();
         ent.1 += 1;
+        Ok(())
+    }
+
+    /// The pass's device timestamps into the profile (NS_INK2_PROFILE=gpu)
+    fn stamps_in(&self) -> Result<()> {
+        let Some(p) = &self.prof else { return Ok(()) };
+        let v: Vec<(&'static str, i64, i64)> = std::mem::take(&mut *self.stamps.lock().unwrap());
+        if v.is_empty() {
+            return Ok(());
+        }
+        let a = nextsycl_core::api()?;
+        let mut m = p.lock().unwrap();
+        for (name, t0, t1) in v {
+            let mut ns = 0f64;
+            // SAFETY: two tickets of this queue; waits for them.
+            unsafe { (a.elapsed)(self.raw(), t0, t1, &mut ns) };
+            let ent = m.entry(name).or_insert((0.0, 0));
+            ent.0 += ns * 1e-9;
+            ent.1 += 1;
+        }
         Ok(())
     }
 
@@ -1016,11 +1052,19 @@ impl<'g> Inkling2<'g> {
         // SAFETY: the rows and caches as ink.h names them.
         unsafe {
             self.op("kv store", || (k.kv_store)(self.raw(), kc.fp(), vc.fp(), t as i64, hk as i64, hd as i64, ss.cap as i64, p0 as i64, ss.kc.ptr(), ss.vc.ptr()))?;
-            let sc = (k.attn_scratch)(t as i64, hq as i64, hd as i64, p0 as i64, win) as usize;
-            let part = if sc > 0 { Some(self.f32(sc)?) } else { None };
-            self.op("attention", || (k.attn)(self.raw(), q.fp(), ss.kc.ptr(), ss.vc.ptr(), r.fp(), ly.rel_bias.fp(), extent, g.rel_len as i64, sink.fp(), att.fp(),
-                                             t as i64, hq as i64, hk as i64, hd as i64, ss.cap as i64, p0 as i64, win, 1.0 / (hd as f32).sqrt(),
-                                             part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+            match self.silo.filter(|s| t > MAXV && (s.attn_prompt_supported)(hq as i64, hk as i64, hd as i64, g.rel_len as i64) != 0) {
+                // a prompt pass's rows: the silo's flash attention on XMX
+                Some(s) => self.op("attention silo", || (s.attn_prompt)(self.raw(), q.fp(), ss.kc.ptr(), ss.vc.ptr(), r.fp(), ly.rel_bias.fp(), extent,
+                                                                       g.rel_len as i64, sink.fp(), att.fp(), t as i64, hq as i64, hk as i64, ss.cap as i64,
+                                                                       p0 as i64, win))?,
+                None => {
+                    let sc = (k.attn_scratch)(t as i64, hq as i64, hd as i64, p0 as i64, win) as usize;
+                    let part = if sc > 0 { Some(self.f32(sc)?) } else { None };
+                    self.op("attention", || (k.attn)(self.raw(), q.fp(), ss.kc.ptr(), ss.vc.ptr(), r.fp(), ly.rel_bias.fp(), extent, g.rel_len as i64, sink.fp(),
+                                                     att.fp(), t as i64, hq as i64, hk as i64, hd as i64, ss.cap as i64, p0 as i64, win,
+                                                     1.0 / (hd as f32).sqrt(), part.as_ref().map_or(std::ptr::null_mut(), |p| p.fp())))?;
+                }
+            }
             self.op("gate", || (k.gate)(self.raw(), att.fp(), gate.fp(), (t * qd) as i64))?;
         }
         let aq = self.xq(&att, qd, t)?;
@@ -1309,7 +1353,10 @@ impl<'g> Inkling2<'g> {
             let lp = if p > 0 {
                 let lp = &self.loops[l - cs];
                 let mk = self.arena.mark();
-                let m = self.mix(&[&s12_prev, &pout], &lp.msg_q, 4, t)?;
+                let m = match self.fused(t) {
+                    Some(sl) => self.mix_norm(&sl.fused, &[&s12_prev, &pout], &lp.msg_q, 4, None, t)?.0,
+                    None => self.mix(&[&s12_prev, &pout], &lp.msg_q, 4, t)?,
+                };
                 msgs.copy_within(0, &m, 0, 4 * tc)?;
                 self.arena.rewind(mk);
                 Some((lp, &msgs))
@@ -1361,9 +1408,11 @@ impl<'g> Inkling2<'g> {
             }
             let mut bb = vec![0u8; n * 4];
             best.read(0, &mut bb)?;
+            self.stamps_in()?;
             return Ok(Out::Ids(bb.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()));
         }
         let all = logits.to_f32()?;
+        self.stamps_in()?;
         Ok(Out::Logits(all.chunks(v).map(|c| c.to_vec()).collect()))
     }
 

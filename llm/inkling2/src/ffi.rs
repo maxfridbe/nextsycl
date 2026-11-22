@@ -134,6 +134,9 @@ pub struct Silo {
     /// (type, w, experts, scale, ids, wts, act_q, y, T, K, F, n_out)
     pub moe_down: unsafe extern "C" fn(G, c_int, P, i64, *const f32, *const i32, *const f32, P, *mut f32, i64, i64, i64, i64) -> c_int,
     pub fused: Fused,
+    pub attn_prompt_supported: unsafe extern "C" fn(i64, i64, i64, i64) -> c_int,
+    /// (q, kc, vc, r, relb, E, R, sink, out, T, Hq, Hkv, cap, p0, win)
+    pub attn_prompt: unsafe extern "C" fn(G, *const f32, P, P, *const f32, *const f32, i64, i64, *const f32, *mut f32, i64, i64, i64, i64, i64, i64) -> c_int,
 }
 
 /// silo.h's Ink2sQkv: the attention's inputs after their projections (ns_ink2s_post_qkv)
@@ -236,6 +239,8 @@ pub fn silo() -> nextsycl_core::Result<Option<&'static Silo>> {
             fmv: sym!("ns_ink2s_fmv"),
             moe_gu: sym!("ns_ink2s_moe_gu"),
             moe_down: sym!("ns_ink2s_moe_down"),
+            attn_prompt_supported: sym!("ns_ink2s_attn_prompt_supported"),
+            attn_prompt: sym!("ns_ink2s_attn_prompt"),
             fused: Fused {
                 mix_norm: sym!("ns_ink2s_mix_norm"),
                 conv_res: sym!("ns_ink2s_conv_res"),

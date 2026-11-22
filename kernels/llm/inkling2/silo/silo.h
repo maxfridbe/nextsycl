@@ -60,7 +60,7 @@ int ns_ink2s_moe_down(ns_gpu* g, int type, const void* w, int64_t E, const float
                       float* y, int64_t T, int64_t K, int64_t F, int64_t n_out);
 
 /* ---- fused decode steps (dec.cpp; T 1..16) ---- */
-/* the depth attention of states s_0 .. s_{ns-1} [T, C] (at most 8) by nq queries (at most 3), each mix then RMS-normed
+/* the depth attention of states s_0 .. s_{ns-1} [T, C] (at most 8) by nq queries (at most 4), each mix then RMS-normed
  * by norm_w[q] (null: left unnormed) into out [nq, T, C], and quantized into xq[q] (nullable) */
 int ns_ink2s_mix_norm(ns_gpu* g, const float* const* states, int64_t ns, const float* query, int64_t nq, const float* const* norm_w, float* out,
                       void* const* xq, int64_t T, int64_t C, float eps_mix, float eps_norm);
@@ -108,6 +108,14 @@ int ns_ink2s_ctrl_apply(ns_gpu* g, const float* cur, const float* msg, const flo
 int64_t ns_ink2s_attn_splits(int64_t T, int64_t p0, int64_t win);
 int ns_ink2s_attn_part(ns_gpu* g, const float* q, const void* kc, const void* vc, const float* r, const float* relb, int64_t E, int64_t R, float* part,
                        int64_t T, int64_t Hq, int64_t Hkv, int64_t cap, int64_t p0, int64_t win, float scale);
+
+/* ---- the prompt attention (pattn.cpp: flash attention on XMX) ---- */
+/* rows q [T, Hq, 128] at positions p0.. (causal; win > 0: the keys less than win back) against the ring caches [Hkv,
+ * cap, 128] half: logit = q.k / sqrt(128) + (distance < E ? r . relb[distance] : 0), the row's sink an extra logit of
+ * no value; out [T, Hq, 128]. Three query heads a key head, r [T, Hq, R] with R at most 16 */
+int ns_ink2s_attn_prompt_supported(int64_t Hq, int64_t Hkv, int64_t D, int64_t R);
+int ns_ink2s_attn_prompt(ns_gpu* g, const float* q, const void* kc, const void* vc, const float* r, const float* relb, int64_t E, int64_t R, const float* sink,
+                         float* out, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap, int64_t p0, int64_t win);
 
 #ifdef __cplusplus
 }

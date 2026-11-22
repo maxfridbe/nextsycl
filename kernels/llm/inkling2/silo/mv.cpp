@@ -65,15 +65,28 @@ struct Line {
     float f[TY == 8 ? 1 : 2];
 };
 
+// a line as read: its 16 bytes and its scale bits (Q8_0: the half; NVFP4: the two UE4M3 bytes) - read first for all
+// a sub-group's rows, so the loads are in flight together, then decoded
+struct Raw {
+    sycl::int4 v;
+    uint16_t s;
+};
+
 template <int TY>
-inline Line<TY> load_line(const int8_t* q, const uint8_t* s, int64_t li, const uint32_t* lut) {
+inline Raw load_raw(const int8_t* q, const uint8_t* s, int64_t li) {
+    Raw r;
+    r.v = *(const sycl::int4*) (q + li * 16);
+    std::memcpy(&r.s, s + (TY == 8 ? (li >> 1) : li) * 2, 2);
+    return r;
+}
+
+template <int TY>
+inline Line<TY> decode_line(const Raw& r, const uint32_t* lut) {
     Line<TY> l;
-    const sycl::int4 v = *(const sycl::int4*) (q + li * 16);
+    const sycl::int4 v = r.v;
     if constexpr (TY == 8) {
         l.w[0] = v.x(); l.w[1] = v.y(); l.w[2] = v.z(); l.w[3] = v.w();
-        uint16_t h;
-        std::memcpy(&h, s + (li >> 1) * 2, 2);
-        l.f[0] = (float) sycl::bit_cast<half>(h);
+        l.f[0] = (float) sycl::bit_cast<half>(r.s);
     } else {
         // the group's 16 bytes: sub-block 0's 8 then sub-block 1's; a byte's low nibble value j, its high one j + 8
         const uint32_t c0 = (uint32_t) v.x(), c1 = (uint32_t) v.y(), c2 = (uint32_t) v.z(), c3 = (uint32_t) v.w();
@@ -81,12 +94,15 @@ inline Line<TY> load_line(const int8_t* q, const uint8_t* s, int64_t li, const u
         fp4_words(c1, lut, l.w[1], l.w[3]);
         fp4_words(c2, lut, l.w[4], l.w[6]);
         fp4_words(c3, lut, l.w[5], l.w[7]);
-        uint16_t sc;
-        std::memcpy(&sc, s + li * 2, 2);
-        l.f[0] = ue4m3(sc);
-        l.f[1] = ue4m3(sc >> 8);
+        l.f[0] = sycl::bit_cast<float>(lut[256 + (r.s & 0xFF)]);
+        l.f[1] = sycl::bit_cast<float>(lut[256 + (r.s >> 8)]);
     }
     return l;
+}
+
+template <int TY>
+inline Line<TY> load_line(const int8_t* q, const uint8_t* s, int64_t li, const uint32_t* lut) {
+    return decode_line<TY>(load_raw<TY>(q, s, li), lut);
 }
 
 // the activations' line li of a row (their quants q, scales d)
@@ -132,9 +148,13 @@ inline float ldot(float acc, const Line<TY>& w, const XLine<TY>& x) {
     }
 }
 
-// the decode table in local memory, filled by the work-group
+// the decode tables in local memory, filled by the work-group: a code byte's two values (256 words), then a UE4M3
+// scale's float (256)
 inline void fill_lut(sycl::nd_item<1> it, uint32_t* lut) {
-    for (int i = (int) it.get_local_id(0); i < 256; i += (int) it.get_local_range(0)) lut[i] = fp4_entry((uint32_t) i);
+    for (int i = (int) it.get_local_id(0); i < 256; i += (int) it.get_local_range(0)) {
+        lut[i] = fp4_entry((uint32_t) i);
+        lut[256 + i] = sycl::bit_cast<uint32_t>(ue4m3((uint32_t) i));
+    }
     sycl::group_barrier(it.get_group());
 }
 
@@ -158,7 +178,7 @@ struct Jobs {
 template <int TY, int TT>
 void mv_launch(sycl::queue& q, Jobs jobs, int64_t blocks) {
     q.submit([&](sycl::handler& h) {
-    sycl::local_accessor<uint32_t, 1> lutm(sycl::range<1>(256), h);
+    sycl::local_accessor<uint32_t, 1> lutm(sycl::range<1>(512), h);
     h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) blocks * SG), sycl::range<1>(NSG * SG)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
         uint32_t* lut = lutm.get_multi_ptr<sycl::access::decorated::no>().get();
         if constexpr (TY == 40) fill_lut(it, lut);
@@ -180,12 +200,15 @@ void mv_launch(sycl::queue& q, Jobs jobs, int64_t blocks) {
 #pragma unroll
             for (int t = 0; t < TT; ++t) acc[r][t] = 0.0f;
         for (int64_t li = lane; li < nl; li += SG) {
-            Line<TY> w[R];
+            Raw raw[R];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 const int64_t row = r0 + sycl::min(r, nr - 1);
-                w[r] = load_line<TY>(jb.q + row * qr, jb.s + row * sr, li, lut);
+                raw[r] = load_raw<TY>(jb.q + row * qr, jb.s + row * sr, li);
             }
+            Line<TY> w[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) w[r] = decode_line<TY>(raw[r], lut);
 #pragma unroll
             for (int t = 0; t < TT; ++t) {
                 const XLine<TY> x = load_x<TY>(jb.xq + t * jb.n_in, jb.xd + t * nb, li);
@@ -294,26 +317,42 @@ int ns_ink2s_unpack_f16(ns_gpu* g, int type, const void* w, int64_t rows, int64_
     // a work-item a group of 16 values
     const int64_t per = n_in / 16, total = n * per;
     if (total <= 0) return 0;
+    // a work-item 16 values, written as two 16-byte stores
+    auto put = [](uint16_t* d, const uint16_t* v) {
+        sycl::uint4 lo, hi;
+        lo.x() = v[0] | ((uint32_t) v[1] << 16); lo.y() = v[2] | ((uint32_t) v[3] << 16);
+        lo.z() = v[4] | ((uint32_t) v[5] << 16); lo.w() = v[6] | ((uint32_t) v[7] << 16);
+        hi.x() = v[8] | ((uint32_t) v[9] << 16); hi.y() = v[10] | ((uint32_t) v[11] << 16);
+        hi.z() = v[12] | ((uint32_t) v[13] << 16); hi.w() = v[14] | ((uint32_t) v[15] << 16);
+        ((sycl::uint4*) d)[0] = lo;
+        ((sycl::uint4*) d)[1] = hi;
+    };
     if (type == 8) {
-        g->q.parallel_for(sycl::range<1>((size_t) total), [=](sycl::id<1> id) {
-            const int64_t r = id[0] / per, c = id[0] % per, row = row0 + r;
+        g->q.parallel_for(sycl::range<2>((size_t) n, (size_t) per), [=](sycl::id<2> id) {
+            const int64_t r = id[0], c = id[1], row = row0 + r;
             uint16_t h;
             std::memcpy(&h, s + row * sr + (c >> 1) * 2, 2);
             const float d = (float) sycl::bit_cast<half>(h);
-            const int8_t* qq = q + row * qr + c * 16;
-            for (int i = 0; i < 16; ++i) dst[r * n_in + c * 16 + i] = sycl::bit_cast<uint16_t>(half(d * (float) qq[i]));
+            const sycl::vec<int8_t, 16> qv = *(const sycl::vec<int8_t, 16>*) (q + row * qr + c * 16);
+            uint16_t v[16];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) v[i] = sycl::bit_cast<uint16_t>(half(d * (float) qv[i]));
+            put(dst + r * n_in + c * 16, v);
         });
     } else {
-        g->q.parallel_for(sycl::range<1>((size_t) total), [=](sycl::id<1> id) {
-            const int64_t r = id[0] / per, c = id[0] % per, row = row0 + r;
+        g->q.parallel_for(sycl::range<2>((size_t) n, (size_t) per), [=](sycl::id<2> id) {
+            const int64_t r = id[0], c = id[1], row = row0 + r;
             // sub-block c: its 8 code bytes, its scale
             const float d = ue4m3(s[row * sr + c]);
-            const uint8_t* cb = (const uint8_t*) q + row * qr + c * 8;
+            const sycl::vec<uint8_t, 8> cb = *(const sycl::vec<uint8_t, 8>*) ((const uint8_t*) q + row * qr + c * 8);
             constexpr float t[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+            uint16_t v[16];
+#pragma unroll
             for (int j = 0; j < 8; ++j) {
-                dst[r * n_in + c * 16 + j] = sycl::bit_cast<uint16_t>(half(t[cb[j] & 15] * d));
-                dst[r * n_in + c * 16 + j + 8] = sycl::bit_cast<uint16_t>(half(t[cb[j] >> 4] * d));
+                v[j] = sycl::bit_cast<uint16_t>(half(t[cb[j] & 15] * d));
+                v[j + 8] = sycl::bit_cast<uint16_t>(half(t[cb[j] >> 4] * d));
             }
+            put(dst + r * n_in + c * 16, v);
         });
     }
     return 0;
@@ -427,7 +466,7 @@ int ns_ink2s_moe_gu(ns_gpu* g, int type, const void* w, int64_t E, const float* 
         constexpr int TY = decltype(tyc)::value;
         g->q.submit([&](sycl::handler& h) {
             sycl::local_accessor<float, 1> av(sycl::range<1>(32), h);
-            sycl::local_accessor<uint32_t, 1> lutm(sycl::range<1>(256), h);
+            sycl::local_accessor<uint32_t, 1> lutm(sycl::range<1>(512), h);
             h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (P * nblk) * NS8 * SG), sycl::range<1>(NS8 * SG)),
                            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
                 uint32_t* lut = lutm.get_multi_ptr<sycl::access::decorated::no>().get();
@@ -487,7 +526,7 @@ int ns_ink2s_moe_down(ns_gpu* g, int type, const void* w, int64_t E, const float
         constexpr int TY = decltype(tyc)::value;
         g->q.submit([&](sycl::handler& h) {
             sycl::local_accessor<float, 1> part(sycl::range<1>(16 * RD), h);
-            sycl::local_accessor<uint32_t, 1> lutm(sycl::range<1>(256), h);
+            sycl::local_accessor<uint32_t, 1> lutm(sycl::range<1>(512), h);
             h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * nrb) * K * SG), sycl::range<1>((size_t) K * SG)),
                            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
                 uint32_t* lut = lutm.get_multi_ptr<sycl::access::decorated::no>().get();
@@ -501,12 +540,15 @@ int ns_ink2s_moe_down(ns_gpu* g, int type, const void* w, int64_t E, const float
 #pragma unroll
                 for (int r = 0; r < RD; ++r) acc[r] = 0.0f;
                 for (int64_t li = lane; li < nl; li += SG) {
-                    const XLine<TY> x = load_x<TY>(aq + p * F, ad + p * nbx, li);
+                    Raw raw[RD];
 #pragma unroll
                     for (int r = 0; r < RD; ++r) {
                         const int64_t row = e * n_out + r0 + sycl::min(r, nr - 1);
-                        acc[r] = ldot<TY>(acc[r], load_line<TY>(wq + row * qr, ws + row * sr, li, lut), x);
+                        raw[r] = load_raw<TY>(wq + row * qr, ws + row * sr, li);
                     }
+                    const XLine<TY> x = load_x<TY>(aq + p * F, ad + p * nbx, li);
+#pragma unroll
+                    for (int r = 0; r < RD; ++r) acc[r] = ldot<TY>(acc[r], decode_line<TY>(raw[r], lut), x);
                 }
                 const float s = (scale ? scale[e] : 1.0f) * wts[p];
 #pragma unroll
