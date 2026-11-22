@@ -116,6 +116,39 @@ clear message where the port begins: `llm/example`, `image/example`, `video/exam
    tables; a model card (`model-cards/<kind>/<id>.yml`, model-cards/README.md) when its files are public - a model
    of an architecture already served needs only its card, no code.
 
+## Silos and variants: how tuning stays out of each other's way
+
+Every kernel an engine runs comes from one of three layers. Each GPU picks an op from the most specific layer that has
+it when the engine loads: **variant → silo → shared kernel**.
+
+| | shared kernel | silo | variant |
+|---|---|---|---|
+| **Scope** | every engine of a kind | one model architecture | one model on one class of hardware |
+| **Where** | `kernels/<kind>/*.cpp`, `kernels/ns`, `kernels/strata` | `kernels/<kind>/<arch>/silo/` | `kernels/<kind>/<arch>/silo/variants/<name>/` + `variant.yml` |
+| **Builds to** | the kind's library | `dist/silo/libnextsycl-<arch>.so` | `dist/silo/libnextsycl-<arch>@<name>.so` |
+| **Holds** | the plain, correct op | the model's ops tuned for its shapes | only the ops that differ from the silo (a delta) |
+| **Chosen by** | always there (the fallback) | the engine's arch | its `match` against what the GPU reports: `vram_mb_min/max`, `units_min/max`, `mhz_min/max`, `sub_group`; a `name` substring as a last resort |
+| **Override** | `NS_SILO=0` (silo off) | `NS_SILO=0` | `NS_SILO_VARIANT=<name>\|none`, or a model card's `silo.variant` |
+| **Who may change it** | a bug fix or new type, with every engine that calls it re-checked | that model's porter | whoever tunes that hardware |
+| **Must prove** | every caller's check and bench | the same output as the shared kernel; before and after numbers | the same output as the silo (`NS_SILO_VARIANT=none` against it); before and after numbers on its hardware |
+
+**What it protects against**
+- **Pull requests fighting.** Someone tuning for a 16 GB card, or a card with fewer units, adds a variant. The default
+  silo that the 32 GB B70 / B65 run doesn't change, so two tunings for different hardware never edit the same file.
+- **One model's speed-up slowing another.** Tuning goes in that model's silo, never in a shared kernel, so another
+  engine's speed and output can't move.
+- **Silent output changes.** Each layer must give the same output as the layer below it, and the merge gate
+  (`tooling/gate.sh`) compares logits and greedy tokens exactly. pp and tg must be within 3% on each card a change
+  touches.
+- **Hard-coded memory.** A variant never changes a memory plan. Memory is planned from what the device reports
+  (`Gpu::free_or_guess`), so a smaller card gets a smaller plan without a fork.
+- **Mixed boxes.** The layer is chosen per GPU (`nextsycl_core::silo_for(arch, gpu)`). A B70 beside a 16 GB card each
+  get their own ops. An engine that binds once per process takes a variant only when every GPU matches it.
+  `nextsycl silo [ARCH]` shows what each GPU takes.
+
+The rules are enforced by tests in `cli/nextsycl/tests/architecture.rs` and by the gate, not only by review
+(CONTRIBUTING.md rule 6). The example variant is `kernels/llm/qwen35/silo/variants/b65/`.
+
 ## Code style
 
 - Write like the code around you: the same comment density, naming and idioms. Comments say what something is and
