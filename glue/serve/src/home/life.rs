@@ -272,6 +272,13 @@ pub(super) fn vouch(m: &Value, gpus: &[usize], seen: Option<&BTreeMap<usize, u64
 /// whole memory. A model that streams its weights from its files (`streams`) sizes itself to its card: every card. A
 /// card not known passes (the room plan then waits for it). Err, saying what it needs and what each card holds, when no
 /// card is left - or, for a model whose one copy spans its cards, when any one is short: it is refused, not tried.
+/// A GPU run holding any one of `m`'s cards keeps it off them all: a model spread over its cards (a chat model's layers
+/// split over them, or one copy spanning them). A one-of model (gpus '0|1') loads whole on any one of them, so only a
+/// run holding every one of them keeps it off
+pub(super) fn needs_all_cards(m: &Value) -> bool {
+    (registry::kind_of(m) == "llm" && !registry::one_of(m)) || registry::spans(m)
+}
+
 pub(super) fn cards_it_fits(m: &Value, gpus: &[usize], files_mb: u64, total: &dyn Fn(usize) -> Option<u64>) -> Result<Vec<usize>, String> {
     if m["streams"] == true || !matches!(registry::kind_of(m), "image" | "audio" | "model3d") {
         return Ok(gpus.to_vec());
@@ -1579,6 +1586,11 @@ impl Home {
             let mut plans: Vec<(usize, Option<Vec<Holder>>)> = gpus.iter().map(|g| (*g, self.room_plan(&snap, *g, want(*g), "llm", false, Some(&info)))).collect();
             // a one-of model: one of its cards, the rest left alone; `llm start` reads the choice
             if registry::one_of(m) && plans.len() > 1 {
+                // never a card a GPU run holds (taken_for let this model through for its other cards)
+                plans.retain(|(g, _)| self.card_taken(*g).is_none());
+                if plans.is_empty() {
+                    return Err((503, self.cards_taken().unwrap_or_else(|| "cards taken by a GPU run".into())));
+                }
                 let k = pick_card(&plans);
                 plans = vec![plans.swap_remove(k)];
                 if let Err(e) = registry::write_chat_gpu(&*self.o.cfg, id, plans[0].0) {
@@ -1655,7 +1667,7 @@ impl Home {
     /// A GPU run keeping a load of `m` off its cards (one of them for a model that needs them all - spanning, or a chat
     /// model spread over them - else every one): the sentence
     pub(crate) fn taken_for(&self, m: &Value) -> Option<String> {
-        let all_needed = registry::kind_of(m) == "llm" || registry::spans(m);
+        let all_needed = needs_all_cards(m);
         let gpus = self.gpus_of(m);
         self.gpu_run().filter(|(_, t)| t.bars(&gpus, all_needed)).map(|(m, _)| m)
     }
@@ -2229,6 +2241,14 @@ mod span_tests {
 
 #[cfg(test)]
 mod one_of_tests {
+
+    #[test]
+    fn a_run_on_one_card_keeps_a_spread_chat_model_off_but_not_a_one_of_one() {
+        assert!(super::needs_all_cards(&json!({"kind": "llm", "gpus": "0,1"})));
+        assert!(super::needs_all_cards(&json!({"kind": "llm", "gpus": "all"})));
+        assert!(!super::needs_all_cards(&json!({"kind": "llm", "gpus": "0|1"})));
+        assert!(!super::needs_all_cards(&json!({"kind": "image", "gpus": "0|1"})));
+    }
     use super::{gpus_value, pick_card};
     use backplane_scheduler::room::{Free, Holder};
     use serde_json::json;
