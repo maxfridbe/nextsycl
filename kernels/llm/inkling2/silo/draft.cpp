@@ -158,7 +158,7 @@ int ns_ink2s_rnn_gates(ns_gpu* g, const float* proj, const float* bias, float* s
 }
 
 int ns_ink2s_bias_argmax(ns_gpu* g, const float* base, const float* bias, const float* fold_b, int64_t n, float cap, float* logits, int32_t* out,
-                         float* prob) {
+                         float* prob, int32_t* stop, float pmin) {
     NS_TRY
     // the step's logits: softcap(base + BF16(fold_b + bias)), over the first n; the largest (the lowest index of equals)
     // and its probability (softmax at temperature 1: the online max and sum of exponentials, merged in a fixed order)
@@ -169,6 +169,8 @@ int ns_ink2s_bias_argmax(ns_gpu* g, const float* base, const float* bias, const 
         sycl::local_accessor<int, 1> bi(sycl::range<1>(W / SG), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             const int tid = (int) it.get_local_id(0);
+            // a block already ended (an earlier draft below p_min): nothing to do
+            if (stop && stop[0]) return;
             float best = -INFINITY, se = 0.0f;
             int at = 0x7FFFFFFF;
             for (int64_t i = tid; i < n; i += W) {
@@ -206,6 +208,7 @@ int ns_ink2s_bias_argmax(ns_gpu* g, const float* base, const float* bias, const 
                     if (bv[s] > -INFINITY) st += bs[s] * sycl::exp(bv[s] - m2);
                 out[0] = a2;
                 if (prob) prob[0] = 1.0f / st;
+                if (stop && 1.0f / st < pmin) stop[0] = 1;
             }
         });
     });
@@ -247,6 +250,33 @@ int ns_ink2s_qk_norm_rope(ns_gpu* g, float* x, int64_t T, int64_t H, const float
         }
 #pragma unroll
         for (int i = 0; i < D / SG; ++i) xr[lane + i * SG] = v[i];
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_ink2s_fold_mv(ns_gpu* g, const uint16_t* w, const float* x, float* y, int64_t rows, int64_t n, const int32_t* stop) {
+    NS_TRY
+    // y [rows] = w [rows, n] (BF16) . x [n]: a sub-group a row, its lanes over the row in a fixed order; nothing when the
+    // block already ended (stop[0])
+    constexpr int RPW = 16;
+    if (rows <= 0) return 0;
+    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((rows + RPW - 1) / RPW) * RPW * SG), sycl::range<1>(RPW * SG)),
+                      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        if (stop && stop[0]) return;
+        auto sg = it.get_sub_group();
+        const int lane = (int) sg.get_local_linear_id();
+        const int64_t r = it.get_group(0) * RPW + sg.get_group_linear_id();
+        if (r >= rows) return;
+        const uint16_t* wr = w + r * n;
+        float acc = 0.0f;
+        for (int64_t i = lane * 8; i < n; i += SG * 8) {
+            const sycl::vec<uint16_t, 8> v = *(const sycl::vec<uint16_t, 8>*) (wr + i);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) acc = sycl::fma(bf16f(v[k]), x[i + k], acc);
+        }
+        acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+        if (lane == 0) y[r] = acc;
     });
     return 0;
     NS_CATCH

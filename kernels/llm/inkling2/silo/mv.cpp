@@ -22,6 +22,7 @@ constexpr int MAXT = 16;
 
 inline size_t align256(size_t n) { return (n + 255) / 256 * 256; }
 
+
 // ---- the formats ----
 inline float ue4m3(uint32_t x) {
     x &= 0xFF;
@@ -30,23 +31,33 @@ inline float ue4m3(uint32_t x) {
     return e == 0 ? sycl::ldexp((float) m, -10) : sycl::ldexp((float) (8 + m), e - 11);
 }
 
-// a code byte's two E2M1 values (doubled: 0 1 2 3 4 6 8 12, the top bit of a code its sign) as signed bytes: the low
-// nibble's in bits 0-7, the high nibble's in bits 16-23 (the decode table, 256 words in local memory)
-inline uint32_t fp4_entry(uint32_t b) {
-    auto val = [](uint32_t c) {
-        int v = (int) ((0xC8643210u >> ((c & 7u) << 2)) & 15u);
-        return (uint32_t) ((c & 8u) ? -v : v) & 0xFFu;
-    };
-    return val(b & 15u) | (val(b >> 4) << 16);
+// ue4m3 by its bits: e >= 1 (1 + m / 8) 2^(e - 8) is float32 exponent e + 119 with m at the mantissa's top; e = 0
+// m 2^-10; 0 and 0x7F (NaN) 0 - the same floats as ue4m3()
+inline float ue4m3_bits(uint32_t x) {
+    const uint32_t e = (x >> 3) & 0xFu, m = x & 7u;
+    const float sub = (float) m * (1.0f / 1024.0f);
+    const float nrm = sycl::bit_cast<float>(((e + 119u) << 23) | (m << 20));
+    return (x == 0x7Fu) ? 0.0f : (e == 0u ? sub : nrm);
+}
+
+// four codes (a nibble in each byte's low half) to their signed byte values, in the word's arithmetic (no table):
+// magnitude c = code & 7 is the value for c <= 4; for c >= 4 add (c & 3) + 2 (b0 b1) (4 6 8 12); then the sign
+inline uint32_t fp4_bytes(uint32_t t) {
+    constexpr uint32_t ONE = 0x01010101u, H = 0x80808080u;
+    const uint32_t c = t & 0x07070707u;
+    const uint32_t ex = (t & 0x03030303u) + (((t & (t >> 1)) & ONE) << 1);
+    const uint32_t hm = ((t >> 2) & ONE) * 0xFFu;
+    const uint32_t m = c + (ex & hm);
+    const uint32_t sm = ((t >> 3) & ONE) * 0xFFu;
+    return ((m | H) - ((m << 1) & sm)) ^ H;
 }
 
 // four code bytes (c: bytes 0-3 of a sub-block) to their eight values as two words of signed bytes: lo the low nibbles'
 // (values j), hi the high nibbles' (values j + 8)
 inline void fp4_words(uint32_t c, const uint32_t* lut, int& lo, int& hi) {
-    const uint32_t a = lut[c & 0xFF] | (lut[(c >> 8) & 0xFF] << 8);
-    const uint32_t b = lut[(c >> 16) & 0xFF] | (lut[c >> 24] << 8);
-    lo = (int) ((a & 0xFFFFu) | (b << 16));
-    hi = (int) ((a >> 16) | (b & 0xFFFF0000u));
+    (void) lut;
+    lo = (int) fp4_bytes(c & 0x0F0F0F0Fu);
+    hi = (int) fp4_bytes((c >> 4) & 0x0F0F0F0Fu);
 }
 
 inline int dp4a(int a, int b, int c) { return dpct::dp4a(a, b, c); }
@@ -94,8 +105,8 @@ inline Line<TY> decode_line(const Raw& r, const uint32_t* lut) {
         fp4_words(c1, lut, l.w[1], l.w[3]);
         fp4_words(c2, lut, l.w[4], l.w[6]);
         fp4_words(c3, lut, l.w[5], l.w[7]);
-        l.f[0] = sycl::bit_cast<float>(lut[256 + (r.s & 0xFF)]);
-        l.f[1] = sycl::bit_cast<float>(lut[256 + (r.s >> 8)]);
+        l.f[0] = ue4m3_bits(r.s & 0xFFu);
+        l.f[1] = ue4m3_bits((uint32_t) r.s >> 8);
     }
     return l;
 }
@@ -148,18 +159,10 @@ inline float ldot(float acc, const Line<TY>& w, const XLine<TY>& x) {
     }
 }
 
-// the decode tables in local memory, filled by the work-group: a code byte's two values (256 words), then a UE4M3
-// scale's float (256)
-inline void fill_lut(sycl::nd_item<1> it, uint32_t* lut) {
-    for (int i = (int) it.get_local_id(0); i < 256; i += (int) it.get_local_range(0)) {
-        lut[i] = fp4_entry((uint32_t) i);
-        lut[256 + i] = sycl::bit_cast<uint32_t>(ue4m3((uint32_t) i));
-    }
-    sycl::group_barrier(it.get_group());
-}
-
-// ---- dense products: R rows a sub-group, NSG sub-groups a work-group ----
-constexpr int R = 4, NSG = 4;
+// ---- dense products: R rows a sub-group (4, or 1 for launches of few rows: more sub-groups in flight; a row's sums
+// are the same either way), NSG sub-groups a work-group ----
+constexpr int NSG = 4;
+constexpr int64_t FEW_ROWS = 16384;
 
 struct Job {
     const int8_t* q;    // the matrix's quants
@@ -175,13 +178,11 @@ struct Jobs {
     int n;
 };
 
-template <int TY, int TT>
+template <int TY, int TT, int R>
 void mv_launch(sycl::queue& q, Jobs jobs, int64_t blocks) {
     q.submit([&](sycl::handler& h) {
-    sycl::local_accessor<uint32_t, 1> lutm(sycl::range<1>(512), h);
     h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) blocks * SG), sycl::range<1>(NSG * SG)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
-        uint32_t* lut = lutm.get_multi_ptr<sycl::access::decorated::no>().get();
-        if constexpr (TY == 40) fill_lut(it, lut);
+        const uint32_t* lut = nullptr;  // (no table: the codes and scales decoded in arithmetic)
         auto sg = it.get_sub_group();
         const int lane = (int) sg.get_local_linear_id();
         const int64_t blk = it.get_group(0) * NSG + sg.get_group_linear_id();
@@ -227,25 +228,25 @@ void mv_launch(sycl::queue& q, Jobs jobs, int64_t blocks) {
     });
 }
 
-template <int TY>
+template <int TY, int R>
 void mv_t(sycl::queue& q, const Jobs& jobs, int64_t blocks, int64_t T) {
     switch (T) {
-        case 1: mv_launch<TY, 1>(q, jobs, blocks); break;
-        case 2: mv_launch<TY, 2>(q, jobs, blocks); break;
-        case 3: mv_launch<TY, 3>(q, jobs, blocks); break;
-        case 4: mv_launch<TY, 4>(q, jobs, blocks); break;
-        case 5: mv_launch<TY, 5>(q, jobs, blocks); break;
-        case 6: mv_launch<TY, 6>(q, jobs, blocks); break;
-        case 7: mv_launch<TY, 7>(q, jobs, blocks); break;
-        case 8: mv_launch<TY, 8>(q, jobs, blocks); break;
-        case 9: mv_launch<TY, 9>(q, jobs, blocks); break;
-        case 10: mv_launch<TY, 10>(q, jobs, blocks); break;
-        case 11: mv_launch<TY, 11>(q, jobs, blocks); break;
-        case 12: mv_launch<TY, 12>(q, jobs, blocks); break;
-        case 13: mv_launch<TY, 13>(q, jobs, blocks); break;
-        case 14: mv_launch<TY, 14>(q, jobs, blocks); break;
-        case 15: mv_launch<TY, 15>(q, jobs, blocks); break;
-        default: mv_launch<TY, 16>(q, jobs, blocks); break;
+        case 1: mv_launch<TY, 1, R>(q, jobs, blocks); break;
+        case 2: mv_launch<TY, 2, R>(q, jobs, blocks); break;
+        case 3: mv_launch<TY, 3, R>(q, jobs, blocks); break;
+        case 4: mv_launch<TY, 4, R>(q, jobs, blocks); break;
+        case 5: mv_launch<TY, 5, R>(q, jobs, blocks); break;
+        case 6: mv_launch<TY, 6, R>(q, jobs, blocks); break;
+        case 7: mv_launch<TY, 7, R>(q, jobs, blocks); break;
+        case 8: mv_launch<TY, 8, R>(q, jobs, blocks); break;
+        case 9: mv_launch<TY, 9, R>(q, jobs, blocks); break;
+        case 10: mv_launch<TY, 10, R>(q, jobs, blocks); break;
+        case 11: mv_launch<TY, 11, R>(q, jobs, blocks); break;
+        case 12: mv_launch<TY, 12, R>(q, jobs, blocks); break;
+        case 13: mv_launch<TY, 13, R>(q, jobs, blocks); break;
+        case 14: mv_launch<TY, 14, R>(q, jobs, blocks); break;
+        case 15: mv_launch<TY, 15, R>(q, jobs, blocks); break;
+        default: mv_launch<TY, 16, R>(q, jobs, blocks); break;
     }
 }
 
@@ -438,12 +439,16 @@ int ns_ink2s_mv_many(ns_gpu* g, int n, const int* ty, const void* const* w, cons
                      const int64_t* n_in, int64_t T) {
     NS_TRY
     if (n < 1 || n > 8 || T < 1 || T > MAXT) return ns_fail("ns_ink2s_mv_many: 1..8 products, 1..16 rows");
-    // the jobs of one type a launch (the launches in order)
+    // the jobs of one type a launch (the launches in order); a launch of few rows takes a row a sub-group
     for (int i = 0; i < n;) {
+        const int t0 = ty[i];
+        int k = i;
+        int64_t total = 0;
+        for (; k < n && ty[k] == t0 && k - i < 8; ++k) total += rows[k];
+        const int R = total < FEW_ROWS ? 1 : 4;
         Jobs js{};
         int64_t blocks = 0;
-        const int t0 = ty[i];
-        for (; i < n && ty[i] == t0 && js.n < 8; ++i) {
+        for (; i < k; ++i) {
             if (!ns_ink2s_supported(ty[i], n_in[i])) return ns_fail("ns_ink2s_mv_many: a type or width it does not take");
             Job& j = js.j[js.n++];
             j.q = (const int8_t*) w[i];
@@ -457,8 +462,13 @@ int ns_ink2s_mv_many(ns_gpu* g, int n, const int* ty, const void* const* w, cons
             blocks += (rows[i] + R - 1) / R;
         }
         const int64_t wgs = (blocks + NSG - 1) / NSG;
-        if (t0 == 8) mv_t<8>(g->q, js, wgs * NSG, T);
-        else mv_t<40>(g->q, js, wgs * NSG, T);
+        if (t0 == 8) {
+            if (R == 1) mv_t<8, 1>(g->q, js, wgs * NSG, T);
+            else mv_t<8, 4>(g->q, js, wgs * NSG, T);
+        } else {
+            if (R == 1) mv_t<40, 1>(g->q, js, wgs * NSG, T);
+            else mv_t<40, 4>(g->q, js, wgs * NSG, T);
+        }
     }
     return 0;
     NS_CATCH
@@ -473,7 +483,7 @@ int ns_ink2s_moe_gu(ns_gpu* g, int type, const void* w, int64_t E, const float* 
     NS_TRY
     if (!ns_ink2s_supported(type, n_in) || F % 32) return ns_fail("ns_ink2s_moe_gu: a type or shape it does not take");
     // a work-group a (pair, 32 act values): 8 sub-groups of 4 values, each 4 gate and 4 up rows
-    constexpr int NS8 = 8, RV = 4;
+    constexpr int RV = 4, NS8 = 32 / RV;
     const int64_t P = T * K, nblk = F / 32, nl = type == 8 ? n_in / 16 : n_in / 32, nbx = n_in / 32;
     const int64_t rows = E * 2 * F, qr = qrow(type, n_in), sr = srow(type, n_in);
     const int8_t* wq = (const int8_t*) w;
@@ -486,11 +496,9 @@ int ns_ink2s_moe_gu(ns_gpu* g, int type, const void* w, int64_t E, const float* 
         constexpr int TY = decltype(tyc)::value;
         g->q.submit([&](sycl::handler& h) {
             sycl::local_accessor<float, 1> av(sycl::range<1>(32), h);
-            sycl::local_accessor<uint32_t, 1> lutm(sycl::range<1>(512), h);
             h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (P * nblk) * NS8 * SG), sycl::range<1>(NS8 * SG)),
                            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
-                uint32_t* lut = lutm.get_multi_ptr<sycl::access::decorated::no>().get();
-                if constexpr (TY == 40) fill_lut(it, lut);
+                const uint32_t* lut = nullptr;  // (no table: the codes and scales decoded in arithmetic)
                 auto sg = it.get_sub_group();
                 const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
                 const int64_t p = it.get_group(0) / nblk, ab = it.get_group(0) % nblk;
@@ -546,11 +554,9 @@ int ns_ink2s_moe_down(ns_gpu* g, int type, const void* w, int64_t E, const float
         constexpr int TY = decltype(tyc)::value;
         g->q.submit([&](sycl::handler& h) {
             sycl::local_accessor<float, 1> part(sycl::range<1>(16 * RD), h);
-            sycl::local_accessor<uint32_t, 1> lutm(sycl::range<1>(512), h);
             h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * nrb) * K * SG), sycl::range<1>((size_t) K * SG)),
                            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
-                uint32_t* lut = lutm.get_multi_ptr<sycl::access::decorated::no>().get();
-                if constexpr (TY == 40) fill_lut(it, lut);
+                const uint32_t* lut = nullptr;  // (no table: the codes and scales decoded in arithmetic)
                 auto sg = it.get_sub_group();
                 const int lane = (int) sg.get_local_linear_id(), k = (int) sg.get_group_linear_id();
                 const int64_t t = it.get_group(0) / nrb, r0 = (it.get_group(0) % nrb) * RD;
@@ -660,13 +666,11 @@ int ns_ink2s_moe_gu_union(ns_gpu* g, int type, const void* w, int64_t E, const f
         constexpr int TY = decltype(tyc)::value;
         g->q.submit([&](sycl::handler& h) {
             sycl::local_accessor<float, 1> av(sycl::range<1>(MP * 32), h);
-            sycl::local_accessor<uint32_t, 1> lutm(sycl::range<1>(512), h);
             h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (P * nblk) * NS8 * SG), sycl::range<1>(NS8 * SG)),
                            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
                 const int64_t u = it.get_group(0) / nblk, ab = it.get_group(0) % nblk;
                 if (u >= uni[0]) return;
-                uint32_t* lut = lutm.get_multi_ptr<sycl::access::decorated::no>().get();
-                if constexpr (TY == 40) fill_lut(it, lut);
+                const uint32_t* lut = nullptr;  // (no table: the codes and scales decoded in arithmetic)
                 auto sg = it.get_sub_group();
                 const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
                 const int32_t* ue = uni + 1;
@@ -745,13 +749,11 @@ int ns_ink2s_moe_down_union(ns_gpu* g, int type, const void* w, int64_t E, const
     auto run = [&](auto tyc) {
         constexpr int TY = decltype(tyc)::value;
         g->q.submit([&](sycl::handler& h) {
-            sycl::local_accessor<uint32_t, 1> lutm(sycl::range<1>(512), h);
             h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (P * nrb) * NSG * SG), sycl::range<1>(NSG * SG)),
                            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
                 const int64_t u = it.get_group(0) / nrb, rb = it.get_group(0) % nrb;
                 if (u >= uni[0]) return;
-                uint32_t* lut = lutm.get_multi_ptr<sycl::access::decorated::no>().get();
-                if constexpr (TY == 40) fill_lut(it, lut);
+                const uint32_t* lut = nullptr;  // (no table: the codes and scales decoded in arithmetic)
                 auto sg = it.get_sub_group();
                 const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
                 const int32_t* ue = uni + 1;

@@ -63,7 +63,10 @@ int ns_ink2s_rnn_gates(ns_gpu* g, const float* proj, const float* bias, float* s
 /* softcap(base + BF16(fold_b + bias)) over the first n (cap <= 0: none) into logits (nullable); its argmax into out[0],
  * the argmax's probability (softmax at temperature 1) into prob[0] (nullable) */
 int ns_ink2s_bias_argmax(ns_gpu* g, const float* base, const float* bias, const float* fold_b, int64_t n, float cap, float* logits, int32_t* out,
-                         float* prob);
+                         float* prob, int32_t* stop, float pmin);
+/* (stop nullable: stop[0] set when the probability is below pmin; a set stop makes this and ns_ink2s_fold_mv do nothing)
+ * y [rows] = w [rows, n] (BF16, n a multiple of 128) . x [n] */
+int ns_ink2s_fold_mv(ns_gpu* g, const uint16_t* w, const float* x, float* y, int64_t rows, int64_t n, const int32_t* stop);
 
 /* ---- the products (repacked matrices) ---- */
 /* y [T, rows] = W [rows, n_in] . x (xq: ns_ink2s_xq's layout of x [T, n_in]), T 1..16 */

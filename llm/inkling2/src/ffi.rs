@@ -233,8 +233,10 @@ pub struct Draft {
     pub rnn_inputs: unsafe extern "C" fn(G, *const f32, *const i32, *const u16, i64, *const f32, *const f32, i64, *mut f32) -> c_int,
     /// (proj, bias, state, latent, rank)
     pub rnn_gates: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, *mut f32, i64) -> c_int,
-    /// (base, bias, fold_b, n, cap, logits, out, prob)
-    pub bias_argmax: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, i64, f32, *mut f32, *mut i32, *mut f32) -> c_int,
+    /// (base, bias, fold_b, n, cap, logits, out, prob, stop, pmin)
+    pub bias_argmax: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, i64, f32, *mut f32, *mut i32, *mut f32, *mut i32, f32) -> c_int,
+    /// (w, x, y, rows, n, stop)
+    pub fold_mv: unsafe extern "C" fn(G, *const u16, *const f32, *mut f32, i64, i64, *const i32) -> c_int,
     /// (x, T, H, w, eps, theta, p0)
     pub qk_norm_rope: unsafe extern "C" fn(G, *mut f32, i64, i64, *const f32, f32, f32, i64) -> c_int,
     /// (q, kc, vc, part, T, Hq, Hkv, cap, p0, win, scale)
@@ -319,6 +321,7 @@ fn bind(lib: &nextsycl_core::SiloLib) -> std::result::Result<Silo, String> {
                 rnn_inputs: sym!("ns_ink2s_rnn_inputs"),
                 rnn_gates: sym!("ns_ink2s_rnn_gates"),
                 bias_argmax: sym!("ns_ink2s_bias_argmax"),
+                fold_mv: sym!("ns_ink2s_fold_mv"),
                 qk_norm_rope: sym!("ns_ink2s_qk_norm_rope"),
                 attn_part_block: sym!("ns_ink2s_attn_part_block"),
             },

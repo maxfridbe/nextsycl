@@ -720,7 +720,7 @@ int ns_ink2_argmax(ns_gpu* g, const float* x, int32_t* out, int64_t T, int64_t n
 // the museglimmer engine's GPU draw (mg.cpp), copied: the 256 largest, temperature, top-p, one uniform a row
 int ns_ink2_sample(ns_gpu* g, const float* x, int32_t* out, int64_t T, int64_t n, float temp, float top_p, uint64_t seed, int64_t pos0) {
     NS_TRY
-    constexpr int W = 1024, K = 256, CAP = 4096;
+    constexpr int W = 1024, K = 256, CAP = 8192;
     if (T <= 0) return 0;
     if (n < K) return ns_fail("ns_ink2_sample: fewer than 256 values a row");
     g->q.submit([&](sycl::handler& h) {
@@ -737,20 +737,23 @@ int ns_ink2_sample(ns_gpu* g, const float* x, int32_t* out, int64_t T, int64_t n
                 const uint32_t b = sycl::bit_cast<uint32_t>(v);
                 return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
             };
-            // the K-th largest key: the largest c with K keys at or above it. The row's values within d of its largest
-            // for the smallest d of 1, 2, 4, .. 64 that holds K of them hold every key at or above it, so the bit-by-bit
-            // search over them alone (in local memory) finds the same c; past CAP of them, over the whole row
+            // the K-th largest key: the largest c with K keys at or above it. The row's values within d of its largest,
+            // for the smallest d of 1/8 .. 22.6 (factors of sqrt 2) or 64 that holds K of them, hold every key at or
+            // above it, so the bit-by-bit search over them alone (in local memory) finds the same c; past CAP of them,
+            // over the whole row
             float mx = -INFINITY;
             for (int64_t i = tid; i < n; i += W) mx = sycl::fmax(mx, xr[i]);
             mx = sycl::reduce_over_group(grp, mx, sycl::maximum<float>());
-            constexpr int ND = 7;
+            // the windows: 1/8 .. 22.6 by factors of sqrt(2), then 64
+            constexpr int ND = 17;
+            auto win = [](int j) { return j == ND - 1 ? 64.0f : 0.125f * sycl::exp2(0.5f * (float) j); };
             int64_t cd[ND];
 #pragma unroll
             for (int j = 0; j < ND; ++j) cd[j] = 0;
             for (int64_t i = tid; i < n; i += W) {
                 const float v = xr[i];
 #pragma unroll
-                for (int j = 0; j < ND; ++j) cd[j] += v >= mx - (float) (1 << j);
+                for (int j = 0; j < ND; ++j) cd[j] += v >= mx - win(j);
             }
             int dsel = -1;
             int64_t csel = 0;
@@ -764,7 +767,7 @@ int ns_ink2_sample(ns_gpu* g, const float* x, int32_t* out, int64_t T, int64_t n
             }
             uint32_t kth = 0;
             if (dsel >= 0 && csel <= CAP) {
-                const float lo = mx - (float) (1 << dsel);
+                const float lo = mx - win(dsel);
                 if (tid == 0) cnt[0] = 0;
                 sycl::group_barrier(grp);
                 for (int64_t i = tid; i < n; i += W) {

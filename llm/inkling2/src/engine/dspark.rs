@@ -477,6 +477,10 @@ impl Inkling2<'_> {
         let proj = self.f32(3 * d.rank)?;
         let bias = self.f32(vp)?;
         let probs = self.f32(nd)?;
+        // set by the pick of a draft below p_min: the later steps' heaviest launches (the fold, the pick) do nothing
+        let pmin = draft_pmin();
+        let stop = self.ab(4)?;
+        stop.fill(0)?;
         let fr = st.frnn.view(if st.frnn_all { last * c * 4 } else { 0 }, c * 4)?;
         for j in 0..nd {
             let tj = toks.view(j * 4, 4)?;
@@ -488,14 +492,17 @@ impl Inkling2<'_> {
             self.matmul(&d.joint, &inp, 1, &proj)?;
             // SAFETY: as above.
             unsafe { self.op("draft rnn gates", || (dk.rnn_gates)(self.raw(), proj.fp(), d.joint_b.fp(), state.fp(), latent.fp(), d.rank as i64))? };
-            self.matmul(&d.fold, &latent, 1, &bias)?;
+            // SAFETY: the fold [vocab_pad, rank] BF16, latent [rank], bias [vocab_pad], the stop flag.
+            unsafe {
+                self.op("draft fold", || (dk.fold_mv)(self.raw(), d.fold.buf.ptr().cast(), latent.fp(), bias.fp(), vp as i64, d.rank as i64, stop.ptr().cast()))?
+            };
             let next = toks.view((j + 1) * 4, 4)?;
             let bj = base.view(j * vp * 4, vp * 4)?;
             // SAFETY: as above.
             unsafe {
                 let pj = probs.view(j * 4, 4)?;
                 self.op("draft pick", || (dk.bias_argmax)(self.raw(), bj.fp(), bias.fp(), d.fold_b.fp(), g.vocab as i64, g.softcap, std::ptr::null_mut(),
-                                                          next.ptr().cast(), pj.fp()))?
+                                                          next.ptr().cast(), pj.fp(), stop.ptr().cast(), pmin))?
             };
         }
         let mut b = vec![0u8; (nd + 1) * 4];
@@ -503,7 +510,6 @@ impl Inkling2<'_> {
         let mut pb = vec![0u8; nd * 4];
         probs.read(0, &mut pb)?;
         // the drafts up to the first the drafter is not sure enough of (NS_INK2_DRAFT_PMIN: its probability)
-        let pmin = draft_pmin();
         let sure = pb.chunks_exact(4).take_while(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) >= pmin).count();
         Ok(b.chunks_exact(4).skip(1).take(sure).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
     }
