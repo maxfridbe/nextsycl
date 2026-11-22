@@ -350,9 +350,10 @@ impl Home {
         let snap = self.snapshot();
         let on: Vec<&Value> = all.iter().filter(|m| registry::kind_of(m) == "video" && m["enabled"] != false).collect();
         let chat_held = matches!(self.chat_hold(), super::life::ChatHold::Held(_));
+        let totals: Vec<(usize, u64)> = snap.cards.iter().filter(|c| c.total_mb > 0).map(|c| (c.index, c.total_mb)).collect();
         let blocked: Vec<usize> = snap.cards.iter().filter(|c| {
             let g = c.index;
-            let want = on.iter().filter_map(|m| self.vouched_mb(m, c.total_mb).0.get(&g).copied()).max();
+            let want = on.iter().filter_map(|m| self.vouched_mb(m, &totals).0.get(&g).copied()).max();
             let Some(want) = want else { return false };
             let kept = c.procs.iter().filter(|p| p.kind.as_deref() != Some("video")).any(|p| snap.kept.contains(&p.model) || (p.kind.as_deref() == Some("llm") && chat_held));
             kept && self.room_plan(&snap, g, want + super::life::MARGIN_MB, "video", false, None).is_none()

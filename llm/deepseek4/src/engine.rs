@@ -806,10 +806,10 @@ impl Part {
             Some(b) => b,
             // what is free less the arena, the forward pass's own buffers, and the sessions' attention caches - sized
             // now so a long context never pushes VRAM into the driver's spill path
-            None => gpu.memory()?.1.map_or(8usize << 30, |f| {
+            None => gpu.free_or_guess().map(|f| {
                 let pass = (600 << 20) + prefill_chunk() * (352 << 10);
                 (f as usize).saturating_sub(pass + arena_bytes().max(1 << 30) + SMALL_ARENA + kv_reserve + mtp_bytes)
-            }),
+            })?,
         };
         let draft = match mtp {
             Some(ml) => {

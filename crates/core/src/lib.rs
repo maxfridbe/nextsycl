@@ -271,6 +271,13 @@ impl Gpu {
         Ok((t, (f >= 0).then_some(f as u64)))
     }
 
+    /// Free bytes: what the driver says, else a quarter of the card's total - with a driver that does not report free
+    /// memory (Level Zero on Arc does), a guess that stays within a card of any size and never plans past what is there
+    pub fn free_or_guess(&self) -> Result<u64> {
+        let (total, free) = self.memory()?;
+        Ok(free.unwrap_or(total / 4))
+    }
+
     pub fn sync(&self) -> Result<()> {
         // SAFETY: a live handle.
         check(self.api, unsafe { (self.api.sync)(self.raw) }, "waiting for the GPU")

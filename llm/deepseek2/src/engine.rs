@@ -485,7 +485,7 @@ impl Part {
         let margin = 1536usize << 20;
         let budget = match expert_bytes {
             Some(b) => b,
-            None => gpu.memory()?.1.map_or(8usize << 30, |f| (f as usize).saturating_sub(kv_reserve + margin)),
+            None => (gpu.free_or_guess()? as usize).saturating_sub(kv_reserve + margin),
         };
         let per_chunk = (CHUNK / slot).max(1);
         let nv = if n_exp == 0 { 0 } else { (budget / slot).min(n_exp) };

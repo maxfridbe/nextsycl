@@ -336,7 +336,7 @@ impl Vae {
     /// The reference's decode window for the memory the card has free (`_get_auto_decode_chunk_size`: 512 frames from
     /// 24 GB, 384 from 16, 256 from 12, else 128), what this scratch holds counted as free
     pub fn auto_chunk(ops: &Ops, s: &Scratch) -> usize {
-        let free = ops.gpu.memory().ok().and_then(|m| m.1).map_or(12u64 << 30, |f| f + s.bytes() as u64) as f64 / (1u64 << 30) as f64;
+        let free = ops.gpu.free_or_guess().map_or(0, |f| f + s.bytes() as u64) as f64 / (1u64 << 30) as f64;
         if free >= 24.0 { 512 } else if free >= 16.0 { 384 } else if free >= 12.0 { 256 } else { 128 }
     }
 

@@ -190,23 +190,105 @@ fn free_on(c: &Value, pending: &[(u16, u64)]) -> u64 {
     free.saturating_sub(to_come)
 }
 
+/// A model's files on disk, MiB: what its memory is estimated from when nothing better is known
+fn files_mb(m: &Value) -> u64 {
+    registry::paths(m).iter().filter(|p| p.is_file()).filter_map(|p| std::fs::metadata(p).ok()).map(|x| x.len() >> 20).sum()
+}
+
 /// An image, audio or 3D model (its copies one card each), or a chat model whose cards are a choice (`gpus: '0|1'`): it
 /// loads whole on one card (the first of its cards with room). Not one whose one copy spans its cards (`spans: true`).
 fn one_card(m: &Value) -> bool {
     (matches!(registry::kind_of(m), "image" | "audio" | "model3d") && !registry::spans(m)) || registry::one_of(m)
 }
 
-/// A model's memory on each of its cards `gpus` from its model card's figures, MiB, at most `cap`: one whose one copy spans
-/// its cards takes each card's own (`vram_gib_per_card`, in its cards' order; a card past the list the last), else
-/// `vram_gib` on each; None when it states none
-fn card_figures(m: &Value, gpus: &[usize], cap: u64) -> Option<BTreeMap<usize, u64>> {
-    let mb = |g: f64| ((g * 1024.0) as u64).min(cap);
+/// A model's memory on each of its cards `gpus` from its model card's figures, MiB, at most `cap` of each card: one whose
+/// one copy spans its cards takes each card's own (`vram_gib_per_card`, in its cards' order; a card past the list the
+/// last), else `vram_gib` on each; None when it states none
+fn card_figures(m: &Value, gpus: &[usize], cap: &dyn Fn(usize) -> u64) -> Option<BTreeMap<usize, u64>> {
+    let mb = |g: f64, i: usize| ((g * 1024.0) as u64).min(cap(i));
     if let Some(per) = registry::vram_per_card(m).filter(|_| registry::spans(m)) {
         let at = |k: usize| per.get(k).or(per.last()).copied().unwrap_or(0.0);
-        return Some(gpus.iter().enumerate().map(|(k, i)| (*i, mb(at(k)))).collect());
+        return Some(gpus.iter().enumerate().map(|(k, i)| (*i, mb(at(k), *i))).collect());
     }
     let g = m["vram_gib"].as_f64().filter(|g| *g > 0.0)?;
-    Some(gpus.iter().map(|i| (*i, mb(g))).collect())
+    Some(gpus.iter().map(|i| (*i, mb(g, *i))).collect())
+}
+
+/// Each card's memory in all, MiB, as the box reports it (`cards`: gpustat's list, a card's place its index): what the
+/// plans below size against - never a card's name or an assumed size
+pub(super) fn totals_of(cards: &Value) -> Vec<(usize, u64)> {
+    cards.as_array().into_iter().flatten().enumerate().filter_map(|(i, c)| c["vram_total_mb"].as_u64().filter(|t| *t > 0).map(|t| (i, t))).collect()
+}
+
+/// Card `g`'s memory in all, MiB: its own as reported; a card the list does not have yet, the largest the box reports
+/// (a cap no lower than any card here: it can only vouch more, which waits for more room, never less); None when no
+/// card is known (nothing is capped then, and nothing places until the cards are read)
+pub(super) fn card_total(totals: &[(usize, u64)], g: usize) -> Option<u64> {
+    totals.iter().find(|(i, _)| *i == g).map(|(_, t)| *t).or_else(|| totals.iter().map(|(_, t)| *t).max())
+}
+
+/// The most a model may be vouched for on a card of `total` MiB: the card less the 1.5 GiB always kept free
+/// (MARGIN_MB) and 512 MiB the driver takes; no cap on a card not known
+pub(super) fn vouch_cap(total: Option<u64>) -> u64 {
+    total.map_or(u64::MAX, |t| t.saturating_sub(MARGIN_MB + 512))
+}
+
+/// A model's memory on each of its cards, MiB, from what is known of it (the arithmetic of `Home::vouched_mb`, no I/O):
+/// `seen` what it took on each card while it ran here, else its model card's figures, else its files' (`files_mb`)
+/// share by kind - each never more than its card holds beside the spare (`vouch_cap` of `total`). Whether it was seen
+/// comes with it.
+pub(super) fn vouch(m: &Value, gpus: &[usize], seen: Option<&BTreeMap<usize, u64>>, files_mb: u64, total: &dyn Fn(usize) -> Option<u64>) -> (BTreeMap<usize, u64>, bool) {
+    let single = one_card(m);
+    let cap = |g: usize| vouch_cap(total(g));
+    // a model that ran fits the card: a peak seen above what a card may be asked for (an edit's, with its vision tower,
+    // touching the card's whole memory) would otherwise refuse the model from then on, its margin never free
+    if let Some(seen) = seen {
+        if single && !seen.is_empty() {
+            let mb = seen.values().copied().max().unwrap_or(0);
+            return (gpus.iter().map(|g| (*g, mb.min(cap(*g)))).collect(), true);
+        }
+        if !single && gpus.iter().all(|i| seen.contains_key(i)) {
+            return (gpus.iter().map(|g| (*g, seen[g].min(cap(*g)))).collect(), true);
+        }
+    }
+    if let Some(v) = card_figures(m, gpus, &cap) {
+        return (v, false);
+    }
+    // (a spanning model's files are shared out over its cards, as a chat model's)
+    let files = if registry::spans(m) { files_mb / gpus.len().max(1) as u64 } else { files_mb };
+    let per = |g: usize| match registry::kind_of(m) {
+        // a video model takes its card, less 4 GiB (on a card not known: its files and 4 GiB)
+        "video" => total(g).map_or(files + 4096, |t| t.saturating_sub(4096)),
+        "image" => files * 105 / 100 + 4096,
+        "audio" => files * 110 / 100 + 2048,
+        "model3d" => files * 110 / 100 + 6144,
+        _ => files / gpus.len().max(1) as u64 + 2048,
+    };
+    (gpus.iter().map(|g| (*g, per(*g).min(cap(*g)))).collect(), false)
+}
+
+/// The cards of `gpus` a picture, sound or 3D model can load on at all: its figure - its model card's `vram_gib` (a spanning
+/// model's share on each card), else its files' estimate, never capped - and the 1.5 GiB kept free within the card's
+/// whole memory. A model that streams its weights from its files (`streams`) sizes itself to its card: every card. A
+/// card not known passes (the room plan then waits for it). Err, saying what it needs and what each card holds, when no
+/// card is left - or, for a model whose one copy spans its cards, when any one is short: it is refused, not tried.
+pub(super) fn cards_it_fits(m: &Value, gpus: &[usize], files_mb: u64, total: &dyn Fn(usize) -> Option<u64>) -> Result<Vec<usize>, String> {
+    if m["streams"] == true || !matches!(registry::kind_of(m), "image" | "audio" | "model3d") {
+        return Ok(gpus.to_vec());
+    }
+    let (need, _) = vouch(m, gpus, None, files_mb, &|_| None);
+    let short: Vec<(usize, u64, u64)> = gpus.iter().filter_map(|g| {
+        let (n, t) = (need.get(g).copied().unwrap_or(0), total(*g)?);
+        (n + MARGIN_MB > t).then_some((*g, n, t))
+    }).collect();
+    let fits: Vec<usize> = gpus.iter().copied().filter(|g| !short.iter().any(|s| s.0 == *g)).collect();
+    if short.is_empty() || (!registry::spans(m) && !fits.is_empty()) {
+        return Ok(fits);
+    }
+    let gib = |mb: u64| mb as f64 / 1024.0;
+    let each: Vec<String> = short.iter().map(|(g, n, t)| format!("{:.1} GiB on GPU {g}, which holds {:.1} GiB", gib(*n), gib(*t))).collect();
+    Err(format!("{} cannot load on its cards: it needs {} (with {:.1} GiB kept free) - a model larger than its cards is refused, not tried",
+                s(m, "id"), each.join("; "), gib(MARGIN_MB)))
 }
 
 /// The arguments that start an image, audio or 3D server: `<kind> start ID --gpu N --port P ...`; a model whose one copy
@@ -547,36 +629,12 @@ impl Home {
     /// The memory a model takes on each of its cards, MiB: as seen while it ran, else its model card's `vram_gib` (as
     /// measured where it runs), else from its files' sizes - never more than a card holds beside the spare. An image or
     /// audio model loads whole on one of its cards: what it takes there, for each.
-    pub(super) fn vouched_mb(&self, m: &Value, card_mb: u64) -> (BTreeMap<usize, u64>, bool) {
+    /// `totals`: each card's memory in all (`totals_of`), a card's own figure capped by it (`vouch`).
+    pub(super) fn vouched_mb(&self, m: &Value, totals: &[(usize, u64)]) -> (BTreeMap<usize, u64>, bool) {
         let id = s(m, "id");
         let gpus = self.gpus_of(m);
-        let single = one_card(m);
-        // a model that ran fits the card: a peak seen above what a card may be asked for (an edit's, with its vision tower,
-        // touching the card's whole memory) would otherwise refuse the model from then on, its margin never free
-        let cap = card_mb.saturating_sub(MARGIN_MB + 512);
-        if let Some(seen) = self.seen.lock().unwrap().get(&id) {
-            if single && !seen.is_empty() {
-                let mb = seen.values().copied().max().unwrap_or(0).min(cap);
-                return (gpus.iter().map(|g| (*g, mb)).collect(), true);
-            }
-            if !single && gpus.iter().all(|i| seen.contains_key(i)) {
-                return (gpus.iter().map(|g| (*g, seen[g].min(cap))).collect(), true);
-            }
-        }
-        if let Some(v) = card_figures(m, &gpus, cap) {
-            return (v, false);
-        }
-        let files: u64 = registry::paths(m).iter().filter(|p| p.is_file()).filter_map(|p| std::fs::metadata(p).ok()).map(|x| x.len() >> 20).sum();
-        // (a spanning model's files are shared out over its cards, as a chat model's)
-        let files = if registry::spans(m) { files / gpus.len().max(1) as u64 } else { files };
-        let per = match registry::kind_of(m) {
-            "video" => card_mb.saturating_sub(4096),
-            "image" => files * 105 / 100 + 4096,
-            "audio" => files * 110 / 100 + 2048,
-            "model3d" => files * 110 / 100 + 6144,
-            _ => files / gpus.len() as u64 + 2048,
-        };
-        (gpus.iter().map(|g| (*g, per.min(cap))).collect(), false)
+        let seen = self.seen.lock().unwrap().get(&id).cloned();
+        vouch(m, &gpus, seen.as_ref(), files_mb(m), &|g| card_total(totals, g))
     }
 
     /// Of what a model is vouched for on each card, MiB: the part that is not its weights - the working memory it
@@ -800,7 +858,7 @@ impl Home {
 
     /// Every registered model (LoRAs aside): kind, enabled, cards, state, memory vouched for
     pub(crate) fn model_states(&self, all: &[Value], cards: &Value) -> Vec<Value> {
-        let card_mb = |g: usize| cards.get(g).and_then(|c| c["vram_total_mb"].as_u64()).unwrap_or(32768);
+        let totals = totals_of(cards);
         let loading = self.loading.lock().unwrap().clone();
         let need = |k: &str| all.iter().any(|m| registry::kind_of(m) == k);
         let chat = if need("llm") { (self.chat_loaded(all), self.chat_mode()) } else { (None, (None, None)) };
@@ -833,7 +891,7 @@ impl Home {
             let (id, kind) = (s(m, "id"), registry::kind_of(m).to_string());
             let enabled = m["enabled"] != false;
             let gpus = self.gpus_of(m);
-            let (mut vouch, measured) = self.vouched_mb(m, gpus.first().map_or(32768, |g| card_mb(*g)));
+            let (mut vouch, measured) = self.vouched_mb(m, &totals);
             // an image or audio model allowed several cards counts on the ones its copies are on, else the first it tries
             if one_card(m) && vouch.len() > 1 {
                 let on: Vec<usize> = held_on(cards, &id).into_iter().filter(|g| vouch.contains_key(g)).collect();
@@ -1201,9 +1259,11 @@ impl Home {
         }
         // (the caller's max_willing_to_wait_s replaces these and enforces itself: Host::give_up)
         let default = if super::backplane::has_limit() { Duration::MAX } else { Duration::from_secs(if job.is_some() { JOB_ROOM_WAIT_S } else { ROOM_WAIT_S }) };
-        let info = self.model_info(&m);
-        let card_mb = self.cards.lock().unwrap().get(info.gpus[0]).and_then(|c| c["vram_total_mb"].as_u64()).unwrap_or(32768);
-        let (need_mb, _) = self.vouched_mb(&m, card_mb);
+        let mut info = self.model_info(&m);
+        let totals = totals_of(&self.cards.lock().unwrap());
+        // a model larger than every card it may use is refused here, not started to run out of memory
+        info.gpus = cards_it_fits(&m, &info.gpus, files_mb(&m), &|g| card_total(&totals, g)).map_err(|e| (409, e))?;
+        let (need_mb, _) = self.vouched_mb(&m, &totals);
         // what its server once refused for: on its first card, and (one whose one copy spans its cards) on the others
         let (asked_mb, asked_rest_mb) = {
             let a = self.asked.lock().unwrap();
@@ -1506,8 +1566,8 @@ impl Home {
                 return Err(f);
             }
             let full = self.snapshot_of(&all, true);
-            let card_mb = |g: usize| full.cards.iter().find(|c| c.index == g).map_or(32768, |c| c.total_mb);
-            let (need, _) = self.vouched_mb(m, card_mb(gpus[0]));
+            let totals: Vec<(usize, u64)> = full.cards.iter().filter(|c| c.total_mb > 0).map(|c| (c.index, c.total_mb)).collect();
+            let (need, _) = self.vouched_mb(m, &totals);
             // the chat model loaded now leaves when this one comes: what it holds counts as free and it is no resident
             let chat_on = |g: usize| full.cards.iter().find(|c| c.index == g).into_iter().flat_map(|c| c.procs.iter()).filter(|p| p.kind.as_deref() == Some("llm")).map(|p| p.mb).sum::<u64>();
             let mut snap = full.clone();
@@ -2135,19 +2195,19 @@ mod span_tests {
     #[test]
     fn a_spanning_model_needs_its_own_share_on_each_card() {
         let cap = 30000;
-        let v = card_figures(&sophon(), &[0, 1], cap).unwrap();
+        let v = card_figures(&sophon(), &[0, 1], &|_| cap).unwrap();
         assert_eq!((v[&0], v[&1]), (23552, 5632));
         // its cards in another order take the shares in that order
-        let v = card_figures(&sophon(), &[1, 0], cap).unwrap();
+        let v = card_figures(&sophon(), &[1, 0], &|_| cap).unwrap();
         assert_eq!((v[&1], v[&0]), (23552, 5632));
         // without shares: vram_gib on each; a model that does not span ignores a stray list
         let mut no_shares = sophon();
         no_shares.as_object_mut().unwrap().remove("vram_gib_per_card");
-        assert_eq!(card_figures(&no_shares, &[0, 1], cap).unwrap()[&1], 23552);
+        assert_eq!(card_figures(&no_shares, &[0, 1], &|_| cap).unwrap()[&1], 23552);
         let one = json!({"id": "a", "kind": "audio", "gpus": "0,1", "vram_gib": 6.0, "vram_gib_per_card": [1.0, 2.0]});
-        assert_eq!(card_figures(&one, &[0, 1], cap).unwrap()[&0], 6144);
-        assert_eq!(card_figures(&json!({"vram_gib": 40.0}), &[0], cap).unwrap()[&0], cap, "never more than a card holds");
-        assert!(card_figures(&json!({"id": "x"}), &[0], cap).is_none());
+        assert_eq!(card_figures(&one, &[0, 1], &|_| cap).unwrap()[&0], 6144);
+        assert_eq!(card_figures(&json!({"vram_gib": 40.0}), &[0], &|_| cap).unwrap()[&0], cap, "never more than a card holds");
+        assert!(card_figures(&json!({"id": "x"}), &[0], &|_| cap).is_none());
     }
 
     #[test]
@@ -2190,5 +2250,136 @@ mod one_of_tests {
         assert_eq!(gpus_value(&json!({"gpus": "0|1"}), &[0, 1]), "0|1");
         assert_eq!(gpus_value(&json!({"gpus": "0,1"}), &[0, 1]), "0,1");
         assert_eq!(gpus_value(&json!({"gpus": "0"}), &[1]), "1");
+    }
+}
+
+/// The front door's memory plan against cards of other sizes: fake 16, 24 and 32 GB cards and a mixed pair (what the
+/// driver reports, MiB), the models as hardac1 registers them
+#[cfg(test)]
+mod card_memory_tests {
+    use super::{card_total, cards_it_fits, vouch, MARGIN_MB};
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+
+    const C16: u64 = 16384;
+    const C24: u64 = 24576;
+    const C32: u64 = 32768;
+
+    /// hardac1's registered models (2026-11-22), as their entries carry them: kind, cards, figures
+    fn served() -> Vec<Value> {
+        let m = |id: &str, kind: &str, gpus: &str, gib: Option<f64>| {
+            let mut v = json!({"id": id, "kind": kind, "gpus": gpus});
+            if let Some(g) = gib {
+                v["vram_gib"] = json!(g);
+            }
+            v
+        };
+        vec![m("qwen-image-2.1-q8", "image", "0,1", Some(25.0)), m("minimax-music3", "audio", "0,1", Some(23.0)),
+             m("qwen3-tts-custom", "audio", "0,1", Some(4.5)), m("deepseek-r1-iq1s", "llm", "all", Some(30.0)),
+             m("nemotron-3.5-super-iq1m", "llm", "all", Some(22.0)), m("hunyuanimage-2.1-q8", "image", "0,1", Some(27.0)),
+             m("hunyuan3d-2.1", "model3d", "0,1", Some(21.0)), m("trellis2", "model3d", "0,1", Some(10.0)),
+             m("seedvr2", "image", "0,1", Some(26.0)), m("flashvsr", "image", "0,1", Some(18.0)), m("z-image-turbo", "image", "0", Some(24.0)),
+             m("p-h3-image", "image", "0,1", Some(26.5)), m("minimax-m3.1-flash-iq1m", "llm", "all", Some(30.5)),
+             m("qwen3.8-flash-next-coder-iq1_m", "llm", "0|1", Some(30.8)), m("qwen3.8-27b-q8", "llm", "0|1", Some(30.5)),
+             m("minimax-h3", "video", "0,1", None), m("minimax-h3-mpeg", "video", "0,1", Some(27.3)), m("unlimited-ocr-q8", "image", "0,1", None),
+             m("glm-5.3-flash-uncensored", "llm", "0,1", None),
+             json!({"id": "sophon-realtime-32b-flash", "kind": "audio", "gpus": "0,1", "spans": true, "vram_gib": 25.5, "vram_gib_per_card": [25.5, 6.2]})]
+    }
+
+    fn gpus(m: &Value) -> Vec<usize> {
+        let g = m["gpus"].as_str().unwrap_or("0");
+        if g == "all" { vec![0, 1] } else { super::registry::gpu_list(g) }
+    }
+
+    /// The vouch before 2026-11-22 (`vouched_mb` with the first card's size for every card, 32 GiB when not known):
+    /// the reference the plan for hardac1's two cards must still equal
+    fn old_vouch(m: &Value, gpus: &[usize], files: u64, card_mb: u64) -> BTreeMap<usize, u64> {
+        let cap = card_mb.saturating_sub(MARGIN_MB + 512);
+        if let Some(v) = super::card_figures(m, gpus, &|_| cap) {
+            return v;
+        }
+        let files = if super::registry::spans(m) { files / gpus.len().max(1) as u64 } else { files };
+        let per = match super::registry::kind_of(m) {
+            "video" => card_mb.saturating_sub(4096),
+            "image" => files * 105 / 100 + 4096,
+            "audio" => files * 110 / 100 + 2048,
+            "model3d" => files * 110 / 100 + 6144,
+            _ => files / gpus.len() as u64 + 2048,
+        };
+        gpus.iter().map(|g| (*g, per.min(cap))).collect()
+    }
+
+    #[test]
+    fn nothing_is_planned_over_a_card_and_the_reserve_is_kept() {
+        for totals in [vec![(0, C16)], vec![(0, C24)], vec![(0, C32)], vec![(0, C16), (1, C32)], vec![(0, C32), (1, C24)]] {
+            for m in served() {
+                let gs: Vec<usize> = gpus(&m).into_iter().filter(|g| totals.iter().any(|t| t.0 == *g)).collect();
+                if gs.is_empty() {
+                    continue;
+                }
+                // a model that ran here too: its peak (an edit touching the card's whole memory) is capped as well
+                let seen: BTreeMap<usize, u64> = gs.iter().map(|g| (*g, 40_000)).collect();
+                for (seen, files) in [(None, 0), (None, 60_000), (Some(&seen), 0)] {
+                    let (v, _) = vouch(&m, &gs, seen, files, &|g| card_total(&totals, g));
+                    for (g, mb) in &v {
+                        let total = card_total(&totals, *g).unwrap();
+                        assert!(mb + MARGIN_MB + 512 <= total, "{} on GPU {g} ({total} MiB): {mb} MiB planned, 1.5 GiB not kept", m["id"]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_model_larger_than_its_cards_is_refused_with_a_clear_error() {
+        let zimg = json!({"id": "z-image-turbo", "kind": "image", "gpus": "0", "vram_gib": 24.0});
+        let fits = |m: &Value, totals: &[(usize, u64)]| cards_it_fits(m, &gpus(m), 0, &|g| card_total(totals, g));
+        let e = fits(&zimg, &[(0, C16)]).unwrap_err();
+        assert!(e.contains("z-image-turbo cannot load on its cards: it needs 24.0 GiB on GPU 0, which holds 16.0 GiB (with 1.5 GiB kept free)"), "{e}");
+        assert!(e.contains("refused, not tried"), "{e}");
+        assert!(fits(&zimg, &[(0, C24)]).is_err(), "24 GiB and the reserve are past a 24 GiB card");
+        assert_eq!(fits(&zimg, &[(0, C32)]).unwrap(), vec![0]);
+        // a mixed pair: the card it fits on, the other left out (the room plan never tries it there)
+        let qimg = json!({"id": "qwen-image-2.1-q8", "kind": "image", "gpus": "0,1", "vram_gib": 25.0});
+        assert_eq!(fits(&qimg, &[(0, C16), (1, C32)]).unwrap(), vec![1]);
+        assert!(fits(&qimg, &[(0, C16), (1, C24)]).unwrap_err().contains("GPU 0, which holds 16.0 GiB; 25.0 GiB on GPU 1, which holds 24.0 GiB"));
+        // one copy over two cards: each card its share, any one short refuses it
+        let sophon = json!({"id": "sophon", "kind": "audio", "gpus": "0,1", "spans": true, "vram_gib": 25.5, "vram_gib_per_card": [25.5, 6.2]});
+        assert_eq!(fits(&sophon, &[(0, C32), (1, C16)]).unwrap(), vec![0, 1]);
+        assert!(fits(&sophon, &[(0, C16), (1, C32)]).unwrap_err().contains("25.5 GiB on GPU 0, which holds 16.0 GiB"));
+        // an estimate from its files when its card states nothing (an image model: files x 1.05 + 4 GiB)
+        let big = json!({"id": "big", "kind": "image", "gpus": "0"});
+        assert!(cards_it_fits(&big, &[0], 20_000, &|_| Some(C16)).is_err());
+        assert!(cards_it_fits(&big, &[0], 8_000, &|_| Some(C16)).is_ok());
+        // chat models and models streaming from their files size themselves to the card (their engines refuse); a card
+        // not known yet waits in the room plan
+        let chat = json!({"id": "q27", "kind": "llm", "gpus": "0|1", "vram_gib": 30.5});
+        assert_eq!(fits(&chat, &[(0, C16), (1, C16)]).unwrap(), vec![0, 1]);
+        assert!(fits(&json!({"id": "s", "kind": "audio", "gpus": "0", "vram_gib": 40.0, "streams": true}), &[(0, C16)]).is_ok());
+        assert_eq!(cards_it_fits(&zimg, &[0], 0, &|_| None).unwrap(), vec![0]);
+        // refused is not no-room: not retryable (another box may be bigger, this one never will be)
+        assert_eq!(super::super::api::code_of(409), "conflict");
+        assert!(!super::super::api::retryable(409, "conflict"));
+    }
+
+    /// No change for hardac1's cards (the B70 and the B65 report 32768 MiB each): every served model's vouch equals the
+    /// old one, and every one fits all its cards
+    #[test]
+    fn hardac1s_plans_are_unchanged() {
+        let totals = [(0usize, C32), (1, C32)];
+        let mut printed = Vec::new();
+        for m in served() {
+            let gs = gpus(&m);
+            for files in [0, 9_000, 120_000] {
+                let (new, _) = vouch(&m, &gs, None, files, &|g| card_total(&totals, g));
+                assert_eq!(new, old_vouch(&m, &gs, files, C32), "{} (files {files} MiB)", m["id"]);
+            }
+            assert_eq!(cards_it_fits(&m, &gs, 0, &|g| card_total(&totals, g)).unwrap(), gs, "{}", m["id"]);
+            printed.push(format!("{}: {:?}", m["id"].as_str().unwrap(), vouch(&m, &gs, None, 0, &|g| card_total(&totals, g)).0));
+        }
+        // a card the list does not have yet: the box's largest, as the old 32 GiB default on this box
+        assert_eq!(card_total(&totals, 7), Some(C32));
+        assert_eq!(card_total(&[], 0), None);
+        eprintln!("hardac1 vouches (MiB a card):\n  {}", printed.join("\n  "));
     }
 }

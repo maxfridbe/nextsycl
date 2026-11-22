@@ -31,6 +31,7 @@ use nextsycl_llm::{Error, ExpertStats, GpuInfo, Result, Sampler, Tap};
 
 use crate::ffi;
 use crate::model::Geometry;
+use crate::plan;
 
 fn e(x: impl std::fmt::Display) -> Error {
     Error(x.to_string())
@@ -1103,34 +1104,52 @@ impl<'g> MiniMax<'g> {
         let k = ffi::api()?;
         let n_layer = g.n_layer as usize;
         let ncard = gpus.len().min(n_layer);
-        // two cards: the slower one (the B65) takes the first layers, the B70 the rest and the head (per token 89 against 95 ms on one text; NS_MM31_ORDER=asis: the order given)
-        let mut ordered: Vec<Arc<Gpu>> = gpus[..ncard].to_vec();
-        if ncard == 2 && std::env::var("NS_MM31_ORDER").map_or(true, |v| v != "asis") {
-            ordered.sort_by_key(|g| !g.name.contains("B65"));
-        }
+        // the cards as their devices report them (plan.rs plans from these, never from a name)
+        let info = |gpu: &Arc<Gpu>| -> Result<plan::CardInfo> {
+            let (total, free) = gpu.memory()?;
+            let (units, mhz) = nextsycl_core::gpu_units(gpu.index).unwrap_or((0, 0));
+            Ok(plan::CardInfo { units, mhz, total: total as usize, free: free.unwrap_or(total) as usize })
+        };
+        let given: Vec<plan::CardInfo> = gpus[..ncard].iter().map(info).collect::<Result<_>>()?;
+        // two cards: the one that computes less takes the first layers, the other the rest and the head (NS_MM31_ORDER=asis: the order given)
+        let order = plan::card_order(&given, std::env::var("NS_MM31_ORDER").is_ok_and(|v| v == "asis"));
+        let ordered: Vec<Arc<Gpu>> = order.iter().map(|i| gpus[*i].clone()).collect();
+        let cards_now: Vec<plan::CardInfo> = order.iter().map(|i| given[*i]).collect();
         let gpus = &ordered[..];
-        // layers over the cards: even by default (NS_MM31_SPLIT=N: N layers on the first of two)
-        let mut bounds: Vec<usize> = (0..=ncard).map(|i| n_layer * i / ncard).collect();
-        // two cards: 40% of the layers on the first (the B65): per token as good as half, prompts better (8K pp 357 against 337)
-        if ncard == 2 {
-            bounds[1] = n_layer * 2 / 5;
-        }
-        if let Some(n) = std::env::var("NS_MM31_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| ncard == 2 && *n > 0 && *n < n_layer) {
-            bounds[1] = n;
-        }
+        // layers over the cards: even, 40% on the first of two (NS_MM31_SPLIT=N: N layers on the first of two)
+        let bounds = plan::layer_bounds(n_layer, ncard, std::env::var("NS_MM31_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()));
         let mut owner = vec![0usize; n_layer];
         for c in 0..ncard {
             for o in owner.iter_mut().take(bounds[c + 1]).skip(bounds[c]) {
                 *o = c;
             }
         }
-        for gpu in gpus {
-            let (total, free) = gpu.memory()?;
-            log(format!("{}: {:.1} GiB, {:.1} GiB free", gpu.name, gib(total as usize), gib(free.unwrap_or(total) as usize)));
+        for (gpu, c) in gpus.iter().zip(&cards_now) {
+            log(format!("{}: {:.1} GiB, {:.1} GiB free", gpu.name, gib(c.total), gib(c.free)));
         }
+        let ranges: Vec<std::ops::Range<usize>> = (0..ncard).map(|c| bounds[c]..bounds[c + 1]).collect();
+        // what each card keeps beside its layers: the arena, the sessions' caches, the drafter's (the last card) and a spare
+        let kv_tokens = if kv.0 > 0 { kv.0 } else { 32768 };
+        let n_sparse_of = |r: &std::ops::Range<usize>| r.clone().filter(|l| *l as u64 >= g.n_dense || sparse_all()).count();
+        let per_tok = |r: &std::ops::Range<usize>| r.len() * 2 * (g.n_kv_head * g.head_dim) as usize * 2 + n_sparse_of(r) * g.indexer.key_len as usize * 2;
+        let draft_on = std::env::var("NS_MM31_DRAFT").is_ok_and(|p| !p.is_empty());
+        let reserves: Vec<plan::Reserve> = (0..ncard).map(|c| plan::Reserve {
+            arena: plan::arena_bytes(prefill_chunk()),
+            kv: kv.1.max(1) * kv_tokens * per_tok(&ranges[c]),
+            // the drafter's layers' caches and its passes' scratch (peaks 250-576 MiB past the sizing without this, at 2K-8K: under the floor)
+            draft: if c + 1 == ncard && draft_on { 5 * kv_tokens * 2 * (g.n_kv_head * g.head_dim) as usize * 2 + (700 << 20) } else { 0 },
+            // the room left besides the arena and the caches (NS_MM31_SPARE_GIB, default 1.9; never below the floor plus what the driver takes)
+            spare: (env_f64("NS_MM31_SPARE_GIB").unwrap_or(1.9).max(1.6) * GIB as f64) as usize,
+        }).collect();
+        // the weights that stay on each card (all but the routed experts and the token embedding, which stays in the file; the head on the last):
+        // a card short of its layers and its reserve refuses the load before anything is placed
+        let dense: Vec<usize> = ranges.iter().enumerate().map(|(c, r)| {
+            let on = |name: &str| r.clone().any(|l| name.starts_with(&format!("blk.{l}."))) || (c + 1 == ncard && name.starts_with("output"));
+            f.tensors.iter().filter(|t| !t.name.contains("_exps") && on(&t.name)).map(|t| t.bytes as usize).sum()
+        }).collect();
+        plan::check_fit(&cards_now, &dense, &reserves, &gpus.iter().map(|g| format!("GPU {} ({})", g.index, g.name)).collect::<Vec<_>>()).map_err(e)?;
         // each card's weights load at once, a thread each (NS_LOAD_SEQ=1: one after the other)
         let seq = std::env::var("NS_LOAD_SEQ").is_ok_and(|v| v == "1");
-        let ranges: Vec<std::ops::Range<usize>> = (0..ncard).map(|c| bounds[c]..bounds[c + 1]).collect();
         let parts: Vec<Result<(Part, Vec<String>)>> = if seq {
             ranges
                 .iter()
@@ -1254,27 +1273,14 @@ impl<'g> MiniMax<'g> {
         // ---- what each card keeps of the experts
         let reader = Arc::new(Reader::open(&f.paths)?);
         let slot_max = layers.iter().filter_map(|l| if let Ffn::Moe(m) = &l.ffn { Some(m.layout().2) } else { None }).max().unwrap_or(256);
-        let kv_tokens = if kv.0 > 0 { kv.0 } else { 32768 };
-        let n_sparse_of = |r: &std::ops::Range<usize>| layers[r.clone()].iter().filter(|l| l.idx.is_some()).count();
-        let per_tok = |r: &std::ops::Range<usize>| r.len() * 2 * (g.n_kv_head * g.head_dim) as usize * 2 + n_sparse_of(r) * g.indexer.key_len as usize * 2;
-        // a prompt pass of 4096 rows fits 1.5 GiB; larger chunks take about 250 KiB a row
-        let arena_bytes = (1536usize << 20).max(prefill_chunk() * (250 << 10));
+        let arena_bytes = plan::arena_bytes(prefill_chunk());
         let mut vram_left = Vec::new();
         for (c, gpu) in gpus.iter().enumerate() {
             let (total, free) = gpu.memory()?;
-            let free = free.unwrap_or(total) as usize;
-            // the arena, the sessions' caches, and 1.5 GiB kept free (a spare of 1 GiB more: the driver's own use)
-            // NS_MM31_SPARE_GIB: the room left besides the arena and the caches (default 1.9; never below the 1.5 GiB floor plus what the driver takes)
-            let spare = (env_f64("NS_MM31_SPARE_GIB").unwrap_or(1.9).max(1.6) * GIB as f64) as usize;
-            // the drafter's layers' caches and its passes' scratch (peaks 250-576 MiB past the sizing without this, at 2K-8K: under the 1.5 GiB floor)
-            let ds_kv = if c + 1 == ncard && ds.is_some() { 5 * kv_tokens * 2 * (g.n_kv_head * g.head_dim) as usize * 2 + (700 << 20) } else { 0 };
-            let reserve = arena_bytes + kv.1.max(1) * kv_tokens * per_tok(&ranges[c]) + spare + ds_kv;
-            let room = free.saturating_sub(reserve);
-            let v = match env_f64("NS_MM31_VRAM_GIB").or(o.expert_bytes.map(|b| b as f64 / GIB as f64)) {
-                Some(v) => ((v * GIB as f64) as usize).min(room),
-                None => room,
-            };
-            vram_left.push(v);
+            // the reserve as planned before the load (the drafter's part only when one loaded)
+            let r = plan::Reserve { draft: if ds.is_some() { reserves[c].draft } else { 0 }, ..reserves[c] };
+            let cap = env_f64("NS_MM31_VRAM_GIB").or(o.expert_bytes.map(|b| b as f64 / GIB as f64)).map(|v| (v * GIB as f64) as usize);
+            vram_left.push(plan::expert_room(free.unwrap_or(total) as usize, &r, cap));
         }
         // the experts each card could keep: its layers' (for the pinned memory's share)
         let exp_bytes: Vec<usize> = ranges

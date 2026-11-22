@@ -814,10 +814,10 @@ impl Part {
             // short of 100 MB on the server's B70) with 0.6 GiB to spare, and the sessions' attention caches - sized
             // now so a long context never pushes VRAM into the driver's spill path (the arena past its 1 GiB comes out
             // of the experts too)
-            None => gpu.memory()?.1.map_or(8usize << 30, |f| {
+            None => gpu.free_or_guess().map(|f| {
                 let pass = (600 << 20) + prefill_chunk() * (352 << 10);
                 (f as usize).saturating_sub(pass + arena_bytes().max(1 << 30) + SMALL_ARENA + kv_reserve)
-            }),
+            })?,
         }
         .saturating_sub(fixed_bytes);
         let per_chunk = (CHUNK / slot_bytes).max(1);

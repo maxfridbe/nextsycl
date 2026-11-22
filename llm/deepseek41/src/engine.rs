@@ -2619,10 +2619,10 @@ impl Part {
         let ring_bytes = prompt_ring() * ring_slot;
         let budget = match expert_bytes {
             Some(b) => b,
-            None => gpu.memory()?.1.map_or(8usize << 30, |f| {
+            None => gpu.free_or_guess().map(|f| {
                 let pass = (900 << 20) + prefill_chunk() * (400 << 10);
                 (f as usize).saturating_sub(pass + arena_bytes() + SMALL_ARENA + kv_reserve + keep_free() + ring_bytes + (512 << 20))
-            }),
+            })?,
         };
         // with several stores and a profile, each gets the slots its experts take in the profile's ranking over all of
         // them (VRAM first, then host memory); without, each the share of its bytes

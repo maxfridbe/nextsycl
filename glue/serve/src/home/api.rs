@@ -868,7 +868,7 @@ impl Home {
                 r["describer_model"] = json!(c.id);
                 // the describer's memory on its card: as measured on this box once it has run, else its card's figure
                 r["memory_mb"] = json!(all.iter().find(|m| m["id"] == c.id.as_str())
-                    .and_then(|m| self.vouched_mb(m, 32768).0.values().copied().max()));
+                    .and_then(|m| self.vouched_mb(m, &super::life::totals_of(&self.cards.lock().unwrap())).0.values().copied().max()));
                 Ok(r)
             }
             ("image", "describers") => {

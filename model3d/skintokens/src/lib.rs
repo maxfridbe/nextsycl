@@ -157,7 +157,7 @@ impl SkinTokens {
         let max_new = s.max_new.min(self.qwen.max_positions() - l0);
         // the pool: the prefix's slots, then one a beam a step - grown as the sequences do, as far as the card holds
         // (1.5 GiB kept free)
-        let free = o.gpu.memory()?.1.unwrap_or(8 << 30) as usize;
+        let free = o.gpu.free_or_guess()? as usize;
         let room = free.saturating_sub(3 << 29) / qwen::Qwen::pool_bytes(1);
         let most = (l0 + nb * max_new).min(room);
         if most < l0 + nb * 8 {
