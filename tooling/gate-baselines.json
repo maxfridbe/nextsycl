@@ -3,24 +3,67 @@
   "recorded": "a8139b8 (2026-11-22)",
   "tolerance": 0.03,
   "shared": {
-    "crates/": ["*"],
-    "kernels/ns/": ["*"],
-    "kernels/llm/common/": ["llm/*"],
-    "kernels/strata/": ["llm/qwen4exp"],
-    "kernels/diffusion/": ["image/*", "video/*", "audio/*", "model3d/*"],
-    "llm/contract/": ["llm/*"],
-    "image/contract/": ["image/*"],
-    "video/contract/": ["video/*"],
-    "audio/contract/": ["audio/*"],
-    "model3d/contract/": ["model3d/*"],
-    "kernels/llm/glm5next/": ["llm/qwen35", "llm/glm5next"]
+    "crates/": [
+      "*"
+    ],
+    "kernels/ns/": [
+      "*"
+    ],
+    "kernels/llm/common/": [
+      "llm/*"
+    ],
+    "kernels/strata/": [
+      "llm/qwen4exp"
+    ],
+    "kernels/diffusion/": [
+      "image/*",
+      "video/*",
+      "audio/*",
+      "model3d/*"
+    ],
+    "llm/contract/": [
+      "llm/*"
+    ],
+    "image/contract/": [
+      "image/*"
+    ],
+    "video/contract/": [
+      "video/*"
+    ],
+    "audio/contract/": [
+      "audio/*"
+    ],
+    "model3d/contract/": [
+      "model3d/*"
+    ],
+    "kernels/llm/glm5next/": [
+      "llm/qwen35",
+      "llm/glm5next"
+    ]
   },
   "engines": {
     "llm/qwen35": {
       "run": "dist/nextsycl llm generate /var/mnt/2TBSSD/qwen38-27b/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_M.gguf --ctx 4096 --max 128 --temp 0 --gpu {gpu} --prompt \"Explain, step by step and with a small worked example, how a hash map handles collisions with open addressing and with separate chaining, what load factor means for each, and when you would pick one over the other in a program that stores ten million short strings.\"",
-      "mounts": ["/var/mnt/2TBSSD/qwen38-27b"],
+      "mounts": [
+        "/var/mnt/2TBSSD/qwen38-27b"
+      ],
       "timeout_s": 600,
-      "cards": {}
+      "gpus": [
+        "0",
+        "1"
+      ],
+      "cards": {
+        "1": {
+          "exact": "0cd13a4e001a171c",
+          "pp": 170.9,
+          "tg": 36.59
+        },
+        "0": {
+          "exact": "a918ec0ff036cd31",
+          "pp": 182.7,
+          "tg": 57.50
+        }
+      }
     }
   }
 }

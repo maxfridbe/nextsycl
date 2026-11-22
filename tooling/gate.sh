@@ -78,7 +78,7 @@ for eng in $(printf '%s\n' "${!want[@]}" | sort); do
   if ! jq -e --arg e "$eng" '.engines[$e]' "$B" >/dev/null; then rows+=("| $eng | - | no baseline | - | - | skip |"); continue; fi
   cmd=$(jq -r --arg e "$eng" '.engines[$e].run' "$B"); lim=$(jq -r --arg e "$eng" '.engines[$e].timeout_s' "$B")
   mounts=$(jq -r --arg e "$eng" '.engines[$e].mounts[] | "-v \(.):\(.):ro"' "$B" | tr '\n' ' ')
-  for card in $(jq -r --arg e "$eng" '.engines[$e].cards | keys[]' "$B"); do
+  for card in $(jq -r --arg e "$eng" '.engines[$e].gpus[]' "$B"); do
     # a variant's change: only the cards it matches (what the program says each GPU takes)
     if [[ "${want[$eng]}" == variant:* ]]; then
       arch=${want[$eng]#variant:}
