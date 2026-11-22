@@ -3,7 +3,9 @@
 //! `kernels/<kind>/<arch>/silo/variants/<name>/` holds a manifest (`variant.yml`) and only the ops that differ; it
 //! builds to `dist/silo/libnextsycl-<arch>@<name>.so` with its manifest beside it (`libnextsycl-<arch>@<name>.yml`).
 //! An op is then taken, per GPU, from the variant that GPU matches, else from the default silo (else the engine's
-//! shared kernel). This module is the pure part: the manifest, the device a rule reads, and the choice.
+//! shared kernel). A variant may also carry `settings`: engine options (the names `--opt-NAME` takes) that become the
+//! engine's defaults when the variant applies to every GPU it loads on (`nextsycl_core::variant_settings`). This
+//! module is the pure part: the manifest, the device a rule reads, the choice, and whether two rules can overlap.
 
 use std::path::PathBuf;
 
@@ -19,6 +21,37 @@ pub struct DeviceInfo {
     pub vram_mb: Option<u64>,
     /// the sub-group sizes it runs (empty: not known)
     pub sub_groups: Vec<u32>,
+}
+
+impl DeviceInfo {
+    /// The card's id in the merge gate's baselines (tooling/gate-baselines.json `cards`): its name without the
+    /// vendor's marks, its units and its memory in GiB - `arc-pro-b70-256u-32g`. Two boxes with the same card share it.
+    pub fn card_id(&self) -> String {
+        let mut words = Vec::new();
+        for w in self.name.to_lowercase().replace("(r)", " ").replace("(tm)", " ").split(|c: char| !c.is_ascii_alphanumeric()) {
+            if !w.is_empty() && !matches!(w, "intel" | "graphics") {
+                words.push(w.to_string());
+            }
+        }
+        words.push(format!("{}u", self.units));
+        if let Some(m) = self.vram_mb {
+            words.push(format!("{}g", (m + 512) / 1024));
+        }
+        words.join("-")
+    }
+
+    /// As one line of JSON: what tooling/gate.sh records beside a card's baseline (the architecture test reads it back
+    /// to check a variant has a baseline on a card it matches)
+    pub fn to_json(&self) -> String {
+        let esc: String = self.name.chars().flat_map(|c| match c {
+            '"' | '\\' => vec!['\\', c],
+            c if (c as u32) < 0x20 => vec![' '],
+            c => vec![c],
+        }).collect();
+        let sg: Vec<String> = self.sub_groups.iter().map(|s| s.to_string()).collect();
+        format!("{{\"name\": \"{esc}\", \"units\": {}, \"mhz\": {}, \"vram_mb\": {}, \"sub_groups\": [{}]}}", self.units, self.mhz,
+                self.vram_mb.map_or("null".into(), |m| m.to_string()), sg.join(", "))
+    }
 }
 
 /// A variant's match rule: every bound given must hold (an unknown device value fails a bound on it)
@@ -52,6 +85,22 @@ impl Match {
     fn is_empty(&self) -> bool {
         *self == Match::default()
     }
+
+    /// Whether one device could match both rules. Only the numbers separate two rules (their ranges do not meet on
+    /// some dimension, an absent bound being open); a sub-group size never does (a device runs several), nor does a
+    /// name (one name can hold two substrings) - conservative: a pair this calls overlapping may in fact never meet,
+    /// and its fix is a tighter numeric bound.
+    pub fn overlaps(&self, other: &Match) -> bool {
+        let meet = |lo1: Option<u64>, hi1: Option<u64>, lo2: Option<u64>, hi2: Option<u64>| {
+            let lo = lo1.unwrap_or(0).max(lo2.unwrap_or(0));
+            let hi = hi1.unwrap_or(u64::MAX).min(hi2.unwrap_or(u64::MAX));
+            lo <= hi
+        };
+        let w = |v: Option<u32>| v.map(u64::from);
+        meet(self.vram_mb_min, self.vram_mb_max, other.vram_mb_min, other.vram_mb_max)
+            && meet(w(self.units_min), w(self.units_max), w(other.units_min), w(other.units_max))
+            && meet(w(self.mhz_min), w(self.mhz_max), w(other.mhz_min), w(other.mhz_max))
+    }
 }
 
 /// A variant's manifest (`variant.yml`)
@@ -62,15 +111,21 @@ pub struct Manifest {
     /// who measured it, on what (the before / after numbers are in its pull request)
     pub measured: String,
     pub rule: Match,
+    /// engine options (option name, value) that become the engine's defaults where the variant applies: below the
+    /// model card's settings, `--opt` and the environment, above the engine's own default (`settings:`)
+    pub settings: Vec<(String, String)>,
 }
 
-/// Reads a manifest: `description:`, `measured:` and a `match:` block of the bounds (`vram_mb_min`, `vram_mb_max`,
-/// `units_min`, `units_max`, `mhz_min`, `mhz_max`, `sub_group`, `name`), a `key: value` a line, `#` comments. A
-/// flat subset of YAML, read here without a YAML crate (the foundation has no dependencies); an unknown key, a
-/// missing field or an empty rule is an error.
+/// Reads a manifest: `description:`, `measured:`, a `match:` block of the bounds (`vram_mb_min`, `vram_mb_max`,
+/// `units_min`, `units_max`, `mhz_min`, `mhz_max`, `sub_group`, `name`) and an optional `settings:` block (engine
+/// option name: value), a `key: value` a line, `#` comments. A flat subset of YAML, read here without a YAML crate
+/// (the foundation has no dependencies); an unknown key, a missing field, an empty rule, a setting given twice or
+/// without a value is an error. Whether a setting names one of its engine's options, with a value that option takes,
+/// is checked against the engine (`nextsycl_core::options::variant_settings`, and the architecture test).
 pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
     let mut m = Manifest::default();
     let mut in_match = false;
+    let mut in_settings = false;
     let mut seen_match = false;
     for (n, raw) in text.lines().enumerate() {
         let line = match raw.find(" #") {
@@ -87,6 +142,20 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
         let num = |what: &str| v.parse::<u64>().map_err(|_| format!("line {}: {what}: a whole number, not {v:?}", n + 1));
         if !indented {
             in_match = false;
+            in_settings = false;
+        }
+        if indented && in_settings {
+            if k.is_empty() || !k.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+                return Err(format!("line {}: settings: an engine option's name ([a-z0-9-_]), not {k:?}", n + 1));
+            }
+            if v.is_empty() {
+                return Err(format!("line {}: settings: {k} has no value", n + 1));
+            }
+            if m.settings.iter().any(|(x, _)| x == k) {
+                return Err(format!("line {}: settings: {k} given twice", n + 1));
+            }
+            m.settings.push((k.to_string(), v.to_string()));
+            continue;
         }
         match (indented, in_match, k) {
             (false, _, "description") => m.description = v.to_string(),
@@ -95,6 +164,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                 in_match = true;
                 seen_match = true;
             }
+            (false, _, "settings") if v.is_empty() => in_settings = true,
             (true, true, "vram_mb_min") => m.rule.vram_mb_min = Some(num(k)?),
             (true, true, "vram_mb_max") => m.rule.vram_mb_max = Some(num(k)?),
             (true, true, "units_min") => m.rule.units_min = Some(num(k)? as u32),
@@ -123,8 +193,35 @@ pub struct VariantFile {
     pub manifest: Manifest,
 }
 
+/// The variants every one of these devices matches, by name
+pub fn matching<'a>(variants: &'a [VariantFile], devices: &[DeviceInfo]) -> Vec<&'a VariantFile> {
+    if devices.is_empty() {
+        return Vec::new();
+    }
+    let mut v: Vec<&VariantFile> = variants.iter().filter(|v| devices.iter().all(|d| v.manifest.rule.matches(d))).collect();
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    v
+}
+
+/// A warning when more than one variant matches these devices and none is forced: two variants of one silo whose
+/// rules meet (the architecture test refuses such a pair; a manifest written or built outside the tree can still
+/// make one). `choose` still picks the first by name.
+pub fn ambiguity(variants: &[VariantFile], devices: &[DeviceInfo], force: Option<&str>) -> Option<String> {
+    if force.is_some_and(|f| !f.trim().is_empty()) {
+        return None;
+    }
+    let m = matching(variants, devices);
+    (m.len() > 1).then(|| {
+        let names: Vec<&str> = m.iter().map(|v| v.name.as_str()).collect();
+        let on: Vec<String> = devices.iter().map(|d| format!("GPU {}", d.index)).collect();
+        format!("warning: silo variants {} all match {}: taking {} (the first by name); tighten their match rules",
+                names.join(", "), on.join(", "), names[0])
+    })
+}
+
 /// The variant for these devices: `force` (NS_SILO_VARIANT, a model card's `silo.variant`) names one - `none` none -,
-/// else the one every device matches (by name order when several do). Err: a forced variant that is not built.
+/// else the one every device matches (by name order when several do: `ambiguity` says so). Err: a forced variant
+/// that is not built.
 pub fn choose<'a>(variants: &'a [VariantFile], devices: &[DeviceInfo], force: Option<&str>) -> Result<Option<&'a VariantFile>, String> {
     match force.map(str::trim).filter(|f| !f.is_empty()) {
         Some("none") => Ok(None),
@@ -132,12 +229,7 @@ pub fn choose<'a>(variants: &'a [VariantFile], devices: &[DeviceInfo], force: Op
             let built: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
             format!("silo variant {f:?} is not built (built: {})", if built.is_empty() { "none".into() } else { built.join(", ") })
         }),
-        None if devices.is_empty() => Ok(None),
-        None => {
-            let mut v: Vec<&VariantFile> = variants.iter().filter(|v| devices.iter().all(|d| v.manifest.rule.matches(d))).collect();
-            v.sort_by(|a, b| a.name.cmp(&b.name));
-            Ok(v.first().copied())
-        }
+        None => Ok(matching(variants, devices).first().copied()),
     }
 }
 
@@ -196,5 +288,62 @@ mod tests {
         assert_eq!(pick(std::slice::from_ref(&b65), Some("none")), None);
         assert!(choose(&vs, std::slice::from_ref(&b65), Some("nope")).unwrap_err().contains("not built"));
         assert_eq!(pick(&[], None), None);
+    }
+
+    #[test]
+    fn settings_read_as_option_names_and_values() {
+        let m = parse_manifest("description: a\nmeasured: b\nmatch:\n  units_max: 200\nsettings:\n  drafts: 3  # the default\n  image-tokens: '4096'\n").unwrap();
+        assert_eq!(m.settings, vec![("drafts".to_string(), "3".to_string()), ("image-tokens".to_string(), "4096".to_string())]);
+        assert_eq!(m.rule, Match { units_max: Some(200), ..Match::default() });
+        // the blocks in either order, and a top-level key after the settings ends them
+        let m = parse_manifest("description: a\nsettings:\n  drafts: 3\nmatch:\n  units_max: 200\nmeasured: b\n").unwrap();
+        assert_eq!(m.settings.len(), 1);
+        assert!(parse_manifest("description: a\nmeasured: b\nmatch:\n  units_max: 2\nsettings:\n  drafts:\n").unwrap_err().contains("no value"));
+        assert!(parse_manifest("description: a\nmeasured: b\nmatch:\n  units_max: 2\nsettings:\n  drafts: 1\n  drafts: 2\n").unwrap_err().contains("twice"));
+        assert!(parse_manifest("description: a\nmeasured: b\nmatch:\n  units_max: 2\nsettings:\n  NS_Q35_DRAFTS: 1\n").unwrap_err().contains("option's name"));
+        // a bound under settings is a setting, not a bound: the rule stays required
+        assert!(parse_manifest("description: a\nmeasured: b\nsettings:\n  units_max: 2\n").unwrap_err().contains("match rule"));
+        assert!(parse_manifest(SMALL).unwrap().settings.is_empty());
+    }
+
+    #[test]
+    fn rules_overlap_unless_a_number_separates_them() {
+        let r = |y: &str| parse_manifest(&format!("description: a\nmeasured: b\nmatch:\n{y}")).unwrap().rule;
+        let few = r("  units_max: 200\n");
+        let many = r("  units_min: 201\n");
+        let small = r("  vram_mb_max: 20000\n");
+        assert!(!few.overlaps(&many) && !many.overlaps(&few));
+        // open on memory: a card of few units and little memory matches both
+        assert!(few.overlaps(&small) && small.overlaps(&few));
+        assert!(few.overlaps(&few));
+        // the edges: a range ending where the other starts meets it
+        assert!(r("  units_max: 200\n").overlaps(&r("  units_min: 200\n")));
+        assert!(!r("  mhz_max: 2000\n  units_max: 200\n").overlaps(&r("  mhz_min: 2001\n  units_max: 200\n")));
+        // a sub-group size or a name never separates two rules
+        assert!(r("  sub_group: 16\n").overlaps(&r("  sub_group: 32\n")));
+        assert!(r("  name: B580\n").overlaps(&r("  name: B570\n")));
+        assert!(r("  name: B580\n  units_max: 100\n").overlaps(&r("  name: B570\n  units_max: 200\n")));
+        assert!(!r("  name: B580\n  units_max: 100\n").overlaps(&r("  name: B580\n  units_min: 101\n")));
+    }
+
+    #[test]
+    fn two_matching_variants_warn_and_the_first_by_name_is_taken() {
+        let vs = vec![var("small", SMALL), var("few-units", "description: a\nmeasured: b\nmatch:\n  units_max: 200\n")];
+        let b580 = dev("B580", 160, 12_216);
+        let w = ambiguity(&vs, std::slice::from_ref(&b580), None).unwrap();
+        assert!(w.contains("few-units, small") && w.contains("taking few-units"), "{w}");
+        assert_eq!(choose(&vs, std::slice::from_ref(&b580), None).unwrap().unwrap().name, "few-units");
+        // one match, or a forced one: no warning
+        assert_eq!(ambiguity(&vs, &[dev("B65", 160, 32_656)], None), None);
+        assert_eq!(ambiguity(&vs, std::slice::from_ref(&b580), Some("small")), None);
+    }
+
+    #[test]
+    fn a_card_is_known_by_what_it_reports() {
+        let d = DeviceInfo { index: 1, name: "Intel(R) Arc(TM) Pro B65 Graphics".into(), units: 160, mhz: 2400, vram_mb: Some(32_656), sub_groups: vec![16, 32] };
+        assert_eq!(d.card_id(), "arc-pro-b65-160u-32g");
+        assert_eq!(DeviceInfo { vram_mb: None, ..d.clone() }.card_id(), "arc-pro-b65-160u");
+        assert_eq!(d.to_json(), r#"{"name": "Intel(R) Arc(TM) Pro B65 Graphics", "units": 160, "mhz": 2400, "vram_mb": 32656, "sub_groups": [16, 32]}"#);
+        assert!(DeviceInfo { name: "a\"b".into(), ..d }.to_json().contains(r#""a\"b""#));
     }
 }

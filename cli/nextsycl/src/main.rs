@@ -63,7 +63,7 @@ every kind:
   nextsycl drives [--json]      the drives the models are on: device, PCIe link, mount, size, free, models, read speed
   nextsycl drives measure <drive>   its read speed: 4 GiB of model files past the page cache (O_DIRECT), kept
   nextsycl gpus                 each GPU in its own context: memory, copy rates, GPU to GPU, host RAM unaffected
-  nextsycl silo [ARCH]          what each GPU reports (units, clock, memory, sub-groups) and the silo variant it takes
+  nextsycl silo [ARCH]          what each GPU reports (units, clock, memory, sub-groups), the silo variant it takes and its settings
                                 for each silo that has variants (NS_SILO_VARIANT forces one; no GPU is opened)
   nextsycl switch [--port 8001] [--upstream 127.0.0.1:8085] [--studio URL] [--alias OLD=NEW]...
                                 the chat front end's model switcher: every registered chat model on one endpoint,
@@ -186,6 +186,11 @@ fn load_engine<'g>(f: &'g Gguf, gpus: &[std::sync::Arc<nextsycl_core::Gpu>], o: 
         log(format!("option {var}={v}"));
         std::env::set_var(var, v);
     }
+    // the silo variant's settings for these GPUs: below everything set above (CONTRIBUTING rule 6)
+    let on: Vec<usize> = gpus.iter().map(|g| g.index).collect();
+    for line in nextsycl_core::apply_variant_settings(k.archs, &on, &llm_options(k)).map_err(|e| e.0)? {
+        log(line);
+    }
     (k.load)(f, gpus, &o, log).map_err(|e| e.0)
 }
 
@@ -212,8 +217,9 @@ fn host_available() -> u64 {
         .map_or(0, |kb| kb * 1024)
 }
 
-/// `nextsycl silo [ARCH]`: each GPU as a variant's match rule reads it, and per silo with variants (or ARCH's) the one
-/// each GPU takes - `silo ARCH GPU N: NAME` / `default` lines (tooling/gate.sh reads them)
+/// `nextsycl silo [ARCH]`: each GPU as a variant's match rule reads it (and its id in the gate's baselines: `card N ID
+/// {json}` lines), and per silo with variants (or ARCH's) the one each GPU takes - `silo ARCH GPU N: NAME` / `default`
+/// lines, the variant's settings under it (tooling/gate.sh reads them)
 fn silo_cmd(args: &[String]) -> Result<(), String> {
     let e = |x: nextsycl_core::Error| x.0;
     let api = nextsycl_core::api().map_err(e)?;
@@ -223,6 +229,9 @@ fn silo_cmd(args: &[String]) -> Result<(), String> {
         let sg: Vec<String> = d.sub_groups.iter().map(|s| s.to_string()).collect();
         println!("GPU {}: {}, {} units at {} MHz, {}, sub-groups {}", d.index, d.name, d.units, d.mhz,
                  d.vram_mb.map_or("memory not reported".into(), |m| format!("{m} MiB")), if sg.is_empty() { "?".into() } else { sg.join(",") });
+    }
+    for d in &devs {
+        println!("card {} {} {}", d.index, d.card_id(), d.to_json());
     }
     // the silos with variants: libnextsycl-<arch>@<name>.so beside the silos
     let mut archs: Vec<String> = match args.first() {
@@ -240,8 +249,17 @@ fn silo_cmd(args: &[String]) -> Result<(), String> {
     for arch in archs {
         let vs = api.silo_variants(&api.silo_name(&arch))?;
         for d in &devs {
+            if let Some(w) = nextsycl_core::variant::ambiguity(&vs, std::slice::from_ref(d), force.as_deref()) {
+                println!("{w} (silo {arch})");
+            }
             match nextsycl_core::variant::choose(&vs, std::slice::from_ref(d), force.as_deref())? {
-                Some(v) => println!("silo {arch} GPU {}: {} - {}", d.index, v.name, v.manifest.description),
+                Some(v) => {
+                    println!("silo {arch} GPU {}: {} - {}", d.index, v.name, v.manifest.description);
+                    if !v.manifest.settings.is_empty() {
+                        let s: Vec<String> = v.manifest.settings.iter().map(|(k, x)| format!("{k}={x}")).collect();
+                        println!("  settings (the engine's defaults where every GPU it loads on takes {}): {}", v.name, s.join(", "));
+                    }
+                }
                 None => println!("silo {arch} GPU {}: default", d.index),
             }
         }

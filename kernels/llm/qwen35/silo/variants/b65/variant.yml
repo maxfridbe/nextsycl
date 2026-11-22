@@ -4,3 +4,5 @@ description: the decode-row RMS norm (ns_q35_rms_q8) as a copy of the default si
 measured: maxfridbe, hardac1 Arc Pro B65 (llm spec-check, llm bench; NS_SILO_VARIANT=none against the variant) 2026-11-22
 match:
   units_max: 200
+settings:                        # the engine's defaults on the cards this matches (its options: nextsycl llm engines)
+  drafts: 3                      # MTP tokens drafted a step - the engine's own default, set here as the demonstration

@@ -127,6 +127,10 @@ fn options(m: &Value, args: &[String]) -> Result<nextsycl_audio::LoadOptions, St
     for (var, v) in nextsycl_core::options::resolve(&load, k.options, nextsycl_core::At::Load, k.name)? {
         settings.insert(var, v);
     }
+    // the silo variant's settings (every GPU of the process matching it): below all of the above (CONTRIBUTING rule 6)
+    for line in nextsycl_core::variant_settings_into(k.archs, &[], k.options, &mut settings).map_err(|e| e.0)? {
+        eprintln!("{line}");
+    }
     Ok(nextsycl_audio::LoadOptions { settings })
 }
 

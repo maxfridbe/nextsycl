@@ -12,8 +12,10 @@
 //! 5. Exact before fast: a review rule (the pull request's parity check and measurements), not a test.
 //! 6. Tuning in silos: `silos_are_their_engines_own` (a silo is opened by its engine, included by nothing outside
 //!    its arch, and gates its ops with `_supported` checks), `silo_variants_are_deltas_off_their_silo` (a variant for
-//!    other cards has a manifest that reads and only ops its silo has) and
-//!    `engines_plan_from_the_device_not_a_cards_name_or_size` (no GPU name, no card size as a number, but a short list).
+//!    other cards has a manifest that reads and only ops its silo has), `variant_settings_are_options_their_engine_takes`
+//!    (a variant's `settings` are its engine's load options, values their shapes take, no memory size),
+//!    `variants_of_one_silo_never_match_the_same_card`, `every_silo_variant_has_a_gate_baseline_on_a_card_it_matches`
+//!    and `engines_plan_from_the_device_not_a_cards_name_or_size` (no GPU name, no card size as a number, but a short list).
 //! 7. A front-door method is its handler: `home::api_files_tests` (the client and the document agree with the table).
 //! 8. One backplane: `every_model_method_takes_the_backplanes_fields`, `the_page_has_no_start_or_stop`,
 //!    `room_passes_over_pins_and_holds`, `the_door_schedules_through_the_crate_and_the_crate_stands_alone` (and the
@@ -599,4 +601,193 @@ fn silo_variants_are_deltas_off_their_silo() {
     }
     assert!(seen > 0, "no silo variant found: is the scan broken? (kernels/llm/qwen35/silo/variants/b65 is the example)");
     assert!(bad.is_empty(), "silo variants broken (rule 6, CONTRIBUTING.md):\n  {}", bad.join("\n  "));
+}
+
+/// Every silo variant: (kind, the silo's arch, its name, its manifest) - a manifest that does not read is left to
+/// `silo_variants_are_deltas_off_their_silo`
+fn silo_variants() -> Vec<(String, String, String, nextsycl_core::variant::Manifest)> {
+    let root = root();
+    let mut out = Vec::new();
+    for kind in ["llm", "image", "video", "audio", "model3d"] {
+        for e in std::fs::read_dir(root.join("kernels").join(kind)).into_iter().flatten().flatten() {
+            let arch = e.file_name().to_string_lossy().to_string();
+            for v in std::fs::read_dir(e.path().join("silo/variants")).into_iter().flatten().flatten() {
+                let Ok(t) = std::fs::read_to_string(v.path().join("variant.yml")) else { continue };
+                let Ok(m) = nextsycl_core::variant::parse_manifest(&t) else { continue };
+                out.push((kind.to_string(), arch.clone(), v.file_name().to_string_lossy().to_string(), m));
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
+    out
+}
+
+/// The options an engine declares, read from its sources (every `EngineOption { name: "..", env: "..", value: "..",
+/// .. at: At::.. }`) - the engine of silo `kernels/<kind>/<arch>`: the crate `<kind>/<arch>`, else the crates of that
+/// kind that open the silo by that name - with its kind's common ones (`<kind>/contract`). None: no engine found.
+fn engine_options_of(kind: &str, arch: &str) -> Option<Vec<nextsycl_core::EngineOption>> {
+    let root = root();
+    let sources = |dir: &Path| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.join("src")];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(std::fs::read_to_string(&p).unwrap_or_default());
+                }
+            }
+        }
+        out
+    };
+    let mut crates: Vec<PathBuf> = Vec::new();
+    if root.join(kind).join(arch).join("Cargo.toml").exists() {
+        crates.push(root.join(kind).join(arch));
+    } else {
+        for e in std::fs::read_dir(root.join(kind)).into_iter().flatten().flatten() {
+            if e.path().join("Cargo.toml").exists()
+                && sources(&e.path()).iter().any(|t| t.contains(&format!("silo(\"{arch}\")")) || t.contains(&format!("SILO: &str = \"{arch}\""))) {
+                crates.push(e.path());
+            }
+        }
+    }
+    if crates.is_empty() {
+        return None;
+    }
+    crates.push(root.join(kind).join("contract"));
+    // a string literal's text from just after its opening quote
+    let quoted = |s: &str| -> String {
+        let mut out = String::new();
+        let mut esc = false;
+        for c in s.chars() {
+            match (esc, c) {
+                (true, c) => {
+                    out.push(c);
+                    esc = false;
+                }
+                (false, '\\') => esc = true,
+                (false, '"') => break,
+                (false, c) => out.push(c),
+            }
+        }
+        out
+    };
+    let field = |block: &str, f: &str| block.find(&format!("{f}: \"")).map(|i| quoted(&block[i + f.len() + 3..]));
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    let mut out = Vec::new();
+    for c in &crates {
+        for t in sources(c) {
+            for (i, _) in t.match_indices("EngineOption {") {
+                let block = &t[i..];
+                // the block ends at its `at: At::..`
+                let Some(a) = block.find("at: At::") else { continue };
+                let at = match block[a + 8..].get(..4) {
+                    Some("Load") => nextsycl_core::At::Load,
+                    Some("Requ") => nextsycl_core::At::Request,
+                    _ => nextsycl_core::At::Both,
+                };
+                let block = &block[..a];
+                let Some(name) = field(block, "name") else { continue };
+                out.push(nextsycl_core::EngineOption { name: leak(name), env: leak(field(block, "env").unwrap_or_default()),
+                                                       value: leak(field(block, "value").unwrap_or_default()), help: "", at });
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Rule 6: a variant's `settings` are options its engine declares, at load, with values their shapes take and no
+/// memory size (`nextsycl_core::options::variant_settings`, what the load itself checks)
+#[test]
+fn variant_settings_are_options_their_engine_takes() {
+    let mut bad = Vec::new();
+    let mut seen = 0;
+    for (kind, arch, name, m) in &silo_variants() {
+        if m.settings.is_empty() {
+            continue;
+        }
+        seen += 1;
+        let at = format!("kernels/{kind}/{arch}/silo/variants/{name}/variant.yml");
+        match engine_options_of(kind, arch) {
+            None => bad.push(format!("{at}: settings, but no engine of the {arch} silo found ({kind}/{arch}/, or a {kind} crate that opens it)")),
+            Some(opts) => {
+                if let Err(e) = nextsycl_core::options::variant_settings(&m.settings, &opts, name) {
+                    bad.push(format!("{at}: {e}"));
+                }
+            }
+        }
+    }
+    assert!(seen > 0, "no variant with settings found: is the scan broken? (kernels/llm/qwen35/silo/variants/b65 sets drafts)");
+    // the scan reads the engine's table as the program has it
+    let q = engine_options_of("llm", "qwen35").unwrap();
+    let real = nextsycl_llm_qwen35::kind().options;
+    for o in real {
+        assert!(q.iter().any(|x| x.name == o.name && x.env == o.env && x.value == o.value && x.at == o.at), "the option scan misread {}", o.name);
+    }
+    assert!(q.iter().any(|o| o.name == "vram-guard-gib"), "the option scan misses the kind's common options");
+    assert!(bad.is_empty(), "silo variant settings broken (rule 6, CONTRIBUTING.md):\n  {}", bad.join("\n  "));
+}
+
+/// Rule 6: two variants of one silo never match the same card - their `match` ranges must not meet on some number
+/// (`Match::overlaps`: a sub-group size or a name never separates two rules). The fix is a tighter `match`.
+#[test]
+fn variants_of_one_silo_never_match_the_same_card() {
+    let vs = silo_variants();
+    let mut bad = Vec::new();
+    for (i, a) in vs.iter().enumerate() {
+        for b in &vs[i + 1..] {
+            if (&a.0, &a.1) == (&b.0, &b.1) && a.3.rule.overlaps(&b.3.rule) {
+                bad.push(format!("kernels/{}/{}/silo/variants: {} and {} can both match one card ({:?} / {:?})", a.0, a.1, a.2, b.2, a.3.rule, b.3.rule));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "ambiguous silo variants (rule 6, CONTRIBUTING.md: give one a tighter match):\n  {}", bad.join("\n  "));
+}
+
+/// The gate: every variant has a baseline (tooling/gate-baselines.json, its engine `<kind>/<arch>`) on at least one
+/// card its `match` accepts - recorded on that card (`NS_GATE_RECORD=1 tooling/gate.sh`) with what the card reports
+/// (`device`), and committed in the variant's pull request
+#[test]
+fn every_silo_variant_has_a_gate_baseline_on_a_card_it_matches() {
+    let b: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root().join("tooling/gate-baselines.json")).unwrap()).unwrap();
+    let mut bad = Vec::new();
+    // every card recorded says what it is, under the id the gate gives it
+    for (eng, e) in b["engines"].as_object().unwrap() {
+        for (id, c) in e["cards"].as_object().into_iter().flatten() {
+            let d = &c["device"];
+            if !d["name"].is_string() || !d["units"].is_u64() {
+                bad.push(format!("gate-baselines.json {eng} card {id}: no device (what the card reports: tooling/gate.sh records it)"));
+                continue;
+            }
+            if device(d).card_id() != *id {
+                bad.push(format!("gate-baselines.json {eng} card {id}: its device's id is {}", device(d).card_id()));
+            }
+        }
+    }
+    let mut seen = 0;
+    for (kind, arch, name, m) in silo_variants() {
+        seen += 1;
+        let cards: Vec<&String> = b["engines"][format!("{kind}/{arch}")]["cards"].as_object().into_iter().flatten()
+            .filter(|(_, c)| c["device"]["units"].is_u64() && m.rule.matches(&device(&c["device"]))).map(|(id, _)| id).collect();
+        if cards.is_empty() {
+            bad.push(format!("kernels/{kind}/{arch}/silo/variants/{name}: no gate baseline for {kind}/{arch} on a card it matches \
+                              (record one on that card: NS_GATE_HOST=local NS_GATE_RECORD=1 tooling/gate.sh HEAD HEAD {kind}/{arch})"));
+        }
+    }
+    assert!(seen > 0, "no silo variant found: is the scan broken?");
+    assert!(bad.is_empty(), "gate baselines missing (CONTRIBUTING.md, the merge gate):\n  {}", bad.join("\n  "));
+}
+
+/// A baseline card's `device` as a variant's rule reads it
+fn device(d: &serde_json::Value) -> nextsycl_core::variant::DeviceInfo {
+    nextsycl_core::variant::DeviceInfo {
+        index: 0,
+        name: d["name"].as_str().unwrap_or("").to_string(),
+        units: d["units"].as_u64().unwrap_or(0) as u32,
+        mhz: d["mhz"].as_u64().unwrap_or(0) as u32,
+        vram_mb: d["vram_mb"].as_u64(),
+        sub_groups: d["sub_groups"].as_array().into_iter().flatten().filter_map(|s| s.as_u64()).map(|s| s as u32).collect(),
+    }
 }

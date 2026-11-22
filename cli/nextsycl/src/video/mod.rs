@@ -73,7 +73,7 @@ pub fn kind_and_options(m: &Value) -> Result<(&'static VideoKind, LoadOptions), 
 /// The engine of entry `m`, loaded on GPU `gpu`
 pub fn load(m: &Value, files: &ModelFiles, gpu: usize, log: &mut dyn FnMut(String)) -> Result<Box<dyn VideoEngine>, String> {
     nextsycl_core::use_kind("video");
-    let (k, o) = kind_and_options(m)?;
+    let (k, mut o) = kind_and_options(m)?;
     // the engine's own variables (the kernels read them with getenv): set before anything opens the GPU
     for (var, v) in &o.settings {
         if var.starts_with("NSD_") || var.starts_with("H3_") {
@@ -81,6 +81,11 @@ pub fn load(m: &Value, files: &ModelFiles, gpu: usize, log: &mut dyn FnMut(Strin
         }
     }
     let g = nextsycl_core::Gpu::open(gpu).map_err(|e| e.0)?;
+    // the silo variant's settings for this GPU, below all of the above (CONTRIBUTING rule 6) - into the load's settings
+    // only: they come after the GPU opens, so not the NSD_ / H3_ variables the kernels read as it does
+    for line in nextsycl_core::variant_settings_into(k.archs, &[gpu], k.options, &mut o.settings).map_err(|e| e.0)? {
+        log(line);
+    }
     (k.load)(files, &[g], &o, log).map_err(|e| e.0)
 }
 

@@ -45,6 +45,18 @@ guide is how to port one, and the few rules every change follows.
    silo's, else the shared kernel (`docs/architecture.md`). A variant gives the same outputs as its silo
    (`NS_SILO_VARIANT=none` against it, with the silo's own check), its pull request quotes before / after numbers on
    its hardware, and it never changes a memory plan (memory is planned from what the device reports).
+   **A variant may also set its engine's options for its cards**: an optional `settings:` block in `variant.yml`,
+   option name -> value, the names the engine declares (`EngineOption`, the ones `--opt-NAME` takes, `nextsycl <kind>
+   engines`). Where the variant applies to every GPU the engine loads on, each becomes the engine's default - below a
+   request's options, `--opt` / the environment and the model card's settings, above the engine's own default
+   (`nextsycl silo` and the load's log say what applied). **An engine's alternative host-side paths** (another
+   chunking, a fusion, an expert placement) are declared options with enumerated values (`value: "spread|pack"`):
+   the variant picks one by name, and a new path is itself an engine change under the gate, never a variant's own
+   code. A setting never sizes memory (an option whose value is `TOKENS`, `GIB`, `MIB` or `BYTES` is refused): an
+   option may choose a placement strategy, the sizes still come from what the device reports. **Two variants of one
+   silo never match the same card**: their numeric `match` ranges must not meet (a sub-group size or a name never
+   tells two rules apart) - give one a tighter `match`. And a variant has a **gate baseline on a card it matches**,
+   recorded on that card and committed in its pull request (the merge gate below).
 
 7. **A front-door method is its handler.** `glue/serve/src/home/methods.rs`: `#[rpc(name = "image.generate", tags
    = "image", example = r#"{...}"#)]` on a fn with a doc comment (its summary), and a request struct with
@@ -100,7 +112,8 @@ clear message where the port begins: `llm/example`, `image/example`, `video/exam
    `nextsycl_diffusion::sigmas` and the decode (image / video) - the template's comments say what each method owes.
 6. **Declare its options.** Anything the engine reads beyond its kind's common settings - a draft layer, a chunk
    size, a schedule, a debug switch - goes in its kind's `options` (`EngineOption`: a name, the environment variable
-   it sets, what the value looks like, a line of help, when it applies). The program then forwards
+   it sets, what the value looks like - `a|b|c` for a choice between paths the engine has, which a silo variant's
+   `settings` can pick for its cards (rule 6) -, a line of help, when it applies). The program then forwards
    `--opt-NAME VALUE` from every command (and an API request's `"options"`) to it, rejects a typo with the list,
    and shows them under `nextsycl <kind> engines` - no change to the command line for a new architecture.
    A new variable (an option's, a setting's, a kernel's getenv) gets a row in `docs/environment.md`; the
@@ -127,10 +140,11 @@ it when the engine loads: **variant → silo → shared kernel**.
 | **Where** | `kernels/<kind>/*.cpp`, `kernels/ns`, `kernels/strata` | `kernels/<kind>/<arch>/silo/` | `kernels/<kind>/<arch>/silo/variants/<name>/` + `variant.yml` |
 | **Builds to** | the kind's library | `dist/silo/libnextsycl-<arch>.so` | `dist/silo/libnextsycl-<arch>@<name>.so` |
 | **Holds** | the plain, correct op | the model's ops tuned for its shapes | only the ops that differ from the silo (a delta) |
-| **Chosen by** | always there (the fallback) | the engine's arch | its `match` against what the GPU reports: `vram_mb_min/max`, `units_min/max`, `mhz_min/max`, `sub_group`; a `name` substring as a last resort |
+| **Settings** | - | - | optional `settings:` in `variant.yml`: engine options (the names `--opt-NAME` takes) as the engine's defaults on its cards - a path the engine already has (an option with enumerated values), never a memory size |
+| **Chosen by** | always there (the fallback) | the engine's arch | its `match` against what the GPU reports: `vram_mb_min/max`, `units_min/max`, `mhz_min/max`, `sub_group`; a `name` substring as a last resort. Two variants of one silo never both match a card |
 | **Override** | `NS_SILO=0` (silo off) | `NS_SILO=0` | `NS_SILO_VARIANT=<name>\|none`, or a model card's `silo.variant` |
 | **Who may change it** | a bug fix or new type, with every engine that calls it re-checked | that model's porter | whoever tunes that hardware |
-| **Must prove** | every caller's check and bench | the same output as the shared kernel; before and after numbers | the same output as the silo (`NS_SILO_VARIANT=none` against it); before and after numbers on its hardware |
+| **Must prove** | every caller's check and bench | the same output as the shared kernel; before and after numbers | the same output as the silo (`NS_SILO_VARIANT=none` against it); before and after numbers on its hardware; a gate baseline recorded on a card it matches, and the gate's table from that card |
 
 **What it protects against**
 - **Pull requests fighting.** Someone tuning for a 16 GB card, or a card with fewer units, adds a variant. The default
@@ -141,10 +155,23 @@ it when the engine loads: **variant → silo → shared kernel**.
   (`tooling/gate.sh`) compares logits and greedy tokens exactly. pp and tg must be within 3% on each card a change
   touches.
 - **Hard-coded memory.** A variant never changes a memory plan. Memory is planned from what the device reports
-  (`Gpu::free_or_guess`), so a smaller card gets a smaller plan without a fork.
+  (`Gpu::free_or_guess`), so a smaller card gets a smaller plan without a fork. A variant's `settings` may not set an
+  option that sizes memory (`TOKENS`, `GIB`, `MIB`, `BYTES`).
+- **Forking an engine for one card.** A card that wants another host-side path - a chunking, a fusion, an expert
+  placement - gets it as an engine option with enumerated values (`value: "spread|pack"`), and its variant picks one
+  in `settings`. A new path is an engine change under the gate; the variant only chooses. Precedence, highest first:
+  a request's options, `--opt` / the environment, the model card's settings, the variant's, the engine's default.
+- **Two tunings claiming one card.** The architecture test fails when two variants of one silo can match the same
+  card (their numeric ranges meet; a sub-group size or a name never separates them). The fix is a tighter `match`.
+  At run time the first by name is taken, with a warning.
+- **Hardware we don't own.** The gate runs on a contributor's own box (`NS_GATE_HOST=local`), and its baselines are
+  per card (`arc-pro-b65-160u-32g`: the name, units and memory the card reports). A variant's pull request records
+  its card's baseline (`NS_GATE_RECORD=1`), commits it, and pastes the gate's table from that card; the
+  architecture test fails on a variant with no baseline on a card it matches.
 - **Mixed boxes.** The layer is chosen per GPU (`nextsycl_core::silo_for(arch, gpu)`). A B70 beside a 16 GB card each
-  get their own ops. An engine that binds once per process takes a variant only when every GPU matches it.
-  `nextsycl silo [ARCH]` shows what each GPU takes.
+  get their own ops. An engine that binds once per process takes a variant only when every GPU matches it, and a
+  variant's settings (process-wide) apply only when every GPU the engine loads on matches it.
+  `nextsycl silo [ARCH]` shows what each GPU takes and the settings that come with it.
 
 The rules are enforced by tests in `cli/nextsycl/tests/architecture.rs` and by the gate, not only by review
 (CONTRIBUTING.md rule 6). The example variant is `kernels/llm/qwen35/silo/variants/b65/`.
@@ -172,3 +199,10 @@ The rules are enforced by tests in `cli/nextsycl/tests/architecture.rs` and by t
   the baselines: the logits and greedy tokens exactly, pp and tg within 3%. Paste its table into the pull request; a
   change that moves a number on purpose records new baselines (`NS_GATE_RECORD=1`) and says why. An engine with no
   baseline is listed as such - add its run to the file when you port one.
+- **Gating hardware the project does not own.** The baselines are per card, keyed by the id `nextsycl silo` prints
+  (`arc-pro-b65-160u-32g`: the name, units and memory it reports, with the `device` recorded beside it), so the gate
+  runs on your own box: `NS_GATE_HOST=local` (no ssh; no GPU lock unless `NS_GATE_LOCK` names one), `NS_GATE_GPUS`
+  your GPU indexes, `NS_GATE_PATHS=FROM=TO` where the baselines' model files are on your disk. Record your card's
+  baseline on the base commit (`NS_GATE_RECORD=1 tooling/gate.sh <base> <base> <kind>/<arch>`), commit it in the same
+  pull request, then run the gate on the head and **paste its table from your hardware**. A variant's pull request
+  always does this: the architecture test fails on a variant with no baseline on a card its `match` accepts.

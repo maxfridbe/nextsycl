@@ -12,6 +12,13 @@
 //! ```
 //!
 //! An option no engine of the command declares is an error that lists those it does - a typo never passes silently.
+//!
+//! A silo variant's `settings` (`variant.yml`: option name -> value) are a fourth source, the lowest above the
+//! engine's own default: where the variant applies to every GPU the engine loads on, each sets its option's variable
+//! unless the environment already has it (a model card's settings, `--opt`, the user's own). The order, highest
+//! first: a request's options > `--opt` / the environment > the model card's settings > the variant's > the engine's
+//! default. An engine's alternative host-side paths (a chunking, a fusion, an expert placement) are options with
+//! enumerated values (`value: "rows|columns"`), so a variant picks one by name; a setting never sizes memory.
 
 use std::collections::BTreeMap;
 
@@ -123,6 +130,66 @@ pub fn by_name(given: &Given, declared: &[EngineOption]) -> Given {
     }).collect()
 }
 
+/// The value shapes that are numbers (`value: "N"`): a whole number is what they take
+const WHOLE: &[&str] = &["N", "TOKENS", "ROWS", "LAYERS", "FRAMES", "GIB", "MIB", "BYTES", "K"];
+
+/// The value shapes that size memory: a variant's setting may not set one (memory is planned from what the device
+/// reports, CONTRIBUTING rule 6)
+const MEMORY: &[&str] = &["TOKENS", "GIB", "MIB", "BYTES"];
+
+/// Whether `v` is a value an option of shape `shape` (its `value`) takes, as far as the shape says: a flag ("") 0 or
+/// 1; `a|b|c` of plain words (lowercase, digits, `-`) one of them (an enumeration: an engine's alternative paths);
+/// `N`, `TOKENS`, `GIB` ... a whole number; any other shape (`FILE`, `X`, `DIR|auto`, `A,B,...`) anything not empty
+pub fn accepts(shape: &str, v: &str) -> Result<(), String> {
+    let v = v.trim();
+    if v.is_empty() {
+        return Err("an empty value".into());
+    }
+    if shape.is_empty() {
+        return if v == "0" || v == "1" { Ok(()) } else { Err(format!("{v:?}: a flag takes 0 or 1")) };
+    }
+    let word = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    let alts: Vec<&str> = shape.split('|').collect();
+    if alts.len() > 1 && alts.iter().all(|a| word(a)) {
+        return if alts.contains(&v) { Ok(()) } else { Err(format!("{v:?}: one of {}", alts.join(", "))) };
+    }
+    if WHOLE.contains(&shape) && v.parse::<u64>().is_err() {
+        return Err(format!("{v:?}: a whole number ({shape})"));
+    }
+    Ok(())
+}
+
+/// Whether an option of shape `shape` sizes memory (`TOKENS`, `GIB`, `MIB`, `BYTES`)
+pub fn sizes_memory(shape: &str) -> bool {
+    shape.split('|').any(|a| MEMORY.contains(&a))
+}
+
+/// One setting of a variant, to apply: (the variable, its value, the option's name)
+pub type Setting = (String, String, &'static str);
+
+/// A silo variant's `settings` checked against what the engine declares: each an option by its name, taken at load
+/// (or at load and per request), with a variable to set, a value its shape accepts and no memory size. The variable
+/// assignments (variable, value, option name), or an error naming the variant and what is wrong.
+pub fn variant_settings(settings: &[(String, String)], declared: &[EngineOption], variant: &str) -> Result<Vec<Setting>, String> {
+    let mut out = Vec::new();
+    for (name, v) in settings {
+        let Some(o) = declared.iter().find(|o| o.name == name.as_str()) else {
+            let names: Vec<&str> = declared.iter().map(|o| o.name).collect();
+            return Err(format!("silo variant {variant}: settings: {name} is not an option of its engine (it takes: {})",
+                               if names.is_empty() { "none".into() } else { names.join(", ") }));
+        };
+        if o.at == At::Request || o.env.is_empty() {
+            return Err(format!("silo variant {variant}: settings: {name} is a per-request option (a setting is a default at load)"));
+        }
+        if sizes_memory(o.value) {
+            return Err(format!("silo variant {variant}: settings: {name} sizes memory ({}): a variant never does - memory is planned from what the device reports", o.value));
+        }
+        accepts(o.value, v).map_err(|e| format!("silo variant {variant}: settings: {name}: {e}"))?;
+        out.push((o.env.to_string(), v.trim().to_string(), o.name));
+    }
+    Ok(out)
+}
+
 /// The options as help lines
 pub fn usage(declared: &[EngineOption]) -> String {
     declared.iter().map(|o| {
@@ -169,5 +236,38 @@ mod tests {
         // per request, a load-only option is not one - and the error says when it is
         let e = resolve(&g, OPTS, At::Request, "x").unwrap_err();
         assert!(e.contains("at load"), "{e}");
+    }
+
+    #[test]
+    fn a_value_is_checked_as_far_as_its_shape_says() {
+        assert!(accepts("", "1").is_ok() && accepts("", "0").is_ok() && accepts("", "yes").is_err());
+        assert!(accepts("rows|columns", "rows").is_ok());
+        assert!(accepts("rows|columns", "diagonal").unwrap_err().contains("one of rows, columns"));
+        assert!(accepts("0|1", "1").is_ok() && accepts("0|1", "2").is_err());
+        assert!(accepts("N", "3").is_ok() && accepts("N", "three").is_err() && accepts("TOKENS", "-1").is_err());
+        // a placeholder among the alternatives: not an enumeration
+        assert!(accepts("DIR|auto", "/models/eagle").is_ok() && accepts("FILE", "x.gguf").is_ok() && accepts("X", "0.5").is_ok());
+        assert!(accepts("N", " ").is_err());
+        assert!(sizes_memory("GIB") && sizes_memory("TOKENS") && !sizes_memory("N") && !sizes_memory("rows|columns"));
+    }
+
+    #[test]
+    fn a_variants_settings_are_its_engines_load_options() {
+        const DECL: &[EngineOption] = &[
+            EngineOption { name: "drafts", env: "NS_X_DRAFTS", value: "N", help: "", at: At::Load },
+            EngineOption { name: "placement", env: "NS_X_PLACE", value: "spread|pack", help: "", at: At::Both },
+            EngineOption { name: "chunk", env: "NS_X_CHUNK", value: "TOKENS", help: "", at: At::Load },
+            EngineOption { name: "seed", env: "", value: "N", help: "", at: At::Request },
+        ];
+        let s = |k: &str, v: &str| vec![(k.to_string(), v.to_string())];
+        assert_eq!(variant_settings(&s("drafts", "3"), DECL, "b65").unwrap(), vec![("NS_X_DRAFTS".into(), "3".into(), "drafts")]);
+        assert_eq!(variant_settings(&s("placement", "pack"), DECL, "b65").unwrap()[0].0, "NS_X_PLACE");
+        let e = variant_settings(&s("draft", "3"), DECL, "b65").unwrap_err();
+        assert!(e.contains("b65") && e.contains("draft is not an option") && e.contains("drafts, placement"), "{e}");
+        assert!(variant_settings(&s("placement", "scatter"), DECL, "b65").unwrap_err().contains("one of spread, pack"));
+        assert!(variant_settings(&s("drafts", "many"), DECL, "b65").unwrap_err().contains("whole number"));
+        assert!(variant_settings(&s("chunk", "512"), DECL, "b65").unwrap_err().contains("sizes memory"));
+        assert!(variant_settings(&s("seed", "1"), DECL, "b65").unwrap_err().contains("per-request"));
+        assert!(variant_settings(&[], DECL, "b65").unwrap().is_empty());
     }
 }

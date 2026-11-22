@@ -64,7 +64,9 @@ guide: guides/chat.md           # how to prompt it (Markdown, relative to this f
 architecture's silo when one is built. `nextsycl models search` shows each model's (`-`: the shared kernels). The
 registry entry carries it as the loader's settings (`NS_SILO_NAME`, `NS_SILO_REQUIRED`, `NS_SILO=0`,
 `NS_SILO_VARIANT`). A silo's variants are its ops tuned for other cards (CONTRIBUTING rule 6): a card pins one only to
-measure it; left alone, each GPU takes the variant made for it.
+measure it; left alone, each GPU takes the variant made for it. A variant may also carry engine options for its cards
+(`settings:` in its `variant.yml`); a card's own `env` setting the same variable wins over the variant's, as `--opt`
+and the environment do - set one in a card only when that model needs it on every card.
 
 A file on a gated Hugging Face repository names the page whose terms its account must accept under `gated` (`gated:
 https://huggingface.co/<repo>`): `pull` downloads it with the account's token (`HF_TOKEN`, else huggingface_hub's token

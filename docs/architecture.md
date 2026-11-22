@@ -176,6 +176,21 @@ kernels/                   SYCL ONLY - one library a kind (dist/libnextsycl-<kin
   `silo.variant`) forces one or none. A variant gives the same outputs as its silo (`NS_SILO_VARIANT=none` against
   it: the silo's own check), comes with its before / after numbers on its cards, and never changes a memory plan:
   memory is planned from what the device reports (`gpu.memory()`, `gpu_units`), not from a card's name.
+- **A variant's settings are its engine's defaults on its cards.** `variant.yml`'s optional `settings:` (option name
+  -> value: the engine's declared `EngineOption`s) is read with the manifest; when the engine loads, the program asks
+  `nextsycl_core::variant_settings(archs, gpus, options)` - the variant every GPU the engine loads on matches (the
+  same rule as `silo(ARCH)`; a load that does not know its GPUs: every GPU of the process), its settings checked
+  against the engine's options (an unknown name, a value the option's shape refuses, a per-request option or one that
+  sizes memory: the load fails, and so does the architecture test) - and sets each variable the environment (a model
+  card's settings, `--opt`, the user's own) does not already have (`apply_variant_settings`; an image, audio or 3D
+  load's settings map: `variant_settings_into`; video after the GPU opens, so not the NSD_ / H3_ variables its kernels
+  read as it does). Precedence, highest first: a request's options > `--opt` / the environment > the model card's
+  settings > the variant's > the engine's default. The load's log and `nextsycl silo` show what applied. An engine's
+  alternative host-side paths are options with enumerated values (`a|b|c`, `options::accepts`), so a variant chooses
+  a path the engine has without code of its own. Two variants of one silo whose `match` ranges meet on every number
+  are refused by the architecture test (`variant::Match::overlaps`); at run time `variant::ambiguity` warns and the
+  first by name is taken. Every variant has a gate baseline on a card it matches (`tooling/gate-baselines.json`,
+  per card id with the card's `device`).
 
 ## The kinds' contracts
 

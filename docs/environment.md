@@ -34,7 +34,7 @@ Where the program, its libraries, its models and its sockets are.
 | `NS_SILO_NAME` | the architecture's own | another silo of the engine's ABI to load (dist/silo/libnextsycl-<name>.so) - a model card's `silo.name` | runtime (every kind) |
 | `NS_SILO_REQUIRED` | 0 | 1: refuse to load when the silo is not built (no fall back to the shared kernels) - a model card's `silo.required` | runtime (every kind) |
 | `NS_SILO_DIR` | silo/ beside the kind's kernel library | directory holding the silos (`libnextsycl-<arch>.so`) | runtime (every kind) |
-| `NS_SILO_VARIANT` | by the card | a silo variant (`kernels/<kind>/<arch>/silo/variants/<name>`, built as dist/silo/libnextsycl-<arch>@<name>.so with its manifest beside it) on every GPU, or `none`: the default silo's ops alone. Unset: each GPU takes the variant its manifest's `match` rule fits (an engine that binds per GPU), or the one every GPU of the process fits - a model card's `silo.variant` | runtime (every kind) |
+| `NS_SILO_VARIANT` | by the card | a silo variant (`kernels/<kind>/<arch>/silo/variants/<name>`, built as dist/silo/libnextsycl-<arch>@<name>.so with its manifest beside it) on every GPU, or `none`: the default silo's ops alone. Unset: each GPU takes the variant its manifest's `match` rule fits (an engine that binds per GPU), or the one every GPU of the process fits - a model card's `silo.variant`. The variant chosen also brings its manifest's `settings` (engine options) as the engine's defaults, below a model card's settings, `--opt` and the environment | runtime (every kind) |
 | `NS_SOCKET_DIR` | $XDG_RUNTIME_DIR/nextsycl (serve's pid and marker files: /tmp) | where the control sockets live (mounted into the containers) | cli, serve, llm, video, studio |
 
 ## Front door and services
@@ -883,10 +883,12 @@ Inputs of the checks and unit tests that need files outside the repository (unse
 |---|---|---|---|
 | `NS_CHECK_COND` | the reference's cond_latents.npy | edit-dit check: a raw float32 file of condition latents to use instead | image qwenimage21 (check) |
 | `NS_CHECK_EMBEDS` | the reference's embeddings | edit-dit check: a raw float32 file of embeddings to use instead (the engine's own, to see their effect) | image qwenimage21 (check) |
-| `NS_GATE_HOST` | this machine | the merge gate's GPU box, over ssh | tooling/gate.sh |
-| `NS_GATE_DIR` | src/nextsycl-gate | the gate's build copy on that box (its own nextsycl.conf: NS_IMAGE, a registry of its own, no NS_STUDIO_MODES) - never the production checkout | tooling/gate.sh |
-| `NS_GATE_LOCK` | ~/src/gpu-lock.sh | the GPU lock script the gate sources there (gpu_lock CARD WAIT MAX_HOLD / gpu_unlock) | tooling/gate.sh |
-| `NS_GATE_RECORD` | 0 | 1: write the measured values into tooling/gate-baselines.json instead of comparing | tooling/gate.sh |
+| `NS_GATE_HOST` | this machine | the merge gate's GPU box, over ssh; empty or `local`: this machine, no ssh (a contributor's own card) | tooling/gate.sh |
+| `NS_GATE_DIR` | src/nextsycl-gate over ssh, ~/.cache/nextsycl-gate here | the gate's build copy on that box (its own nextsycl.conf: NS_IMAGE, a registry of its own, no NS_STUDIO_MODES) - never the production checkout | tooling/gate.sh |
+| `NS_GATE_LOCK` | ~/src/gpu-lock.sh (here: `none` when it is not there) | the GPU lock script the gate sources there (gpu_lock CARD WAIT MAX_HOLD / gpu_unlock); `none`: no lock | tooling/gate.sh |
+| `NS_GATE_GPUS` | each engine's `gpus` (hardac1's) | the GPU indexes the gate runs on, a comma list (a contributor's box: its own) | tooling/gate.sh |
+| `NS_GATE_PATHS` | - | FROM=TO[,FROM=TO]: the baselines' model paths (`run`, `mounts`: hardac1's) where they are on this box | tooling/gate.sh |
+| `NS_GATE_RECORD` | 0 | 1: write the measured values into tooling/gate-baselines.json instead of comparing - under each card's id, with what it reports and the box | tooling/gate.sh |
 | `NS_CHECK_LATENTS` | the reference's last latents_N.npy | vae check (HunyuanImage 2.1): a .npy of latents [h * w, 64] to decode instead | image hunyuanimage21 (check) |
 | `NS_CHECK_NOISE` | the reference's noise.npy | edit-dit check: a raw float32 noise file to use instead | image qwenimage21 (check) |
 | `NS_CHECK_PICTURE` | edit-pre check fails | edit-pre check: the original picture (PNG) resized and compared with the reference's | image qwenimage21 (check) |
@@ -915,6 +917,7 @@ Inputs of the checks and unit tests that need files outside the repository (unse
 | `NS_TEST_QWEN_TOKENS` | test skipped | the reference pipeline's tokens.json the tokenizer test compares against | tests (crates/tok) |
 | `NS_X_INT8` | - | fixture: an option table's variable in the --opt-NAME unit tests (never read by an engine) | tests (crates/core options) |
 | `NS_X_SIGMAS` | - | fixture: an option table's variable in the --opt-NAME unit tests (never read by an engine) | tests (crates/core options) |
+| `NS_X_DRAFTS`, `NS_X_PLACE`, `NS_X_CHUNK` | - | fixtures: an option table's variables in the silo variant settings unit tests (never read by an engine) | tests (crates/core options) |
 
 ## Build
 

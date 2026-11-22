@@ -86,54 +86,136 @@ fn base_silo(arch: &str) -> Result<Option<&'static nextsycl_sys::Silo>> {
     Ok(s)
 }
 
+/// The variants built of `arch`'s silo (`Api::silo_variants`), listed once and kept
+fn variants_of(arch: &str) -> Result<Vec<nextsycl_sys::variant::VariantFile>> {
+    type Variants = Vec<(String, std::result::Result<Vec<nextsycl_sys::variant::VariantFile>, String>)>;
+    static VARIANTS: std::sync::Mutex<Variants> = std::sync::Mutex::new(Vec::new());
+    let a = api()?;
+    let mut m = VARIANTS.lock().unwrap();
+    if !m.iter().any(|(x, _)| x == arch) {
+        m.push((arch.to_string(), a.silo_variants(&a.silo_name(arch))));
+    }
+    m.iter().find(|(x, _)| x == arch).map(|(_, v)| v.clone()).unwrap_or_else(|| Ok(Vec::new())).map_err(Error)
+}
+
+/// The variant of `arch`'s silo for `gpus` (every one of them must match it; empty: every GPU of the process), or
+/// the forced one (NS_SILO_VARIANT): None with no silo (or NS_SILO=0), `none`, or no variant matching. Two matching
+/// say so once (`variant::ambiguity`); the first by name is taken.
+fn chosen_variant(arch: &str, gpus: &[usize]) -> Result<Option<(nextsycl_sys::variant::VariantFile, Vec<nextsycl_sys::variant::DeviceInfo>)>> {
+    static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    if base_silo(arch)?.is_none() {
+        return Ok(None);
+    }
+    let force = std::env::var("NS_SILO_VARIANT").ok().filter(|v| !v.trim().is_empty());
+    if force.as_deref() == Some("none") {
+        return Ok(None);
+    }
+    let variants = variants_of(arch)?;
+    if variants.is_empty() && force.is_none() {
+        return Ok(None);
+    }
+    let a = api()?;
+    let gpus: Vec<usize> = if gpus.is_empty() { self::gpus()?.into_iter().map(|g| g.0).collect() } else { gpus.to_vec() };
+    let devices: Vec<nextsycl_sys::variant::DeviceInfo> = gpus.iter().map(|g| a.device_info(*g).map_err(Error)).collect::<Result<_>>()?;
+    if let Some(w) = nextsycl_sys::variant::ambiguity(&variants, &devices, force.as_deref()) {
+        let mut said = WARNED.lock().unwrap();
+        let key = format!("{arch} {gpus:?}");
+        if !said.contains(&key) {
+            eprintln!("silo {arch}: {w}");
+            said.push(key);
+        }
+    }
+    let v = nextsycl_sys::variant::choose(&variants, &devices, force.as_deref()).map_err(Error)?.cloned();
+    Ok(v.map(|v| (v, devices)))
+}
+
 /// The silo of `arch` for GPU `gpu`, or every GPU of the process (`silo`, `silo_for`): a variant all of them match,
 /// else the default
 fn silo_over(arch: &str, gpu: Option<usize>) -> Result<Option<&'static nextsycl_sys::Silo>> {
-    type Variants = Vec<(String, std::result::Result<Vec<nextsycl_sys::variant::VariantFile>, String>)>;
-    static VARIANTS: std::sync::Mutex<Variants> = std::sync::Mutex::new(Vec::new());
     static OVER: std::sync::Mutex<Vec<(String, String, &'static nextsycl_sys::Silo)>> = std::sync::Mutex::new(Vec::new());
     static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let Some(base) = base_silo(arch)? else { return Ok(None) };
-    let a = api()?;
-    let force = std::env::var("NS_SILO_VARIANT").ok().filter(|v| !v.trim().is_empty());
-    if force.as_deref() == Some("none") {
-        return Ok(Some(base));
-    }
-    let variants = {
-        let mut m = VARIANTS.lock().unwrap();
-        if !m.iter().any(|(x, _)| x == arch) {
-            m.push((arch.to_string(), a.silo_variants(&a.silo_name(arch))));
-        }
-        m.iter().find(|(x, _)| x == arch).map(|(_, v)| v.clone()).unwrap_or_else(|| Ok(Vec::new())).map_err(Error)?
-    };
-    if variants.is_empty() && force.is_none() {
-        return Ok(Some(base));
-    }
-    let gpus: Vec<usize> = match gpu {
-        Some(g) => vec![g],
-        None => gpus()?.into_iter().map(|g| g.0).collect(),
-    };
-    let devices: Vec<nextsycl_sys::variant::DeviceInfo> = gpus.iter().map(|g| a.device_info(*g).map_err(Error)).collect::<Result<_>>()?;
-    let Some(v) = nextsycl_sys::variant::choose(&variants, &devices, force.as_deref()).map_err(Error)? else { return Ok(Some(base)) };
+    let gpus: Vec<usize> = gpu.into_iter().collect();
+    let Some((v, devices)) = chosen_variant(arch, &gpus)? else { return Ok(Some(base)) };
     let s = {
         let mut m = OVER.lock().unwrap();
         match m.iter().find(|(x, n, _)| x == arch && *n == v.name) {
             Some((_, _, s)) => *s,
             None => {
-                let s: &'static nextsycl_sys::Silo = Box::leak(Box::new(a.with_variant(base, v).map_err(Error)?));
+                let s: &'static nextsycl_sys::Silo = Box::leak(Box::new(api()?.with_variant(base, &v).map_err(Error)?));
                 m.push((arch.to_string(), v.name.clone(), s));
                 s
             }
         }
     };
-    let said = format!("{arch} {gpus:?} {}", v.name);
+    let on: Vec<String> = devices.iter().map(|d| format!("GPU {} ({})", d.index, d.name)).collect();
+    let said = format!("{arch} {} {}", on.join(","), v.name);
     let mut sd = SAID.lock().unwrap();
     if !sd.contains(&said) {
-        let on: Vec<String> = devices.iter().map(|d| format!("GPU {} ({})", d.index, d.name)).collect();
         eprintln!("silo {arch}: variant {} on {} - {} ({})", v.name, on.join(", "), v.manifest.description, v.path.display());
         sd.push(said);
     }
     Ok(Some(s))
+}
+
+/// A silo variant's settings for an engine about to load (CONTRIBUTING rule 6, `options::variant_settings`): the
+/// variant of the first of `archs` with a silo, chosen for `gpus` (every one must match it, as `silo(arch)` asks of
+/// every GPU of the process; empty: every GPU of the process), its `settings` checked against the engine's options
+/// `declared`. The variant's name and the assignments (variable, value, option name) - the caller sets those the
+/// environment (or the load's settings) does not have, so a model card, `--opt` and the user's own environment win.
+/// None: no silo, no variant applying, or one without settings. Err: a setting the engine does not take.
+pub fn variant_settings(archs: &[&str], gpus: &[usize], declared: &[EngineOption]) -> Result<Option<(String, Vec<options::Setting>)>> {
+    // only once the command has opened its kind's library (a GPU open): never choose the library, nor touch the GPUs
+    // before the variables an engine's kernels read when they open are set
+    if API.get().is_none() {
+        return Ok(None);
+    }
+    for arch in archs {
+        if base_silo(arch)?.is_none() {
+            continue;
+        }
+        let Some((v, _)) = chosen_variant(arch, gpus)? else { return Ok(None) };
+        if v.manifest.settings.is_empty() {
+            return Ok(None);
+        }
+        let set = options::variant_settings(&v.manifest.settings, declared, &v.name).map_err(Error)?;
+        return Ok(Some((v.name, set)));
+    }
+    Ok(None)
+}
+
+/// `variant_settings` applied to this process's environment: each variable the environment does not have set, and a
+/// line each for the load's log - what was set, and what was not because something above the variant gave it
+pub fn apply_variant_settings(archs: &[&str], gpus: &[usize], declared: &[EngineOption]) -> Result<Vec<String>> {
+    let Some((name, set)) = variant_settings(archs, gpus, declared)? else { return Ok(Vec::new()) };
+    let mut log = Vec::new();
+    for (var, v, opt) in set {
+        match std::env::var(&var) {
+            Ok(given) => log.push(format!("silo variant {name}: {opt}={v} not applied - {var}={given} is given (a model card, --opt or the environment)")),
+            Err(_) => {
+                log.push(format!("silo variant {name}: {opt}={v} ({var})"));
+                std::env::set_var(&var, &v);
+            }
+        }
+    }
+    Ok(log)
+}
+
+/// `variant_settings` into a load's settings (an image, video, audio or 3D engine's `LoadOptions::settings`, by
+/// variable): each the settings and the environment do not have; the log lines as `apply_variant_settings`'s
+pub fn variant_settings_into(archs: &[&str], gpus: &[usize], declared: &[EngineOption], settings: &mut std::collections::BTreeMap<String, String>) -> Result<Vec<String>> {
+    let Some((name, set)) = variant_settings(archs, gpus, declared)? else { return Ok(Vec::new()) };
+    let mut log = Vec::new();
+    for (var, v, opt) in set {
+        match settings.get(&var).cloned().or_else(|| std::env::var(&var).ok()) {
+            Some(given) => log.push(format!("silo variant {name}: {opt}={v} not applied - {var}={given} is given (a model card, --opt or the environment)")),
+            None => {
+                log.push(format!("silo variant {name}: {opt}={v} ({var})"));
+                settings.insert(var, v);
+            }
+        }
+    }
+    Ok(log)
 }
 
 /// An engine's own kernel library (`libnextsycl-<name>.so`, beside the kind's: `nextsycl_sys::Api::engine_lib`), opened

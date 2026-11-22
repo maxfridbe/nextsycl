@@ -1,5 +1,5 @@
 {
-  "about": "tooling/gate.sh's baselines on hardac1 (card 0 the Arc Pro B70, card 1 the B65): each engine's quick run - the prompt's logits and greedy tokens hashed (exact), pp and tg in tok/s (best of two) - and the shared parts' engines. Recorded with NS_GATE_RECORD=1 on the commit named; a change that moves a number on purpose records it again in its pull request.",
+  "about": "tooling/gate.sh's baselines: each engine's quick run - the prompt's logits and greedy tokens hashed (exact), pp and tg in tok/s (best of two) - per card, keyed by the card's id (`nextsycl silo`: its name, units and memory - the same card on another box shares it) with what the card reports (`device`, which a variant's match reads) and the box it was recorded on (`host`); `gpus` are the GPU indexes the run takes on hardac1 (card 0 the Arc Pro B70, card 1 the B65; NS_GATE_GPUS elsewhere), `run` and `mounts` its paths there (NS_GATE_PATHS maps them elsewhere), and the shared parts' engines. Recorded with NS_GATE_RECORD=1 on the commit named; a change that moves a number on purpose records it again in its pull request, and a contributor's card gets its own entry recorded on that card.",
   "recorded": "a8139b8 (2026-11-22)",
   "tolerance": 0.03,
   "shared": {
@@ -53,15 +53,37 @@
         "1"
       ],
       "cards": {
-        "1": {
+        "arc-pro-b65-160u-32g": {
           "exact": "0cd13a4e001a171c",
           "pp": 170.9,
-          "tg": 36.59
+          "tg": 36.59,
+          "device": {
+            "name": "Intel(R) Arc(TM) Pro B65 Graphics",
+            "units": 160,
+            "mhz": 2400,
+            "vram_mb": 32656,
+            "sub_groups": [
+              16,
+              32
+            ]
+          },
+          "host": "hardac1"
         },
-        "0": {
+        "arc-pro-b70-256u-32g": {
           "exact": "a918ec0ff036cd31",
           "pp": 182.7,
-          "tg": 57.5
+          "tg": 57.5,
+          "device": {
+            "name": "Intel(R) Arc(TM) Pro B70 Graphics",
+            "units": 256,
+            "mhz": 2800,
+            "vram_mb": 32656,
+            "sub_groups": [
+              16,
+              32
+            ]
+          },
+          "host": "hardac1"
         }
       }
     },
@@ -76,15 +98,37 @@
         "1"
       ],
       "cards": {
-        "1": {
+        "arc-pro-b65-160u-32g": {
           "exact": "f81f8133476ddc68",
           "pp": 183.5,
-          "tg": 71.77
+          "tg": 71.77,
+          "device": {
+            "name": "Intel(R) Arc(TM) Pro B65 Graphics",
+            "units": 160,
+            "mhz": 2400,
+            "vram_mb": 32656,
+            "sub_groups": [
+              16,
+              32
+            ]
+          },
+          "host": "hardac1"
         },
-        "0": {
+        "arc-pro-b70-256u-32g": {
           "exact": "8b83271e5005ad14",
           "pp": 268.2,
-          "tg": 87.30
+          "tg": 87.3,
+          "device": {
+            "name": "Intel(R) Arc(TM) Pro B70 Graphics",
+            "units": 256,
+            "mhz": 2800,
+            "vram_mb": 32656,
+            "sub_groups": [
+              16,
+              32
+            ]
+          },
+          "host": "hardac1"
         }
       }
     }
