@@ -137,12 +137,13 @@ back to back, so SYCL graphs or fewer launches alone buy nothing here (the kerne
 | dense products (q k v r gate in one launch / the rest) | 2.14 + 1.84 | 2.22 + 1.86 | |
 | depth mixes (117 a token) | 1.83 | 1.18 | templated on its states and queries, 576 threads |
 | decode attention | 1.39 | 0.99 | a lane a key, the split's softmax at once (no reduction a key) |
-| router product + choice | 0.44 + 0.65 | ~0.6 | rows in quarters; the K largest by a parallel rank (B65: 1.27 -> 0.86) |
+| router product + choice | 0.44 + 0.65 | 0.75 | rows in quarters; the K largest by a parallel rank |
 | controllers (down, apply, norms) | 0.94 + 0.63 + 0.61 | 0.44 + 0.40 + 0.43 | three controllers a launch each |
 | post-projection step | 0.84 | 0.84 | (the sink and tap projections folded in) |
-| B70 tg, short chat | 58.0 | 64.2 | |
+| B70 tg, short chat | 58.0 | 66.1 | (device time 15.8 ms) |
 
-B65 the same way: tg 52.4 -> 59.4. The bound is unchanged (4.0 GB a token, 7.3 ms on the B70): tg 64 is ~47% of it.
+B65 the same way: tg 52.4 -> 59.4. The bound is unchanged (4.0 GB a token, 7.3 ms on the B70): tg 66 is ~48% of it.
+pp is unchanged (B70 1,147 / 2,089 / 1,655 at 512 / 4K / 32K; tg after them 65.9 / 58.9 / 43.4).
 The rest is in the expert products (~330 GB/s of the ~550 the dense ones reach): with the NVFP4 decoding table
 removed (a wrong-answer experiment) they stream at 465 GB/s, so the code decode costs ~30%; the rest is latency.
 
@@ -165,7 +166,18 @@ layer application; prose and code alike): 8.0 / 12.6 / 16.2 / 19.2 / 22.0 / 28.5
 verify reads each distinct expert once for all its rows (`moe_union`, `moe_gu_union`, `moe_down_union`; bit for bit
 the per-pair kernels' sums) - little faster in practice (the pairs of a shared expert already met in L2).
 
-tg on the B65 (400 tokens, the chat template; `drafts` 3 and p_min 0.7 the defaults):
+tg on the B70 (400 tokens, the chat template; `drafts` 3 and p_min 0.7 the defaults):
+
+| text | temperature | plain | 2 drafts | 3 drafts | 5 drafts | 3 drafts, no p_min |
+|---|---|---|---|---|---|---|
+| prose | 0 | 64.6 | 66.7 | 66.9 | 65.1 | 56.6 |
+| code | 0 | 65.0 | 85.1 | 88.4 | 89.8 | 86.3 |
+| prose | 1.0 | 62.3 | 68.2 | 67.5 | 64.8 | 58.2 |
+| code | 1.0 | 62.0 | 94.3 | 99.2 | 104.2 | 98.2 |
+
+UD-Q8_K_XL on the B70: prose 51.5 -> 53.4 greedy, 49.7 -> 52.5 at 1.0; code 51.5 -> 87.7, 49.6 -> 90.2; pp 876 / 1,892.
+
+and on the B65:
 
 | text | temperature | plain | 2 drafts | 3 drafts | 5 drafts | 3 drafts, no p_min |
 |---|---|---|---|---|---|---|
