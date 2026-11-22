@@ -253,7 +253,7 @@ int ns_ink2s_post_qkv(ns_gpu* g, const Ink2sQkv* pp) {
     constexpr int W = 128;
     const int64_t groups = 2 * p.Hkv + 2 * p.Hq;
     g->q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> sm(sycl::range<1>(16 * 128 + 64), h);
+        sycl::local_accessor<float, 1> sm(sycl::range<1>(16 * 128 + 16 * 4 + 64), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) groups * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             const int64_t gi = it.get_group(0);
             const int tid = (int) it.get_local_id(0);
@@ -263,11 +263,31 @@ int ns_ink2s_post_qkv(ns_gpu* g, const Ink2sQkv* pp) {
             auto tau = [&](int64_t t) {
                 return p.alpha > 0.0f ? p.alpha * sycl::log(sycl::fmax((float) (p.p0 + t + 1) * (1.0f / p.floor), 1.0f)) + 1.0f : 1.0f;
             };
+            // a BF16 row of C against a float row: the work-group's sum
+            auto bdot = [&](const uint16_t* wr, const float* xr) {
+                float acc = 0.0f;
+                for (int64_t i = tid; i < p.C; i += W) acc += sycl::bit_cast<float>((uint32_t) wr[i] << 16) * xr[i];
+                return sycl::reduce_over_group(grp, acc, sycl::plus<float>());
+            };
             if (gi < 2 * p.Hkv) {
                 const bool isv = gi >= p.Hkv;
                 const int64_t hh = isv ? gi - p.Hkv : gi, c = hh * 128 + tid;
                 const float* x = isv ? p.vraw : p.kraw;
                 const float* dyn = isv ? p.vdyn : p.kdyn;
+                // the head's input-dependent taps, made here: [T][4] in local memory (after the rows' space)
+                const uint16_t* dw = isv ? p.vdw : p.kdw;
+                float* dloc = rows + 16 * 128;
+                if (dw) {
+                    const float* nx = isv ? p.n2 : p.n1;
+                    for (int64_t t = 0; t < T; ++t)
+                        for (int l = 0; l < 4; ++l) {
+                            const float v = bdot(dw + (hh * 4 + l) * p.C, nx + t * p.C);
+                            if (tid == 0) dloc[t * 4 + l] = v;
+                        }
+                    sycl::group_barrier(grp);
+                    dyn = dloc;
+                }
+                const int64_t dstride = dw ? 4 : p.Hkv * 4, doff = dw ? 0 : hh * 4;
                 float* st = isv ? p.vstate : p.kstate;
                 float* sn = isv ? p.vsnap : p.ksnap;
                 const float* w = isv ? p.vw : p.kw;
@@ -286,7 +306,7 @@ int ns_ink2s_post_qkv(ns_gpu* g, const Ink2sQkv* pp) {
                     s += h2 * w[c * 4 + 2];
                     s += xc * w[c * 4 + 3];
                     if (dyn) {
-                        const float* dt = dyn + (t * p.Hkv + hh) * 4;
+                        const float* dt = dyn + t * dstride + doff;
                         s += dt[0] * xc;
                         s += dt[1] * h2;
                         s += dt[2] * h1;
@@ -326,6 +346,13 @@ int ns_ink2s_post_qkv(ns_gpu* g, const Ink2sQkv* pp) {
             float* x = isr ? p.r : p.q;
             const float* scl = isr ? p.rscale : p.qscale;
             const float thr = isr ? p.rthr : p.thr;
+            if (!isr && p.sinkw) {
+                // the row's sink logit for this head
+                for (int64_t t = 0; t < T; ++t) {
+                    const float v = bdot(p.sinkw + hh * p.C, p.n0 + t * p.C);
+                    if (tid == 0) p.sink[t * p.Hq + hh] = v;
+                }
+            }
             for (int64_t t = 0; t < T; ++t) {
                 float* xr = x + (t * p.Hq + hh) * D;
                 const float v = tid < D ? xr[tid] * scl[hh * D + tid] : 0.0f;

@@ -93,6 +93,16 @@ typedef struct Ink2sQkv {
     const float* qscale; /* [Hq, D] */
     const float* rscale; /* [Hq, R] */
     float thr, rthr, alpha, floor, eps;
+    /* the BF16 projections made here from the normed inputs n0 / n1 / n2 [T, C] (nullable: kdyn / vdyn above, and no
+     * sink): the sink [Hq, C] into sink [T, Hq] by the q work-groups; the k / v taps [Hkv x 4, C] by the k / v ones */
+    int64_t C;
+    const float* n0;
+    const float* n1;
+    const float* n2;
+    const uint16_t* sinkw;
+    float* sink;
+    const uint16_t* kdw;
+    const uint16_t* vdw;
 } Ink2sQkv;
 int ns_ink2s_post_qkv(ns_gpu* g, const Ink2sQkv* p);
 /* the decode attention's splits (part: the base kernel's layout) merged in order with the sink, times sigmoid(gate),

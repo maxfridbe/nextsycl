@@ -47,6 +47,7 @@ for a chat model. Measured speeds: tg (token generation, decode) / pp (prompt pr
 | `muse-glimmer-30b-q8` | **Muse Glimmer 30B** abliterated, dense Q8_0 with its DFlash drafter (reasons on its to=self channel) | 30-77 tok/s by text (18.7 without drafts) / ~1,350 tok/s (1,215 at 35K), 128K; [ladder](docs/ladders/muse-glimmer-30b-q8_ladder_stats.md): pp 962 / 795 / 530 at 3K / 35K / 100K |
 | `muse-glimmer-30b-q8-b70`, `-b65` | the same on one card alone, without the drafter (it does not fit beside the model) | 18.7 (B70) / 16.9 (B65) tok/s, 128K |
 | `muse-glimmer-30b-q4`, `-q6` | **Muse Glimmer 30B** Q4_K_M / Q6_K on the B70 alone, with its drafter | 43 / 35 tok/s (25.4 / 20 without drafts) / ~1,400 tok/s, 128K |
+| `inkling-2-mini-q4kxl` (also `-q8kxl`) | **Inkling-2-Mini** (Thinking Machines' looped 26B-A3.4B MoE, NVFP4 experts; reasoning effort, tools), one card, 256K | B70: tg 57 / pp 1,138 / 2,085 / 1,657 at 512 / 4K / 32K (B65: tg 52, pp 832 / 1,470 / 1,080); `-q8kxl` tg 47; [notes](docs/ports/inkling2.md) |
 | `ripple-65b-ad-q4km` | **Ripple-65B-Preview** AD-Q4_K_M (Ricursive's dense 65B, gated attention, value residual), both GPUs, 32K | tg 10.5 / 9.4 tok/s at 2K / 31K; pp 531 / 409 tok/s; [notes](docs/ports/ripple-65b.md) |
 | `qwen-image-2.1-q8` | **Qwen-Image 2.1** text to image, edits | 1024x1024, 40 steps: 23.8 s (16.5 s int8) |
 | `hunyuanimage-2.1-distilled-q8` | **HunyuanImage 2.1** text to image at 2K (quoted text spelled by its glyph encoder) | 2048x2048, 8 steps: 7.8 s; 1024x1024: 2.5 s |

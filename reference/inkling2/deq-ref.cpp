@@ -1,6 +1,6 @@
 // deq-ref: ggml's own dequantize_row_* on a GGUF's tensors, the parity reference for the inkling2 engine's weight
 // kernels (`nextsycl llm kernels <model> ` with NS_INK2_DEQ_REF=<dir> compares its expansions with these bit for bit).
-// For each tensor named on the command line: its first ROWS rows (default 4096, as `llm kernels` takes them) through
+// For each tensor named on the command line: its first NS_DEQ_ROWS rows (default 4096, as `llm kernels` takes them) through
 // ggml_get_type_traits(type)->to_float, written as <dir>/<name>.f32.
 //
 //   c++ -O2 -std=c++17 deq-ref.cpp -I<llama.cpp>/ggml/include -L<build>/bin -lggml-base -o deq-ref
@@ -20,7 +20,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "deq-ref MODEL.gguf OUTDIR TENSOR...\n");
         return 2;
     }
-    const int64_t want = getenv("ROWS") ? atoll(getenv("ROWS")) : 4096;
+    const int64_t want = getenv("NS_DEQ_ROWS") ? atoll(getenv("NS_DEQ_ROWS")) : 4096;
     gguf_init_params ip = {/*no_alloc*/ true, /*ctx*/ nullptr};
     gguf_context* g = gguf_init_from_file(argv[1], ip);
     if (!g) return 1;

@@ -430,7 +430,9 @@ impl<'g> Inkling2<'g> {
         let mut chunk = 0;
         let mut need = 0u64;
         for &c in &tries {
-            need = weights + w16_bytes as u64 + arena_bytes(&g, c) as u64 + session_bytes(&g, ctx, c) as u64 + margin;
+            // the sessions: their contexts in all (kv.0), and the rings and states of each beyond the first
+            let extra = kv.1.max(1).saturating_sub(1) as u64 * session_bytes(&g, (g.window + c).min(ctx), c) as u64;
+            need = weights + w16_bytes as u64 + arena_bytes(&g, c) as u64 + session_bytes(&g, ctx, c) as u64 + extra + margin;
             if need <= free {
                 chunk = c;
                 break;
@@ -518,12 +520,27 @@ impl<'g> Inkling2<'g> {
             }
         }
         let read = |name: &str| -> Result<Mat> { mat(f, &gpu, silo, name, &loaded) };
+        // the controllers in float32 (UD-Q8_K_XL stores them in BF16; the fused decode steps read float32): exact
+        let read32 = |name: &str| -> Result<Mat> {
+            let m = read(name)?;
+            match m.ty {
+                GType::F32 => return Ok(m),
+                GType::BF16 => {}
+                t => return Err(e(format!("{name}: {} (float32 or BF16 expected)", t.name()))),
+            }
+            let mut raw = vec![0u8; m.rows * m.cols * 2];
+            m.buf.read(0, &mut raw)?;
+            let wide: Vec<u8> = raw.chunks_exact(2).flat_map(|b| [0, 0, b[0], b[1]]).collect();
+            let buf = DevBuf::new(&gpu, wide.len())?;
+            buf.write(0, &wide)?;
+            Ok(Mat { buf, ty: GType::F32, ..m })
+        };
         let mut loops = Vec::new();
         for l in g.core.0..g.core.1 {
             let n = |s: &str| format!("blk.{l}.loop_{s}.weight");
             let ctrl = ["q", "k", "v", "ffn"];
             let part = |what: &str| -> Result<[Mat; 4]> {
-                let v: Vec<Mat> = ctrl.iter().map(|c| read(&n(&format!("{c}_ctrl_{what}")))).collect::<Result<_>>()?;
+                let v: Vec<Mat> = ctrl.iter().map(|c| read32(&n(&format!("{c}_ctrl_{what}")))).collect::<Result<_>>()?;
                 <[Mat; 4]>::try_from(v).map_err(|_| e("four controllers"))
             };
             let down = part("down")?;
@@ -854,15 +871,13 @@ impl<'g> Inkling2<'g> {
         let logits = self.mm(&ly.router, h, t)?;
         let ids = self.ab(t * kk * 4)?;
         let wts = self.f32(t * kk)?;
-        // SAFETY: logits [t, E] -> ids, weights [t, K].
-        self.op("route", || unsafe {
-            (k.route)(self.raw(), logits.fp(), ly.exp_bias.as_ref().map_or(std::ptr::null(), |b| b.fp()), ids.ptr().cast(), wts.fp(), t as i64,
-                      g.experts as i64, kk as i64, g.w_scale)
-        })?;
         let out = self.f32(t * c)?;
+        let (gu, dn) = (&ly.gu, &ly.down);
+        let bias = ly.exp_bias.as_ref().map_or(std::ptr::null(), |b| b.fp() as *const f32);
+        // SAFETY: logits [t, E] -> ids, weights [t, K].
+        self.op("route", || unsafe { (k.route)(self.raw(), logits.fp(), bias, ids.ptr().cast(), wts.fp(), t as i64, g.experts as i64, kk as i64, g.w_scale) })?;
         // the experts' work rewound after (the queue is in order)
         let mark = self.arena.mark();
-        let (gu, dn) = (&ly.gu, &ly.down);
         if let (Some(s), Some(q)) = (self.dec(t), hq) {
             if gu.packed && dn.packed {
                 // SAFETY: arithmetic only; then gate | up and SiTU into the act's quants, the down products weighted into out.
@@ -1200,9 +1215,13 @@ impl<'g> Inkling2<'g> {
                                                                (&ly.v, &normed[2], nq[2].as_ref()), (&ly.rel, &normed[0], nq[0].as_ref()),
                                                                (&ly.gate, &normed[0], nq[0].as_ref())], t)?
             .try_into().map_err(|_| e("five products"))?;
-        let sink = self.mm(&ly.sink, &normed[0], t)?;
-        let kdyn = ly.k_dyn.as_ref().map(|m| self.mm(m, &normed[1], t)).transpose()?;
-        let vdyn = ly.v_dyn.as_ref().map(|m| self.mm(m, &normed[2], t)).transpose()?;
+        // the sink and (full layers) the k / v taps: BF16 projections made in the post-projection launch when they are
+        // BF16, else products of their own
+        let bf = |m: &Mat| m.ty == GType::BF16 && m.cols == g.n_embd;
+        let inline = bf(&ly.sink) && ly.k_dyn.as_ref().is_none_or(bf) && ly.v_dyn.as_ref().is_none_or(bf);
+        let sink = if inline { self.f32(t * hq)? } else { self.mm(&ly.sink, &normed[0], t)? };
+        let kdyn = if inline { None } else { ly.k_dyn.as_ref().map(|m| self.mm(m, &normed[1], t)).transpose()? };
+        let vdyn = if inline { None } else { ly.v_dyn.as_ref().map(|m| self.mm(m, &normed[2], t)).transpose()? };
         // k and v through their convolutions into the caches, q and r clipped
         let (kst, ksn) = self.conv_bufs(ss, 0, t)?;
         let (vst, vsn) = self.conv_bufs(ss, 1, t)?;
@@ -1215,7 +1234,10 @@ impl<'g> Inkling2<'g> {
             ksnap: ksn.as_ref().map_or(std::ptr::null_mut(), |s| s.fp()), vsnap: vsn.as_ref().map_or(std::ptr::null_mut(), |s| s.fp()), kw: ly.convs[0].fp(),
             vw: ly.convs[1].fp(), inv: 1.0 / ((g.conv + 1) as f32).sqrt(), inv_dyn: 1.0 / ((2 * g.conv + 1) as f32).sqrt(), kout: kout.fp(), vout: vout.fp(),
             kc: ss.kc.ptr(), vc: ss.vc.ptr(), q: q.fp(), r: r.fp(), qscale: ly.q_clip.fp(), rscale: ly.rel_clip.fp(), thr: g.qk_clip, rthr: g.rel_clip, alpha,
-            floor: g.log_floor, eps: g.eps,
+            floor: g.log_floor, eps: g.eps, c: c as i64, n0: normed[0].fp(), n1: normed[1].fp(), n2: normed[2].fp(),
+            sinkw: if inline { ly.sink.buf.ptr().cast() } else { std::ptr::null() }, sink: sink.fp(),
+            kdw: if inline { ly.k_dyn.as_ref().map_or(std::ptr::null(), |m| m.buf.ptr().cast()) } else { std::ptr::null() },
+            vdw: if inline { ly.v_dyn.as_ref().map_or(std::ptr::null(), |m| m.buf.ptr().cast()) } else { std::ptr::null() },
         };
         // SAFETY: every buffer as Ink2sQkv describes it.
         self.op("post qkv silo", || unsafe { (f.post_qkv)(self.raw(), &p) })?;

@@ -1,0 +1,27 @@
+# Inkling-2-Mini UD-Q4_K_XL (native NVFP4 experts; one card, 256K + 32K)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: inkling-2-mini-q4kxl
+kind: llm
+arch: inkling2_loop
+license: apache-2.0
+commercial: true
+license_note: 'Thinking Machines'' Inkling 2 Mini (Apache-2.0); Unsloth''s GGUF (Mainline_Support layout, the same tensors as its root files) under the same terms.'
+title: Inkling-2-Mini UD-Q4_K_XL (native NVFP4 experts; one card, 256K + 32K)
+about: 'Thinking Machines'' Inkling 2 Mini (2026-11-20): a looped MoE of 26.2B (3.4B active) - 24 layers of 2,304, the middle twelve run three times (48 applications a token), 128 experts (8 a token, SiTU), attention with a relative-position bias and per-row sinks (20 layers over a 1,024 window, 4 full), short convolutions, attention over the depth; it thinks in its own message before the answer (reasoning effort low / medium / high / max). Its experts in their native NVFP4 (lossless against the checkpoint), the rest Q8_0: Unsloth''s KLD against UD-Q8_K_XL 0.0107, the same top token 98.0%. Text only here (the vision tower is not ported). 17.6 GB.'
+gpus: '0|1'                     # one of the cards, the B70 preferred: the whole model on whichever has the room
+vram_gib: 27.5                  # measured on the B70 (docs/ports/inkling2.md): 18.7 GiB at 32K, 25.7 at 256K (32 KiB a token), + the 32K session
+ctx: '262144,32768'
+tools: true
+tasks: true
+env: {}
+silo:                   # its tuned kernels: kernels/llm/inkling2/silo (dist/silo/libnextsycl-inkling2.so)
+  name: inkling2
+  required: false       # its own kernels run it too (slower)
+files:
+  model:
+    key: ink2-mini-q4kxl
+    url: https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/45fd08764f2b0bf16b03a5483a80e5c7aaec8772/Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file
+    size: 17629760736
+    sha256: e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3
+    path: inkling-2-mini/Inkling-2-Mini-UD-Q4_K_XL.gguf
+guide: guides/inkling2.md

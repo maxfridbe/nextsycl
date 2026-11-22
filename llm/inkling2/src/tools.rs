@@ -81,7 +81,7 @@ pub fn kernels(model: &Path, gpu: usize) -> Result<(), String> {
             names.push(t.name.clone());
         }
     }
-    for n in ["blk.0.ffn_gate_up_exps.weight", "blk.0.ffn_down_exps.weight", "blk.0.attn_q.weight", "output.weight"] {
+    for n in ["blk.0.ffn_gate_up_exps.weight", "blk.0.ffn_down_exps.weight", "blk.0.attn_q.weight", "blk.0.attn_output.weight", "blk.0.attn_rel.weight", "output.weight"] {
         if !names.iter().any(|x| x == n) && f.tensor(n).is_some() {
             names.push(n.to_string());
         }
@@ -273,6 +273,14 @@ fn stream(f: &Gguf, g: &std::sync::Arc<nextsycl_core::Gpu>, s: &ffi::Silo) -> Re
         Ok((p, t.ty, rows, cols))
     };
     let reps = 50;
+    let packs = |name: &str| {
+        // SAFETY: arithmetic only.
+        f.tensor(name).is_some_and(|t| unsafe { (s.supported)(t.ty.code() as c_int, t.shape[t.shape.len() - 1] as i64) } != 0)
+    };
+    if !packs("output.weight") || !packs("blk.0.ffn_gate_up_exps.weight") || !packs("blk.0.ffn_down_exps.weight") {
+        println!("silo bandwidth: the head or the experts are not types it repacks (their float products are above)");
+        return Ok(());
+    }
     let (head, hty, hrows, hcols) = up("output.weight")?;
     let x = DevBuf::from_f32(g, &(0..hcols).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect::<Vec<f32>>()).map_err(e)?;
     // SAFETY: arithmetic only; x quantized.

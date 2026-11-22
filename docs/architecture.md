@@ -334,6 +334,22 @@ CONTRIBUTING.md walks through a port step by step; each kind's template (`<kind>
   matrices the silo does not all take gets float rows from the decode norms (the shared products need them). The chat template's channels (a `to=self` message, then `to=user`) come back as
   `reasoning_content` and `content` (nextsycl_tok::muse_channels).
 
+- **inkling2_loop** (`llm/inkling2`) - Thinking Machines' Inkling 2 Mini (Apache-2.0; Unsloth's GGUFs, the
+  Mainline_Support layout): a looped MoE of 24 layers of 2,304 whose middle twelve run three times (48 applications a
+  token, each its own caches), 128 experts (8 a token, sigmoid routing with a bias, SiTU, NVFP4 with a scale an
+  expert), attention with a relative-position bias and a sink logit a row (no RoPE; 20 layers over a 1,024 window),
+  short convolutions on k, v and both outputs (a state of three inputs a slot), attention over the depth (block
+  residuals) and, in the later passes, controllers mixing messages from the pass before. Its kernels
+  (`kernels/llm/inkling2/ink.cpp`): NVFP4 / Q8_0 / BF16 decoding (bit for bit ggml's dequantize_row_*), every step
+  of the layer on float rows. Its silo: Q8_0 and NVFP4 repacked at load (quants apart from scales), decode products
+  on Q8_0-quantized activations (dp4a; the NVFP4 codes through a table in local memory), the routed experts in two
+  launches (gate | up with SiTU into the quantized activations, then the weighted down products), fused decode steps (the depth mix with the norms and the
+  quantization, the k / v convolutions with their clip / norm / cache write and the sink and tap projections, the
+  attention's merge with the gate and quantization, the convolutions with the residual, the controllers), and flash
+  attention on XMX for prompts (museglimmer's, with the bias and the sink). A verify row is its one-row pass bit for
+  bit (spec-check 0). The chat template's messages come back as `reasoning_content` and `content`, its JSON calls as
+  `tool_calls` (nextsycl_tok::inkling_channels). Notes and numbers: docs/ports/inkling2.md.
+
 - **ricursive** (`llm/ricursive`) - Ricursive Ripple-65B-Preview (Apache-2.0; AtomicChat's AD-Q4_K_M, 37.7 GiB: Q4_K /
   Q5_K / Q6_K / Q8_0, an IQ4_XS embedding): 80 dense blocks of 5,120 with 80 / 8 heads of 128, a SwiGLU of 40,960 clamped
   at 20, four RMS norms a block (the post norms before the residual), per-head q / k norms, a sigmoid output gate from its

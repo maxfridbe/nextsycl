@@ -887,6 +887,7 @@ Inputs of the checks and unit tests that need files outside the repository (unse
 | `NS_DUMP_RE` | the GLM layer outputs (inp_embd, attn_norm-N, l_out-N, result_output, ...) | Regex of the llama.cpp graph tensor names llama-ns-dump writes | reference/llama-dump (ns-dump.cpp, llama.cpp parity tool) |
 | `NS_DUMP_PROMPT` | unset (-p) | a file whose bytes are the prompt as they are (-p and -f drop a trailing newline) | reference/llama-dump (ns-mtmd-dump.cpp, llama.cpp mtmd parity tool) |
 | `NS_DUMP_GEN` | 48 | greedy tokens llama-ns-mtmd-dump generates after the prompt (next.txt) | reference/llama-dump (ns-mtmd-dump.cpp, llama.cpp mtmd parity tool) |
+| `NS_DEQ_ROWS` | 4096 | rows of each tensor deq-ref writes (ggml's dequantize_row_* output, for `llm kernels` with NS_INK2_DEQ_REF) | reference/inkling2 (deq-ref.cpp, ggml parity tool) |
 | `NS_MM3_CHECK_STEPS` | 3 | chunks check: flow steps a window | audio minimaxmusic3 (check) |
 | `NS_TEST_H3_TOKENIZER` | test skipped | the H3 tokenizer's directory (vocab.json, merges.txt, tokenizer_config.json) for its reference-match test | video h3 (cargo test) |
 | `NS_TEST_STARVECTOR_TOKENIZER` | test skipped | StarVector's tokenizer.json, for its prompt / stop tokens and decoding test | image starvector (cargo test) |

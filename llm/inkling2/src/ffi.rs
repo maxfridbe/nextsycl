@@ -174,6 +174,14 @@ pub struct Qkv {
     pub alpha: f32,
     pub floor: f32,
     pub eps: f32,
+    pub c: i64,
+    pub n0: *const f32,
+    pub n1: *const f32,
+    pub n2: *const f32,
+    pub sinkw: *const u16,
+    pub sink: *mut f32,
+    pub kdw: *const u16,
+    pub vdw: *const u16,
 }
 
 /// The silo's fused decode steps (dec.cpp, attn.cpp)

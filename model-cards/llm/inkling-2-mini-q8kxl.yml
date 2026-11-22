@@ -1,0 +1,27 @@
+# Inkling-2-Mini UD-Q8_K_XL (the reference quality: NVFP4 experts, BF16 the rest; one card, 128K + 32K)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: inkling-2-mini-q8kxl
+kind: llm
+arch: inkling2_loop
+license: apache-2.0
+commercial: true
+license_note: 'Thinking Machines'' Inkling 2 Mini (Apache-2.0); Unsloth''s GGUF (Mainline_Support layout, the same tensors as its root files) under the same terms.'
+title: 'Inkling-2-Mini UD-Q8_K_XL (reference quality: NVFP4 experts, BF16 the rest; one card, 128K + 32K)'
+about: 'Thinking Machines'' Inkling 2 Mini at Unsloth''s reference quality: its experts in their native NVFP4, the attention, the embeddings and the head in BF16 (the last four layers'' experts too) - slower than UD-Q4_K_XL (tg 47 against 57 on the B70: its attention reads twice the bytes); UD-Q4_K_XL is within KLD 0.0107 of it (Unsloth''s measure). A looped MoE of 26.2B (3.4B active), 48 layer applications a token; it thinks before the answer (reasoning effort low / medium / high / max). Text only. 22.9 GB.'
+gpus: '0|1'                     # one of the cards, the B70 preferred
+vram_gib: 28.0                  # measured on the B70 (docs/ports/inkling2.md): 26.1 GiB at 128K (32 KiB a token), + the 32K session
+ctx: '131072,32768'
+tools: true
+tasks: true
+env: {}
+silo:
+  name: inkling2
+  required: false
+files:
+  model:
+    key: ink2-mini-q8kxl
+    url: https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/45fd08764f2b0bf16b03a5483a80e5c7aaec8772/Mainline_Support/Inkling-2-Mini-UD-Q8_K_XL.gguf_file
+    size: 22867452896
+    sha256: 2da51788d43a17e1f033bec420fa83ba9cb87ac1f0130dc9135a4d2ed2678b68
+    path: inkling-2-mini/Inkling-2-Mini-UD-Q8_K_XL.gguf
+guide: guides/inkling2.md
