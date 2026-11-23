@@ -36,22 +36,6 @@ pub fn host(f: &Gguf, name: &str) -> Result<Vec<f32>> {
     floats(name, t.ty, &f.read(t).map_err(ge)?)
 }
 
-/// The values of one Q4_0 block run (an fp16 scale, 16 bytes of nibbles a 32 values) on the host: a token's
-/// embedding row
-pub fn q4_0_row(b: &[u8]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(b.len() / 18 * 32);
-    for blk in b.chunks_exact(18) {
-        let d = f16([blk[0], blk[1]]);
-        let mut v = [0f32; 32];
-        for j in 0..16 {
-            v[j] = d * ((blk[2 + j] & 0xF) as i32 - 8) as f32;
-            v[j + 16] = d * ((blk[2 + j] >> 4) as i32 - 8) as f32;
-        }
-        out.extend_from_slice(&v);
-    }
-    out
-}
-
 /// How a linear layer's matrix is kept on the GPU
 pub enum Wt {
     /// Q8_0 or Q4_0 blocks as stored, expanded to half before each use
@@ -331,13 +315,6 @@ impl Lin {
             xq: q.0,
             xs: q.1,
         })
-    }
-
-    /// `ready` then `gemm`
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply(&self, nsd: &Nsd, k8: &K, scratch: &DevBuf, x: *const std::ffi::c_void, m: usize, out: *mut std::ffi::c_void, out_dt: Dt) -> Result<()> {
-        let w = self.ready(nsd, k8, scratch)?;
-        self.gemm(nsd, k8, w, x, m, out, out_dt)
     }
 }
 

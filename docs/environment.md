@@ -353,6 +353,9 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 | `NS_VIDEO_STUDIO` | http://127.0.0.1:8095 | the studio the video tools talk to | cli (video tools) |
 | `NS_VIDEO_STUDIO_DIR` | ~/.local/share/nextsycl/studio | the studio's state (queue, projects, plan.json) | cli (video serve, plan), studio |
 | `NS_VIDEO_TEMPLATES` | none | prompt templates for the studio | cli (video serve), studio |
+| `NS_HV15_CFG` | 1 | HunyuanVideo-1.5's classifier-free guidance scale: 1 one pass a step (the cfg-distilled card), 6 the base card's (a second pass over the negative prompt, default empty); a request's `cfg` first (--opt-cfg) | video hunyuanvideo15 |
+| `NS_HV15_STEPS` | 50 | HunyuanVideo-1.5's steps when a request does not say (the cfg-distilled model needs its 50) (--opt-steps) | video hunyuanvideo15 |
+| `NS_HV15_SHIFT` | 5 | HunyuanVideo-1.5's schedule shift (the 480p T2V cards' 5; the step-distilled I2V's 7) (--opt-shift) | video hunyuanvideo15 |
 
 ## Audio
 
