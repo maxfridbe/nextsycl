@@ -391,6 +391,12 @@ impl HunyuanVideo15 {
             log(format!("[prompt {} frames of {}x{} decoded in {:.2} s ({:.1} tok/s)] (the second: thousands of pixels a second)", m.frames, m.width,
                         m.height, m.decode_s, (m.frames * m.width * m.height) as f64 / 1000.0 / m.decode_s));
         }
+        // the clip's folder must be there before ffmpeg starts: ffmpeg failing to open its output closes the pipe the
+        // frames go down, and the write's SIGPIPE ends the worker instead of answering with an error (2026-11-23: a
+        // clip sent with a folder the daemon's container does not have)
+        if let Some(d) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(d).map_err(|e| Error(format!("{}: {e} (where the clip goes)", d.display())))?;
+        }
         nextsycl_h3::media::write_mp4(&out, &nextsycl_h3::media::Frames { px: &m.px, count: m.frames, height: m.height, width: m.width, fps: 24 }, None,
                                       &mut |l| log(l))
             .map_err(|e| Error(e.0))?;
