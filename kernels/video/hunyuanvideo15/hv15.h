@@ -60,6 +60,14 @@ int ns_video_hv15_add(ns_gpu* g, void* x, const void* y, int64_t n);
  *     To = T. */
 int ns_video_hv15_upsample(ns_gpu* g, const void* conv, const void* x, int64_t T, int64_t H, int64_t W, int64_t C, int64_t Ci, int temporal,
                            void* out);
+/* The encoder's Downsample of one frame (I2V's picture): conv [H, W, Cc] (its convolution's output, Cc = Cout / 8 in
+ * time and space, Cout / 4 in space) and x [H, W, Ci] -> out [H / 2, W / 2, Cout]: conv's "(r2 r3 c)" space-to-depth
+ * (in time: twice over, the first frame's channels repeated), plus x's "(r2 r3 c)" averaged over groups of 4 Ci / Cout
+ * channels */
+int ns_video_hv15_downsample(ns_gpu* g, const void* conv, const void* x, int64_t H, int64_t W, int64_t Cc, int64_t Ci, int64_t Cout, void* out);
+/* out [N, C] half += the mean of x [N, C r] half over each run of r channels ("(c r)": channel c r + j): the encoder's
+ * last shortcut */
+int ns_video_hv15_group_mean_add(ns_gpu* g, void* out, const void* x, int64_t N, int64_t C, int64_t r);
 /* out [N, C] half = x [N, C] half transposed to [C, N] */
 int ns_video_hv15_transpose(ns_gpu* g, const void* x, int64_t R, int64_t C, void* out);
 /* The VAE's frame-causal softmax: x float32 [M, Nk] holds scores of query rows row0 .. row0 + M against keys 0 .. Nk; a

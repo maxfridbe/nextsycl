@@ -1,0 +1,37 @@
+# HunyuanVideo-1.5 480p I2V step-distilled (Q8_0 products; a picture and a prompt to video, 8 steps; Tencent Hunyuan Community License)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: hunyuanvideo-1.5-480p-i2v-step-distilled-q8
+kind: video
+arch: hunyuanvideo-1.5
+license: tencent-hunyuan-community
+commercial: true
+license_note: 'Tencent Hunyuan Community License (HunyuanVideo-1.5): not licensed in the European Union, the United Kingdom or South Korea; a licence from Tencent above 100 million monthly active users; its Acceptable Use Policy; outputs may not improve another AI model. The DiT and VAE are the official float32 files (the DiT quantized to Q8_0 as it loads); the text encoders are HunyuanImage 2.1''s files: Qwen2.5-VL-7B (Apache-2.0, calcuis'' Q4_0 GGUF) and Glyph-SDXL-v2''s byT5 (calcuis/pig-encoder, MIT as that repository states). The image encoder is google/siglip-so400m-patch14-384 (Apache-2.0): the pipeline loads FLUX.1-Redux-dev''s image_encoder, an so400m-patch14-384 tower behind a gated non-commercial licence; that the two hold the same weights is not checked (the gated file was not readable here).'
+title: 'HunyuanVideo-1.5 480p I2V step-distilled (Q8_0 products; a picture and a prompt to video, 8 steps; Tencent Hunyuan Community License)'
+about: Tencent's 8.3B video DiT, its step-distilled 480p image-to-video checkpoint (MeanFlow, 8 or 12 steps, no CFG) - the clip starts on the picture given (first_frame); its 3-D causal VAE (encoder and decoder), SigLIP's vision tower, HunyuanImage 2.1's text encoders
+gpus: '0'
+defaults:
+  steps: 8
+  seconds: 5.0
+  size: 848x480
+env:
+  NS_HV15_CFG: '1'
+  NS_HV15_STEPS: '8'
+  NS_HV15_SHIFT: '7'
+files:
+  denoiser:
+    key: hunyuanvideo15-480p-i2v-step-distilled
+    url: https://huggingface.co/tencent/HunyuanVideo-1.5/resolve/9b49404b3f5df2a8f0b31df27a0c7ab872e7b038/transformer/480p_i2v_step_distilled/diffusion_pytorch_model.safetensors
+    size: 33325523336
+    sha256: 29418e43ef5bfa1868703c26f9b45c622b473960c479dc5be43bba7bd0004f6d
+    path: hunyuanvideo15/transformer/480p_i2v_step_distilled/diffusion_pytorch_model.safetensors
+  text-encoder: hunyuanimage-21-qwen25vl-q40
+  tokenizer: qwen25-vl-tokenizer
+  byt5: hunyuanimage-21-byt5-f16
+  vae: hunyuanvideo15-vae
+  vision:
+    key: siglip-so400m-patch14-384
+    url: https://huggingface.co/google/siglip-so400m-patch14-384/resolve/9fdffc58afc957d1a03a25b10dba0329ab15c2a3/model.safetensors
+    size: 3511950624
+    sha256: ea2abad2b7f8a9c1aa5e49a244d5d57ffa71c56f720c94bc5d240ef4d6e1d94a
+    path: hunyuanvideo15/siglip/model.safetensors
+guide: guides/hunyuanvideo-1.5.md

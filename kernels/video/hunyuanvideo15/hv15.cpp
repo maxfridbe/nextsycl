@@ -329,6 +329,47 @@ int ns_video_hv15_upsample(ns_gpu* g, const void* conv, const void* x, int64_t T
     NS_CATCH
 }
 
+int ns_video_hv15_downsample(ns_gpu* g, const void* conv, const void* x, int64_t H, int64_t W, int64_t Cc, int64_t Ci, int64_t Cout, void* out) {
+    NS_TRY
+    if (H <= 0 || W <= 0 || H % 2 || W % 2 || Cc <= 0 || Ci <= 0 || Cout <= 0) return ns_fail("ns_video_hv15_downsample: even sides, channels");
+    if (Cout % (4 * Cc) != 0 || (4 * Ci) % Cout != 0) return ns_fail("ns_video_hv15_downsample: channels that do not split");
+    const half* cv = (const half*) conv;
+    const half* s = (const half*) x;
+    half* o = (half*) out;
+    const int64_t Ho = H / 2, Wo = W / 2, gsz = 4 * Ci / Cout;
+    g->q.parallel_for(sycl::range<2>((size_t) (Ho * Wo), (size_t) Cout), [=](sycl::id<2> id) {
+        const int64_t p = id[0], oc = id[1];
+        const int64_t y = p / Wo, xx = p % Wo;
+        // the convolution: "(r2 r3 c)", repeated when Cout = 8 Cc (the first frame's channels twice)
+        const int64_t j = oc % (4 * Cc), r23 = j / Cc, c = j % Cc;
+        float a = (float) cv[((2 * y + r23 / 2) * W + 2 * xx + r23 % 2) * Cc + c];
+        // the shortcut: x's "(r2 r3 c)" (4 Ci channels), each output the mean of its gsz
+        float b = 0.0f;
+        for (int64_t k = oc * gsz; k < (oc + 1) * gsz; ++k) {
+            const int64_t q = k / Ci, ci = k % Ci;
+            b += (float) s[((2 * y + q / 2) * W + 2 * xx + q % 2) * Ci + ci];
+        }
+        o[p * Cout + oc] = (half) (a + b / (float) gsz);
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_video_hv15_group_mean_add(ns_gpu* g, void* out, const void* x, int64_t N, int64_t C, int64_t r) {
+    NS_TRY
+    if (N <= 0 || C <= 0 || r <= 0) return 0;
+    half* o = (half*) out;
+    const half* s = (const half*) x;
+    g->q.parallel_for(sycl::range<2>((size_t) N, (size_t) C), [=](sycl::id<2> id) {
+        const int64_t n = id[0], c = id[1];
+        float m = 0.0f;
+        for (int64_t j = 0; j < r; ++j) m += (float) s[(n * C + c) * r + j];
+        o[n * C + c] = (half) ((float) o[n * C + c] + m / (float) r);
+    });
+    return 0;
+    NS_CATCH
+}
+
 int ns_video_hv15_transpose(ns_gpu* g, const void* x, int64_t R, int64_t C, void* out) {
     NS_TRY
     if (R <= 0 || C <= 0) return 0;

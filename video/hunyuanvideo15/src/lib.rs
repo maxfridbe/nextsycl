@@ -20,6 +20,7 @@ pub mod check;
 pub mod dit;
 mod ffi;
 pub mod vae;
+pub mod vision;
 mod w;
 
 use std::path::{Path, PathBuf};
@@ -27,6 +28,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use nextsycl_core::{DevBuf, Gpu};
+use nextsycl_diffusion::Picture;
 use nextsycl_diffusion::kernels::Nsd;
 use nextsycl_hunyuan_text::{byt5, te};
 use nextsycl_video::{At, Clip, Defaults, EngineOption, Error, JobCtl, LoadOptions, ModelFiles, Progress, Result, Sampler, Schedule, VideoEngine,
@@ -34,8 +36,8 @@ use nextsycl_video::{At, Clip, Defaults, EngineOption, Error, JobCtl, LoadOption
 use serde_json::{json, Value};
 
 pub const ARCH: &str = "hunyuanvideo-1.5";
-/// the denoiser (the transformer's safetensors, its config.json beside it), the text encoders, the VAE (its
-/// safetensors); `vision` the I2V image encoder
+/// the denoiser (the transformer's safetensors), the text encoders, the VAE (its safetensors); an I2V card adds
+/// `vision` (SigLIP so400m-patch14-384's safetensors: the image encoder)
 pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "byt5", "vae"];
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -167,6 +169,8 @@ pub struct HunyuanVideo15 {
     pub byt5: byt5::Byt5,
     pub dit: dit::Dit,
     pub vae: vae::Vae,
+    /// I2V's image encoder (a card with a vision file)
+    pub vision: Option<vision::Vision>,
     cfg: f32,
     steps: usize,
     shift: f32,
@@ -206,10 +210,15 @@ impl HunyuanVideo15 {
         // the pipeline's text_len: 1000 tokens after the crop
         te.template.max_tokens = te.template.crop + 1000;
         let byt5 = byt5::Byt5::load(role(files, "byt5")?, &nsd, kern, log)?;
-        let vae = vae::Vae::load(role(files, "vae")?, &k, log)?;
+        let i2v = files.contains_key("vision");
+        if i2v && !dit.has_vision() {
+            return Err(Error(format!("{ARCH}: a vision file with a DiT that has no vision projection")));
+        }
+        let vae = vae::Vae::load(role(files, "vae")?, &k, i2v, log)?;
+        let vision = if i2v { Some(vision::Vision::load(role(files, "vision")?, &k, log)?) } else { None };
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("{ARCH}: loaded in {load_s:.1} s (cfg {cfg}, {steps} steps, shift {shift})"));
-        Ok(HunyuanVideo15 { nsd, k, te, byt5, dit, vae, cfg, steps, shift, loaded: Instant::now(), load_s, peak: Default::default() })
+        Ok(HunyuanVideo15 { nsd, k, te, byt5, dit, vae, vision, cfg, steps, shift, loaded: Instant::now(), load_s, peak: Default::default() })
     }
 
     /// The card's memory in use now, kept as the clip's peak when it is the most seen
@@ -269,22 +278,41 @@ impl HunyuanVideo15 {
 
     /// A clip from a prompt
     #[allow(clippy::too_many_arguments)]
-    pub fn make(&self, prompt: &str, negative: &str, width: usize, height: usize, frames: usize, steps: usize, cfg: f32, shift: f32, seed: u64,
-                progress: &mut dyn FnMut(&'static str, usize, usize) -> Result<()>, log: &mut dyn FnMut(String)) -> Result<Made> {
-        let (w, h) = canvas(width, height);
+    pub fn make(&self, prompt: &str, negative: &str, image: Option<&Picture>, width: usize, height: usize, frames: usize, steps: usize, cfg: f32, shift: f32,
+                seed: u64, progress: &mut dyn FnMut(&'static str, usize, usize) -> Result<()>, log: &mut dyn FnMut(String)) -> Result<Made> {
+        // I2V: the canvas the picture's shape picks (get_closest_resolution_given_reference_image), else the request's
+        let (w, h) = match image {
+            Some(p) => canvas(p.width as usize, p.height as usize),
+            None => canvas(width, height),
+        };
         let f = (frames - 1) / 4 + 1;
         let grid = (f, h / 16, w / 16);
         let t0 = Instant::now();
         self.peak.store(0, std::sync::atomic::Ordering::Relaxed);
         let at_start = self.note();
         progress("encode", 0, 0)?;
-        let pos = self.encode(prompt, None)?;
-        let neg = if cfg > 1.0 { Some(self.encode(negative, None)?) } else { None };
+        let n = grid.0 * grid.1 * grid.2;
+        let mut cond = vec![0f32; n * (dit::IN - dit::LATENT)];
+        let tokens = match image {
+            Some(p) => {
+                let v = self.vision.as_ref().ok_or_else(|| Error(format!("{ARCH}: this card makes video from text only (an I2V card takes a picture)")))?;
+                let rgb = p.rgb();
+                let px = vision::cover(&rgb.data, rgb.width as usize, rgb.height as usize, w, h)?;
+                let lat = self.vae.encode(&self.nsd, &px, h, w)?;
+                // the first frame's latent and the mask (1) on frame 0's rows; zeros after
+                for (r, row) in lat.chunks_exact(dit::LATENT).enumerate() {
+                    cond[r * (dit::IN - dit::LATENT)..r * (dit::IN - dit::LATENT) + dit::LATENT].copy_from_slice(row);
+                    cond[r * (dit::IN - dit::LATENT) + dit::LATENT] = 1.0;
+                }
+                Some(v.encode(&self.nsd, &vision::siglip_pixels(&px, w, h)?)?)
+            }
+            None => None,
+        };
+        let pos = self.encode(prompt, tokens.as_deref())?;
+        let neg = if cfg > 1.0 { Some(self.encode(negative, tokens.as_deref())?) } else { None };
         log(format!("{ARCH}: {w}x{h}, {frames} frames ({} x {} x {} latents, {} tokens), {steps} steps, cfg {cfg}, shift {shift}, seed {seed}; text in {:.1} s",
                     grid.0, grid.1, grid.2, grid.0 * grid.1 * grid.2, t0.elapsed().as_secs_f64()));
         let x = noise(seed, grid.0, grid.1, grid.2);
-        let n = grid.0 * grid.1 * grid.2;
-        let cond = vec![0f32; n * (dit::IN - dit::LATENT)];
         let sig = sigmas(steps, shift);
         let t1 = Instant::now();
         let lat = self.denoise(&pos, neg.as_ref().map(|e| (e, cfg)), &x, grid, &cond, &sig, &mut |i, _| {
@@ -332,6 +360,11 @@ impl HunyuanVideo15 {
         let shift = n("shift").map_or(self.shift, |x| x as f32);
         let seed = n("seed").map_or(0, |x| x as i64 as u64);
         let negative = s("negative").or(s("negative_prompt")).unwrap_or("");
+        // I2V: the picture the clip starts from (the studio's first_frame)
+        let image = match s("image").or(s("first_frame")).filter(|p| !p.is_empty()) {
+            Some(p) => Some(Picture::decode(&std::fs::read(p).map_err(|e| Error(format!("{p}: {e}")))?).map_err(|e| Error(format!("{p}: {e}")))?),
+            None => None,
+        };
         let t0 = Instant::now();
         let JobCtl { log, cancel, progress: report } = ctl;
         let mut progress = |stage: &'static str, at: usize, of: usize| -> Result<()> {
@@ -343,7 +376,7 @@ impl HunyuanVideo15 {
             }
             Ok(())
         };
-        let m = self.make(prompt, negative, width, height, frames, steps, cfg, shift, seed, &mut progress, &mut |l| log(l))?;
+        let m = self.make(prompt, negative, image.as_ref(), width, height, frames, steps, cfg, shift, seed, &mut progress, &mut |l| log(l))?;
         // the merge gate's quick run (tooling/gate.sh): the last latents and the frames to hash, and two speeds as its
         // [prompt ...] lines: the DiT's latent tokens a second over the steps, the decoder's frames' pixels a second
         if let Some(p) = s("logits-out") {
@@ -405,7 +438,8 @@ impl VideoEngine for HunyuanVideo15 {
             Ok(())
         };
         let negative = req.negative.clone().or_else(|| req.extra.get("negative").cloned()).unwrap_or_default();
-        let m = self.make(&req.prompt, &negative, req.width.unwrap_or(d.width) as usize, req.height.unwrap_or(d.height) as usize, frames,
+        let image = req.keyframes.first().map(|k| k.picture.clone());
+        let m = self.make(&req.prompt, &negative, image.as_ref(), req.width.unwrap_or(d.width) as usize, req.height.unwrap_or(d.height) as usize, frames,
                           req.steps.unwrap_or(d.steps) as usize, cfg, req.shift.unwrap_or(d.shift), req.seed, &mut p, &mut |l| eprintln!("{l}"))?;
         progress(Progress { stage: "mux", at: 0, of: 0, seconds: t0.elapsed().as_secs_f64() });
         nextsycl_h3::media::write_mp4(&req.out, &nextsycl_h3::media::Frames { px: &m.px, count: m.frames, height: m.height, width: m.width, fps: 24 }, None,

@@ -167,7 +167,7 @@ impl Lin {
         let w = match keep {
             Keep::F32 => Wt::F32(DevBuf::from_f32(gpu, &v)?),
             Keep::Q8 | Keep::Q8Blocks => {
-                if k % 32 != 0 {
+                if !k.is_multiple_of(32) {
                     return Err(Error(format!("{}: {k} columns are not whole Q8_0 blocks", names[0])));
                 }
                 let q = q8_0(&v);

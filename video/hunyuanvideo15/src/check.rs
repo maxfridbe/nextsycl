@@ -7,7 +7,9 @@
 //!   dit    embeds + byt5 + noise   -> noise (the seed's draws), vec0, txt0 (the token refiner), txt_all0 (the text rows),
 //!                                     dbl0_img / dbl0_txt (double block 0), dbl_img (after the 54), v0 (the velocity)
 //!   steps                          -> latents_N.npy every step (Euler over sigmas.npy)
+//!   i2v    siglip_pixels, cond_pixels -> vision.npy (SigLIP's tokens), cond_latent.npy (the VAE encoder's)
 //!   vae    latents (latents.npy or the last step's) -> video.npy (RGB in [-1, 1])
+//! A dit.json with "i2v" runs the I2V DiT on the reference's cond_latent and vision tokens.
 //! ```
 //!
 //! The job: `nextsycl video job check --dir DIR --stages te,byt5,dit,steps,vae --here` (with the hunyuanvideo15 model).
@@ -46,7 +48,7 @@ pub fn read_npy(path: &Path) -> Result<(Vec<usize>, Vec<f32>)> {
 pub fn write_npy(path: &Path, shape: &[usize], v: &[f32]) -> Result<()> {
     let dims = shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ");
     let mut head = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({dims}{}), }}", if shape.len() == 1 { "," } else { "" });
-    while (10 + head.len() + 1) % 64 != 0 {
+    while !(10 + head.len() + 1).is_multiple_of(64) {
         head.push(' ');
     }
     head.push('\n');
@@ -154,6 +156,19 @@ pub fn job(m: &HunyuanVideo15, spec: &Value, ctl: &mut JobCtl) -> Result<Value> 
             r.line("byt5", &got, &read_npy(&dir.join("byt5.npy"))?.1);
         }
     }
+    if has("i2v") {
+        let (_, sp) = read_npy(&dir.join("siglip_pixels.npy"))?;
+        let v = m.vision.as_ref().ok_or_else(|| Error("check i2v: the model has no vision file".into()))?;
+        let t0 = std::time::Instant::now();
+        let tok = v.encode(nsd, &sp)?;
+        (r.log)(format!("siglip: {:.2} s", t0.elapsed().as_secs_f64()));
+        r.line("vision", &tok, &read_npy(&dir.join("vision.npy"))?.1);
+        let (shape, cp) = read_npy(&dir.join("cond_pixels.npy"))?;
+        let t1 = std::time::Instant::now();
+        let lat = m.vae.encode(nsd, &cp, shape[0], shape[1])?;
+        (r.log)(format!("vae encode: {:.2} s", t1.elapsed().as_secs_f64()));
+        r.line("cond latent", &lat, &read_npy(&dir.join("cond_latent.npy"))?.1);
+    }
     if has("dit") || has("steps") {
         let d = json_file(&dir.join("dit.json"))?;
         let lat = d["latent"].as_array().ok_or_else(|| Error("dit.json: no latent".into()))?;
@@ -167,18 +182,30 @@ pub fn job(m: &HunyuanVideo15, spec: &Value, ctl: &mut JobCtl) -> Result<Value> 
         r.line("noise (seed)", &crate::noise(seed, grid.0, grid.1, grid.2), &noise);
         let sig = sigmas(steps, shift);
         r.line("sigmas", &sig, &read_npy(&dir.join("sigmas.npy"))?.1);
+        let i2v = d["i2v"].as_bool().unwrap_or(false);
+        let vision = if i2v { Some(read_npy(&dir.join("vision.npy"))?.1) } else { None };
         let text = |p: &str| -> Result<dit::Text> {
             let (_, e) = read_npy(&dir.join(format!("{p}embeds.npy")))?;
             let b5 = dir.join(format!("{p}byt5.npy"));
             let b = if b5.exists() { Some(read_npy(&b5)?.1) } else { None };
-            m.dit.text(nsd, &e, b.as_deref(), None)
+            m.dit.text(nsd, &e, b.as_deref(), vision.as_deref())
         };
         let pos = text("")?;
         let neg = match cfg {
             Some(_) => Some(text("neg_")?),
             None => None,
         };
-        let cond = DevBuf::from_f32(&nsd.gpu, &vec![0f32; n * (dit::IN - dit::LATENT)])?;
+        let w = dit::IN - dit::LATENT;
+        let mut c = vec![0f32; n * w];
+        if i2v {
+            // the first frame's latent and the mask on frame 0's rows
+            let (_, cl) = read_npy(&dir.join("cond_latent.npy"))?;
+            for (r, row) in cl.chunks_exact(dit::LATENT).enumerate() {
+                c[r * w..r * w + dit::LATENT].copy_from_slice(row);
+                c[r * w + dit::LATENT] = 1.0;
+            }
+        }
+        let cond = DevBuf::from_f32(&nsd.gpu, &c)?;
         let ts: Vec<(f32, Option<f32>)> =
             (0..steps).map(|i| (sig[i] * 1000.0, m.dit.meanflow.then(|| if i + 1 < steps { sig[i + 1] * 1000.0 } else { 0.0 }))).collect();
         let st = m.dit.steps(nsd, &ts)?;

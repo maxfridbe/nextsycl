@@ -68,8 +68,21 @@ struct Level {
     up: Option<(Conv, bool)>,
 }
 
+/// The encoder (I2V's first frame): 5 levels (128, 256, 512, 1024, 1024) of 2 resnets, downsampled after levels 0 - 3
+/// (in time too after 2 and 3), the middle, RMS norm, swish, conv_out to 64 (mean | log variance) plus the channels'
+/// mean over runs of 16
+struct Encoder {
+    conv_in: Conv,
+    levels: Vec<(Vec<Resnet>, Option<Conv>)>,
+    mid: [Resnet; 2],
+    att: Att,
+    norm_out: DevBuf,
+    conv_out: Conv,
+}
+
 pub struct Vae {
     k: K,
+    enc: Option<Encoder>,
     conv_in: Conv,
     mid: [Resnet; 2],
     att: Att,
@@ -98,7 +111,8 @@ impl Vol {
 }
 
 impl Vae {
-    pub fn load(file: &Path, k: &K, log: &mut dyn FnMut(String)) -> Result<Vae> {
+    /// The decoder, and the encoder too with `encoder` (I2V)
+    pub fn load(file: &Path, k: &K, encoder: bool, log: &mut dyn FnMut(String)) -> Result<Vae> {
         let t0 = std::time::Instant::now();
         let gpu = &k.gpu;
         let st = St::open(file)?;
@@ -163,8 +177,48 @@ impl Vae {
         }
         let norm_out = gamma("decoder.norm_out")?;
         let conv_out = conv("decoder.conv_out.conv")?;
-        log(format!("vae: the decoder ({:.2} GiB, half) on {} in {:.1} s", bytes as f64 / (1u64 << 30) as f64, gpu.name, t0.elapsed().as_secs_f64()));
-        Ok(Vae { k: k.clone(), conv_in, mid, att, levels, norm_out, conv_out, bytes })
+        let enc = if encoder {
+            let conv_in = conv("encoder.conv_in.conv")?;
+            let mut levels = Vec::new();
+            for l in 0.. {
+                if !st.has(&format!("encoder.down.{l}.block.0.conv1.conv.weight")) {
+                    break;
+                }
+                let mut rs = Vec::new();
+                for b in 0.. {
+                    let p = format!("encoder.down.{l}.block.{b}");
+                    if !st.has(&format!("{p}.conv1.conv.weight")) {
+                        break;
+                    }
+                    rs.push(resnet(&p, &mut conv)?);
+                }
+                let down = if st.has(&format!("encoder.down.{l}.downsample.conv.conv.weight")) {
+                    Some(conv(&format!("encoder.down.{l}.downsample.conv.conv"))?)
+                } else {
+                    None
+                };
+                levels.push((rs, down));
+            }
+            Some(Encoder {
+                conv_in,
+                levels,
+                mid: [resnet("encoder.mid.block_1", &mut conv)?, resnet("encoder.mid.block_2", &mut conv)?],
+                att: Att {
+                    norm: gamma("encoder.mid.attn_1.norm")?,
+                    q: conv("encoder.mid.attn_1.q")?,
+                    k: conv("encoder.mid.attn_1.k")?,
+                    v: conv("encoder.mid.attn_1.v")?,
+                    proj: conv("encoder.mid.attn_1.proj_out")?,
+                },
+                norm_out: gamma("encoder.norm_out")?,
+                conv_out: conv("encoder.conv_out.conv")?,
+            })
+        } else {
+            None
+        };
+        log(format!("vae: the decoder{} ({:.2} GiB, half) on {} in {:.1} s", if enc.is_some() { " and the encoder" } else { "" }, bytes as f64 / (1u64 << 30) as f64,
+                    gpu.name, t0.elapsed().as_secs_f64()));
+        Ok(Vae { k: k.clone(), enc, conv_in, mid, att, levels, norm_out, conv_out, bytes })
     }
 
     /// A causal 3x3x3 convolution (or a 1x1x1 one: a linear over the channels)
@@ -204,9 +258,8 @@ impl Vae {
     }
 
     /// The middle's attention: one head over every voxel, causal by frame
-    fn attention(&self, nsd: &Nsd, x: Vol) -> Result<Vol> {
+    fn attention(&self, nsd: &Nsd, a: &Att, x: Vol) -> Result<Vol> {
         let gpu = &nsd.gpu;
-        let a = &self.att;
         let n = x.n();
         let c = x.c;
         let hw = x.h * x.w;
@@ -249,7 +302,7 @@ impl Vae {
         self.k.rep_add(x.b.ptr(), z.b.ptr(), x.n(), x.c, z.c)?;
         drop(z);
         x = self.resnet(nsd, &self.mid[0], x)?;
-        x = self.attention(nsd, x)?;
+        x = self.attention(nsd, &self.att, x)?;
         x = self.resnet(nsd, &self.mid[1], x)?;
         each("mid");
         for (li, l) in self.levels.iter().enumerate() {
@@ -271,6 +324,47 @@ impl Vae {
         let out = self.conv(nsd, &self.conv_out, &h)?;
         nsd.wait()?;
         Ok(out)
+    }
+
+    /// One picture (float32 [H, W, 3] in [-1, 1], sides multiples of 16) through the encoder: its latent's mean times the
+    /// scaling, float32 [H / 16 * W / 16, 32] - I2V's first frame (the pipeline's encode(...).latent_dist.mode())
+    pub fn encode(&self, nsd: &Nsd, px: &[f32], h: usize, w: usize) -> Result<Vec<f32>> {
+        let e = self.enc.as_ref().ok_or_else(|| Error("the VAE was loaded without its encoder".into()))?;
+        let gpu = &nsd.gpu;
+        if !h.is_multiple_of(16) || !w.is_multiple_of(16) || px.len() != h * w * 3 {
+            return Err(Error(format!("a picture of {} values for {w}x{h} (sides multiples of 16)", px.len())));
+        }
+        let pf = DevBuf::from_f32(gpu, px)?;
+        let p = Vol::new(gpu, 1, h, w, 3)?;
+        self.k.to_half(pf.fp(), p.b.ptr(), px.len(), 1.0)?;
+        let mut x = self.conv(nsd, &e.conv_in, &p)?;
+        drop(p);
+        for (li, (rs, down)) in e.levels.iter().enumerate() {
+            for r in rs {
+                x = self.resnet(nsd, r, x)?;
+            }
+            if let Some(c) = down {
+                let conv = self.conv(nsd, c, &x)?;
+                // the output channels: the next level's input (the conv gives a quarter or an eighth of them)
+                let cout = e.levels.get(li + 1).and_then(|l| l.0.first()).map(|r| r.conv1.ci).ok_or_else(|| Error("a downsample after the last level".into()))?;
+                let o = Vol::new(gpu, 1, x.h / 2, x.w / 2, cout)?;
+                self.k.downsample(conv.b.ptr(), x.b.ptr(), x.h, x.w, c.co, x.c, cout, o.b.ptr())?;
+                x = o;
+            }
+        }
+        x = self.resnet(nsd, &e.mid[0], x)?;
+        x = self.attention(nsd, &e.att, x)?;
+        x = self.resnet(nsd, &e.mid[1], x)?;
+        let hn = self.norm(nsd, &x, &e.norm_out, true)?;
+        let o = self.conv(nsd, &e.conv_out, &hn)?;
+        drop(hn);
+        self.k.group_mean_add(o.b.ptr(), x.b.ptr(), o.n(), o.c, x.c / o.c)?;
+        let of = DevBuf::f32(gpu, o.n() * o.c)?;
+        self.k.to_float(o.b.ptr(), of.fp(), o.n() * o.c)?;
+        nsd.wait()?;
+        let all = of.to_f32()?;
+        // the mean: the first 32 of each voxel's 64
+        Ok(all.chunks_exact(o.c).flat_map(|v| v[..Z].iter().map(|m| m * SCALING)).collect())
     }
 
     /// Latents float32 [F, h, w, 32] (as the DiT writes them, not yet divided by the scaling) -> frames float32 [To, H,

@@ -326,6 +326,11 @@ impl Dit {
         Ok(Dit { bytes, ..dit })
     }
 
+    /// Whether it reads SigLIP tokens (an I2V DiT; the T2V ones carry the projection too, unused)
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
     /// An MLP embedder (sinusoid -> linear -> SiLU -> linear) of `vals`
     fn embed(&self, nsd: &Nsd, m: &Mlp2, vals: &[f32]) -> Result<DevBuf> {
         let gpu = &nsd.gpu;
@@ -525,6 +530,7 @@ impl Dit {
     /// The velocity of each branch's latents at step row `si` of `st`: `lats[i]` float32 [n, 32] (frames, rows, columns
     /// in order, channels last), `cond` float32 [n, 33] (the condition latents and the mask). Returns float32 [n, 32]
     /// each. `tap(name, buffer, first row, rows)` sees branch 0's stages a check compares.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(&self, nsd: &Nsd, st: &Steps, si: usize, bt: &Batch, lats: &[&DevBuf], cond: &DevBuf,
                    tap: &mut dyn FnMut(&str, &DevBuf, usize, usize) -> Result<()>) -> Result<Vec<DevBuf>> {
         let k = &self.k;

@@ -30,6 +30,8 @@ struct Api {
     add: unsafe extern "C" fn(G, M, P, i64) -> c_int,
     upsample: unsafe extern "C" fn(G, P, P, i64, i64, i64, i64, i64, c_int, M) -> c_int,
     transpose: unsafe extern "C" fn(G, P, i64, i64, M) -> c_int,
+    downsample: unsafe extern "C" fn(G, P, P, i64, i64, i64, i64, i64, M) -> c_int,
+    group_mean_add: unsafe extern "C" fn(G, M, P, i64, i64, i64) -> c_int,
     softmax_causal: unsafe extern "C" fn(G, *const f32, i64, i64, i64, i64, f32, M) -> c_int,
 }
 
@@ -71,6 +73,8 @@ fn api() -> Result<&'static Api> {
             add: sym!("ns_video_hv15_add"),
             upsample: sym!("ns_video_hv15_upsample"),
             transpose: sym!("ns_video_hv15_transpose"),
+            downsample: sym!("ns_video_hv15_downsample"),
+            group_mean_add: sym!("ns_video_hv15_group_mean_add"),
             softmax_causal: sym!("ns_video_hv15_softmax_causal"),
         })
     })
@@ -291,6 +295,19 @@ impl K {
     pub fn upsample(&self, conv: P, x: P, t: usize, h: usize, w: usize, c: usize, ci: usize, temporal: bool, out: M) -> Result<()> {
         // SAFETY: conv [t, h, w, 8c or 4c], x [t, h, w, ci], out [2t - 1 or t, 2h, 2w, c].
         check(unsafe { (self.k.upsample)(self.g(), conv, x, t as i64, h as i64, w as i64, c as i64, ci as i64, temporal as c_int, out) }, "upsample")
+    }
+
+    /// conv [h, w, cc] and x [h, w, ci] -> out [h / 2, w / 2, cout] (one frame's Downsample)
+    #[allow(clippy::too_many_arguments)]
+    pub fn downsample(&self, conv: P, x: P, h: usize, w: usize, cc: usize, ci: usize, cout: usize, out: M) -> Result<()> {
+        // SAFETY: conv [h, w, cc], x [h, w, ci], out [h / 2, w / 2, cout] halves.
+        check(unsafe { (self.k.downsample)(self.g(), conv, x, h as i64, w as i64, cc as i64, ci as i64, cout as i64, out) }, "downsample")
+    }
+
+    /// out [n, c] += the mean of x [n, c r] over runs of r channels
+    pub fn group_mean_add(&self, out: M, x: P, n: usize, c: usize, r: usize) -> Result<()> {
+        // SAFETY: out [n, c], x [n, c r] halves.
+        check(unsafe { (self.k.group_mean_add)(self.g(), out, x, n as i64, c as i64, r as i64) }, "group mean")
     }
 
     pub fn transpose(&self, x: P, r: usize, c: usize, out: M) -> Result<()> {

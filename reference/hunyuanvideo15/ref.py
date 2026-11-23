@@ -7,6 +7,8 @@ engine is checked against (`nextsycl video job check` with the hunyuanvideo15 en
     python ref.py dit  --dit transformer/480p_t2v_distilled/diffusion_pytorch_model.safetensors --off OFF --out DIR
                        [--weights q8|fp32] [--frames 9] [--height 128] [--width 224] [--steps 2] [--shift 5] [--cfg 1] [--seed 7] [--full]
     python ref.py vae  --vae vae/diffusion_pytorch_model.safetensors --off OFF --out DIR [--latents FILE.npy --frames F --height H --width W]
+    python ref.py i2v  --image PNG --siglip SIGLIP_DIR --vae ... --off OFF --out DIR [--height H --width W]   (I2V's two image inputs)
+    python ref.py dit  ... --i2v                        (the I2V DiT: the first frame's latent and the SigLIP tokens from i2v)
 
 The stages run one at a time (each frees its weights; hardac1: `podman run --memory 40g`) and talk through DIR:
   te:   tokens.json (the template's ids, the crop), te_layer0.npy, embeds.npy [T, 3584] - Qwen2.5-VL's hidden_states[-3]
@@ -18,6 +20,10 @@ The stages run one at a time (each frees its weights; hardac1: `podman run --mem
         token refiner's output), txt_all0.npy (the text rows the blocks see: [valid byT5 | valid Qwen] + the condition
         type embeddings), dbl0_img.npy / dbl0_txt.npy (double block 0), dbl_img.npy (after the 54 blocks), v0.npy (the
         first velocity [F*h*w, 32]), with --full latents_<i>.npy after every step (the pipeline's Euler)
+  i2v:  siglip_pixels.npy [384, 384, 3] (the picture as SigLIP sees it: resize_and_center_crop to the canvas with PIL's
+        Lanczos, then SiglipImageProcessor), vision.npy [729, 1152] (SiglipVisionModel's last_hidden_state), cond_pixels.npy
+        [H, W, 3] (get_image_condition_latents' picture: torchvision Resize (Lanczos) + CenterCrop + Normalize),
+        cond_latent.npy [h w, 32] (the VAE encoder's mode x 1.03682)
   vae:  video.npy [F, H, W, 3] in [-1, 1] - AutoencoderKLConv3D.decode(latents / 1.03682) under the pipeline's
         memory_efficient_context (spatial tiles of 256 pixels, overlap 0.125) - and frame_000.png ...
 
@@ -318,6 +324,35 @@ def text_inputs(out, neg):
     return e, b
 
 
+def run_i2v(a):
+    from PIL import Image
+    from transformers import SiglipImageProcessor, SiglipVisionModel
+    import torchvision.transforms as tvt
+    sys.path.insert(0, a.off)
+    from hyvideo.utils.data_utils import resize_and_center_crop
+    img = Image.open(a.image).convert("RGB")
+    h, w = a.height, a.width
+    # the semantic picture: resize_and_center_crop then the SigLIP processor
+    sem = resize_and_center_crop(np.array(img), target_width=w, target_height=h)
+    proc = SiglipImageProcessor.from_pretrained(a.siglip)
+    px = proc.preprocess(images=sem, return_tensors="pt")["pixel_values"]          # [1, 3, 384, 384]
+    save(a.out, "siglip_pixels.npy", px[0].permute(1, 2, 0))
+    m = SiglipVisionModel.from_pretrained(a.siglip).float().eval()
+    save(a.out, "vision.npy", m(pixel_values=px).last_hidden_state[0])
+    del m
+    # the condition picture: get_image_condition_latents
+    ow, oh = img.size
+    sf = max(w / ow, h / oh)
+    rw, rh = int(round(ow * sf)), int(round(oh * sf))
+    t = tvt.Compose([tvt.Resize((rh, rw), interpolation=tvt.InterpolationMode.LANCZOS), tvt.CenterCrop((h, w)), tvt.ToTensor(), tvt.Normalize([0.5], [0.5])])
+    x = t(img)                                                                     # [3, H, W]
+    save(a.out, "cond_pixels.npy", x.permute(1, 2, 0))
+    vae = vae_model(a)
+    lat = vae.encode(x[None, :, None]).latent_dist.mode() * SCALING               # [1, 32, 1, h, w]
+    save(a.out, "cond_latent.npy", tokens(lat))
+    json.dump({"image": a.image, "height": h, "width": w}, open(os.path.join(a.out, "i2v.json"), "w"))
+
+
 def run_dit(a):
     T = official(a.off)
     d = Dit(a.dit, T, a.weights)
@@ -334,18 +369,25 @@ def run_dit(a):
     cfg = a.cfg if a.cfg > 1 else None
     neg = text_inputs(a.out, True) if cfg else None
     json.dump({"frames": a.frames, "height": a.height, "width": a.width, "latent": [f, h, w], "steps": a.steps, "shift": a.shift,
-               "cfg": cfg, "seed": a.seed, "meanflow": d.meanflow, "weights": a.weights}, open(os.path.join(a.out, "dit.json"), "w"))
+               "cfg": cfg, "seed": a.seed, "meanflow": d.meanflow, "weights": a.weights, "i2v": a.i2v}, open(os.path.join(a.out, "dit.json"), "w"))
     lat = noise
-    # T2V: the condition latents zero, the mask zero (the pipeline's _prepare_cond_latents)
+    # T2V: the condition latents zero, the mask zero (the pipeline's _prepare_cond_latents); I2V: the first frame's
+    # latent at frame 0 (zeros after), the mask 1 there
     cond = torch.zeros(1, 33, f, h, w)
+    vision = None
+    if a.i2v:
+        c = torch.from_numpy(np.load(os.path.join(a.out, "cond_latent.npy")))
+        cond[0, :32, 0] = c.reshape(h, w, 32).permute(2, 0, 1)
+        cond[0, 32, 0] = 1.0
+        vision = torch.from_numpy(np.load(os.path.join(a.out, "vision.npy")))[None]
     for i in range(a.steps if a.full else 1):
         t = ts[i:i + 1]
         tr = (ts[i + 1:i + 2] if i + 1 < a.steps else torch.zeros(1)) if d.meanflow else None
         dump = (lambda n, v: save(a.out, n, v)) if i == 0 else None
         x = torch.cat([lat, cond], 1)
-        v = d.forward(x, t, pos[0], pos[1], tr=tr, dump=dump)
+        v = d.forward(x, t, pos[0], pos[1], tr=tr, vision=vision, dump=dump)
         if cfg:
-            vn = d.forward(x, t, neg[0], neg[1], tr=tr)
+            vn = d.forward(x, t, neg[0], neg[1], tr=tr, vision=vision)
             v = vn + cfg * (v - vn)
         if i == 0:
             save(a.out, "v0.npy", v[0])
@@ -391,7 +433,10 @@ def run_vae(a):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("stage", choices=["te", "byt5", "dit", "vae"])
+    p.add_argument("stage", choices=["te", "byt5", "dit", "vae", "i2v"])
+    p.add_argument("--image")
+    p.add_argument("--siglip")
+    p.add_argument("--i2v", action="store_true")
     p.add_argument("--te")
     p.add_argument("--tokenizer")
     p.add_argument("--byt5")
@@ -413,7 +458,7 @@ def main():
     p.add_argument("--latents")
     a = p.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    {"te": run_te, "byt5": run_byt5, "dit": run_dit, "vae": run_vae}[a.stage](a)
+    {"te": run_te, "byt5": run_byt5, "dit": run_dit, "vae": run_vae, "i2v": run_i2v}[a.stage](a)
 
 
 if __name__ == "__main__":
