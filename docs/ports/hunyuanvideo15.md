@@ -89,6 +89,7 @@ steps of the cfg-distilled DiT; I2V: the step-distilled DiT, a 1024 x 1024 pictu
 | latents after step 1 / 2 | 1.4e-4 / 6.0e-4 | 6.3e-4 / 4.2e-3 | 1.000000 |
 | 320 x 320: latents after 2 steps | 1.2e-3 | 2.3e-2 | 0.999999 |
 | VAE decode (one tile / 2 x 2 tiles) | 1.4e-3 / 2.7e-3 | 1.6e-2 / 5.1e-2 | 0.999999 / 0.999996 |
+| VAE decode as a stream (latent frames 1 + 1 + 1, carried state) against the whole decode's reference | 1.35e-3 | 1.6e-2 | 0.999999 |
 | I2V: SigLIP tokens (from the reference's 384 x 384 pixels) | 6.2e-5 | 1.1e-2 | 1.000000 |
 | I2V: the first frame's latent (VAE encoder) | 7.9e-4 | 4.2e-3 | 1.000000 |
 | I2V: after the 54 blocks / velocity / latents after 2 steps / decode | 9.0e-4 / 2.9e-4 / 5.3e-4 / 3.5e-4 | 6.2e-3 / 4.1e-3 / 5.3e-3 / 3.9e-3 | 1.000000 |
@@ -171,10 +172,10 @@ machinery built against them could be run but not checked. What its public code 
 `movieroll_transformer.py` `forward_inference`, `streaming_attention.py` `chunk_inference_attention`,
 `movieroll_dmd_pipeline.py`) asks of this engine, in order:
 
-1. **Per-chunk timesteps**: a window of 5 chunks (4 latent frames each) at rising noise levels - `vec` (hence every
-   block's modulations) a row per chunk. The engine's modulations are already one row per step (`Steps`); a window
-   takes a row per chunk, and each norm / gated product is called per chunk over its contiguous rows (5 calls where
-   there is 1).
+1. **Per-chunk timesteps - built**: a window of 5 chunks (4 latent frames each) at rising noise levels, `vec` (hence
+   every block's modulations) a row per chunk. `Dit::forward_spans` takes the image rows in spans, each at its own row
+   of `Steps` (the norms, gated products and final layer called per span); one span is `forward` (every check and
+   clip here ran through it). Several spans at different levels need MovieRoll's weights to mean anything.
 2. **Attention over a cached history**: the window's image queries over `[cached history K, V | window image | text]`,
    the text queries over `[window image | text]` only (the history unseen by the text). `nsd.attention_qk` takes
    queries and keys / values apart already; the cache is a per-block buffer of post-RoPE K and V rows the window's own
@@ -185,8 +186,11 @@ machinery built against them could be run but not checked. What its public code 
    recent at t = 0 without text (`forward_kv_recompute`, the K / V only, no text stream). Memory (movieroll.md): ~13 GB
    bf16 at 480 x 864 - a second card or int8 K / V when it does not fit beside the 8.2 GiB DiT.
 4. **Events**: one prompt a window; a new prompt re-encodes the text (cheap: 0.1 s here) and triggers a recompute.
-5. **Streaming decode**: the VAE decoder is causal in time (causal convs, frame-causal attention), so a chunk can be
-   decoded as it leaves the window if each causal conv keeps its last two input frames and the middle attention its K
-   / V of the frames before (MovieRoll's PS-VAE `streaming_vae.py` does this with its own decoder - to read when the
-   weights come: it may not be this VAE).
+5. **Streaming decode - built and checked**: the decoder is causal in time, so `Vae::stream_begin / stream_chunk /
+   stream_end` decode a video a few latent frames at a time - each causal convolution carries its last two padded
+   input frames, the middle attention its keys and values, the temporal upsamples treat only the first chunk's first
+   frame as the video's - and give the whole decode's frames (the check above: 1.35e-3 against the reference, the same
+   as one decode). MovieRoll's `streaming_vae.py` ("causal RMSNorm 3D VAE with T-cache streaming", the same parameters
+   and keys as its `causal_vae.py`) is this design; whether its decoder weights are HunyuanVideo-1.5's is for when the
+   weights can be read.
 6. **Phase 3** (`video.roll`, `video.rollAppend`, `video.rollEnd`, fragmented MP4 + HLS while it runs) sits on 1 - 5.

@@ -285,7 +285,7 @@ pub fn job(m: &HunyuanVideo15, spec: &Value, ctl: &mut JobCtl) -> Result<Value> 
         let (f, h, w) = (lat[0].as_u64().unwrap_or(1) as usize, lat[1].as_u64().unwrap_or(1) as usize, lat[2].as_u64().unwrap_or(1) as usize);
         let steps = d["steps"].as_u64().unwrap_or(1);
         let (_, z) = read_npy(&dir.join(format!("latents_{}.npy", steps - 1)))?;
-        let chunk = spec.get("chunk").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+        let chunk = spec.get("chunk").and_then(Value::as_f64).unwrap_or(1.0).max(1.0) as usize;
         let plane = h * w * crate::vae::Z;
         m.vae.stream_begin()?;
         let mut out = Vec::new();
