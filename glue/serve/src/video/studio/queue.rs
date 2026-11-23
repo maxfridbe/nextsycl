@@ -159,6 +159,9 @@ pub fn requested_engine(p: &Value, known: &dyn Fn(&str) -> bool) -> Result<Strin
 pub fn hv15_rules(engine: &str) -> Option<(f64, f64)> {
     match engine {
         "HV15-I2V" => Some((8.0, 50.0)),
+        // the cfg-distilled T2V card's fast default (the user's pick, 2026-11-23): 30 steps with DeepCache and Sage
+        // attention from its card - 3.7x the 50-step clip, another take of the scene as sharp
+        "HV15" => Some((30.0, 100.0)),
         e if e.starts_with("HV15") => Some((50.0, 100.0)),
         _ => None,
     }
@@ -928,7 +931,8 @@ mod tests {
         assert_eq!(quant_of("hunyuanvideo-1.5-480p-t2v-q8"), "HV15-CFG");
         assert_eq!(quant_of("hunyuanvideo-1.5-480p-i2v-step-distilled-q8"), "HV15-I2V");
         assert_eq!(quant_of("minimax-h3-q6k"), "Q6_K");
-        assert_eq!(hv15_rules("HV15"), Some((50.0, 100.0)));
+        assert_eq!(hv15_rules("HV15"), Some((30.0, 100.0)));
+        assert_eq!(hv15_rules("HV15-CFG"), Some((50.0, 100.0)));
         assert_eq!(hv15_rules("HV15-I2V"), Some((8.0, 50.0)));
         assert_eq!(hv15_rules("INT8"), None);
         assert_eq!(hv15_frames(5.0), 121);
