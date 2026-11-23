@@ -2,8 +2,9 @@
 //!
 //! - **The page** (`/`, wfe/home): every GPU - its memory by process, and the memory the enabled models are vouched
 //!   for (hatched; several may vouch for one card: whichever loads first holds it) - and every registered model:
-//!   enable it on GPU(s), pin it, its page, its state (no start or stop: requests load, idle or a need for room unloads;
-//!   system.load and system.unload remain for tools);
+//!   enable it on GPU(s), pin it, its page, its state (no start or load: requests load, idle or a need for room unloads;
+//!   system.load and a plain system.unload remain for tools; the only stop, a served copy's ×, is a force unload of
+//!   an idle model, unload.rs);
 //!   an API tab with the bearer token and a curl for every method; maintenance mode on and off (maint.rs).
 //! - **The drives** (disks.rs, crate::drives): each drive the models are on - device, link, free space, a read speed
 //!   measured on demand - and moving a model's files to another one (copied, checked, the registry repointed, the old
@@ -39,6 +40,7 @@ mod pulls;
 mod spec;
 mod timing;
 mod transcribe;
+mod unload;
 pub mod registry;
 
 /// What the #[rpc] methods make (methods.rs, rpcgen), as (path under the repo, content): the typed client of the
@@ -755,10 +757,13 @@ impl Home {
     fn named_cards(&self, all: &[Value]) -> Value {
         let base = |f: &str| f.rsplit('/').next().unwrap_or(f).to_string();
         let mut cards = self.cards.lock().unwrap().clone();
-        // a chat process by what the chat server answers as (several entries can share one file)
+        // the chat server's process by what it answers as (several entries can share one file) - only the one on the
+        // chat port: another llm process (a bench or run under the GPU lock) is named by its own file, never as the
+        // served model
         let chat = if cards.to_string().contains("\"kind\":\"llm\"") { self.chat_loaded(all) } else { None };
+        let chat_port = self.o.ports.llm.to_string();
         for p in cards.as_array_mut().into_iter().flatten().flat_map(|c| c["procs"].as_array_mut().into_iter().flatten()) {
-            if let (Some(id), "llm") = (&chat, p["kind"].as_str().unwrap_or("")) {
+            if let (Some(id), "llm", true) = (&chat, p["kind"].as_str().unwrap_or(""), p["port"].as_str() == Some(chat_port.as_str())) {
                 p["model"] = json!(id);
             }
             if let Some(f) = p["model"].as_str().map(str::to_string) {

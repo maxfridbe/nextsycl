@@ -29,8 +29,13 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
   - **The page**: every GPU's memory by process, and below it, hatched, what the enabled models are vouched for (as
     seen while they ran, else an estimate from their files; chat models and video engines count once a card - one
     runs at a time - and an overbooked card is flagged: whichever loads first holds it). Every registered model by
-    kind: enable it on its GPU(s), pin it, disable it, its page. There is no start or stop: requests load a model and
-    idle or a need for room unloads it (`system.load` and `system.unload` remain for tools).
+    kind: enable it on its GPU(s), pin it, disable it, its page. There is no start or load: requests load a model and
+    idle or a need for room unloads it (`system.load` and a plain `system.unload` remain for tools). The page's only
+    stop is the × on a card's line for a served copy: a force unload of an idle model (`system.unload {model,
+    force_when_idle: true, gpu}`), refused while the model answers a request, runs a job or loads (409 `busy`,
+    retryable - nothing is stopped mid-work); idle, that card's copy goes at once, over its pin (unpinned: the answer
+    says `unpinned`) and its hold (`hold_ended`). A process of the same file that is not a served copy - a bench or
+    run under the GPU lock - has a line of its own and no ×.
   - **The scheduler is a crate:** the decisions below - placement, room, pins and holds, concurrency profiles, ETAs, the waits - are
     `crates/scheduler` (`backplane-scheduler`, nextcuda's, copied with its patches listed in its CHANGELOG.md), driven over `Sched` in `home/life.rs`. A
     model card's `concurrency` and `coexistence` (model-cards/README.md; absent: one copy, shared; bad values refused at load, naming the file) are on each
@@ -47,7 +52,9 @@ nextsycl gpustat [--out /run/gpustat.json] [--interval 3] [--pci ADDR] [--once] 
       stopped for room or idleness, `pinned` in the registry, loaded again after a restart (not during maintenance or a
       GPU run). A load that fails leaves the pin set: a run on the page, tried again every 5 minutes. A video pin keeps the
       daemon and its workers once loaded; weights load with the first clip. Unpin clears the flag only. `system.unload`
-      remains a tool's say, also on a pinned model (the pin brings it back); disabling unpins.
+      remains a tool's say, also on a pinned model (the pin brings it back); with `force_when_idle: true` it is
+      refused while the model works (409 `busy`, retryable) and, idle, unpins it and ends its hold first, so it stays
+      unloaded (`gpu`: that card's copy only); disabling unpins.
     - `rsvp_s` on a method that runs a model: held that long after the request ends (answered, failed or cancelled),
       clamped to `NS_MAX_RSVP_S` (86400; unset or 0: that), never shortened by a later one. 0 releases: the model goes as
       soon as it is idle, unless an earlier hold stands. The result says `rsvp_granted_s`. A clip's hold starts when it

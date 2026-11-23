@@ -3,7 +3,7 @@
 import { jsx } from "../jsx.js";
 import { client } from "../gen/nextsycl.js";
 import type { ImageDescribeReq } from "../gen/nextsycl.js";
-import { copy, loadSpec, render, ui } from "../main.js";
+import { copy, render, rpc, ui } from "../main.js";
 
 const TARGETS = ["natural", "z-image", "qwen-image", "h3", "hunyuanimage", "moss-image", "ming-image", "tags"];
 
@@ -17,15 +17,6 @@ export const describe = {
   result: null as Record<string, any> | null,
   error: null as string | null,
 };
-
-/** The front door's /rpc with the page's token (the spec carries it) */
-async function post(method: string, body: unknown): Promise<any> {
-  if (!ui.spec) await loadSpec();
-  const r = await fetch(`/rpc/${method}`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${ui.spec?.token ?? ""}` }, body: JSON.stringify(body) });
-  const j = (await r.json()) as { ok: boolean; result?: unknown; error?: { code: string; message: string } };
-  if (!j.ok) throw new Error(`${j.error?.code}: ${j.error?.message}`);
-  return j.result;
-}
 
 function pick(ev: Event): void {
   const f = (ev.target as HTMLInputElement).files?.[0];
@@ -43,7 +34,7 @@ async function run(): Promise<void> {
   try {
     const req: ImageDescribeReq = { image: describe.picture, target: describe.target, detail: describe.detail, include_negative: describe.negative,
                                     label: `page-describe-${Date.now()}` };
-    describe.result = (await client(post)["image.describe"](req)) as Record<string, any>;
+    describe.result = (await client(rpc)["image.describe"](req)) as Record<string, any>;
   } catch (e) {
     describe.error = String(e);
   }

@@ -104,3 +104,8 @@
 .spin.small{padding:4px 0;font-size:12px}.spin.small::before{width:12px;height:12px}
 @keyframes nsspin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.spin::before{animation-duration:2.8s}}
+/* a served copy's x on a card's line: unload it, only when idle (system.unload force_when_idle) */
+.procs button.unloadx{background:transparent;color:#94a3b8;border:1px solid #2f3646;border-radius:5px;padding:0 6px;font-size:13px;line-height:18px;flex:none}
+.procs button.unloadx:hover{color:#f87171;border-color:#7f1d1d} .procs button.unloadx.busy{opacity:.4} .procs button.unloadx:disabled{background:transparent}
+.procs button.unloadx .btnspin{margin:0;width:9px;height:9px}
+.procs .unloadsaid{flex:0 0 100%;padding:0 0 2px 18px;font-size:12px}

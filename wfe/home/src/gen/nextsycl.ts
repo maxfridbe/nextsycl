@@ -2076,6 +2076,14 @@ export interface SystemStateReq {
 
 /** What system.unload takes. */
 export interface SystemUnloadReq {
+  /** true: unload now only if the model is idle - answering no request, running no job, not loading - else refused with 409 busy (retryable; nothing is stopped mid-work); idle, it goes at once, over its pin (unpinned: the answer says unpinned) and its hold (rsvp_s or keep: hold_ended). Default false: unloaded after the requests it is answering, a pin kept (it loads it again) */
+  force_when_idle?: boolean | null;
+  /**
+   * with force_when_idle: only its copy on this card (system.cards' index; another card's copy at work still refuses); not loaded there: nothing to do. Default: every copy
+   * @minimum 0
+   * @maximum 15
+   */
+  gpu?: number | null;
   /** the model's registry id (system.models) */
   model: string;
   /** other keys */
@@ -2833,9 +2841,9 @@ export interface Methods {
    */
   "system.load": { req: SystemLoadReq; resp: any };
   /**
-   * Unload a model now (it stays enabled)
+   * Unload a model now (it stays enabled): after the requests it is answering, or with force_when_idle only while it is idle (409 busy otherwise, nothing stopped), over its pin and hold
    * @tags system
-   * @example {"model":"minimax-music3"}
+   * @example {"force_when_idle":true,"model":"minimax-music3"}
    */
   "system.unload": { req: SystemUnloadReq; resp: any };
   /**
@@ -3501,9 +3509,9 @@ export function client(post: Post, raw?: PostRaw) {
      */
     "system.load": (req: SystemLoadReq): Promise<any> => post("system.load", req),
     /**
-     * Unload a model now (it stays enabled)
+     * Unload a model now (it stays enabled): after the requests it is answering, or with force_when_idle only while it is idle (409 busy otherwise, nothing stopped), over its pin and hold
      * @tags system
-     * @example {"model":"minimax-music3"}
+     * @example {"force_when_idle":true,"model":"minimax-music3"}
      */
     "system.unload": (req: SystemUnloadReq): Promise<any> => post("system.unload", req),
     /**

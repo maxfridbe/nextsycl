@@ -477,6 +477,17 @@ pub struct SystemEtaReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct SystemUnloadReq {
+    /// true: unload now only if the model is idle - answering no request, running no job, not loading - else refused
+    /// with 409 busy (retryable; nothing is stopped mid-work); idle, it goes at once, over its pin (unpinned: the
+    /// answer says unpinned) and its hold (rsvp_s or keep: hold_ended). Default false: unloaded after the requests it
+    /// is answering, a pin kept (it loads it again)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_when_idle: Option<bool>,
+    /// with force_when_idle: only its copy on this card (system.cards' index; another card's copy at work still
+    /// refuses); not loaded there: nothing to do. Default: every copy
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = 0, max = 15)]
+    pub gpu: Option<i64>,
     /// the model's registry id (system.models)
     pub model: String,
     /// what else the caller sent: passed on as it came
@@ -3261,9 +3272,12 @@ fn system_load(h: &Arc<Home>, req: SystemLoadReq) -> Answer {
     h.legacy("system.load", req)
 }
 
-/// Unload a model now (it stays enabled)
-#[rpc(name = "system.unload", tags = "system", example = r#"{"model": "minimax-music3"}"#)]
+/// Unload a model now (it stays enabled): after the requests it is answering, or with force_when_idle only while it is idle (409 busy otherwise, nothing stopped), over its pin and hold
+#[rpc(name = "system.unload", tags = "system", example = r#"{"model": "minimax-music3", "force_when_idle": true}"#)]
 fn system_unload(h: &Arc<Home>, req: SystemUnloadReq) -> Answer {
+    if req.force_when_idle == Some(true) {
+        return h.unload_when_idle(&req.model, req.gpu.map(|g| g.max(0) as u64)).map(Untyped).map_err(RpcFail);
+    }
     h.legacy("system.unload", req)
 }
 

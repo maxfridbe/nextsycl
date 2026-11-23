@@ -68,7 +68,9 @@ guide is how to port one, and the few rules every change follows.
    answer's envelope (`error.code`, `retryable`), never only in the HTTP status.
 8. **The cards are one backplane.** Every enabled model of every kind loads on demand; only an idle holder neither
    pinned nor held is stopped for room, running work never; a method that runs a model takes `rsvp_s` and
-   `max_willing_to_wait_s` (`home/backplane.rs`, `RUNS_MODEL`), and the page has no start or stop. The decisions are
+   `max_willing_to_wait_s` (`home/backplane.rs`, `RUNS_MODEL`), and the page has no start or load: the page's only stop
+   is a force unload of an idle model (`system.unload` with `force_when_idle`: refused while it answers a request or
+   runs a job, over its pin and hold once idle). The decisions are
    `crates/scheduler` (`backplane-scheduler`, nextcuda's, copied): pure code the front door drives through its `Host` traits (`Sched`, `home/life.rs`),
    never a second copy of the logic beside it; a change to the crate is written in its CHANGELOG.md, so the next copy can carry it.
 

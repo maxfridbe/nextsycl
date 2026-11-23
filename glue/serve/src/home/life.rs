@@ -1206,6 +1206,12 @@ impl Home {
 
     /// Unload `id` if it is loaded (after the requests it is answering): a tool's say (a pin brings it back)
     pub(crate) fn unload(&self, id: &str) -> Result<(), (u16, String)> {
+        self.unload_on(id, None)
+    }
+
+    /// `unload`, of its copy on one card only when `only` names it - the card and that copy's server ports (an image,
+    /// audio or 3D model's other copies and a video model's other cards stay; a chat model has the one copy)
+    pub(crate) fn unload_on(&self, id: &str, only: Option<(usize, &[u16])>) -> Result<(), (u16, String)> {
         let m = self.entry(id)?;
         // an explicit unload ends the model's hold too (rsvp_s or keep): else the hold outlives the unload and other
         // work keeps waiting on it
@@ -1216,12 +1222,18 @@ impl Home {
         match kind {
             "image" | "audio" | "model3d" => {
                 let _g = self.kind_lock[kind].lock().unwrap();
-                for x in self.servers(kind).iter().filter(|x| x.model.as_deref() == Some(id)) {
+                for x in self.servers(kind).iter().filter(|x| x.model.as_deref() == Some(id) && only.is_none_or(|(_, ports)| ports.contains(&x.port))) {
                     self.exec(format!("{kind} stop ({id})"), &[kind.into(), "stop".into(), "--slot".into(), x.slot.to_string()]).map_err(|e| (500, e))?;
                 }
                 Ok(())
             }
-            "video" => self.exec("video: unload the engines".into(), &["video".into(), "unload".into()]).map(|_| ()).map_err(|e| (500, e)),
+            "video" => {
+                let mut args: Vec<String> = vec!["video".into(), "unload".into()];
+                if let Some((g, _)) = only {
+                    args.extend(["--gpu".into(), g.to_string()]);
+                }
+                self.exec("video: unload the engines".into(), &args).map(|_| ()).map_err(|e| (500, e))
+            }
             _ => {
                 if self.chat_loaded(&self.models()).as_deref() == Some(id) && !listening(self.o.ports.video) {
                     return self.exec(format!("llm stop ({id})"), &["llm".into(), "stop".into()]).map(|_| ()).map_err(|e| (500, e));

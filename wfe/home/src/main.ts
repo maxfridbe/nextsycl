@@ -49,6 +49,8 @@ export const ui = {
   /** the run whose output is open */
   openRun: null as number | null,
   copied: null as string | null,
+  /** per card row ("model@gpu"): a × under way (null) or what its answer said - a refusal while busy (kept a while) */
+  unloading: {} as Record<string, { said: string | null; bad: boolean } | null>,
 };
 
 const patch = init([attributesModule, propsModule, classModule, styleModule, eventListenersModule]);
@@ -109,7 +111,23 @@ export async function loadSpec(): Promise<void> {
   render();
 }
 
-/** enable / disable / load / unload a model; its button spins until the state shows the result */
+/** An /rpc failure: the envelope's error.code, its words, and whether the same call may work later */
+export class RpcFailed extends Error {
+  constructor(readonly code: string, readonly words: string, readonly retryable: boolean) {
+    super(`${code}: ${words}`);
+  }
+}
+
+/** The front door's /rpc with the page's token (the spec carries it): what the generated client calls */
+export async function rpc(method: string, body: unknown): Promise<any> {
+  if (!ui.spec) await loadSpec();
+  const r = await fetch(`/rpc/${method}`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${ui.spec?.token ?? ""}` }, body: JSON.stringify(body) });
+  const j = (await r.json()) as { ok: boolean; result?: unknown; error?: { code: string; message: string; retryable?: boolean } };
+  if (!j.ok) throw new RpcFailed(j.error?.code ?? "internal", j.error?.message ?? `HTTP ${r.status}`, !!j.error?.retryable);
+  return j.result;
+}
+
+/** enable / disable / pin / unpin a model, change its cards; its button spins until the state shows the result */
 export async function act(what: string, model: string, extra: Record<string, unknown> = {}): Promise<void> {
   ui.pending[model] = { what, since: Date.now() };
   render();

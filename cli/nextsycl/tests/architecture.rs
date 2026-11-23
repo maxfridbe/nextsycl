@@ -374,13 +374,42 @@ fn every_model_method_takes_the_backplanes_fields() {
     }
 }
 
-/// Rule 8: requests load and idle unloads; the page offers no start or stop (the RPCs stay, for tools)
+/// Rule 8: requests load and idle unloads; the page offers no start or load, and its only stop is a force unload of an
+/// idle model (system.unload with force_when_idle: true, refused while the model works); the other RPCs stay, for tools
 #[test]
 fn the_page_has_no_start_or_stop() {
-    let page = std::fs::read_to_string(root().join("wfe/home/src/components/App.tsx")).unwrap();
+    let src = root().join("wfe/home/src");
+    let page = std::fs::read_to_string(src.join("components/App.tsx")).unwrap();
     for b in ["btn(\"load\"", "btn(\"unload\"", "\"start\"", "\"stop\""] {
         assert!(!page.contains(b), "the page has {b}");
     }
+    // every source of the page but the generated client (which lists every method)
+    let mut files = Vec::new();
+    let mut dirs = vec![src.clone()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n != "gen") {
+                    dirs.push(p);
+                }
+            } else if p.extension().is_some_and(|x| x == "ts" || x == "tsx") {
+                files.push(p);
+            }
+        }
+    }
+    let mut unloads = 0;
+    for f in &files {
+        let text = std::fs::read_to_string(f).unwrap();
+        for b in ["act(\"load\"", "act(\"unload\"", "do: \"load\"", "do: \"unload\"", "\"system.load\""] {
+            assert!(!text.contains(b), "{}: the page starts or stops with {b}", f.display());
+        }
+        for l in text.lines().filter(|l| l.contains("\"system.unload\"")) {
+            assert!(l.contains("force_when_idle: true"), "{}: system.unload without force_when_idle: true (the page unloads only an idle model): {l}", f.display());
+            unloads += 1;
+        }
+    }
+    assert!(unloads >= 1 && page.contains("\"system.unload\"]({ model, force_when_idle: true"), "the page's × is system.unload with force_when_idle");
 }
 
 /// Rule 8: the two places a holder is chosen for room look at its pin and hold first
