@@ -1,5 +1,8 @@
-// mm.cpp: products with half inputs and a float32 output on oneDNN (hi21's mm.cpp, the strides added): the text
-// encoder's products into its float32 residual, the VAE attention's scores. A primitive is made once a shape.
+// mm.cpp: products on oneDNN, deterministic (oneDNN's attribute: no split reductions whose order changes run to run -
+// the shared nsd_linear's GEMV-shaped calls differed in the last bits between two runs, so a clip did): half inputs
+// with a float32 output (hi21's mm.cpp, the strides added) - the text encoder's products into its float32 residual, the
+// VAE attention's scores -, and float32 throughout (the DiT's embedders, token refiner, final layer, SigLIP). A
+// primitive is made once a shape.
 #include "ns.h"
 #include "ns_internal.hpp"
 #include "hv15.h"
@@ -57,7 +60,34 @@ extern "C" int ns_video_hv15_linear_f32(ns_gpu* g, const void* x, int64_t M, int
     const std::vector<int64_t> key{M, K, N, ldw, ldo, bias ? 1 : 0};
     auto it = d.prims.find(key);
     if (it == d.prims.end()) {
-        auto pd = bias ? dnnl::matmul::primitive_desc(d.eng, smd, wmd, bmd, dmd) : dnnl::matmul::primitive_desc(d.eng, smd, wmd, dmd);
+        dnnl::primitive_attr attr;
+        attr.set_deterministic(true);
+        auto pd = bias ? dnnl::matmul::primitive_desc(d.eng, smd, wmd, bmd, dmd, attr) : dnnl::matmul::primitive_desc(d.eng, smd, wmd, dmd, attr);
+        it = d.prims.emplace(key, dnnl::matmul(pd)).first;
+    }
+    std::unordered_map<int, memory> args{{DNNL_ARG_SRC, usm(smd, d.eng, x)}, {DNNL_ARG_WEIGHTS, usm(wmd, d.eng, w)}, {DNNL_ARG_DST, usm(dmd, d.eng, out)}};
+    if (bias) args.insert({DNNL_ARG_BIAS, usm(bmd, d.eng, bias)});
+    it->second.execute(d.st, args);
+    return 0;
+    NS_CATCH
+}
+
+extern "C" int ns_video_hv15_linear32(ns_gpu* g, const float* x, int64_t M, int64_t K, const float* w, int64_t N, const float* bias, float* out) {
+    NS_TRY
+    if (M <= 0 || K <= 0 || N <= 0) return 0;
+    std::lock_guard<std::mutex> l(mu);
+    Dnn& d = dnn(g);
+    memory::desc smd({M, K}, memory::data_type::f32, memory::format_tag::ab);
+    memory::desc wmd({K, N}, memory::data_type::f32, memory::format_tag::ba);
+    memory::desc bmd({1, N}, memory::data_type::f32, memory::format_tag::ab);
+    memory::desc dmd({M, N}, memory::data_type::f32, memory::format_tag::ab);
+    // (a key apart from the half products': -1 marks float32)
+    const std::vector<int64_t> key{M, K, N, -1, -1, bias ? 1 : 0};
+    auto it = d.prims.find(key);
+    if (it == d.prims.end()) {
+        dnnl::primitive_attr attr;
+        attr.set_deterministic(true);
+        auto pd = bias ? dnnl::matmul::primitive_desc(d.eng, smd, wmd, bmd, dmd, attr) : dnnl::matmul::primitive_desc(d.eng, smd, wmd, dmd, attr);
         it = d.prims.emplace(key, dnnl::matmul(pd)).first;
     }
     std::unordered_map<int, memory> args{{DNNL_ARG_SRC, usm(smd, d.eng, x)}, {DNNL_ARG_WEIGHTS, usm(wmd, d.eng, w)}, {DNNL_ARG_DST, usm(dmd, d.eng, out)}};

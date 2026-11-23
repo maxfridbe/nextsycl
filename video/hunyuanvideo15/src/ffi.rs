@@ -20,6 +20,7 @@ struct Api {
     geglu: unsafe extern "C" fn(G, P, c_int, i64, i64, M) -> c_int,
     attn_small: unsafe extern "C" fn(G, *const f32, i64, *const f32, *const f32, i64, i64, i64, i64, i64, f32, *const f32, c_int, *mut f32) -> c_int,
     linear_f32: unsafe extern "C" fn(G, P, i64, i64, P, i64, i64, *const f32, *mut f32, i64) -> c_int,
+    linear32: unsafe extern "C" fn(G, *const f32, i64, i64, *const f32, i64, *const f32, *mut f32) -> c_int,
     axpy: unsafe extern "C" fn(G, *mut f32, *const f32, i64, f32) -> c_int,
     to_half: unsafe extern "C" fn(G, *const f32, M, i64, f32) -> c_int,
     to_float: unsafe extern "C" fn(G, P, *mut f32, i64) -> c_int,
@@ -63,6 +64,7 @@ fn api() -> Result<&'static Api> {
             geglu: sym!("ns_video_hv15_geglu"),
             attn_small: sym!("ns_video_hv15_attn_small"),
             linear_f32: sym!("ns_video_hv15_linear_f32"),
+            linear32: sym!("ns_video_hv15_linear32"),
             axpy: sym!("ns_video_hv15_axpy"),
             to_half: sym!("ns_video_hv15_to_half"),
             to_float: sym!("ns_video_hv15_to_float"),
@@ -248,6 +250,13 @@ impl K {
     pub fn linear_f32(&self, x: P, m: usize, k: usize, w: P, ldw: usize, n: usize, bias: *const f32, out: *mut f32, ldo: usize) -> Result<()> {
         // SAFETY: x [m, k], w n rows of k values ldw apart, out m rows of n values ldo apart, bias [n] or null.
         check(unsafe { (self.k.linear_f32)(self.g(), x, m as i64, k as i64, w, ldw as i64, n as i64, bias, out, ldo as i64) }, "linear (float32 out)")
+    }
+
+    /// out [m, n] float32 = x [m, k] float32 . w^T + bias, deterministic
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear32(&self, x: P, m: usize, k: usize, w: P, n: usize, bias: P, out: M) -> Result<()> {
+        // SAFETY: x [m, k], w [n, k], out [m, n] floats, bias [n] or null.
+        check(unsafe { (self.k.linear32)(self.g(), x.cast(), m as i64, k as i64, w.cast(), n as i64, bias.cast(), out.cast()) }, "linear (float32)")
     }
 
     pub fn axpy(&self, x: *mut f32, y: *const f32, n: usize, a: f32) -> Result<()> {

@@ -105,6 +105,12 @@ fox clip is clean (a coherent fox walking through the snow, the camera tracking 
 | Arc Pro B70 | 26 - 66 s | 642.5 s | 12.85 s | 34.5 s | 677.6 s (11.3 min) | 18.7 GiB |
 | Arc Pro B65 | 40 s | 1015.8 s | 20.32 s | 61.8 s | 1078.3 s (18.0 min) | 18.5 GiB |
 
+The other cards on the B70 (one run each): the base card with CFG 6, 3 steps: 25.5 s a step (two passes), peak 19.4
+GiB - 50 steps would be ~21 min; the step-distilled I2V card from a 1024 x 1024 picture (640 x 640, 121 frames, 49,600
+tokens): 8 steps 105.8 s (13.2 s a step), decode 33.9 s, the clip 141 s, peak 21.8 GiB (SigLIP's tower and the VAE
+encoder loaded beside the rest: 17.2 GiB before the first step). The I2V clip starts on the picture (the fox sitting
+in the snow), turns its head and trots off.
+
 Measured with `video job generate --seconds 5 --steps 50 --seed 7` (the fox prompt), one run each; the load is the
 33 GB float32 file read and quantized (66 s cold, 26 s with the file in the page cache). The B65 is 1.58x the B70 a
 step, as for H3 (1.5x). The base card (CFG 6) runs two passes a step: twice the step time.
@@ -137,6 +143,14 @@ the gate's grammar). The run resolves `--model` from the build copy's registry: 
 pulled (`nextsycl models pull hunyuanvideo-1.5-480p-t2v-distilled-q8 --dir <the models' drive>`).
 
 ### Lessons
+
+- **oneDNN is not deterministic by default on this GPU**: two runs of the same clip differed (latents up to 7e-3 after
+  one step) - the shared `nsd_linear`'s small float32 products (the timestep embedders: M = 1) and the half products
+  pick split reductions whose order varies. `attr.set_deterministic(true)` on every primitive this engine makes (its
+  `linear32` / `linear_f32`, the silo's products) and its float32 products moved off the shared `nsd_linear` made the
+  clip bit-identical run to run (the attention, the VAE's convolutions and its 1x1 products, still shared, were
+  already) - what lets the merge gate hash it. The speed did not move measurably. MiniMax H3's "not bit-reproducible
+  run to run" (docs/video.md, cosine 0.996) is likely the same.
 
 - Read the template, not the README: the video encoder's system prompt is a Python string with backslash line
   continuations, so its text holds runs of eight spaces - and the crop is computed from the tokenized head (108), not

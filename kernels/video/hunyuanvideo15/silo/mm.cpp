@@ -97,6 +97,8 @@ dnnl::matmul prim(Dnn& d, const ns_hv15_mm& a, const Descs& ds) {
     auto it = d.prims.find(key);
     if (it != d.prims.end()) return it->second;
     dnnl::primitive_attr attr;
+    // the same result every run (oneDNN picks no split reduction whose order varies)
+    attr.set_deterministic(true);
     if (!i8) {
         // the scales: one a (32 values of K, column n) - mask over both of the matrix's own dimensions
         const int mask = a.B == 1 ? (1 << 0) | (1 << 1) : (1 << 1) | (1 << 2);

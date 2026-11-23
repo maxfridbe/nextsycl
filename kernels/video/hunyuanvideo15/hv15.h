@@ -30,6 +30,8 @@ int ns_video_hv15_attn_small(ns_gpu* g, const float* q, int64_t qs, const float*
  * and written in float32 (oneDNN); out rows ldo apart (0: N) */
 int ns_video_hv15_linear_f32(ns_gpu* g, const void* x, int64_t M, int64_t K, const void* w, int64_t ldw, int64_t N, const float* bias, float* out,
                              int64_t ldo);
+/* out [M, N] float32 = x [M, K] float32 . w^T (w [N, K] float32) + bias (float32 [N] or NULL), deterministic (oneDNN) */
+int ns_video_hv15_linear32(ns_gpu* g, const float* x, int64_t M, int64_t K, const float* w, int64_t N, const float* bias, float* out);
 /* x float32 += a * y float32, n values */
 int ns_video_hv15_axpy(ns_gpu* g, float* x, const float* y, int64_t n, float a);
 /* float32 -> half (times s), half -> float32 */

@@ -337,10 +337,10 @@ impl Dit {
         let e: Vec<f32> = vals.iter().flat_map(|t| sinusoid(*t)).collect();
         let e = DevBuf::from_f32(gpu, &e)?;
         let h = DevBuf::f32(gpu, vals.len() * DIM)?;
-        nsd.linear(e.ptr(), Dt::F32, vals.len(), 256, w32(&m.l1)?, DIM, bias(&m.l1), h.ptr(), Dt::F32)?;
+        self.k.linear32(e.ptr(), vals.len(), 256, w32(&m.l1)?, DIM, bias(&m.l1), h.ptr())?;
         self.k.act(h.ptr(), T::F32, vals.len() * DIM, Act::Silu)?;
         let o = DevBuf::f32(gpu, vals.len() * DIM)?;
-        nsd.linear(h.ptr(), Dt::F32, vals.len(), DIM, w32(&m.l2)?, DIM, bias(&m.l2), o.ptr(), Dt::F32)?;
+        self.k.linear32(h.ptr(), vals.len(), DIM, w32(&m.l2)?, DIM, bias(&m.l2), o.ptr())?;
         Ok(o)
     }
 
@@ -360,7 +360,7 @@ impl Dit {
         self.k.act(sv.ptr(), T::F32, n * DIM, Act::Silu)?;
         let m = |l: &Lin| -> Result<DevBuf> {
             let o = DevBuf::f32(gpu, n * l.n)?;
-            l.apply_f32(nsd, &self.k, &self.scratch, sv.ptr(), n, o.ptr())?;
+            l.apply_f32(&self.k, &self.scratch, sv.ptr(), n, o.ptr())?;
             Ok(o)
         };
         let mut dbl = Vec::with_capacity(self.doubles.len());
@@ -384,7 +384,7 @@ impl Dit {
         }
         let raw = DevBuf::from_f32(gpu, qwen)?;
         let qx = DevBuf::f32(gpu, tq * DIM)?;
-        nsd.linear(raw.ptr(), Dt::F32, tq, TEXT, w32(&self.ref_in)?, DIM, bias(&self.ref_in), qx.ptr(), Dt::F32)?;
+        self.k.linear32(raw.ptr(), tq, TEXT, w32(&self.ref_in)?, DIM, bias(&self.ref_in), qx.ptr())?;
         // c_embedder of the tokens' mean (every token valid)
         let mut mean = vec![0f64; TEXT];
         for r in 0..tq {
@@ -395,10 +395,10 @@ impl Dit {
         let mean: Vec<f32> = mean.iter().map(|m| (*m / tq as f64) as f32).collect();
         let md = DevBuf::from_f32(gpu, &mean)?;
         let h = DevBuf::f32(gpu, DIM)?;
-        nsd.linear(md.ptr(), Dt::F32, 1, TEXT, w32(&self.ref_c.l1)?, DIM, bias(&self.ref_c.l1), h.ptr(), Dt::F32)?;
+        self.k.linear32(md.ptr(), 1, TEXT, w32(&self.ref_c.l1)?, DIM, bias(&self.ref_c.l1), h.ptr())?;
         k.act(h.ptr(), T::F32, DIM, Act::Silu)?;
         let c = DevBuf::f32(gpu, DIM)?;
-        nsd.linear(h.ptr(), Dt::F32, 1, DIM, w32(&self.ref_c.l2)?, DIM, bias(&self.ref_c.l2), c.ptr(), Dt::F32)?;
+        self.k.linear32(h.ptr(), 1, DIM, w32(&self.ref_c.l2)?, DIM, bias(&self.ref_c.l2), c.ptr())?;
         let mut pre: Vec<f32> = Vec::new();
         let add_type = |rows: &mut Vec<f32>, which: usize| {
             for (i, v) in rows.iter_mut().enumerate() {
@@ -412,10 +412,10 @@ impl Dit {
             let n = DevBuf::f32(gpu, tv * VISION)?;
             k.ln_mod(x.fp(), tv, VISION, 1e-5, n1w.fp(), n1b.fp(), std::ptr::null(), std::ptr::null(), n.ptr(), T::F32)?;
             let a = DevBuf::f32(gpu, tv * VISION)?;
-            nsd.linear(n.ptr(), Dt::F32, tv, VISION, w32(l1)?, VISION, bias(l1), a.ptr(), Dt::F32)?;
+            self.k.linear32(n.ptr(), tv, VISION, w32(l1)?, VISION, bias(l1), a.ptr())?;
             k.act(a.ptr(), T::F32, tv * VISION, Act::GeluErf)?;
             let b = DevBuf::f32(gpu, tv * DIM)?;
-            nsd.linear(a.ptr(), Dt::F32, tv, VISION, w32(l2)?, DIM, bias(l2), b.ptr(), Dt::F32)?;
+            self.k.linear32(a.ptr(), tv, VISION, w32(l2)?, DIM, bias(l2), b.ptr())?;
             let o = DevBuf::f32(gpu, tv * DIM)?;
             k.ln_mod(b.fp(), tv, DIM, 1e-5, n2w.fp(), n2b.fp(), std::ptr::null(), std::ptr::null(), o.ptr(), T::F32)?;
             let mut rows = o.to_f32()?;
@@ -430,13 +430,13 @@ impl Dit {
             k.ln_mod(x.fp(), tb, BYT5, 1e-5, self.byt5_norm.0.fp(), self.byt5_norm.1.fp(), std::ptr::null(), std::ptr::null(), n.ptr(), T::F32)?;
             let [f1, f2, f3] = &self.byt5_fc;
             let a = DevBuf::f32(gpu, tb * f1.n)?;
-            nsd.linear(n.ptr(), Dt::F32, tb, BYT5, w32(f1)?, f1.n, bias(f1), a.ptr(), Dt::F32)?;
+            self.k.linear32(n.ptr(), tb, BYT5, w32(f1)?, f1.n, bias(f1), a.ptr())?;
             k.act(a.ptr(), T::F32, tb * f1.n, Act::GeluErf)?;
             let b2 = DevBuf::f32(gpu, tb * f2.n)?;
-            nsd.linear(a.ptr(), Dt::F32, tb, f1.n, w32(f2)?, f2.n, bias(f2), b2.ptr(), Dt::F32)?;
+            self.k.linear32(a.ptr(), tb, f1.n, w32(f2)?, f2.n, bias(f2), b2.ptr())?;
             k.act(b2.ptr(), T::F32, tb * f2.n, Act::GeluErf)?;
             let o = DevBuf::f32(gpu, tb * DIM)?;
-            nsd.linear(b2.ptr(), Dt::F32, tb, f2.n, w32(f3)?, DIM, bias(f3), o.ptr(), Dt::F32)?;
+            self.k.linear32(b2.ptr(), tb, f2.n, w32(f3)?, DIM, bias(f3), o.ptr())?;
             let mut rows = o.to_f32()?;
             add_type(&mut rows, 1);
             pre.extend(rows);
@@ -493,7 +493,7 @@ impl Dit {
         self.k.act(c.ptr(), T::F32, DIM, Act::Silu)?;
         let gates = DevBuf::f32(gpu, 2 * DIM * self.ref_blocks.len())?;
         for (i, rb) in self.ref_blocks.iter().enumerate() {
-            nsd.linear(c.ptr(), Dt::F32, 1, DIM, w32(&rb.ada)?, 2 * DIM, bias(&rb.ada), fptr(&gates, i * 2 * DIM).cast(), Dt::F32)?;
+            self.k.linear32(c.ptr(), 1, DIM, w32(&rb.ada)?, 2 * DIM, bias(&rb.ada), fptr(&gates, i * 2 * DIM).cast())?;
         }
         let zeros = DevBuf::new(gpu, tq * 4)?;
         zeros.fill(0)?;
@@ -504,15 +504,15 @@ impl Dit {
         for (i, rb) in self.ref_blocks.iter().enumerate() {
             let gate = fptr(&gates, i * 2 * DIM);
             self.k.ln_mod(x, tq, DIM, EPS, rb.norm1.0.fp(), rb.norm1.1.fp(), std::ptr::null(), std::ptr::null(), nrm.cast(), T::F32)?;
-            nsd.linear(nrm.cast(), Dt::F32, tq, DIM, w32(&rb.qkv)?, 3 * DIM, bias(&rb.qkv), qkv.cast(), Dt::F32)?;
+            self.k.linear32(nrm.cast(), tq, DIM, w32(&rb.qkv)?, 3 * DIM, bias(&rb.qkv), qkv.cast())?;
             self.k.attn_small(qkv, 3 * DIM, qkv.wrapping_add(DIM), qkv.wrapping_add(2 * DIM), 3 * DIM, tq, HEADS, HEADS, HEAD, 1.0 / (HEAD as f32).sqrt(),
                               std::ptr::null(), false, att)?;
-            nsd.linear(att.cast(), Dt::F32, tq, DIM, w32(&rb.proj)?, DIM, bias(&rb.proj), nrm.cast(), Dt::F32)?;
+            self.k.linear32(att.cast(), tq, DIM, w32(&rb.proj)?, DIM, bias(&rb.proj), nrm.cast())?;
             nsd.gate_add(x.cast(), Dt::F32, tq, DIM, nrm.cast(), Dt::F32, zeros.ptr(), gate.cast())?;
             self.k.ln_mod(x, tq, DIM, EPS, rb.norm2.0.fp(), rb.norm2.1.fp(), std::ptr::null(), std::ptr::null(), nrm.cast(), T::F32)?;
-            nsd.linear(nrm.cast(), Dt::F32, tq, DIM, w32(&rb.fc1)?, FFN, bias(&rb.fc1), mlp.cast(), Dt::F32)?;
+            self.k.linear32(nrm.cast(), tq, DIM, w32(&rb.fc1)?, FFN, bias(&rb.fc1), mlp.cast())?;
             self.k.act(mlp.cast(), T::F32, tq * FFN, Act::Silu)?;
-            nsd.linear(mlp.cast(), Dt::F32, tq, FFN, w32(&rb.fc2)?, DIM, bias(&rb.fc2), nrm.cast(), Dt::F32)?;
+            self.k.linear32(mlp.cast(), tq, FFN, w32(&rb.fc2)?, DIM, bias(&rb.fc2), nrm.cast())?;
             nsd.gate_add(x.cast(), Dt::F32, tq, DIM, nrm.cast(), Dt::F32, zeros.ptr(), gate.wrapping_add(DIM).cast())?;
         }
         if b.r0 == 0 {
@@ -567,7 +567,7 @@ impl Dit {
             // img_in over [latents | condition | mask]
             bt.inp.copy_2d(0, IN * 4, lat, 0, LATENT * 4, LATENT * 4, b.n)?;
             bt.inp.copy_2d(LATENT * 4, IN * 4, cond, 0, (IN - LATENT) * 4, (IN - LATENT) * 4, b.n)?;
-            nsd.linear(bt.inp.ptr(), Dt::F32, b.n, IN, w32(&self.img_in)?, DIM, bias(&self.img_in), fptr(&bt.x, b.r0 * DIM).cast(), Dt::F32)?;
+            self.k.linear32(bt.inp.ptr(), b.n, IN, w32(&self.img_in)?, DIM, bias(&self.img_in), fptr(&bt.x, b.r0 * DIM).cast())?;
             self.refine(nsd, st, si, bt, b, tap)?;
         }
         let b0 = &branches[0];
@@ -620,7 +620,7 @@ impl Dit {
                          fptr(&st.fin, s * 2 * DIM), fptr(&o, r0 * DIM).cast(), T::F32)?;
             }
             let v = DevBuf::f32(&nsd.gpu, b.n * LATENT)?;
-            nsd.linear(o.ptr(), Dt::F32, b.n, DIM, w32(&self.final_lin)?, LATENT, bias(&self.final_lin), v.ptr(), Dt::F32)?;
+            self.k.linear32(o.ptr(), b.n, DIM, w32(&self.final_lin)?, LATENT, bias(&self.final_lin), v.ptr())?;
             out.push(v);
         }
         nsd.wait()?;

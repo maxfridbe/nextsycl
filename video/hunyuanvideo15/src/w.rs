@@ -202,7 +202,7 @@ impl Lin {
     }
 
     /// out [m, n] float32 = x [m, k] float32 W^T + bias, a Q8_0 matrix expanded into `scratch` (n x k floats at least)
-    pub fn apply_f32(&self, nsd: &Nsd, k8: &K, scratch: &DevBuf, x: *const std::ffi::c_void, m: usize, out: *mut std::ffi::c_void) -> Result<()> {
+    pub fn apply_f32(&self, k8: &K, scratch: &DevBuf, x: *const std::ffi::c_void, m: usize, out: *mut std::ffi::c_void) -> Result<()> {
         let w = match &self.w {
             Wt::Blocks(b) => {
                 if scratch.len < self.n * self.k * 4 {
@@ -215,7 +215,7 @@ impl Lin {
             Wt::I8 { .. } => return Err(Error("a split matrix has no float32 product here".into())),
         };
         let bias = self.bias.as_ref().map_or(none(), |b| b.ptr() as *const _);
-        nsd.linear(x, Dt::F32, m, self.k, w, self.n, bias, out, Dt::F32)
+        k8.linear32(x, m, self.k, w, self.n, bias, out)
     }
 
     /// The DiT's product: x half [m, k] (rows lda apart) -> out (rows ldo apart) as `post` says. On the silo straight

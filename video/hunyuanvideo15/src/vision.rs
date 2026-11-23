@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use nextsycl_core::{DevBuf, Error, Result};
-use nextsycl_diffusion::kernels::{Dt, Nsd};
+use nextsycl_diffusion::kernels::Nsd;
 
 use crate::ffi::{Act, K, T};
 use crate::w::St;
@@ -121,7 +121,7 @@ impl Vision {
         }
         let pd = DevBuf::from_f32(gpu, &patches)?;
         let x = DevBuf::f32(gpu, TOKENS * DIM)?;
-        let lin = |l: &Lin, inp: &DevBuf, out: &DevBuf| nsd.linear(inp.ptr(), Dt::F32, TOKENS, l.k, l.w.ptr(), l.n, l.b.ptr(), out.ptr(), Dt::F32);
+        let lin = |l: &Lin, inp: &DevBuf, out: &DevBuf| self.k.linear32(inp.ptr(), TOKENS, l.k, l.w.ptr(), l.n, l.b.ptr(), out.ptr());
         lin(&self.patch, &pd, &x)?;
         k.axpy(x.fp(), self.pos.fp(), TOKENS * DIM, 1.0)?;
         let h = DevBuf::f32(gpu, TOKENS * DIM)?;
@@ -140,7 +140,7 @@ impl Vision {
             k.ln_mod(x.fp(), TOKENS, DIM, EPS, l.ln2.0.fp(), l.ln2.1.fp(), std::ptr::null(), std::ptr::null(), h.ptr(), T::F32)?;
             lin(&l.fc1, &h, &mid)?;
             k.act(mid.ptr(), T::F32, TOKENS * ff, Act::GeluTanh)?;
-            nsd.linear(mid.ptr(), Dt::F32, TOKENS, ff, l.fc2.w.ptr(), l.fc2.n, l.fc2.b.ptr(), o.ptr(), Dt::F32)?;
+            self.k.linear32(mid.ptr(), TOKENS, ff, l.fc2.w.ptr(), l.fc2.n, l.fc2.b.ptr(), o.ptr())?;
             k.axpy(x.fp(), o.fp(), TOKENS * DIM, 1.0)?;
         }
         k.ln_mod(x.fp(), TOKENS, DIM, EPS, self.post.0.fp(), self.post.1.fp(), std::ptr::null(), std::ptr::null(), h.ptr(), T::F32)?;
