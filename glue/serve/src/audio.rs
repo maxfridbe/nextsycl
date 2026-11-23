@@ -130,7 +130,7 @@ fn earlier(dir: &std::path::Path) -> VecDeque<Value> {
 }
 
 /// A Range header's first span ("bytes=a-b", "bytes=a-", "bytes=-n") within `len` bytes
-fn range(head: &[u8], len: usize) -> Option<(usize, usize)> {
+pub(crate) fn range(head: &[u8], len: usize) -> Option<(usize, usize)> {
     let h = String::from_utf8_lossy(head);
     let v = h.lines().find_map(|l| {
         let (k, v) = l.split_once(':')?;

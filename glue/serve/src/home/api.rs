@@ -1606,16 +1606,25 @@ impl Home {
                 pass(s, &t)
             }
             ("GET", p) if p.starts_with("/v1/images/files/") || p.starts_with("/v1/audio/files/") => {
-                // from the directory when the file is there (no server need run); gone: a 404 that says so, and that a
-                // retry of the request that made it (a cached or deduplicated answer named it) may bring it back
+                // from the directory, by the door itself: no server need run (handing it to the kind's server answered
+                // 502 whenever none was listening - after an idle unload or a restart - though the file was there,
+                // 2026-11-23); gone: a 404 that says so, and that a retry of the request that made it (a cached or
+                // deduplicated answer named it) may bring it back
                 let (kind, pre) = if p.starts_with("/v1/images/") { ("image", "/v1/images/files/") } else { ("audio", "/v1/audio/files/") };
                 let name = p[pre.len()..].split('?').next().unwrap_or("");
-                if !self.out_dir(kind).join(crate::files::plain(name).unwrap_or("-")).is_file() {
+                let found = crate::files::plain(name).and_then(|n| file_type(kind, n).map(|t| (n, t)))
+                    .and_then(|(n, t)| std::fs::read(self.out_dir(kind).join(n)).ok().map(|b| (b, t)));
+                let Some((b, t)) = found else {
                     let e = json!({"error": format!("no file {name}"), "code": "not_found", "retryable": true});
                     http::respond(s, 404, &e);
                     return Ok(());
+                };
+                let cache = "Cache-Control: max-age=31536000, immutable\r\nAccept-Ranges: bytes\r\n";
+                match crate::audio::range(&req.head, b.len()) {
+                    Some((a, z)) => http::respond_bytes(s, 206, t, &b[a..=z], &format!("{cache}Content-Range: bytes {a}-{z}/{}\r\n", b.len())),
+                    None => http::respond_bytes(s, 200, t, &b, cache),
                 }
-                pass(s, &self.file_target(kind))
+                Ok(())
             }
             ("GET", p) if p.starts_with("/v1/model3d/files/") => {
                 // from the directory (a tool's result needs no 3D server running)
@@ -2145,5 +2154,30 @@ mod default_3d_tests {
         assert!(!default_3d(&mesh, "generate", &ply));
         // painting and rigging are not about splats
         assert!(default_3d(&splat, "rig", &plain));
+    }
+}
+
+/// The content type of a result file of `kind`'s servers, only the types they served themselves (audio: wav; image:
+/// png and mp4) - nothing else in their directories is handed out
+fn file_type(kind: &str, name: &str) -> Option<&'static str> {
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    match (kind, ext.as_str()) {
+        ("audio", "wav") => Some("audio/wav"),
+        ("image", "png") => Some("image/png"),
+        ("image", "mp4") => Some("video/mp4"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod file_type_tests {
+    #[test]
+    fn a_result_file_is_served_with_its_type_and_nothing_else() {
+        assert_eq!(super::file_type("audio", "1795461609-omnivoice-665511.wav"), Some("audio/wav"));
+        assert_eq!(super::file_type("image", "x.png"), Some("image/png"));
+        assert_eq!(super::file_type("image", "x.mp4"), Some("video/mp4"));
+        assert_eq!(super::file_type("audio", "x.png"), None);
+        assert_eq!(super::file_type("image", "jobs.json"), None);
+        assert_eq!(super::file_type("audio", "noext"), None);
     }
 }
