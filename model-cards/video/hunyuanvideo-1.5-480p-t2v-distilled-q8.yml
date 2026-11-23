@@ -18,6 +18,13 @@ env:
   NS_HV15_CFG: '1'
   NS_HV15_STEPS: '50'
   NS_HV15_SHIFT: '5'
+# faster takes (docs/ports/hunyuanvideo15.md "Faster"; cache / attention: NS_HV15_CACHE / NS_HV15_ATTN here or a daemon
+# job's keys, steps a request's): the 5 s clip on the B70 676.7 s as it is,
+#   attention sage                          517.3 s (1.31x)  the same clip by eye, PSNR 26-30 dB to the default
+#   cache deepcache + attention sage        281.8 s (2.40x)  the same clip by eye, PSNR 29-30 dB
+#   steps 30 + cache deepcache              232.0 s (2.92x)  another take of the scene (PSNR 16 dB), sharp
+#   steps 30 + cache deepcache + sage       183.2 s (3.69x)  the same
+#   steps 20                                (B65 2.29x)      another take (PSNR 14 dB)
 files:
   denoiser:
     key: hunyuanvideo15-480p-t2v-distilled

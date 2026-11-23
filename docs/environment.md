@@ -356,6 +356,9 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 | `NS_HV15_CFG` | 1 | HunyuanVideo-1.5's classifier-free guidance scale: 1 one pass a step (the cfg-distilled card), 6 the base card's (a second pass over the negative prompt, default empty); a request's `cfg` first (--opt-cfg) | video hunyuanvideo15 |
 | `NS_HV15_STEPS` | 50 | HunyuanVideo-1.5's steps when a request does not say (the cfg-distilled model needs its 50) (--opt-steps) | video hunyuanvideo15 |
 | `NS_HV15_SHIFT` | 5 | HunyuanVideo-1.5's schedule shift (the 480p T2V cards' 5; the step-distilled I2V's 7) (--opt-shift) | video hunyuanvideo15 |
+| `NS_HV15_ATTN` | half | HunyuanVideo-1.5's attention: `half` (the silo's, ARK's half flash: the same bits as the shared kernel), `half:N` (its tile N, 0 - 4: debugging), `shared` (the shared kernels' call), `sage` (SageAttention v1, int8 q and k: 1.5x the attention, 1.3x the clip; approximate - docs/ports/hunyuanvideo15.md); a request's `attention` first (--opt-attention) | video hunyuanvideo15 |
+| `NS_HV15_CACHE` | off | HunyuanVideo-1.5's step caching: `deepcache` (upstream's: steps 11 - 44 of 50 reuse block 53's input but every 4th - 25 of 50 cached, 1.9x the steps; scaled to other step counts), `deepcache:START,END,INTERVAL[,BLOCKS]`; approximate; a request's `cache` first (--opt-cache) | video hunyuanvideo15 |
+| `NS_HV15_PROFILE` | unset | Debug: 1 = HunyuanVideo-1.5 drains the queue between the parts of a DiT pass and logs each part's device time a step after the steps (slower) | video hunyuanvideo15 |
 
 ## Audio
 

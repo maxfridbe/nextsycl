@@ -147,8 +147,8 @@
       "cards": {
         "arc-pro-b65-160u-32g": {
           "exact": "9d80ad04dc6c5baa",
-          "pp": 6467.1,
-          "tg": 727.3,
+          "pp": 6401.7,
+          "tg": 727.6,
           "device": {
             "name": "Intel(R) Arc(TM) Pro B65 Graphics",
             "units": 160,
@@ -160,12 +160,12 @@
             ]
           },
           "host": "hardac1",
-          "recorded": "12844f8 (2026-11-23)"
+          "recorded": "2d646fc (2026-11-23)"
         },
         "arc-pro-b70-256u-32g": {
           "exact": "1225588c2ce6e65a",
-          "pp": 9689.0,
-          "tg": 1375.6,
+          "pp": 9684.6,
+          "tg": 1355.2,
           "device": {
             "name": "Intel(R) Arc(TM) Pro B70 Graphics",
             "units": 256,
@@ -177,7 +177,7 @@
             ]
           },
           "host": "hardac1",
-          "recorded": "12844f8 (2026-11-23)"
+          "recorded": "2d646fc (2026-11-23)"
         }
       }
     }
