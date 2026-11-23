@@ -2710,6 +2710,9 @@ pub struct Model3dDescribePromptGuideMdReq {
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
 pub struct VideoGenerateReq {
+    /// the video model by registry id (system.models): the clip is made by its engine - e.g. hunyuanvideo-1.5-480p-t2v-distilled-q8 is engine HV15 - or refused when the engine does not run it; instead of engine (both: they must agree). None: engine
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(min = 0)]

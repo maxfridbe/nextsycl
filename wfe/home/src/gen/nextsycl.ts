@@ -2272,6 +2272,8 @@ export interface VideoFilmsListReq {
 
 /** What video.generate takes. */
 export interface VideoGenerateReq {
+  /** the video model by registry id (system.models): the clip is made by its engine - e.g. hunyuanvideo-1.5-480p-t2v-distilled-q8 is engine HV15 - or refused when the engine does not run it; instead of engine (both: they must agree). None: engine */
+  model?: string | null;
   /**
    * hold the model this long after the request ends: nothing stops it for room meanwhile. Clamped to NS_MAX_RSVP_S (a day), never shortened by a smaller value, 0 releases; the answer says rsvp_granted_s
    * @minimum 0

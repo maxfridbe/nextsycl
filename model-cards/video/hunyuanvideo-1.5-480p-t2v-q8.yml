@@ -9,6 +9,7 @@ license_note: 'Tencent Hunyuan Community License (HunyuanVideo-1.5): not license
 title: 'HunyuanVideo-1.5 480p T2V (Q8_0 products; text to video with CFG 6 - twice the passes; Tencent Hunyuan Community License)'
 about: Tencent's 8.3B video DiT, its base 480p text-to-video checkpoint - classifier-free guidance 6 over an empty negative prompt, 50 steps (the reference the distilled card was made from); its 3-D causal VAE; HunyuanImage 2.1's text encoders
 gpus: '0'
+vram_gib: 20.5                   # its memory on the card when it runs: 19.4 GiB peak measured on the B70 (848x480, 5 s, CFG: two passes a step)
 defaults:
   steps: 50
   seconds: 5.0

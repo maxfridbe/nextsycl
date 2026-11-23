@@ -9,6 +9,7 @@ license_note: 'Tencent Hunyuan Community License (HunyuanVideo-1.5): not license
 title: 'HunyuanVideo-1.5 480p I2V step-distilled (Q8_0 products; a picture and a prompt to video, 8 steps; Tencent Hunyuan Community License)'
 about: Tencent's 8.3B video DiT, its step-distilled 480p image-to-video checkpoint (MeanFlow, 8 or 12 steps, no CFG) - the clip starts on the picture given (first_frame); its 3-D causal VAE (encoder and decoder), SigLIP's vision tower, HunyuanImage 2.1's text encoders
 gpus: '0'
+vram_gib: 23.0                   # its memory on the card when it runs: 21.8 GiB peak measured on the B70 (640x640, 5 s, 8 steps; SigLIP and the VAE encoder beside the rest)
 defaults:
   steps: 8
   seconds: 5.0

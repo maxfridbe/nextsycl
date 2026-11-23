@@ -131,6 +131,29 @@ pub fn check_canvas(w: i64, h: i64) -> Result<(), RpcError> {
     Ok(())
 }
 
+/// Whether the daemon runs the model of registry id `id` (the start's models, then those it listed since)
+pub fn engine_id_known(id: &str) -> bool {
+    engine_pairs().iter().any(|(_, i)| i == id)
+}
+
+/// The engine a request asks for, as the front end names it: its `model` - a registry id the daemon runs (`known`),
+/// refused otherwise rather than made by another model - else its `engine` (INT8 when it names none). A model and an
+/// engine that disagree are refused.
+pub fn requested_engine(p: &Value, known: &dyn Fn(&str) -> bool) -> Result<String, RpcError> {
+    let by_engine = p.get("engine").and_then(|v| v.as_str()).map(str::trim).filter(|e| !e.is_empty());
+    let Some(id) = p.get("model").and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(engine_name(by_engine));
+    };
+    if !known(id) {
+        return Err(RpcError::param(&format!("model {id}: not a video model the engine runs (video.engines.list; a registered video model is added by enabling it)")));
+    }
+    let name = engine_quant(id);
+    if let Some(e) = by_engine.map(|e| engine_name(Some(e))).filter(|e| *e != name) {
+        return Err(RpcError::param(&format!("model {id} is engine {name}, not {e}: name one of them")));
+    }
+    Ok(name)
+}
+
 /// HunyuanVideo-1.5's engines (video.generate engine HV15, HV15-CFG, HV15-I2V): their default steps and the most
 /// they take, or None for H3's
 pub fn hv15_rules(engine: &str) -> Option<(f64, f64)> {
@@ -415,8 +438,17 @@ impl Studio {
         if te != "teacher" && te != "student" {
             return Err(RpcError::param("te must be teacher or student"));
         }
+        // the engine: the model the request names (a registry id the daemon runs), else `engine` (2026-11-23: a
+        // video.generate naming hunyuanvideo-1.5-480p-t2v-distilled-q8 ran as H3 - `model` was not read)
+        let requested = requested_engine(p, &|id| {
+            if engine_id_known(id) {
+                return true;
+            }
+            let _ = self.engines(); // the daemon's list (a model added since the studio started)
+            engine_id_known(id)
+        })?;
         // HunyuanVideo-1.5 (engine HV15...): its own canvas, length and step rules (hv15_rules)
-        let hv = hv15_rules(&engine_name(p.get("engine").and_then(|v| v.as_str())));
+        let hv = hv15_rules(&requested);
         let (dw, dh) = hv.map_or((768.0, 576.0), |_| (848.0, 480.0));
         let width = num(p, "width", dw, 256.0, 1344.0, true)?;
         let height = num(p, "height", dh, 256.0, 1344.0, true)?;
@@ -494,7 +526,7 @@ impl Studio {
         it.insert("te".into(), json!(te));
         it.insert("title".into(), title_of(p));
         it.insert("label".into(), json!(clean_label(&p.get("label").map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).unwrap_or_default())));
-        let engine = engine_name(p.get("engine").and_then(|v| v.as_str()));
+        let engine = requested;
         if engine != "INT8" && !engine_known(&engine) {
             let _ = self.engines(); // the daemon's list (a model added since the studio started)
             if !engine_known(&engine) {
@@ -860,6 +892,34 @@ fn pika_flex_lora(denoisers: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A video.generate naming a HunyuanVideo-1.5 model reaches its engine and that engine's rules (1 s: 25 frames, not
+    /// H3's 39); an unknown model is refused, not made by H3; a model and an engine that disagree are refused
+    #[test]
+    fn a_clip_naming_a_model_takes_its_engine_and_rules() {
+        use super::*;
+        let ids = ["hunyuanvideo-1.5-480p-t2v-distilled-q8", "hunyuanvideo-1.5-480p-t2v-q8", "hunyuanvideo-1.5-480p-i2v-step-distilled-q8"];
+        learn_engines(&ids.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let known = |id: &str| engine_id_known(id);
+        for (id, want) in ids.iter().zip(["HV15", "HV15-CFG", "HV15-I2V"]) {
+            let p = json!({"model": id, "prompt": "a fox", "seconds": 1});
+            let e = requested_engine(&p, &known).unwrap();
+            assert_eq!(e, want, "{id}");
+            assert!(hv15_rules(&e).is_some());
+            assert_eq!(hv15_frames(1.0), 25);
+            assert!(engine_known(&e));
+            assert_eq!(engine_id(&e), *id);
+        }
+        // no model: engine as before, H3's INT8 by default
+        assert_eq!(requested_engine(&json!({"prompt": "x"}), &known).unwrap(), "INT8");
+        assert_eq!(requested_engine(&json!({"engine": "HV15"}), &known).unwrap(), "HV15");
+        // an unknown model: refused
+        let e = requested_engine(&json!({"model": "no-such-video-model"}), &known).unwrap_err();
+        assert!(format!("{e:?}").contains("no-such-video-model"), "{e:?}");
+        // disagreeing
+        assert!(requested_engine(&json!({"model": ids[0], "engine": "INT8"}), &known).is_err());
+        assert!(requested_engine(&json!({"model": ids[0], "engine": "HV15"}), &known).is_ok());
+    }
+
     /// HunyuanVideo-1.5's models by id, and its rules: 4k + 1 frames, its steps, sides of 16
     #[test]
     fn hunyuanvideo_engines_have_their_own_rules() {
