@@ -119,7 +119,13 @@ struct Silo {
     q8_split: unsafe extern "C" fn(G, P, i64, i64, *mut i8, M) -> c_int,
     linear_supported: unsafe extern "C" fn(G, c_int) -> c_int,
     linear: unsafe extern "C" fn(G, *const Mm) -> c_int,
+    /// the yardstick (silo.h), when this build has it
+    bench_gemm: Option<unsafe extern "C" fn(G, c_int, i64, i64, i64, c_int, *mut f64) -> c_int>,
+    /// the joint attention (silo.h), when this build has it
+    attention: Option<(unsafe extern "C" fn(G) -> c_int, AttnFn)>,
 }
+
+type AttnFn = unsafe extern "C" fn(G, P, i64, i64, i64, i64, M, i64, c_int, c_int) -> c_int;
 
 // SAFETY: function pointers into a library that stays loaded for the process.
 unsafe impl Send for Silo {}
@@ -147,6 +153,18 @@ fn silo() -> Result<Option<&'static Silo>> {
             q8_split: sym!("ns_video_hv15_silo_q8_split"),
             linear_supported: sym!("ns_video_hv15_silo_linear_supported"),
             linear: sym!("ns_video_hv15_silo_linear"),
+            attention: {
+                let (t, a) = (lib.symbol("ns_video_hv15_silo_attention_tiles"), lib.symbol("ns_video_hv15_silo_attention"));
+                // SAFETY: declared in silo.h with these signatures.
+                (!t.is_null() && !a.is_null()).then(|| unsafe {
+                    (std::mem::transmute::<*mut c_void, unsafe extern "C" fn(G) -> c_int>(t), std::mem::transmute::<*mut c_void, AttnFn>(a))
+                })
+            },
+            bench_gemm: {
+                let p = lib.symbol("ns_video_hv15_silo_bench_gemm");
+                // SAFETY: declared in silo.h with this signature.
+                (!p.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(G, c_int, i64, i64, i64, c_int, *mut f64) -> c_int>(p) })
+            },
         }))
     })
     .as_ref()
@@ -199,6 +217,29 @@ impl K {
 
     fn g(&self) -> G {
         self.gpu.raw()
+    }
+
+    /// How many half tiles the silo's attention has (0: none - no sycl-tla part, or an older silo)
+    pub fn attention_tiles(&self) -> usize {
+        // SAFETY: a query on the GPU's handle.
+        self.silo.and_then(|s| s.attention).map(|(t, _)| unsafe { t(self.g()) }.max(0) as usize).unwrap_or(0)
+    }
+
+    /// The joint attention: qkv half [s, stride] (q | k | v, H heads of 128 each), out half [s, o_rs]; sage: int8 q, k
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention(&self, qkv: P, s: usize, h: usize, d: usize, stride: usize, out: M, o_rs: usize, sage: bool, tile: usize) -> Result<()> {
+        let (_, f) = self.silo.and_then(|s| s.attention).ok_or_else(|| Error("the silo has no attention (rebuild it)".into()))?;
+        // SAFETY: qkv holds s rows of stride halves, out s rows of o_rs.
+        check(unsafe { f(self.g(), qkv, s as i64, h as i64, d as i64, stride as i64, out, o_rs as i64, sage as c_int, tile as c_int) }, "attention (silo)")
+    }
+
+    /// oneDNN's plain product [m, k] x [k, n] (int8: int8 -> int32, else half -> half): milliseconds a run, mean of `iters`
+    pub fn bench_gemm(&self, int8: bool, m: usize, n: usize, k: usize, iters: usize) -> Result<f64> {
+        let f = self.silo.and_then(|s| s.bench_gemm).ok_or_else(|| Error("the silo has no bench_gemm (rebuild it)".into()))?;
+        let mut ms = 0f64;
+        // SAFETY: the silo allocates its own buffers; ms is written once.
+        check(unsafe { f(self.g(), int8 as c_int, m as i64, n as i64, k as i64, iters as c_int, &mut ms) }, "bench_gemm")?;
+        Ok(ms)
     }
 
     /// A Q8_0 matrix [n, k] into the silo's int8 values [n, k] and half scales [k / 32, n]

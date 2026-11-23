@@ -52,6 +52,18 @@ typedef struct ns_hv15_mm {
 int ns_video_hv15_silo_linear_supported(ns_gpu* g, int int8);
 int ns_video_hv15_silo_linear(ns_gpu* g, const ns_hv15_mm* a);
 
+/* The DiT's joint attention (attn.cpp, its kernels in libnextsycl-hunyuanvideo15-tla.so beside the silo): qkv half
+ * [S, stride] (q, k, v at columns 0, H D, 2 H D; stride a multiple of 8), out half [S, o_rs]; D 128. mode 0 half (on
+ * tile `tile`, 0 .. ns_video_hv15_silo_attention_tiles() - 1; 0 is the shared kernels' flash), 1 SageAttention v1 (int8
+ * q and k - approximate, an opt-in). _tiles: 0 when the sycl-tla part is missing. */
+int ns_video_hv15_silo_attention_tiles(ns_gpu* g);
+int ns_video_hv15_silo_attention(ns_gpu* g, const void* qkv, int64_t S, int64_t H, int64_t D, int64_t stride, void* out, int64_t o_rs,
+                                 int mode, int tile);
+
+/* The yardstick (bench.cpp): oneDNN's plain product [M, K] x [K, N] on scratch buffers, kind 0 half -> half, 1 int8 ->
+ * int32; *ms the mean of `iters` runs (1..1000) */
+int ns_video_hv15_silo_bench_gemm(ns_gpu* g, int kind, int64_t M, int64_t N, int64_t K, int iters, double* ms);
+
 #ifdef __cplusplus
 }
 #endif

@@ -31,6 +31,8 @@ pub const DIM: usize = 2048;
 pub const HEADS: usize = 16;
 pub const HEAD: usize = 128;
 pub const FFN: usize = 8192;
+/// the double blocks of the released DiTs
+pub const DOUBLES: usize = 54;
 pub const LATENT: usize = 32;
 /// img_in's channels: the latents, the condition latents, the mask
 pub const IN: usize = 2 * LATENT + 1;
@@ -113,6 +115,53 @@ pub struct Dit {
     scratch: DevBuf,
     pub meanflow: bool,
     pub bytes: usize,
+    /// where a pass's time goes (NS_HV15_PROFILE=1)
+    pub prof: crate::prof::Prof,
+    /// the joint attention's kernel by default (the silo's half when it has one: the engine's NS_HV15_ATTN over it)
+    pub attn: Attn,
+    /// the silo's half tiles (0: no sycl-tla part)
+    pub tiles: usize,
+}
+
+/// The joint attention's kernel: the shared kernels' (ARK's half flash), the silo's half on a tile, or the silo's
+/// SageAttention (int8 q and k: approximate, an opt-in)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attn {
+    Shared,
+    Half(usize),
+    Sage,
+}
+
+impl Attn {
+    /// NS_HV15_ATTN: shared | half | half:N | sage; the silo's half (its best tile) when it has one, else shared
+    pub fn parse(v: Option<&str>, tiles: usize) -> std::result::Result<Attn, String> {
+        let best = if tiles > 0 { Attn::Half(0) } else { Attn::Shared };
+        match v.map(str::trim) {
+            None | Some("") => Ok(best),
+            Some("shared") => Ok(Attn::Shared),
+            Some("half") => Ok(best),
+            Some("sage") if tiles > 0 => Ok(Attn::Sage),
+            Some(x) => match x.strip_prefix("half:").and_then(|n| n.parse::<usize>().ok()) {
+                Some(n) if n < tiles => Ok(Attn::Half(n)),
+                _ => Err(format!("NS_HV15_ATTN={x}: shared, half, half:0..{}, or sage (the silo's need its sycl-tla part)", tiles.max(1) - 1)),
+            },
+        }
+    }
+}
+
+/// DeepCache's rows (Dit::deep_cache): every branch's rows as block `from` got them on the last full pass
+pub struct DeepCache {
+    x: DevBuf,
+    pub from: usize,
+    filled: std::cell::Cell<bool>,
+}
+
+/// Which steps DeepCache skips (upstream's no_cache_steps): every step before `start`, from `end` on, and every
+/// `interval`-th from `start` runs in full; the rest reuse the last full one's rows. Upstream's defaults for 50 steps:
+/// 11, 45, 4 - 25 cached.
+pub fn deep_cache_skips(steps: usize, start: usize, end: usize, interval: usize) -> Vec<bool> {
+    let interval = interval.max(1);
+    (0..steps).map(|i| i >= start && i < end && !(i - start).is_multiple_of(interval)).collect()
 }
 
 /// The prompt's part that does not change with the step
@@ -316,6 +365,9 @@ impl Dit {
             scratch: DevBuf::new(gpu, (mods * 4).max(if silo { 0 } else { biggest * 2 }))?,
             meanflow,
             bytes: 0,
+            prof: crate::prof::Prof::new(std::env::var("NS_HV15_PROFILE").is_ok_and(|v| v == "1")),
+            attn: Attn::parse(None, k.attention_tiles()).map_err(Error)?,
+            tiles: k.attention_tiles(),
             doubles,
         };
         let bytes = dit.doubles.iter().flat_map(|d| [&d.img, &d.txt]).flat_map(|s| [&s.modulation, &s.qkv, &s.proj, &s.fc1, &s.fc2]).map(|l| l.bytes()).sum::<usize>()
@@ -534,15 +586,36 @@ impl Dit {
     pub fn forward(&self, nsd: &Nsd, st: &Steps, si: usize, bt: &Batch, lats: &[&DevBuf], cond: &DevBuf,
                    tap: &mut dyn FnMut(&str, &DevBuf, usize, usize) -> Result<()>) -> Result<Vec<DevBuf>> {
         let n = bt.branches.first().map_or(0, |b| b.n);
-        self.forward_spans(nsd, st, si, &[(0, n, si)], bt, lats, cond, tap)
+        self.forward_cached(nsd, st, si, &[(0, n, si)], bt, lats, cond, None, self.attn, tap)
+    }
+
+    /// `forward_spans`
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_spans(&self, nsd: &Nsd, st: &Steps, si: usize, spans: &[(usize, usize, usize)], bt: &Batch, lats: &[&DevBuf], cond: &DevBuf,
+                         tap: &mut dyn FnMut(&str, &DevBuf, usize, usize) -> Result<()>) -> Result<Vec<DevBuf>> {
+        self.forward_cached(nsd, st, si, spans, bt, lats, cond, None, self.attn, tap)
+    }
+
+    /// A buffer for DeepCache (upstream's --cache_type deepcache): every row of a pass as the last `blocks` double
+    /// blocks get them
+    pub fn deep_cache(&self, nsd: &Nsd, bt: &Batch, blocks: usize) -> Result<DeepCache> {
+        if blocks == 0 || blocks > self.doubles.len() {
+            return Err(Error(format!("deepcache: 1 to {} blocks recomputed, not {blocks}", self.doubles.len())));
+        }
+        Ok(DeepCache { x: DevBuf::f32(&nsd.gpu, bt.rows * DIM)?, from: self.doubles.len() - blocks, filled: std::cell::Cell::new(false) })
     }
 
     /// `forward` with the image rows in spans at their own step rows of `st`: (first image row, rows, step row) - a
     /// rolling window's chunks at their own noise levels (MovieRoll). The text stream and the token refiner take step
     /// row `si`. One span over every image row at `si` is `forward`.
+    ///
+    /// With `cache` (DeepCache): Some((c, false)) a full pass that keeps every row as block `c.from` gets them;
+    /// Some((c, true)) a cached pass - those rows put back and only blocks `c.from`.. run (with this step's modulation),
+    /// the embedding, the token refiner and the blocks before skipped. `attn`: the joint attention's kernel.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_spans(&self, nsd: &Nsd, st: &Steps, si: usize, spans: &[(usize, usize, usize)], bt: &Batch, lats: &[&DevBuf], cond: &DevBuf,
-                         tap: &mut dyn FnMut(&str, &DevBuf, usize, usize) -> Result<()>) -> Result<Vec<DevBuf>> {
+    pub fn forward_cached(&self, nsd: &Nsd, st: &Steps, si: usize, spans: &[(usize, usize, usize)], bt: &Batch, lats: &[&DevBuf], cond: &DevBuf,
+                          cache: Option<(&DeepCache, bool)>, attn: Attn, tap: &mut dyn FnMut(&str, &DevBuf, usize, usize) -> Result<()>)
+                          -> Result<Vec<DevBuf>> {
         let k = &self.k;
         let branches = &bt.branches;
         if si >= st.n || spans.iter().any(|x| x.2 >= st.n) {
@@ -563,7 +636,17 @@ impl Dit {
         if lats.len() != branches.len() {
             return Err(Error(format!("{} latents for {} branches", lats.len(), branches.len())));
         }
-        for (b, lat) in branches.iter().zip(lats) {
+        let pf = &self.prof;
+        pf.start(nsd)?;
+        let reuse = match cache {
+            Some((c, true)) if c.filled.get() => Some(c),
+            Some((_, true)) => return Err(Error("deepcache: a cached pass before any full one".into())),
+            _ => None,
+        };
+        if let Some(c) = reuse {
+            bt.x.copy_within(0, &c.x, 0, bt.rows * DIM * 4)?;
+        }
+        for (b, lat) in branches.iter().zip(lats).filter(|_| reuse.is_none()) {
             // img_in over [latents | condition | mask]
             bt.inp.copy_2d(0, IN * 4, lat, 0, LATENT * 4, LATENT * 4, b.n)?;
             bt.inp.copy_2d(LATENT * 4, IN * 4, cond, 0, (IN - LATENT) * 4, (IN - LATENT) * 4, b.n)?;
@@ -572,8 +655,17 @@ impl Dit {
         }
         let b0 = &branches[0];
         tap("txt_all0", &bt.x, b0.n, b0.t)?;
+        pf.mark(nsd, "embed + refiner")?;
         let sc = &self.scratch;
         for (bi, d) in self.doubles.iter().enumerate() {
+            match cache {
+                Some((c, _)) if bi < c.from && reuse.is_some() => continue,
+                Some((c, false)) if bi == c.from => {
+                    c.x.copy_within(0, &bt.x, 0, bt.rows * DIM * 4)?;
+                    c.filled.set(true);
+                }
+                _ => {}
+            }
             let (mi, mt) = (&st.dbl[bi].0, &st.dbl[bi].1);
             let md = |m: &DevBuf, s: usize, j: usize| -> *const f32 { fptr(m, s * 6 * DIM + j * DIM) };
             let parts = |b: &Branch| [(b.r0, b.n), (b.r0 + b.n, b.t)];
@@ -588,22 +680,36 @@ impl Dit {
                 for (_, m, r0, rows, s) in mod_parts(b) {
                     k.ln_mod(fptr(&bt.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, s, 1), md(m, s, 0), hptr(&bt.h, r0 * DIM), T::F16)?;
                 }
-                for ((s, _), (r0, rows)) in streams.iter().zip(parts(b)) {
+                pf.mark(nsd, "norm + modulate")?;
+                for (si_, (s, _)) in streams.iter().enumerate() {
+                    let (r0, rows) = parts(b)[si_];
                     s.qkv.mm(nsd, k, sc, &bt.tmp, hptr(&bt.h, r0 * DIM), DIM, rows, hptr(&bt.big, r0 * 3 * DIM), 3 * DIM, Post::Half)?;
+                    pf.mark(nsd, if si_ == 0 { "qkv img" } else { "qkv txt" })?;
                 }
                 let (q, s) = (b.r0 * 3 * DIM, b.n + b.t);
                 nsd.rms_rope(hptr(&bt.big, q), Dt::F16, b.n, HEADS, HEAD, 3 * DIM, d.img.q_norm.ptr(), EPS, b.cs.ptr(), HEAD)?;
                 nsd.rms_rope(hptr(&bt.big, q + DIM), Dt::F16, b.n, HEADS, HEAD, 3 * DIM, d.img.k_norm.ptr(), EPS, b.cs.ptr(), HEAD)?;
                 nsd.rms_rope(hptr(&bt.big, q + b.n * 3 * DIM), Dt::F16, b.t, HEADS, HEAD, 3 * DIM, d.txt.q_norm.ptr(), EPS, b.cs.ptr(), 0)?;
                 nsd.rms_rope(hptr(&bt.big, q + b.n * 3 * DIM + DIM), Dt::F16, b.t, HEADS, HEAD, 3 * DIM, d.txt.k_norm.ptr(), EPS, b.cs.ptr(), 0)?;
-                nsd.attention_qk(hptr(&bt.big, q), s, 3 * DIM, hptr(&bt.big, q + DIM), hptr(&bt.big, q + 2 * DIM), s, 3 * DIM, Dt::F16, HEADS, HEAD,
-                                 hptr(&bt.att, b.r0 * DIM), Dt::F16)?;
+                pf.mark(nsd, "rms + rope")?;
+                match attn {
+                    Attn::Shared => nsd.attention_qk(hptr(&bt.big, q), s, 3 * DIM, hptr(&bt.big, q + DIM), hptr(&bt.big, q + 2 * DIM), s, 3 * DIM, Dt::F16,
+                                                     HEADS, HEAD, hptr(&bt.att, b.r0 * DIM), Dt::F16)?,
+                    Attn::Half(t) => k.attention(hptr(&bt.big, q), s, HEADS, HEAD, 3 * DIM, hptr(&bt.att, b.r0 * DIM), DIM, false, t)?,
+                    Attn::Sage => k.attention(hptr(&bt.big, q), s, HEADS, HEAD, 3 * DIM, hptr(&bt.att, b.r0 * DIM), DIM, true, 0)?,
+                }
+                pf.mark(nsd, "attention")?;
                 for (which, m, r0, rows, s) in mod_parts(b) {
                     let st_ = streams[which].0;
+                    let img = which == 0;
                     st_.proj.mm(nsd, k, sc, &bt.tmp, hptr(&bt.att, r0 * DIM), DIM, rows, fptr(&bt.x, r0 * DIM).cast(), DIM, Post::Gate(md(m, s, 2)))?;
+                    pf.mark(nsd, if img { "proj img" } else { "proj txt" })?;
                     k.ln_mod(fptr(&bt.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, s, 4), md(m, s, 3), hptr(&bt.h, r0 * DIM), T::F16)?;
+                    pf.mark(nsd, "norm + modulate")?;
                     st_.fc1.mm(nsd, k, sc, &bt.tmp, hptr(&bt.h, r0 * DIM), DIM, rows, hptr(&bt.mlp, r0 * FFN), FFN, Post::Gelu)?;
+                    pf.mark(nsd, if img { "fc1 img" } else { "fc1 txt" })?;
                     st_.fc2.mm(nsd, k, sc, &bt.tmp, hptr(&bt.mlp, r0 * FFN), FFN, rows, fptr(&bt.x, r0 * DIM).cast(), DIM, Post::Gate(md(m, s, 5)))?;
+                    pf.mark(nsd, if img { "fc2 img" } else { "fc2 txt" })?;
                 }
             }
             if bi == 0 {
@@ -624,6 +730,7 @@ impl Dit {
             out.push(v);
         }
         nsd.wait()?;
+        pf.mark(nsd, "final")?;
         Ok(out)
     }
 }
@@ -646,6 +753,29 @@ mod tests {
         // row 3 (frame 0, row 1, column 0): pair 8 by 1 radian (the h axis' first)
         assert!((cs[3 * head + 17] - 1f32.sin()).abs() < 1e-6);
         assert!(cs[12 * head..].chunks(2).all(|p| p[0] == 1.0 && p[1] == 0.0));
+    }
+
+    #[test]
+    fn deepcache_skips_the_steps_upstream_does() {
+        let s = super::deep_cache_skips(50, 11, 45, 4);
+        let full: Vec<usize> = (0..50).filter(|i| !s[*i]).collect();
+        let want: Vec<usize> = (0..11).chain((11..45).step_by(4)).chain(45..50).collect();
+        assert_eq!(full, want);
+        assert_eq!(s.iter().filter(|x| **x).count(), 25);
+        assert!(super::deep_cache_skips(20, 0, 0, 4).iter().all(|x| !x));
+    }
+
+    #[test]
+    fn the_attention_option_names_a_kernel_the_silo_has() {
+        use super::Attn;
+        assert_eq!(Attn::parse(None, 5), Ok(Attn::Half(0)));
+        assert_eq!(Attn::parse(None, 0), Ok(Attn::Shared));
+        assert_eq!(Attn::parse(Some("shared"), 5), Ok(Attn::Shared));
+        assert_eq!(Attn::parse(Some("half:3"), 5), Ok(Attn::Half(3)));
+        assert_eq!(Attn::parse(Some("sage"), 5), Ok(Attn::Sage));
+        assert!(Attn::parse(Some("half:5"), 5).is_err());
+        assert!(Attn::parse(Some("sage"), 0).is_err());
+        assert!(Attn::parse(Some("fast"), 5).is_err());
     }
 
     #[test]

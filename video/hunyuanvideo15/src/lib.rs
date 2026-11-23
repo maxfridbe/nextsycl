@@ -19,6 +19,7 @@
 pub mod check;
 pub mod dit;
 mod ffi;
+pub mod prof;
 pub mod vae;
 pub mod vision;
 mod w;
@@ -48,7 +49,46 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "steps", env: "NS_HV15_STEPS", value: "N", help: "the denoising steps when a request does not say (default 50: what the cfg-distilled card needs)", at: At::Load },
     EngineOption { name: "shift", env: "NS_HV15_SHIFT", value: "X", help: "the schedule's shift (default 5, the 480p cards')", at: At::Both },
     EngineOption { name: "negative", env: "", value: "TEXT", help: "the negative prompt of a guided run (default empty, as the pipeline)", at: At::Request },
+    EngineOption { name: "attention", env: "NS_HV15_ATTN", value: "KERNEL",
+                   help: "the DiT's attention: half (the silo's, the default), half:N (its tile N), shared (the shared kernels' flash), sage (int8 q and k: approximate)",
+                   at: At::Both },
+    EngineOption { name: "cache", env: "NS_HV15_CACHE", value: "SPEC",
+                   help: "step caching: off (default), deepcache (upstream's: steps 11-44 of 50 reuse all but the last block every 3 in 4; scaled to the steps), \
+                          deepcache:START,END,INTERVAL[,BLOCKS]",
+                   at: At::Both },
 ];
+
+/// DeepCache's schedule (upstream's --cache_start_step / --cache_end_step / --cache_step_interval / --no_cache_block_id
+/// as the last `blocks` double blocks)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cache {
+    pub start: usize,
+    pub end: usize,
+    pub interval: usize,
+    pub blocks: usize,
+}
+
+impl Cache {
+    /// off | deepcache | deepcache:START,END,INTERVAL[,BLOCKS]; plain deepcache is upstream's 11, 45, 4 (block 53) for
+    /// 50 steps, its start and end scaled to other step counts
+    pub fn parse(v: &str, steps: usize) -> std::result::Result<Option<Cache>, String> {
+        let v = v.trim();
+        if v.is_empty() || v == "off" || v == "0" {
+            return Ok(None);
+        }
+        if v == "deepcache" || v == "1" || v == "on" {
+            let at = |s: usize| (s * steps + 25) / 50;
+            return Ok(Some(Cache { start: at(11), end: at(45), interval: 4, blocks: 1 }));
+        }
+        let bad = || format!("cache={v}: off, deepcache, or deepcache:START,END,INTERVAL[,BLOCKS]");
+        let nums: Vec<usize> = v.strip_prefix("deepcache:").ok_or_else(bad)?.split(',').map(|x| x.trim().parse().map_err(|_| bad())).collect::<std::result::Result<_, _>>()?;
+        match nums[..] {
+            [start, end, interval] => Ok(Some(Cache { start, end, interval: interval.max(1), blocks: 1 })),
+            [start, end, interval, blocks] if (1..=dit::DOUBLES).contains(&blocks) => Ok(Some(Cache { start, end, interval: interval.max(1), blocks })),
+            _ => Err(bad()),
+        }
+    }
+}
 
 /// This engine's registry entry
 pub fn kind() -> VideoKind {
@@ -174,6 +214,10 @@ pub struct HunyuanVideo15 {
     cfg: f32,
     steps: usize,
     shift: f32,
+    /// NS_HV15_CACHE (a request's "cache" over it)
+    cache: String,
+    /// NS_HV15_ATTN (a request's "attention" over it)
+    attention: String,
     loaded: Instant,
     load_s: f64,
     /// the most of the card in use seen during the last clip (total less the driver's free): what a card must hold
@@ -204,9 +248,13 @@ impl HunyuanVideo15 {
         let cfg = num("NS_HV15_CFG", 1.0)?;
         let steps = num("NS_HV15_STEPS", 50.0)? as usize;
         let shift = num("NS_HV15_SHIFT", 5.0)?;
+        let cache = setting("NS_HV15_CACHE").unwrap_or_default().to_string();
+        Cache::parse(&cache, steps).map_err(Error)?;
+        let attention = setting("NS_HV15_ATTN").unwrap_or_default().to_string();
         let st = w::St::open(role(files, "denoiser")?)?;
         let dit = dit::Dit::load(&st, &k, log)?;
         drop(st);
+        dit::Attn::parse(Some(&attention), dit.tiles).map_err(Error)?;
         let kern: Arc<dyn nextsycl_hunyuan_text::Kern> = Arc::new(k.clone());
         let mut te = te::TextEncoder::load(role(files, "text-encoder")?, role(files, "tokenizer")?, &nsd, kern.clone(), template(), log)?;
         // the pipeline's text_len: 1000 tokens after the crop
@@ -219,8 +267,9 @@ impl HunyuanVideo15 {
         let vae = vae::Vae::load(role(files, "vae")?, &k, i2v, log)?;
         let vision = if i2v { Some(vision::Vision::load(role(files, "vision")?, &k, log)?) } else { None };
         let load_s = t0.elapsed().as_secs_f64();
-        log(format!("{ARCH}: loaded in {load_s:.1} s (cfg {cfg}, {steps} steps, shift {shift})"));
-        Ok(HunyuanVideo15 { nsd, k, te, byt5, dit, vae, vision, cfg, steps, shift, loaded: Instant::now(), load_s, peak: Default::default() })
+        log(format!("{ARCH}: loaded in {load_s:.1} s (cfg {cfg}, {steps} steps, shift {shift}, attention {:?}{})",
+                    dit::Attn::parse(Some(&attention), dit.tiles).unwrap_or(dit.attn), if cache.is_empty() { String::new() } else { format!(", cache {cache}") }));
+        Ok(HunyuanVideo15 { nsd, k, te, byt5, dit, vae, vision, cfg, steps, shift, cache, attention, loaded: Instant::now(), load_s, peak: Default::default() })
     }
 
     /// The card's memory in use now, kept as the clip's peak when it is the most seen
@@ -244,7 +293,7 @@ impl HunyuanVideo15 {
     /// scale; `cond` float32 [n, 33] (the condition latents and the mask; zeros for T2V). Returns the latents.
     #[allow(clippy::too_many_arguments)]
     pub fn denoise(&self, pos: &Encoded, neg: Option<(&Encoded, f32)>, x: &[f32], grid: (usize, usize, usize), cond: &[f32], sigmas: &[f32],
-                   each: &mut dyn FnMut(usize, &DevBuf) -> Result<()>) -> Result<DevBuf> {
+                   cache: Option<Cache>, attn: dit::Attn, each: &mut dyn FnMut(usize, &DevBuf) -> Result<()>) -> Result<DevBuf> {
         let nsd = &self.nsd;
         let steps = sigmas.len() - 1;
         let ts: Vec<(f32, Option<f32>)> = (0..steps)
@@ -259,9 +308,16 @@ impl HunyuanVideo15 {
         let lat = DevBuf::from_f32(&nsd.gpu, x)?;
         let cond = DevBuf::from_f32(&nsd.gpu, cond)?;
         let n = x.len();
+        let dc = match cache {
+            Some(c) => Some((self.dit.deep_cache(nsd, &batch, c.blocks)?, dit::deep_cache_skips(steps, c.start, c.end, c.interval))),
+            None => None,
+        };
+        let all = [(0, grid.0 * grid.1 * grid.2, 0)];
         for i in 0..steps {
             let lats: Vec<&DevBuf> = texts.iter().map(|_| &lat).collect();
-            let v = self.dit.forward(nsd, &st, i, &batch, &lats, &cond, &mut |_, _, _, _| Ok(()))?;
+            let spans = [(all[0].0, all[0].1, i)];
+            let v = self.dit.forward_cached(nsd, &st, i, &spans, &batch, &lats, &cond, dc.as_ref().map(|(c, skip)| (c, skip[i])), attn,
+                                              &mut |_, _, _, _| Ok(()))?;
             let v = match neg {
                 Some((_, scale)) => {
                     // v_neg + scale (v - v_neg)
@@ -281,7 +337,7 @@ impl HunyuanVideo15 {
     /// A clip from a prompt
     #[allow(clippy::too_many_arguments)]
     pub fn make(&self, prompt: &str, negative: &str, image: Option<&Picture>, width: usize, height: usize, frames: usize, steps: usize, cfg: f32, shift: f32,
-                seed: u64, progress: &mut dyn FnMut(&'static str, usize, usize) -> Result<()>, log: &mut dyn FnMut(String)) -> Result<Made> {
+                seed: u64, cache: Option<Cache>, attn: dit::Attn, progress: &mut dyn FnMut(&'static str, usize, usize) -> Result<()>, log: &mut dyn FnMut(String)) -> Result<Made> {
         // I2V: the canvas the picture's shape picks (get_closest_resolution_given_reference_image), else the request's
         let (w, h) = match image {
             Some(p) => canvas(p.width as usize, p.height as usize),
@@ -317,13 +373,22 @@ impl HunyuanVideo15 {
         let x = noise(seed, grid.0, grid.1, grid.2);
         let sig = sigmas(steps, shift);
         let t1 = Instant::now();
-        let lat = self.denoise(&pos, neg.as_ref().map(|e| (e, cfg)), &x, grid, &cond, &sig, &mut |i, _| {
+        if let Some(c) = cache {
+            log(format!("{ARCH}: deepcache - steps {} to {} (all but every {}th) reuse the rows block {} got on the last full step; {} of {steps} steps cached",
+                        c.start, c.end.saturating_sub(1), c.interval,
+                        dit::DOUBLES - c.blocks, dit::deep_cache_skips(steps, c.start, c.end, c.interval).iter().filter(|x| **x).count()));
+        }
+        log(format!("{ARCH}: attention {attn:?}"));
+        let lat = self.denoise(&pos, neg.as_ref().map(|e| (e, cfg)), &x, grid, &cond, &sig, cache, attn, &mut |i, _| {
             self.note();
             progress("denoise", i + 1, steps)
         })?;
         let lat = lat.to_f32()?;
         let ds = t1.elapsed().as_secs_f64();
         log(format!("{ARCH}: {steps} steps in {ds:.1} s ({:.2} s a step)", ds / steps as f64));
+        for l in self.dit.prof.report(steps) {
+            log(l);
+        }
         progress("decode", 0, 0)?;
         let t2 = Instant::now();
         let (v, to, oh, ow) = self.vae.decode(&self.nsd, &lat, grid.0, grid.1, grid.2, &mut |s| {
@@ -362,6 +427,8 @@ impl HunyuanVideo15 {
         let shift = n("shift").map_or(self.shift, |x| x as f32);
         let seed = n("seed").map_or(0, |x| x as i64 as u64);
         let negative = s("negative").or(s("negative_prompt")).unwrap_or("");
+        let cache = Cache::parse(s("cache").unwrap_or(&self.cache), steps).map_err(Error)?;
+        let attn = dit::Attn::parse(Some(s("attention").unwrap_or(&self.attention)), self.dit.tiles).map_err(Error)?;
         // I2V: the picture the clip starts from (the studio's first_frame)
         let image = match s("image").or(s("first_frame")).filter(|p| !p.is_empty()) {
             Some(p) => Some(Picture::decode(&std::fs::read(p).map_err(|e| Error(format!("{p}: {e}")))?).map_err(|e| Error(format!("{p}: {e}")))?),
@@ -378,7 +445,7 @@ impl HunyuanVideo15 {
             }
             Ok(())
         };
-        let m = self.make(prompt, negative, image.as_ref(), width, height, frames, steps, cfg, shift, seed, &mut progress, &mut |l| log(l))?;
+        let m = self.make(prompt, negative, image.as_ref(), width, height, frames, steps, cfg, shift, seed, cache, attn, &mut progress, &mut |l| log(l))?;
         // the merge gate's quick run (tooling/gate.sh): the last latents and the frames to hash, and two speeds as its
         // [prompt ...] lines: the DiT's latent tokens a second over the steps, the decoder's frames' pixels a second
         if let Some(p) = s("logits-out") {
@@ -401,7 +468,7 @@ impl HunyuanVideo15 {
                                       &mut |l| log(l))
             .map_err(|e| Error(e.0))?;
         Ok(json!({"out": out, "width": m.width, "height": m.height, "frames": m.frames, "fps": 24, "seconds": t0.elapsed().as_secs_f64(), "steps": steps,
-                  "cfg": cfg, "seed": seed, "denoise_s": m.denoise_s, "decode_s": m.decode_s, "peak_gib": m.peak as f64 / GIB}))
+                  "cfg": cfg, "seed": seed, "attention": format!("{attn:?}"), "cache": cache.map(|c| format!("deepcache:{},{},{},{}", c.start, c.end, c.interval, c.blocks)), "denoise_s": m.denoise_s, "decode_s": m.decode_s, "peak_gib": m.peak as f64 / GIB}))
     }
 }
 
@@ -447,8 +514,11 @@ impl VideoEngine for HunyuanVideo15 {
         };
         let negative = req.negative.clone().or_else(|| req.extra.get("negative").cloned()).unwrap_or_default();
         let image = req.keyframes.first().map(|k| k.picture.clone());
+        let steps = req.steps.unwrap_or(d.steps) as usize;
+        let cache = Cache::parse(req.extra.get("cache").map(String::as_str).unwrap_or(&self.cache), steps).map_err(Error)?;
+        let attn = dit::Attn::parse(Some(req.extra.get("attention").map(String::as_str).unwrap_or(&self.attention)), self.dit.tiles).map_err(Error)?;
         let m = self.make(&req.prompt, &negative, image.as_ref(), req.width.unwrap_or(d.width) as usize, req.height.unwrap_or(d.height) as usize, frames,
-                          req.steps.unwrap_or(d.steps) as usize, cfg, req.shift.unwrap_or(d.shift), req.seed, &mut p, &mut |l| eprintln!("{l}"))?;
+                          steps, cfg, req.shift.unwrap_or(d.shift), req.seed, cache, attn, &mut p, &mut |l| eprintln!("{l}"))?;
         progress(Progress { stage: "mux", at: 0, of: 0, seconds: t0.elapsed().as_secs_f64() });
         nextsycl_h3::media::write_mp4(&req.out, &nextsycl_h3::media::Frames { px: &m.px, count: m.frames, height: m.height, width: m.width, fps: 24 }, None,
                                       &mut |l| eprintln!("{l}"))
@@ -463,6 +533,20 @@ impl VideoEngine for HunyuanVideo15 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_cache_option_is_upstreams_schedule() {
+        use super::Cache;
+        assert_eq!(Cache::parse("", 50), Ok(None));
+        assert_eq!(Cache::parse("off", 50), Ok(None));
+        assert_eq!(Cache::parse("deepcache", 50), Ok(Some(Cache { start: 11, end: 45, interval: 4, blocks: 1 })));
+        // scaled: 20 steps start at 4.4 -> 4, end at 18
+        assert_eq!(Cache::parse("deepcache", 20), Ok(Some(Cache { start: 4, end: 18, interval: 4, blocks: 1 })));
+        assert_eq!(Cache::parse("deepcache:5,40,3,2", 50), Ok(Some(Cache { start: 5, end: 40, interval: 3, blocks: 2 })));
+        assert!(Cache::parse("deepcache:5,40", 50).is_err());
+        assert!(Cache::parse("deepcache:5,40,3,99", 50).is_err());
+        assert!(Cache::parse("teacache", 50).is_err());
+    }
+
     #[test]
     fn the_480p_buckets_are_the_pipelines() {
         // 16:9 -> 848 x 480, 9:16 -> 480 x 848, 1:1 -> 640 x 640

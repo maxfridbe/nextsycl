@@ -10,6 +10,9 @@
 //!   i2v    siglip_pixels, cond_pixels -> vision.npy (SigLIP's tokens), cond_latent.npy (the VAE encoder's)
 //!   vae    latents (latents.npy or the last step's) -> video.npy (RGB in [-1, 1])
 //! A dit.json with "i2v" runs the I2V DiT on the reference's cond_latent and vision tokens.
+//!
+//! `bench` (no reference needed): the card's plain product rates (half, int8) and the attention at the 5 s clip's
+//! length (spec "tokens", default 49,290 + 256), as TFLOPS.
 //! ```
 //!
 //! The job: `nextsycl video job check --dir DIR --stages te,byt5,dit,steps,vae --here` (with the hunyuanvideo15 model).
@@ -106,12 +109,90 @@ fn ids(v: &Value) -> Vec<u32> {
 }
 
 /// The check job: {"dir": DIR, "stages": "te,byt5,dit,steps,vae"}
+fn bytemuck_u16(v: &[u16]) -> &[u8] {
+    // SAFETY: u16 has no padding; the byte view covers the same memory.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), v.len() * 2) }
+}
+
+/// The yardsticks: plain products and the attention, timed
+fn bench(m: &HunyuanVideo15, spec: &Value, log: &mut dyn FnMut(String)) -> Result<()> {
+    let iters = spec.get("iters").and_then(Value::as_u64).unwrap_or(10).clamp(1, 100) as usize;
+    for int8 in if spec.get("attention_only").and_then(Value::as_bool).unwrap_or(false) { vec![] } else { vec![false, true] } {
+        for (mm, n, k) in [(8192, 8192, 8192), (16384, 16384, 8192), (49290, 6144, 2048), (49290, 8192, 2048), (49290, 2048, 8192)] {
+            let ms = m.k.bench_gemm(int8, mm, n, k, iters)?;
+            log(format!("[bench gemm {} {mm} x {n} x {k}: {ms:.3} ms, {:.1} T{}]", if int8 { "int8" } else { "half" },
+                        2.0 * (mm * n * k) as f64 / ms / 1e9, if int8 { "OPS" } else { "FLOPS" }));
+        }
+    }
+    // the attention on values like the DiT's (q and k unit-RMS after their norm, a spread of scales; v as it comes):
+    // each kernel timed, and its result against the shared kernel's (relative RMS, cosine)
+    for s in spec.get("tokens").and_then(Value::as_str).unwrap_or("4096,49546").split(',').filter_map(|x| x.trim().parse::<usize>().ok()) {
+        let s = s.clamp(64, 200_000);
+        let (h, d) = (dit::HEADS, dit::HEAD);
+        let qkv = DevBuf::new(&m.nsd.gpu, s * 3 * h * d * 2)?;
+        let out = DevBuf::new(&m.nsd.gpu, s * h * d * 2)?;
+        let mut st = 0x2545_f491_4f6c_dd1du64;
+        let mut host = vec![0u16; s * 3 * h * d];
+        for (i, x) in host.iter_mut().enumerate() {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            // roughly normal (a sum of four uniforms), scaled: q and k x 2.5 (sharp attention, as after the norm's gain), v x 1
+            let u: f32 = (0..4).map(|j| ((st >> (j * 16)) & 0xffff) as f32 / 65535.0 - 0.5).sum::<f32>() * 1.7;
+            let col = i % (3 * h * d);
+            *x = crate::w::f32_to_f16(if col < 2 * h * d { u * 2.5 } else { u });
+        }
+        qkv.write(0, bytemuck_u16(&host))?;
+        drop(host);
+        let p = qkv.ptr() as *const u16;
+        let read = |b: &DevBuf| -> Result<Vec<f32>> {
+            let mut raw = vec![0u8; s * h * d * 2];
+            b.read(0, &mut raw)?;
+            Ok(raw.chunks_exact(2).map(|c| nextsycl_gguf::safetensors::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect())
+        };
+        let flops = 4.0 * (s * s * d * h) as f64;
+        let time = |name: String, f: &dyn Fn() -> Result<()>, log: &mut dyn FnMut(String)| -> Result<()> {
+            f()?;
+            m.nsd.wait()?;
+            let t = std::time::Instant::now();
+            let n = iters.min(5);
+            for _ in 0..n {
+                f()?;
+            }
+            m.nsd.wait()?;
+            let ms = t.elapsed().as_secs_f64() * 1e3 / n as f64;
+            log(format!("[bench attention {name} {s} tokens: {ms:.2} ms, {:.1} TFLOPS (4 S^2 D H)]", flops / ms / 1e9));
+            Ok(())
+        };
+        let shared = || m.nsd.attention_qk(p.cast(), s, 3 * h * d, p.wrapping_add(h * d).cast(), p.wrapping_add(2 * h * d).cast(), s, 3 * h * d,
+                                           nextsycl_diffusion::kernels::Dt::F16, h, d, out.ptr().cast(), nextsycl_diffusion::kernels::Dt::F16);
+        time("shared".into(), &shared, log)?;
+        let want = read(&out)?;
+        for tile in 0..m.k.attention_tiles() {
+            let f = || m.k.attention(qkv.ptr(), s, h, d, 3 * h * d, out.ptr(), h * d, false, tile);
+            time(format!("half tile {tile}"), &f, log)?;
+            let (rel, mx, cos) = compare(&read(&out)?, &want);
+            log(format!("[bench attention half tile {tile} vs shared: rel {rel:.3e} max {mx:.3e} cos {cos:.8}]"));
+        }
+        if m.k.attention_tiles() > 0 {
+            let f = || m.k.attention(qkv.ptr(), s, h, d, 3 * h * d, out.ptr(), h * d, true, 0);
+            time("sage".into(), &f, log)?;
+            let (rel, mx, cos) = compare(&read(&out)?, &want);
+            log(format!("[bench attention sage vs shared: rel {rel:.3e} max {mx:.3e} cos {cos:.8}]"));
+        }
+    }
+    Ok(())
+}
+
 pub fn job(m: &HunyuanVideo15, spec: &Value, ctl: &mut JobCtl) -> Result<Value> {
     let dir = Path::new(spec.get("dir").and_then(Value::as_str).ok_or_else(|| Error("check: no dir".into()))?).to_path_buf();
     let stages: Vec<String> = spec.get("stages").and_then(Value::as_str).unwrap_or("te,byt5,dit,vae").split(',').map(|s| s.trim().to_string()).collect();
     let has = |s: &str| stages.iter().any(|x| x == s);
     let mut r = Report { log: &mut *ctl.log, rows: Vec::new(), worst: 0.0 };
     let nsd = &m.nsd;
+    if has("bench") {
+        bench(m, spec, &mut *r.log)?;
+    }
     if has("te") {
         let toks = json_file(&dir.join("tokens.json"))?;
         let crop = toks["crop"].as_u64().unwrap_or(0) as usize;
