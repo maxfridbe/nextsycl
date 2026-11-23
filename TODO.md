@@ -11,7 +11,7 @@ Engine `llm/inkling2` (`inkling2_loop`), cards `inkling-2-mini-q4kxl` / `-q8kxl`
 - [x] Engine, exact against llama.cpp 690b87d (CPU): layers 0.9987-0.9999 cosine (27 tokens), greedy 48/48 and 32/32
   tokens (2,410), spec-check 0; NVFP4 / Q8_0 / BF16 decoding bit for bit ggml's
 - [x] Silo: repacked products, fused decode steps, XMX prompt attention
-- [ ] Register `inkling-2-mini-q4kxl` (and `-q8kxl`) in production (the user's call)
+- [x] Register `inkling-2-mini-q4kxl` and `-q8kxl` in production (2026-11-22, drafter on for both)
 - [x] The DSpark drafter (2026-11-22, round 2): features at applications 5 / 23 / 41 + the head's input, the
   Markov head folded through the head, drafts gated at p 0.7; B65 temperature 1.0: code 55.6 -> 83.8, prose 55.8 ->
   56.6; drafted text = plain text (greedy and sampled)
@@ -24,6 +24,21 @@ Engine `llm/inkling2` (`inkling2_loop`), cards `inkling-2-mini-q4kxl` / `-q8kxl`
   flight did not help), the post-projection step (0.83 ms), the depth mixes (1.2 ms; fusing the convolution into them
   lost)
 - [ ] Prompt: the experts expanded to half one at a time (an XMX int8 grouped GEMM on the repacked blocks instead)
+- [ ] **Next (user approved 2026-11-22, queued): the cheap experiment first.** Fold the depth mix and its norm into
+  the start of the product that consumes it. Each work-group recomputes the 2,304-wide mix from L2, and the mix's
+  117 launches per token are gone. Measure whether removing launches buys the time the profile suggests. A similar
+  fold (the router into gate | up) lost in round 1, so this is a test, not a sure win. Exact as always: spec-check 0,
+  the same greedy tokens, NS_SILO=0 scoring per quant, gate on both cards.
+- [ ] **Then, only if the experiment pays: one fat kernel per layer application.** On the B70 a token is ~14.9 ms of
+  device time: experts 4.8 and dense products 3.8 (both near bandwidth), and ~6.3 ms of small latency-bound steps
+  (depth mixes 1.2, attention 1.0, post-projection 0.83, router 0.75, controllers ~1.3, norms). That is ~1,000 launches
+  per token, each one row of 2,304. Replace ~20 launches per application with one kernel whose resident work-groups
+  walk the phases, with a device-wide barrier between them.
+  - Guess, not measured: ~10-11 ms per token (B70 plain tg ~71 -> 90s). The floor is reading the weights, 7.3 ms.
+  - Risks: Arc SYCL has no supported grid barrier (atomics plus a spin, and a wrong spin wedges the GPU: bound every
+    spin, test small first); every work-group must be resident; round 3 page-faulted both cards with far less.
+  - Cost: days. A new decode path in the silo beside the current one (kept as the fallback and reference), exact on
+    both cards and both quants. The technique would carry over to other engines' decode.
 
 ## Review another DeepSeek engine: Promethevs (2026-11-02)
 
