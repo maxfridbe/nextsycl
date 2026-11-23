@@ -41,15 +41,16 @@ inline float ue4m3_bits(uint32_t x) {
 }
 
 // four codes (a nibble in each byte's low half) to their signed byte values, in the word's arithmetic (no table):
-// magnitude c = code & 7 is the value for c <= 4; for c >= 4 add (c & 3) + 2 (b0 b1) (4 6 8 12); then the sign
+// magnitude c = code & 7 is the value for c <= 4; for c >= 4 add (c & 3) + 2 (b0 b1) (4 6 8 12); then the sign by
+// ones' complement plus one - no carry leaves a byte because the repacking stores -0 (code 8) as +0 (code 0)
 inline uint32_t fp4_bytes(uint32_t t) {
-    constexpr uint32_t ONE = 0x01010101u, H = 0x80808080u;
+    constexpr uint32_t ONE = 0x01010101u;
     const uint32_t c = t & 0x07070707u;
-    const uint32_t ex = (t & 0x03030303u) + (((t & (t >> 1)) & ONE) << 1);
+    const uint32_t ex = (t & 0x03030303u) + (((t << 1) & t) & 0x02020202u);
     const uint32_t hm = ((t >> 2) & ONE) * 0xFFu;
     const uint32_t m = c + (ex & hm);
-    const uint32_t sm = ((t >> 3) & ONE) * 0xFFu;
-    return ((m | H) - ((m << 1) & sm)) ^ H;
+    const uint32_t sg = (t >> 3) & ONE;
+    return (m ^ (sg * 0xFFu)) + sg;
 }
 
 // four code bytes (c: bytes 0-3 of a sub-block) to their eight values as two words of signed bytes: lo the low nibbles'
@@ -302,7 +303,13 @@ int ns_ink2s_pack(ns_gpu* g, int type, const void* raw, int64_t rows, int64_t n_
             const int64_t b = id[0];
             const uint8_t* p = src + b * 36;
             for (int i = 0; i < 4; ++i) s[b * 4 + i] = p[i];
-            for (int i = 0; i < 32; ++i) q[b * 32 + i] = (int8_t) p[4 + i];
+            // -0 (code 8) stored as +0 (code 0): the same value, and the decode's sign step never carries
+            for (int i = 0; i < 32; ++i) {
+                uint8_t c = p[4 + i];
+                if ((c & 0x0F) == 0x08) c &= 0xF0;
+                if ((c & 0xF0) == 0x80) c &= 0x0F;
+                q[b * 32 + i] = (int8_t) c;
+            }
         });
     }
     return 0;
