@@ -260,6 +260,27 @@ enum Ev {
     Fail(String),
 }
 
+/// The tokens an answer is given room for when a session is chosen (`pick_slot`): a request that may run to the end
+/// of the context asks this much at least, so a short session holding its prefix is not taken when it would cut the
+/// answer off (a 25K-token chat in a 32K session ended at 7,372 tokens, 2026-11-22)
+const ANSWER_ROOM: usize = 16384;
+
+/// The free session a prompt `ids` (wanting up to `max` new tokens) goes to, from `free` = (index, its context, the
+/// tokens it holds): among those it fits (16 tokens to spare), first those with room for its answer (`max`, at most
+/// ANSWER_ROOM), then the one holding the longest prefix of the prompt, then the smallest (a long session kept for
+/// the long prompts). A prefix only another session holds is read back from the prompt cache's disk copy, so moving
+/// to a longer session costs little. None: no free session fits it.
+fn pick_slot(free: &[(usize, usize, &[u32])], ids: &[u32], max: usize) -> Option<usize> {
+    let want = max.min(ANSWER_ROOM);
+    free.iter().filter(|(_, ctx, _)| *ctx >= ids.len() + 16)
+        .max_by_key(|(_, ctx, live)| {
+            let room = ctx - ids.len() > want;
+            let prefix = if live.len() < ids.len() && ids.starts_with(live) { live.len() + 1 } else { 0 };
+            (room, prefix, std::cmp::Reverse(*ctx))
+        })
+        .map(|(i, _, _)| *i)
+}
+
 /// A session of the engine's, and the tokens it holds
 struct Slot {
     sess: Session,
@@ -831,14 +852,9 @@ impl Server {
             while active.len() < self.parallel {
                 let Some(mut job) = self.queue.lock().unwrap().pop_front() else { break };
                 let used: Vec<usize> = active.iter().map(|a| a.slot).collect();
-                let fits = |i: usize| slots[i].sess.max_ctx() >= job.ids.len() + 16;
-                // among the free sessions it fits: the one holding the longest prefix of this prompt, then the
-                // smallest (a long session kept for the long prompts)
-                let slot = (0..slots.len()).filter(|i| !used.contains(i) && fits(*i))
-                    .max_by_key(|&i| {
-                        let l = &slots[i].live;
-                        (if l.len() < job.ids.len() && job.ids.starts_with(l) { l.len() + 1 } else { 0 }, std::cmp::Reverse(slots[i].sess.max_ctx()))
-                    });
+                let free: Vec<(usize, usize, &[u32])> = (0..slots.len()).filter(|i| !used.contains(i))
+                    .map(|i| (i, slots[i].sess.max_ctx(), slots[i].live.as_slice())).collect();
+                let slot = pick_slot(&free, &job.ids, job.max);
                 let Some(slot) = slot else {
                     // only busy sessions fit it: it waits at the front
                     self.queue.lock().unwrap().push_front(job);
@@ -1554,6 +1570,29 @@ impl Server {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_long_answer_moves_to_a_session_with_room_for_it() {
+        use super::pick_slot;
+        let held: Vec<u32> = (0..25_000).collect();
+        let ids: Vec<u32> = (0..25_395).collect();
+        // the 32K session holds the chat, the 128K one is empty: an answer with no limit goes to the 128K one
+        let free = [(0, 131_072, &[][..]), (1, 32_768, &held[..])];
+        assert_eq!(pick_slot(&free, &ids, 131_072 - ids.len() - 1), Some(0));
+        // a short answer stays where its prefix is
+        assert_eq!(pick_slot(&free, &ids, 500), Some(1));
+        // a short prompt with room in both: the prefix wins, then the smallest
+        let short: Vec<u32> = (0..2_000).collect();
+        let free2 = [(0, 131_072, &[][..]), (1, 32_768, &[][..])];
+        assert_eq!(pick_slot(&free2, &short, usize::MAX), Some(1));
+        // only the 128K one free and the 32K one too small for the prompt: the 128K one; none fits: None
+        let big: Vec<u32> = (0..40_000).collect();
+        assert_eq!(pick_slot(&free2, &big, 100), Some(0));
+        assert_eq!(pick_slot(&[(1, 32_768, &[][..])], &big, 100), None);
+        // nothing with room for the whole answer: the prefix still decides
+        let free3 = [(0, 32_768, &[][..]), (1, 32_768, &held[..])];
+        assert_eq!(pick_slot(&free3, &ids, usize::MAX), Some(1));
+    }
     use super::cors_headers;
     use super::{calls_of, close_thinking, content_of, py_json, safe_end, typed_args};
     use serde_json::json;
