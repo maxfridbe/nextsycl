@@ -143,6 +143,14 @@ speeds are the DiT's latent tokens a second over the steps and the decoder's tho
 the gate's grammar). The run resolves `--model` from the build copy's registry: the gate's copy needs the model
 pulled (`nextsycl models pull hunyuanvideo-1.5-480p-t2v-distilled-q8 --dir <the models' drive>`).
 
+Recorded at 12844f8 on hardac1 (gate.sh's per-card step run by hand in the build copy - two runs a card under the card's
+lock, the same commands; gate.sh itself would have relinked every kind's library and built without a memory cap):
+
+| Card | exact (both runs) | pp (DiT tokens/s) | tg (decoder kpixels/s) |
+|---|---|---|---|
+| arc-pro-b70-256u-32g | 1225588c2ce6e65a | 9689.0 | 1375.6 |
+| arc-pro-b65-160u-32g | 9d80ad04dc6c5baa | 6467.1 | 727.3 |
+
 ### Lessons
 
 - **oneDNN is not deterministic by default on this GPU**: two runs of the same clip differed (latents up to 7e-3 after

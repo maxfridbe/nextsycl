@@ -133,6 +133,53 @@
           "recorded": "b190b1c (2026-11-22)"
         }
       }
+    },
+    "video/hunyuanvideo15": {
+      "run": "dist/nextsycl video job generate --model hunyuanvideo-1.5-480p-t2v-distilled-q8 --gpu {gpu} --prompt \"A red fox walks through fresh snow in a quiet pine forest at dawn, its breath visible in the cold air, the camera tracking slowly beside it.\" --width 848 --height 480 --seconds 1 --steps 4 --seed 7 --out gate-out/hv15.mp4 --here",
+      "mounts": [
+        "/var/mnt/4TBSSD/nextsycl-models"
+      ],
+      "timeout_s": 900,
+      "gpus": [
+        "0",
+        "1"
+      ],
+      "cards": {
+        "arc-pro-b65-160u-32g": {
+          "exact": "9d80ad04dc6c5baa",
+          "pp": 6467.1,
+          "tg": 727.3,
+          "device": {
+            "name": "Intel(R) Arc(TM) Pro B65 Graphics",
+            "units": 160,
+            "mhz": 2400,
+            "vram_mb": 32656,
+            "sub_groups": [
+              16,
+              32
+            ]
+          },
+          "host": "hardac1",
+          "recorded": "12844f8 (2026-11-23)"
+        },
+        "arc-pro-b70-256u-32g": {
+          "exact": "1225588c2ce6e65a",
+          "pp": 9689.0,
+          "tg": 1375.6,
+          "device": {
+            "name": "Intel(R) Arc(TM) Pro B70 Graphics",
+            "units": 256,
+            "mhz": 2800,
+            "vram_mb": 32656,
+            "sub_groups": [
+              16,
+              32
+            ]
+          },
+          "host": "hardac1",
+          "recorded": "12844f8 (2026-11-23)"
+        }
+      }
     }
   }
 }
