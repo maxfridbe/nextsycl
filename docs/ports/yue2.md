@@ -155,14 +155,20 @@ Forced length (`NS_YUE2_MIN_CODES=15000`), seed 7, folk rock, build copy `~/src/
 | 1206-word lyrics, 600 s, end to end | B70 | | | | | 423 s wall | 8792 MiB |
 | 1206-word lyrics, 600 s, end to end | B65 | 40.1 s | 81.5 codes/s | 367.3 s | 9.3 s | 603 s | 8815 MiB |
 | 1206-word lyrics, 600 s, crossfade | B70 | 28.7 s | 99.7 codes/s | 237.2 s | 6.8 s | 424 s | 8798 MiB |
+| 1206-word lyrics, 600 s, crossfade | B65 | | | | | 622 s wall | 8815 MiB |
+| 420 s, crossfade | B70 | | | | | 315 s wall | 8794 MiB |
+| 420 s, crossfade | B65 | | | | | 454 s wall | 8809 MiB |
+| 600 s, crossfade, guided (cfg 1.2) | B70 | | | | | 541 s wall | 10421 MiB |
+| 600 s, crossfade, guided (cfg 1.2) | B65 | | | | | 747 s wall | 10392 MiB |
 
 The shorter lyrics' song ended at ~390 s (the forced rest is near silence, -85 dB), so its chunk join (401 s) fell in
 silence; the longer lyrics put it in the music (362.9 s). End to end, the latent step at the cut was at the 97th (B70) /
 92nd (B65) percentile of the song's frame steps, level and spectral flux unremarkable (a dip before the B70 cut is the
 music's own: the same codes solved inside chunk 2 dip the same). Crossfaded (B70): the step mid-fade at the 3rd
 percentile, level jump 13th, flux 30th; Whisper over 330-390 s hears the same 11 lines with either join, the line sung
-through the crossfade whole. Not yet measured when this was written: the crossfade on the B65, 420 s on both cards,
-guided (cfg 1.2) peak VRAM at the cap.
+through the crossfade whole. The other crossfaded joins (B65 600 s, 420 s on both cards, guided 600 s on both): spectral
+flux at the join between the 53rd and 80th percentile of the song's, the largest 2 ms sample step well under the song's
+p99.9 - no click, no level jump. Guidance keeps a second cache: 10.2 GiB at the cap, so the card vouches 10.4 GiB.
 
 A free-running song never reached the cap (long lyrics ended at 98 and 234 s). `concurrency` and `coexistence` are not on the card: not measured.
 

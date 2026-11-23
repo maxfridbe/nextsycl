@@ -14,8 +14,8 @@ about: 'M-A-P''s YuE2-3B, non-commercial (CC BY-NC 4.0): one AR-NAR Mixture-of-T
 license: cc-by-nc-4.0
 commercial: false
 gpus: '0,1'                      # a whole copy can run on either card (the B70 first); `audio gen --gpus 0,1` also splits one song: LM there, VAE here
-vram_gib: 8.8                    # on one card: 8.64 GiB measured at the 600 s cap (B65, 15000 codes forced, cfg 1; B70 8.62); guided (cfg != 1) at the cap not yet measured
-headroom_gib: 3.75               #   of it, beyond the 5.05 GiB of weights (the language model, the VAE, SheetSage2)
+vram_gib: 10.4                   # on one card: 10.18 GiB measured at the 600 s cap guided (cfg 1.2: a second cache; B70 10421 MiB, B65 10392); unguided 8.64 GiB
+headroom_gib: 5.35               #   of it, beyond the 5.05 GiB of weights (the language model, the VAE, SheetSage2)
 max_seconds: 600.0                # the longest a request may ask (the engine's MAX_SECONDS; system.models rows carry it)
 defaults:
   seconds: 360.0
