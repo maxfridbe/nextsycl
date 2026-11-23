@@ -352,6 +352,14 @@ fn engine_pairs() -> Vec<(String, String)> {
 /// The front end's name for a model id: by its suffix (minimax-h3 -> INT8, -q6k -> Q6_K, -q4km -> Q4_K_M, -q8 -> Q8_0,
 /// -ref2va -> REF2VA)
 pub fn quant_of(id: &str) -> &'static str {
+    // HunyuanVideo-1.5's models (video/hunyuanvideo15): by the whole id, their suffix (q8) is not a denoiser of H3's
+    if let Some(rest) = id.strip_prefix("hunyuanvideo-1.5-") {
+        return match rest {
+            "480p-t2v-q8" => "HV15-CFG",
+            "480p-i2v-step-distilled-q8" => "HV15-I2V",
+            _ => "HV15",
+        };
+    }
     match id.rsplit('-').next().unwrap_or("") {
         "q6k" => "Q6_K",
         "q4km" => "Q4_K_M",
@@ -361,11 +369,6 @@ pub fn quant_of(id: &str) -> &'static str {
         "ic" => "REGEN2K",
         // minimax-h3-mpeg: MPEG-Diffusion's two-track sampler (video.generate engine: "MPEG")
         "mpeg" => "MPEG",
-        _ if id.starts_with("hunyuanvideo-1.5-") => match id.trim_start_matches("hunyuanvideo-1.5-") {
-            "480p-t2v-q8" => "HV15-CFG",
-            "480p-i2v-step-distilled-q8" => "HV15-I2V",
-            _ => "HV15",
-        },
         _ => "INT8",
     }
 }
