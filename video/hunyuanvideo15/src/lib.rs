@@ -1,0 +1,406 @@
+//! HunyuanVideo-1.5 on Intel Arc (SYCL): text to video at 480p, the whole pipeline on one GPU - the 480p T2V DiT
+//! (cfg-distilled: one pass a step; or the base model with CFG over a negative prompt), the step-distilled I2V DiT
+//! later.
+//!
+//! ```text
+//!   prompt -> the video template (PROMPT_TEMPLATE_ENCODE_VIDEO_JSON, chat-formatted) -> Qwen2.5-VL-7B
+//!             (crates/hunyuan-text: hidden_states[-3], the template's head dropped)
+//!          -> its quoted text "..." / “...” -> byT5-small (the glyph tokens)
+//!   noise [F, h, w, 32] (torch.randn's draws from the seed, bfloat16 as the pipeline makes them)
+//!     -> Euler over the shifted schedule (shift 5), the DiT's velocity each step (dit.rs: 54 double blocks; CFG on the
+//!        base model)
+//!   latents -> the 3-D causal VAE decoder (vae.rs: 16x in space, 4x in time; tiles of 256 pixels) -> frames -> mp4
+//! ```
+//!
+//! The files are the official ones: the DiT's float32 safetensors (quantized to Q8_0 as it loads), the VAE's; the
+//! text encoders are HunyuanImage 2.1's GGUFs (the same Qwen2.5-VL-7B and Glyph-SDXL-v2 byT5: model-cards/video).
+//! `check` compares each stage with reference/hunyuanvideo15/ref.py's dumps.
+
+pub mod check;
+pub mod dit;
+mod ffi;
+pub mod vae;
+mod w;
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+use nextsycl_core::{DevBuf, Gpu};
+use nextsycl_diffusion::kernels::Nsd;
+use nextsycl_hunyuan_text::{byt5, te};
+use nextsycl_video::{At, Clip, Defaults, EngineOption, Error, JobCtl, LoadOptions, ModelFiles, Progress, Result, Sampler, Schedule, VideoEngine,
+                     VideoKind, VideoRequest};
+use serde_json::{json, Value};
+
+pub const ARCH: &str = "hunyuanvideo-1.5";
+/// the denoiser (the transformer's safetensors, its config.json beside it), the text encoders, the VAE (its
+/// safetensors); `vision` the I2V image encoder
+pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "byt5", "vae"];
+
+const GIB: f64 = (1u64 << 30) as f64;
+
+/// The options it takes (`--opt-NAME`)
+pub const OPTIONS: &[EngineOption] = &[
+    EngineOption { name: "cfg", env: "NS_HV15_CFG", value: "X", help: "the classifier-free guidance scale (the base model's 6; 1: one pass a step, the cfg-distilled card)", at: At::Both },
+    EngineOption { name: "steps", env: "NS_HV15_STEPS", value: "N", help: "the denoising steps when a request does not say (default 50: what the cfg-distilled card needs)", at: At::Load },
+    EngineOption { name: "shift", env: "NS_HV15_SHIFT", value: "X", help: "the schedule's shift (default 5, the 480p cards')", at: At::Both },
+    EngineOption { name: "negative", env: "", value: "TEXT", help: "the negative prompt of a guided run (default empty, as the pipeline)", at: At::Request },
+];
+
+/// This engine's registry entry
+pub fn kind() -> VideoKind {
+    VideoKind { archs: &[ARCH], name: "HunyuanVideo-1.5 (8.3B DiT with Q8_0 products, Qwen2.5-VL + byT5 text, 3-D causal VAE; 480p text to video)", roles: ROLES, load,
+                options: OPTIONS }
+}
+
+fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<Box<dyn VideoEngine>> {
+    let gpu = gpus.first().ok_or_else(|| Error("no GPU".into()))?;
+    Ok(Box::new(HunyuanVideo15::load(files, gpu, o, log)?))
+}
+
+fn role<'f>(files: &'f ModelFiles, r: &str) -> Result<&'f Path> {
+    files.get(r).map(|p| p.as_path()).ok_or_else(|| Error(format!("{ARCH}: no {r} file")))
+}
+
+/// The video template (PROMPT_TEMPLATE_ENCODE_VIDEO_JSON through Qwen2.5-VL's chat template, the generation prompt
+/// added; the system text keeps the source's line continuations as runs of spaces)
+pub fn template() -> te::Template {
+    let system = "You are a helpful assistant. Describe the video by detailing the following aspects:         1. The main content and theme of the video.         2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects.         3. Actions, events, behaviors temporal relationships, physical movement changes of the objects.         4. background environment, light, style and atmosphere.         5. camera angles, movements, and transitions used in the video.";
+    te::Template { head: format!("<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n"), tail: "<|im_end|>\n<|im_start|>assistant\n".into(), crop: 0,
+                   max_tokens: 0, empty_as_space: true }
+}
+
+/// The 480p buckets (generate_crop_size_list(640, 16)): (height, width)
+pub fn buckets() -> Vec<(usize, usize)> {
+    let n = 1600usize;
+    let (mut wp, mut hp) = (n, 1usize);
+    let mut v = Vec::new();
+    while wp > 0 {
+        if wp.max(hp) as f64 / wp.min(hp) as f64 <= 4.0 {
+            v.push((wp * 16, hp * 16));
+        }
+        if (hp + 1) * wp <= n {
+            hp += 1;
+        } else {
+            wp -= 1;
+        }
+    }
+    v
+}
+
+/// The bucket nearest in aspect to width x height (get_closest_ratio: the first of equals): (width, height)
+pub fn canvas(width: usize, height: usize) -> (usize, usize) {
+    let ar = height as f64 / width.max(1) as f64;
+    let b = buckets();
+    let mut best = 0;
+    let mut bd = f64::INFINITY;
+    for (i, (h, w)) in b.iter().enumerate() {
+        let r = ((*h as f64 / *w as f64) * 1e5).round() / 1e5;
+        let d = (r - ar).abs();
+        if d < bd {
+            bd = d;
+            best = i;
+        }
+    }
+    (b[best].1, b[best].0)
+}
+
+/// Frames for `seconds` at 24 fps: 4k + 1, rounded up (121 for 5 s)
+pub fn frames_for(seconds: f32) -> usize {
+    let f = ((seconds.max(0.04) * 24.0).round() as usize).max(1);
+    (f - 1).div_ceil(4) * 4 + 1
+}
+
+/// The pipeline's starting noise: torch.randn((1, 32, F, h, w), generator seeded, bfloat16) - the draws in that order,
+/// rounded to bfloat16 - as tokens [F h w, 32]
+pub fn noise(seed: u64, f: usize, h: usize, w: usize) -> Vec<f32> {
+    let n = f * h * w;
+    let v = nextsycl_diffusion::torch_rng::Mt19937::new(seed).randn(n * dit::LATENT);
+    let bf = |x: f32| -> f32 {
+        let b = x.to_bits();
+        let r = b.wrapping_add(0x7fff + ((b >> 16) & 1));
+        f32::from_bits(r & 0xffff_0000)
+    };
+    let mut out = vec![0f32; n * dit::LATENT];
+    for c in 0..dit::LATENT {
+        for p in 0..n {
+            out[p * dit::LATENT + c] = bf(v[c * n + p]);
+        }
+    }
+    out
+}
+
+/// The shifted schedule: linspace(1, 0, steps + 1), sigma' = shift sigma / (1 + (shift - 1) sigma), in float32
+pub fn sigmas(steps: usize, shift: f32) -> Vec<f32> {
+    (0..=steps)
+        .map(|i| {
+            let s = 1.0 - i as f32 / steps as f32;
+            shift * s / (1.0 + (shift - 1.0) * s)
+        })
+        .collect()
+}
+
+/// A prompt encoded for the DiT
+pub struct Encoded {
+    pub text: dit::Text,
+}
+
+pub struct HunyuanVideo15 {
+    pub nsd: Nsd,
+    k: ffi::K,
+    pub te: te::TextEncoder,
+    pub byt5: byt5::Byt5,
+    pub dit: dit::Dit,
+    pub vae: vae::Vae,
+    cfg: f32,
+    steps: usize,
+    shift: f32,
+    loaded: Instant,
+    load_s: f64,
+}
+
+impl HunyuanVideo15 {
+    pub fn load(files: &ModelFiles, gpu: &Arc<Gpu>, o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<HunyuanVideo15> {
+        let t0 = Instant::now();
+        nextsycl_core::use_kind("video");
+        let size = |r: &str| -> Result<u64> { std::fs::metadata(role(files, r)?).map(|m| m.len()).map_err(|e| Error(format!("{r}: {e}"))) };
+        // the plan before anything is allocated (the driver has no out-of-memory error): the DiT's float32 file as Q8_0
+        // (a quarter, plus scales), 26 of the text encoder's 28 layers, byT5 in float32, the VAE's decoder in half (an
+        // eighth of the float32 file: half of it the decoder) and its reordered copy, the activations of a 480p clip
+        // (measured: docs/ports/hunyuanvideo15.md)
+        let need = size("denoiser")? * 34 / 128 + size("text-encoder")? * 26 / 28 + size("byt5")? * 2 + size("vae")? / 4 + (10u64 << 30);
+        let (total, free) = gpu.memory()?;
+        let free = free.unwrap_or(total);
+        if need > free {
+            return Err(Error(format!("{ARCH} needs about {:.1} GiB on {}; {:.1} GiB are free", need as f64 / GIB, gpu.name, free as f64 / GIB)));
+        }
+        let nsd = Nsd::new(gpu)?;
+        let k = ffi::K::new(gpu)?;
+        let setting = |name: &str| o.setting(name).filter(|v| !v.is_empty());
+        let num = |name: &str, d: f32| -> Result<f32> { setting(name).map_or(Ok(d), |v| v.parse().map_err(|_| Error(format!("{name}={v}: a number")))) };
+        let cfg = num("NS_HV15_CFG", 1.0)?;
+        let steps = num("NS_HV15_STEPS", 50.0)? as usize;
+        let shift = num("NS_HV15_SHIFT", 5.0)?;
+        let st = w::St::open(role(files, "denoiser")?)?;
+        let dit = dit::Dit::load(&st, &k, log)?;
+        drop(st);
+        let kern: Arc<dyn nextsycl_hunyuan_text::Kern> = Arc::new(k.clone());
+        let mut te = te::TextEncoder::load(role(files, "text-encoder")?, role(files, "tokenizer")?, &nsd, kern.clone(), template(), log)?;
+        // the pipeline's text_len: 1000 tokens after the crop
+        te.template.max_tokens = te.template.crop + 1000;
+        let byt5 = byt5::Byt5::load(role(files, "byt5")?, &nsd, kern, log)?;
+        let vae = vae::Vae::load(role(files, "vae")?, &k, log)?;
+        let load_s = t0.elapsed().as_secs_f64();
+        log(format!("{ARCH}: loaded in {load_s:.1} s (cfg {cfg}, {steps} steps, shift {shift})"));
+        Ok(HunyuanVideo15 { nsd, k, te, byt5, dit, vae, cfg, steps, shift, loaded: Instant::now(), load_s })
+    }
+
+    /// The prompt through both text encoders and the DiT's prompt-only layers
+    pub fn encode(&self, prompt: &str, vision: Option<&[f32]>) -> Result<Encoded> {
+        let q = self.te.encode(&self.nsd, prompt)?;
+        let b = match byt5::quoted(prompt, byt5::Quotes::InOrder) {
+            Some(t) => Some(self.byt5.encode(&self.nsd, &byt5::ids(&t, 256))?),
+            None => None,
+        };
+        Ok(Encoded { text: self.dit.text(&self.nsd, &q, b.as_deref(), vision)? })
+    }
+
+    /// Denoise `x` (float32 [F h w, 32]) over `sigmas` with Euler on the GPU; `neg` the guided run's negative and its
+    /// scale; `cond` float32 [n, 33] (the condition latents and the mask; zeros for T2V). Returns the latents.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise(&self, pos: &Encoded, neg: Option<(&Encoded, f32)>, x: &[f32], grid: (usize, usize, usize), cond: &[f32], sigmas: &[f32],
+                   each: &mut dyn FnMut(usize, &DevBuf) -> Result<()>) -> Result<DevBuf> {
+        let nsd = &self.nsd;
+        let steps = sigmas.len() - 1;
+        let ts: Vec<(f32, Option<f32>)> = (0..steps)
+            .map(|i| (sigmas[i] * 1000.0, self.dit.meanflow.then(|| if i + 1 < steps { sigmas[i + 1] * 1000.0 } else { 0.0 })))
+            .collect();
+        let st = self.dit.steps(nsd, &ts)?;
+        let mut texts = vec![&pos.text];
+        if let Some((e, _)) = neg {
+            texts.push(&e.text);
+        }
+        let batch = self.dit.batch(nsd, &texts, grid)?;
+        let lat = DevBuf::from_f32(&nsd.gpu, x)?;
+        let cond = DevBuf::from_f32(&nsd.gpu, cond)?;
+        let n = x.len();
+        for i in 0..steps {
+            let lats: Vec<&DevBuf> = texts.iter().map(|_| &lat).collect();
+            let v = self.dit.forward(nsd, &st, i, &batch, &lats, &cond, &mut |_, _, _, _| Ok(()))?;
+            let v = match neg {
+                Some((_, scale)) => {
+                    // v_neg + scale (v - v_neg)
+                    self.k.axpy(v[0].fp(), v[1].fp(), n, -1.0)?;
+                    self.k.axpy(v[1].fp(), v[0].fp(), n, scale)?;
+                    v.into_iter().nth(1).ok_or_else(|| Error("no velocity".into()))?
+                }
+                None => v.into_iter().next().ok_or_else(|| Error("no velocity".into()))?,
+            };
+            self.k.axpy(lat.fp(), v.fp(), n, sigmas[i + 1] - sigmas[i])?;
+            nsd.gpu.sync()?;
+            each(i, &lat)?;
+        }
+        Ok(lat)
+    }
+
+    /// A clip: (frames planar [3, F, H, W] in [0, 1], frames, height, width) and its timings
+    #[allow(clippy::too_many_arguments)]
+    pub fn make(&self, prompt: &str, negative: &str, width: usize, height: usize, frames: usize, steps: usize, cfg: f32, shift: f32, seed: u64,
+                progress: &mut dyn FnMut(&'static str, usize, usize) -> Result<()>, log: &mut dyn FnMut(String)) -> Result<(Vec<f32>, usize, usize, usize)> {
+        let (w, h) = canvas(width, height);
+        let f = (frames - 1) / 4 + 1;
+        let grid = (f, h / 16, w / 16);
+        let t0 = Instant::now();
+        progress("encode", 0, 0)?;
+        let pos = self.encode(prompt, None)?;
+        let neg = if cfg > 1.0 { Some(self.encode(negative, None)?) } else { None };
+        log(format!("{ARCH}: {w}x{h}, {frames} frames ({} x {} x {} latents, {} tokens), {steps} steps, cfg {cfg}, shift {shift}, seed {seed}; text in {:.1} s",
+                    grid.0, grid.1, grid.2, grid.0 * grid.1 * grid.2, t0.elapsed().as_secs_f64()));
+        let x = noise(seed, grid.0, grid.1, grid.2);
+        let n = grid.0 * grid.1 * grid.2;
+        let cond = vec![0f32; n * (dit::IN - dit::LATENT)];
+        let sig = sigmas(steps, shift);
+        let t1 = Instant::now();
+        let lat = self.denoise(&pos, neg.as_ref().map(|e| (e, cfg)), &x, grid, &cond, &sig, &mut |i, _| progress("denoise", i + 1, steps))?;
+        let lat = lat.to_f32()?;
+        let ds = t1.elapsed().as_secs_f64();
+        log(format!("{ARCH}: {steps} steps in {ds:.1} s ({:.2} s a step)", ds / steps as f64));
+        progress("decode", 0, 0)?;
+        let t2 = Instant::now();
+        let (v, to, oh, ow) = self.vae.decode(&self.nsd, &lat, grid.0, grid.1, grid.2, &mut |s| log(format!("decode: {s}")))?;
+        log(format!("{ARCH}: decoded {to} frames {ow}x{oh} in {:.1} s", t2.elapsed().as_secs_f64()));
+        let plane = oh * ow;
+        let mut px = vec![0f32; 3 * to * plane];
+        for t in 0..to {
+            for p in 0..plane {
+                for c in 0..3 {
+                    px[(c * to + t) * plane + p] = (v[(t * plane + p) * 3 + c] * 0.5 + 0.5).clamp(0.0, 1.0);
+                }
+            }
+        }
+        Ok((px, to.min(frames), oh, ow))
+    }
+
+    fn generate_job(&self, spec: &Value, ctl: &mut JobCtl) -> Result<Value> {
+        let s = |k: &str| spec.get(k).and_then(Value::as_str);
+        let n = |k: &str| spec.get(k).and_then(Value::as_f64);
+        let prompt = s("prompt").ok_or_else(|| Error("generate: no prompt".into()))?;
+        let out = PathBuf::from(s("out").ok_or_else(|| Error("generate: no out".into()))?);
+        let (w0, h0) = canvas(848, 480);
+        let width = n("width").map_or(w0, |x| x as usize);
+        let height = n("height").map_or(h0, |x| x as usize);
+        let frames = match n("frames") {
+            Some(f) => frames_for(f as f32 / 24.0),
+            None => frames_for(n("seconds").unwrap_or(5.0) as f32),
+        };
+        let steps = n("steps").map_or(self.steps, |x| x as usize).clamp(1, 200);
+        let cfg = n("cfg").map_or(self.cfg, |x| x as f32);
+        let shift = n("shift").map_or(self.shift, |x| x as f32);
+        let seed = n("seed").map_or(0, |x| x as i64 as u64);
+        let negative = s("negative").or(s("negative_prompt")).unwrap_or("");
+        let t0 = Instant::now();
+        let cancel = ctl.cancel;
+        let mut progress = |stage: &'static str, at: usize, of: usize| -> Result<()> {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Error("cancelled".into()));
+            }
+            if let (Some(p), true) = (ctl.progress.as_mut(), stage == "denoise") {
+                p(at, of);
+            }
+            Ok(())
+        };
+        let mut log_lines = Vec::new();
+        let (px, f, h, w) = self.make(prompt, negative, width, height, frames, steps, cfg, shift, seed, &mut progress, &mut |l| log_lines.push(l))?;
+        for l in log_lines {
+            (ctl.log)(l);
+        }
+        let mut log = |l: String| (ctl.log)(l);
+        nextsycl_h3::media::write_mp4(&out, &nextsycl_h3::media::Frames { px: &px, count: f, height: h, width: w, fps: 24 }, None, &mut log)
+            .map_err(|e| Error(e.0))?;
+        Ok(json!({"out": out, "width": w, "height": h, "frames": f, "fps": 24, "seconds": t0.elapsed().as_secs_f64(), "steps": steps, "cfg": cfg,
+                  "seed": seed}))
+    }
+}
+
+impl VideoEngine for HunyuanVideo15 {
+    fn arch(&self) -> &'static str {
+        ARCH
+    }
+    fn defaults(&self) -> Defaults {
+        Defaults { width: 848, height: 480, seconds: 5.0, fps: 24.0, steps: self.steps as u32, cfg: self.cfg, sampler: Sampler::Euler, schedule: Schedule::Shift,
+                   shift: self.shift, upscale: 1.0 }
+    }
+    fn load_seconds(&self) -> f64 {
+        self.load_s
+    }
+    fn options(&self) -> &'static [EngineOption] {
+        OPTIONS
+    }
+    fn jobs(&self) -> &'static [&'static str] {
+        &["generate", "check"]
+    }
+    fn run_job(&self, spec: &Value, ctl: &mut JobCtl) -> Result<Value> {
+        match spec.get("kind").and_then(Value::as_str) {
+            Some("generate") => self.generate_job(spec, ctl),
+            Some("check") => check::job(self, spec, ctl),
+            k => Err(Error(format!("{ARCH}: no job {k:?} (generate, check)"))),
+        }
+    }
+    fn device_stats(&self) -> Option<(u64, u64, Option<u64>)> {
+        let (total, free) = self.nsd.gpu.memory().ok()?;
+        Some((total - free.unwrap_or(total), total, free))
+    }
+    fn generate(&self, req: &VideoRequest, progress: &mut dyn FnMut(Progress), cancel: &dyn Fn() -> bool) -> Result<Clip> {
+        let d = self.defaults();
+        let t0 = Instant::now();
+        let frames = frames_for(req.seconds.unwrap_or(d.seconds));
+        let cfg = req.cfg.unwrap_or(d.cfg);
+        let mut p = |stage: &'static str, at: usize, of: usize| -> Result<()> {
+            if cancel() {
+                return Err(Error("cancelled".into()));
+            }
+            progress(Progress { stage, at: at as u32, of: of as u32, seconds: t0.elapsed().as_secs_f64() });
+            Ok(())
+        };
+        let negative = req.negative.clone().or_else(|| req.extra.get("negative").cloned()).unwrap_or_default();
+        let (px, f, h, w) = self.make(&req.prompt, &negative, req.width.unwrap_or(d.width) as usize, req.height.unwrap_or(d.height) as usize, frames,
+                                      req.steps.unwrap_or(d.steps) as usize, cfg, req.shift.unwrap_or(d.shift), req.seed, &mut p, &mut |l| eprintln!("{l}"))?;
+        progress(Progress { stage: "mux", at: 0, of: 0, seconds: t0.elapsed().as_secs_f64() });
+        nextsycl_h3::media::write_mp4(&req.out, &nextsycl_h3::media::Frames { px: &px, count: f, height: h, width: w, fps: 24 }, None, &mut |l| eprintln!("{l}"))
+            .map_err(|e| Error(e.0))?;
+        Ok(Clip { path: req.out.clone(), width: w as u32, height: h as u32, frames: f as u32, fps: 24.0, audio: false })
+    }
+    fn report(&self) -> Vec<String> {
+        vec![format!("{ARCH} on {} (loaded {:.0} s ago; {:.1} GiB of weights)", self.nsd.gpu.name, self.loaded.elapsed().as_secs_f64(),
+                     (self.dit.bytes + self.te.bytes + self.byt5.bytes + self.vae.bytes) as f64 / GIB)]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_480p_buckets_are_the_pipelines() {
+        // 16:9 -> 848 x 480, 9:16 -> 480 x 848, 1:1 -> 640 x 640
+        assert_eq!(super::canvas(16, 9), (848, 480));
+        assert_eq!(super::canvas(9, 16), (480, 848));
+        assert_eq!(super::canvas(640, 640), (640, 640));
+        assert_eq!(super::canvas(848, 480), (848, 480));
+    }
+
+    #[test]
+    fn frames_are_4k_plus_1() {
+        assert_eq!(super::frames_for(5.0), 121);
+        assert_eq!(super::frames_for(0.375), 9);
+        assert_eq!(super::frames_for(1.0), 25);
+    }
+
+    #[test]
+    fn the_schedule_is_shifted_linspace() {
+        let s = super::sigmas(2, 5.0);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0], 1.0);
+        assert!((s[1] - 2.5 / 3.0).abs() < 1e-6);
+        assert_eq!(s[2], 0.0);
+    }
+}

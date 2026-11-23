@@ -2759,7 +2759,7 @@ pub struct VideoGenerateReq {
     /// a ControlNet control clip (file); not with Ref2VA
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_video: Option<String>,
-    /// the denoiser, by video.engines.list's quant (Q8_0 is read as INT8); REF2VA is chosen by itself when ref_images or ref_videos are given. MPEG (minimax-h3-mpeg): a fast draft on two tracks - half resolution, then full resolution on the subject the model picks; it takes keyframes, guides and sound (first_frame, last_frame, guide_clip, first_audio, soundtrack), not references ("REF2VA is not supported by MPEG yet"), ControlNet, masked runs or other samplers; width and height multiples of 64
+    /// the denoiser, by video.engines.list's quant (Q8_0 is read as INT8); REF2VA is chosen by itself when ref_images or ref_videos are given. MPEG (minimax-h3-mpeg): a fast draft on two tracks - half resolution, then full resolution on the subject the model picks; it takes keyframes, guides and sound (first_frame, last_frame, guide_clip, first_audio, soundtrack), not references ("REF2VA is not supported by MPEG yet"), ControlNet, masked runs or other samplers; width and height multiples of 64. HV15 (hunyuanvideo-1.5-480p-t2v-distilled-q8) / HV15-CFG (hunyuanvideo-1.5-480p-t2v-q8): HunyuanVideo-1.5 text to video, no sound - the 480p frame nearest the width x height asked in shape (16:9: 848 x 480; default 848 x 480), 4k + 1 frames (5 s: 121, at most 10 s), 50 steps; prompt, seconds or frames, steps and seed are what it reads
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(default = "INT8")]
     pub engine: Option<String>,
@@ -2909,9 +2909,9 @@ pub struct VideoGenerateReq {
     /// anchor or file: a masked run - this clip's latents are kept outside the regenerated part
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// denoising steps; below 8 only with a turbo LoRA
+    /// denoising steps; below 8 only with a turbo LoRA. H3: at most 40 (default 10); HunyuanVideo-1.5 (engine HV15, HV15-CFG): default 50, at most 100 - the cfg-distilled model needs its 50
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
-    #[schema(min = 1, max = 40, default = 10)]
+    #[schema(min = 1, max = 100, default = 10)]
     pub steps: Option<i64>,
     /// the text encoder
     #[serde(default, skip_serializing_if = "Option::is_none")]

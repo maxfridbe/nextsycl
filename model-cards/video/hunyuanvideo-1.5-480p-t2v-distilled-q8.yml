@@ -1,0 +1,36 @@
+# HunyuanVideo-1.5 480p T2V cfg-distilled (Q8_0 products; text to video, 5 s at 480p; Tencent Hunyuan Community License)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: hunyuanvideo-1.5-480p-t2v-distilled-q8
+kind: video
+arch: hunyuanvideo-1.5
+license: tencent-hunyuan-community
+commercial: true
+license_note: 'Tencent Hunyuan Community License (HunyuanVideo-1.5): not licensed in the European Union, the United Kingdom or South Korea; a licence from Tencent above 100 million monthly active users; its Acceptable Use Policy; outputs may not improve another AI model. The DiT and VAE are the official float32 files (the DiT quantized to Q8_0 as it loads); the text encoders are HunyuanImage 2.1''s files: Qwen2.5-VL-7B (Apache-2.0, calcuis'' Q4_0 GGUF) and Glyph-SDXL-v2''s byT5 (calcuis/pig-encoder, MIT as that repository states).'
+title: 'HunyuanVideo-1.5 480p T2V cfg-distilled (Q8_0 products; text to video, 5 s at 480p; Tencent Hunyuan Community License)'
+about: Tencent's 8.3B video DiT (54 double-stream blocks), its cfg-distilled 480p text-to-video checkpoint - one pass a step, 50 steps - with its 3-D causal VAE; HunyuanImage 2.1's Qwen2.5-VL and byT5 text encoders
+gpus: '0'
+defaults:
+  steps: 50
+  seconds: 5.0
+  size: 848x480
+env:
+  NS_HV15_CFG: '1'
+  NS_HV15_STEPS: '50'
+  NS_HV15_SHIFT: '5'
+files:
+  denoiser:
+    key: hunyuanvideo15-480p-t2v-distilled
+    url: https://huggingface.co/tencent/HunyuanVideo-1.5/resolve/9b49404b3f5df2a8f0b31df27a0c7ab872e7b038/transformer/480p_t2v_distilled/diffusion_pytorch_model.safetensors
+    size: 33306632192
+    sha256: 0f35dc10a4037a618b22fef4ee20f8a9d972b4cf2e684764ed8f442fc7a2583f
+    path: hunyuanvideo15/transformer/480p_t2v_distilled/diffusion_pytorch_model.safetensors
+  text-encoder: hunyuanimage-21-qwen25vl-q40
+  tokenizer: qwen25-vl-tokenizer
+  byt5: hunyuanimage-21-byt5-f16
+  vae:
+    key: hunyuanvideo15-vae
+    url: https://huggingface.co/tencent/HunyuanVideo-1.5/resolve/9b49404b3f5df2a8f0b31df27a0c7ab872e7b038/vae/diffusion_pytorch_model.safetensors
+    size: 5042560980
+    sha256: 2609ed7033c052fdf164afcac71e8a7c82afccdbb001d673444a72f194fbb918
+    path: hunyuanvideo15/vae/diffusion_pytorch_model.safetensors
+guide: guides/hunyuanvideo-1.5.md

@@ -46,6 +46,7 @@ nextsycl-image-starvector.workspace = true
 nextsycl-video.workspace = true
 nextsycl-video-example.workspace = true
 nextsycl-video-h3.workspace = true
+nextsycl-video-hunyuanvideo15.workspace = true
 nextsycl-audio.workspace = true
 nextsycl-audio-example.workspace = true
 nextsycl-audio-minimaxmusic3.workspace = true

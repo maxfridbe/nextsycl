@@ -32,7 +32,7 @@ in the service's container: nextsycl video daemon --socket PATH --model ID [--en
 
 /// The video engines this program has (video/<arch>)
 pub fn engines() -> Vec<VideoKind> {
-    vec![nextsycl_video_h3::kind(), nextsycl_video_example::kind()]
+    vec![nextsycl_video_h3::kind(), nextsycl_video_hunyuanvideo15::kind(), nextsycl_video_example::kind()]
 }
 
 pub(crate) fn opt<'a>(args: &'a [String], k: &str) -> Option<&'a str> {

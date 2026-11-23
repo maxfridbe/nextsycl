@@ -1,0 +1,15 @@
+[package]
+name = "nextsycl-video-hunyuanvideo15"
+description = "HunyuanVideo-1.5 on Intel Arc (SYCL): its 8.3B DiT (Q8_0 products), Qwen2.5-VL + byT5 text encoders and 3-D causal VAE - text to video at 480p"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-h3.workspace = true
+nextsycl-hunyuan-text.workspace = true
+nextsycl-video.workspace = true
+serde_json.workspace = true

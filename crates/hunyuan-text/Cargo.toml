@@ -1,0 +1,12 @@
+[package]
+name = "nextsycl-hunyuan-text"
+description = "Hunyuan's text encoders, shared by HunyuanImage 2.1 and HunyuanVideo-1.5: Qwen2.5-VL-7B's hidden states (Q4_0) and Glyph-SDXL-v2's byT5-small for quoted text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nextsycl-core.workspace = true
+nextsycl-diffusion.workspace = true
+nextsycl-gguf.workspace = true
+nextsycl-tok.workspace = true

@@ -131,6 +131,36 @@ pub fn check_canvas(w: i64, h: i64) -> Result<(), RpcError> {
     Ok(())
 }
 
+/// HunyuanVideo-1.5's engines (video.generate engine HV15, HV15-CFG, HV15-I2V): their default steps and the most
+/// they take, or None for H3's
+pub fn hv15_rules(engine: &str) -> Option<(f64, f64)> {
+    match engine {
+        "HV15-I2V" => Some((8.0, 50.0)),
+        e if e.starts_with("HV15") => Some((50.0, 100.0)),
+        _ => None,
+    }
+}
+
+/// HunyuanVideo-1.5's frame counts: 4k + 1, 5 s is 121 (what it was trained on), at most 10 s
+pub const HV15_FRAMES: (u64, u64) = (5, 241);
+
+/// HunyuanVideo-1.5's frames for `seconds` (the engine's frames_for: 24 fps, up to the next 4k + 1)
+pub fn hv15_frames(seconds: f64) -> u64 {
+    let f = ((seconds * 24.0).round() as u64).max(1);
+    (f - 1).div_ceil(4) * 4 + 1
+}
+
+/// HunyuanVideo-1.5's canvas: sides multiples of 16 (the engine takes the 480p bucket nearest in shape)
+pub fn check_canvas_16(w: i64, h: i64) -> Result<(), RpcError> {
+    if w % 16 != 0 || h % 16 != 0 {
+        return Err(RpcError::param("width and height must be multiples of 16"));
+    }
+    if !(256..=1344).contains(&w) || !(256..=1344).contains(&h) {
+        return Err(RpcError::param("width and height must be between 256 and 1344"));
+    }
+    Ok(())
+}
+
 /// Frame counts the model makes: 17k + 5, from 22 (0.92 s) to 362 (15.08 s) at 24 fps
 pub const FRAMES: (u64, u64) = (22, 362);
 
@@ -331,6 +361,11 @@ pub fn quant_of(id: &str) -> &'static str {
         "ic" => "REGEN2K",
         // minimax-h3-mpeg: MPEG-Diffusion's two-track sampler (video.generate engine: "MPEG")
         "mpeg" => "MPEG",
+        _ if id.starts_with("hunyuanvideo-1.5-") => match id.trim_start_matches("hunyuanvideo-1.5-") {
+            "480p-t2v-q8" => "HV15-CFG",
+            "480p-i2v-step-distilled-q8" => "HV15-I2V",
+            _ => "HV15",
+        },
         _ => "INT8",
     }
 }
@@ -377,9 +412,15 @@ impl Studio {
         if te != "teacher" && te != "student" {
             return Err(RpcError::param("te must be teacher or student"));
         }
-        let width = num(p, "width", 768.0, 256.0, 1344.0, true)?;
-        let height = num(p, "height", 576.0, 256.0, 1344.0, true)?;
-        check_canvas(width.as_i64().unwrap_or(0), height.as_i64().unwrap_or(0))?;
+        // HunyuanVideo-1.5 (engine HV15...): its own canvas, length and step rules (hv15_rules)
+        let hv = hv15_rules(&engine_name(p.get("engine").and_then(|v| v.as_str())));
+        let (dw, dh) = hv.map_or((768.0, 576.0), |_| (848.0, 480.0));
+        let width = num(p, "width", dw, 256.0, 1344.0, true)?;
+        let height = num(p, "height", dh, 256.0, 1344.0, true)?;
+        match hv {
+            Some(_) => check_canvas_16(width.as_i64().unwrap_or(0), height.as_i64().unwrap_or(0))?,
+            None => check_canvas(width.as_i64().unwrap_or(0), height.as_i64().unwrap_or(0))?,
+        }
         let chain_mode = p.get("chain_mode").and_then(|v| v.as_str()).unwrap_or("video");
         if !CHAIN_MODES.iter().any(|(m, _)| *m == chain_mode) {
             return Err(RpcError::param("chain_mode must be one of video, png, latent, none"));
@@ -413,6 +454,17 @@ impl Studio {
         it.insert("knots".into(), knots);
         // frames, when given, set the length exactly (seconds = frames / 24); else seconds snapped up to the grid
         match p.get("frames").filter(|v| !v.is_null()) {
+            Some(f) if hv.is_some() => {
+                let f = f.as_u64().filter(|f| f % 4 == 1 && (HV15_FRAMES.0..=HV15_FRAMES.1).contains(f))
+                    .ok_or_else(|| RpcError::param(&format!("frames: HunyuanVideo-1.5 makes 4k + 1 frames ({}-{})", HV15_FRAMES.0, HV15_FRAMES.1)))?;
+                it.insert("seconds".into(), json!(f as f64 / 24.0));
+                it.insert("frames".into(), json!(f));
+            }
+            None if hv.is_some() => {
+                let sec = num(p, "seconds", 5.0, 0.2, HV15_FRAMES.1 as f64 / 24.0, false)?;
+                it.insert("frames".into(), json!(hv15_frames(sec.as_f64().unwrap_or(5.0))));
+                it.insert("seconds".into(), sec);
+            }
             Some(f) => {
                 let f = check_frames(f.as_u64().ok_or_else(|| RpcError::param("frames: a whole number"))?)?;
                 it.insert("seconds".into(), json!(f as f64 / 24.0));
@@ -433,7 +485,8 @@ impl Studio {
             },
             None => it.insert("clip".into(), Value::Null),
         };
-        it.insert("steps".into(), num(p, "steps", 10.0, 1.0, 40.0, true)?);
+        let (dsteps, max_steps) = hv.unwrap_or((10.0, 40.0));
+        it.insert("steps".into(), num(p, "steps", dsteps, 1.0, max_steps, true)?);
         it.insert("seed".into(), num(p, "seed", 0.0, -2147483648.0, 2147483648.0, true)?);
         it.insert("te".into(), json!(te));
         it.insert("title".into(), title_of(p));
@@ -804,6 +857,22 @@ fn pika_flex_lora(denoisers: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// HunyuanVideo-1.5's models by id, and its rules: 4k + 1 frames, its steps, sides of 16
+    #[test]
+    fn hunyuanvideo_engines_have_their_own_rules() {
+        use super::*;
+        assert_eq!(quant_of("hunyuanvideo-1.5-480p-t2v-distilled-q8"), "HV15");
+        assert_eq!(quant_of("hunyuanvideo-1.5-480p-t2v-q8"), "HV15-CFG");
+        assert_eq!(quant_of("hunyuanvideo-1.5-480p-i2v-step-distilled-q8"), "HV15-I2V");
+        assert_eq!(quant_of("minimax-h3-q6k"), "Q6_K");
+        assert_eq!(hv15_rules("HV15"), Some((50.0, 100.0)));
+        assert_eq!(hv15_rules("HV15-I2V"), Some((8.0, 50.0)));
+        assert_eq!(hv15_rules("INT8"), None);
+        assert_eq!(hv15_frames(5.0), 121);
+        assert_eq!(hv15_frames(1.0), 25);
+        assert!(check_canvas_16(848, 480).is_ok() && check_canvas_16(850, 480).is_err());
+    }
+
     /// A regen2k draft: the platform's 864x480 10.125 s clip is two windows, all of it; a portrait one, a 3 s one and a
     /// 20 s one are refused, saying why
     /// Engine MPEG takes the singer film's keyframes and sound, and refuses references with a message naming REF2VA

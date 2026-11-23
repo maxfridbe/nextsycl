@@ -150,8 +150,8 @@ impl HunyuanImage21 {
         let int8 = o.setting("NS_HI_INT8").is_some_and(|v| v == "1");
         let dit = dit::Dit::load(&f, &nsd, &k, int8, log)?;
         drop(f);
-        let te = te::TextEncoder::load(role(files, "text-encoder")?, role(files, "tokenizer")?, &nsd, &k, log)?;
-        let byt5 = byt5::Byt5::load(role(files, "byt5")?, &nsd, &k, log)?;
+        let te = te::load(role(files, "text-encoder")?, role(files, "tokenizer")?, &nsd, &k, log)?;
+        let byt5 = byt5::load(role(files, "byt5")?, &nsd, &k, log)?;
         let vae = vae::Vae::load(role(files, "vae")?, &nsd, &k, log)?;
         log(format!("{ARCH}: {} model, loaded in {:.1} s", if dit.meanflow { "MeanFlow-distilled" } else { "base" }, t0.elapsed().as_secs_f64()));
         Ok(HunyuanImage21 { nsd, k, te, byt5, dit, vae, guidance, loaded: Instant::now(), load_s: t0.elapsed().as_secs_f64() })

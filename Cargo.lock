@@ -746,6 +746,7 @@ dependencies = [
  "nextsycl-video",
  "nextsycl-video-example",
  "nextsycl-video-h3",
+ "nextsycl-video-hunyuanvideo15",
  "serde_json",
  "serde_yaml",
 ]
@@ -995,6 +996,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextsycl-hunyuan-text"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-tok",
+]
+
+[[package]]
 name = "nextsycl-image"
 version = "0.0.0"
 dependencies = [
@@ -1046,6 +1057,7 @@ dependencies = [
  "nextsycl-core",
  "nextsycl-diffusion",
  "nextsycl-gguf",
+ "nextsycl-hunyuan-text",
  "nextsycl-image",
  "nextsycl-tok",
  "serde_json",
@@ -1545,6 +1557,19 @@ version = "0.0.0"
 dependencies = [
  "nextsycl-core",
  "nextsycl-h3",
+ "nextsycl-video",
+ "serde_json",
+]
+
+[[package]]
+name = "nextsycl-video-hunyuanvideo15"
+version = "0.0.0"
+dependencies = [
+ "nextsycl-core",
+ "nextsycl-diffusion",
+ "nextsycl-gguf",
+ "nextsycl-h3",
+ "nextsycl-hunyuan-text",
  "nextsycl-video",
  "serde_json",
 ]

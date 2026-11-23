@@ -350,3 +350,23 @@ impl K {
         check(unsafe { (self.k.to_rgb8)(self.g(), x, n as i64, out) }, "to rgb")
     }
 }
+
+/// The text encoders' kernels (crates/hunyuan-text) are this engine's own (hi21.h)
+impl nextsycl_hunyuan_text::Kern for K {
+    fn q4_0_half(&self, src: P, n: usize, out: M) -> Result<()> {
+        K::q4_0_half(self, src, n, out)
+    }
+    fn to_half(&self, x: *const f32, out: M, n: usize, s: f32) -> Result<()> {
+        K::to_half(self, x, out, n, s)
+    }
+    fn linear_f32(&self, x: P, m: usize, k: usize, w: P, n: usize, bias: *const f32, out: *mut f32) -> Result<()> {
+        K::linear_f32(self, x, m, k, w, n, bias, out)
+    }
+    fn attn_small(&self, q: *const f32, qs: usize, k: *const f32, v: *const f32, kvs: usize, l: usize, hq: usize, hkv: usize, d: usize, scale: f32,
+                  bias: *const f32, causal: bool, out: *mut f32) -> Result<()> {
+        K::attn_small(self, q, qs, k, v, kvs, l, hq, hkv, d, scale, bias, causal, out)
+    }
+    fn geglu_f32(&self, x: P, m: usize, c: usize, out: M) -> Result<()> {
+        K::geglu(self, x, T::F32, m, c, out)
+    }
+}
