@@ -249,6 +249,35 @@ Short chat tg (256 tokens, greedy): B70 66.1 -> 70.0, B65 59.4 -> 62.0. The gree
 medium the near tie at 35, long 32 / 32), spec-check 0 on both cards and quants, drafted text = plain text greedy and
 sampled.
 
+## Round 4: a shorter decode; what did not pay
+
+**The NVFP4 decode in 16 operations a word** (from 20): the repacking now stores -0 (code 8) as +0 (code 0) - the same
+value - so a decoded magnitude negates as (m ^ 0xFF) + 1 with no carry out of its byte, and the b0 b1 term takes one
+fewer step. The same bytes, so every product is what it was (the silo-against-own-kernels KL and the sampled tokens
+of round 3 reproduced to the bit on both cards). Experts a token: B70 5.05 -> 4.83 ms (gate | up 3.33 -> 3.22, down
+1.71 -> 1.62; 383 GB/s by the profile), B65 5.82 -> 5.49 (337 GB/s).
+
+Tried and dropped (each measured, then reverted):
+
+| change | what happened |
+|---|---|
+| the attention-output product (2,304 rows of 3,072) with its row's lines split over 4 sub-groups and an SLM sum | slower: the projections 2.1 -> 2.9 ms (B65) - four times the work-groups, each too short |
+| two lines in flight a lane (separate sums) for one-row products | no change (2.12 / 1.70 ms) |
+| the attention's convolution and residual made inside the FFN's depth-mix launch (one row) | the convolution's launch saved 0.11 ms, the mix grew 0.18 (one work-group a row doing 2,304 channels serially) |
+
+The depth mixes (1.2 ms, 117 a token) and the post-projection step (0.83) stay latency-bound single-work-group launches;
+neither fusion above nor more threads helped. The 4-row verify still reads 19 distinct experts a layer against 8 (the
+union kernels decode each once for all its rows).
+
+**Round 4 tables** (400 tokens, the chat template, plain / drafted with the defaults; short chat tg greedy):
+
+| card, quant | short chat | prose, 0 | code, 0 | prose, 1.0 | code, 1.0 | pp 512 / 4K / 32K |
+|---|---|---|---|---|---|---|
+| B70 Q4 | 71.0 | 69.8 / 70.3 | 70.1 / 93.3 | 67.6 / 72.5 | 65.7 / 112.0 | 1,134 / 2,095 / 1,650 |
+| B65 Q4 | 63.1 | 61.8 / 62.0 | 61.8 / 85.5 | 59.7 / 60.7 | 57.9 / 90.9 | 831 / 1,458 / 1,084 |
+| B70 Q8 | - | 53.7 / 55.6 | 53.8 / 95.2 | 52.2 / 54.5 | 50.9 / 96.1 | 1,013 / 1,910 / - |
+| B65 Q8 | - | 48.4 / 50.5 | 48.5 / 67.2 | 46.9 / 48.3 | 45.6 / 73.2 | 720 / 1,361 / - |
+
 ## Quantization choice
 
 - **UD-Q4_K_XL** (17.6 GB, the fast card): the experts in their native NVFP4 (the checkpoint's own format: no loss),

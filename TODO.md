@@ -19,9 +19,10 @@ Engine `llm/inkling2` (`inkling2_loop`), cards `inkling-2-mini-q4kxl` / `-q8kxl`
   drafting only (drafts need not be exact) would cut ~0.7 ms a step
 - [ ] Vision: the 23-layer ViT (`mmproj-*.gguf`, patch 20, merge 2) through `image_tokens`, parity against llama.cpp
   mtmd (`reference/llama-dump/ns-mtmd-dump.cpp`), as deepseek41's sidecar
-- [ ] Decode toward the bound (B70 tg 70 of ~137): the experts' NVFP4 products (382 GB/s since the table went; the
-  arithmetic decode still costs ~20%: 446 GB/s on the B65 without it), the attention output product (~220 GB/s alone,
-  latency-bound), the post-projection step (0.83 ms), the depth mixes (1.2 ms)
+- [ ] Decode toward the bound (B70 tg 71 of ~137): the experts' NVFP4 products (383 GB/s; the 16-operation decode
+  still costs ~15%), the attention output product (~220 GB/s alone, latency-bound: a 4-way line split and two lines in
+  flight did not help), the post-projection step (0.83 ms), the depth mixes (1.2 ms; fusing the convolution into them
+  lost)
 - [ ] Prompt: the experts expanded to half one at a time (an XMX int8 grouped GEMM on the repacked blocks instead)
 
 ## Review another DeepSeek engine: Promethevs (2026-11-02)
