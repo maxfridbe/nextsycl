@@ -533,10 +533,32 @@ impl Dit {
     #[allow(clippy::too_many_arguments)]
     pub fn forward(&self, nsd: &Nsd, st: &Steps, si: usize, bt: &Batch, lats: &[&DevBuf], cond: &DevBuf,
                    tap: &mut dyn FnMut(&str, &DevBuf, usize, usize) -> Result<()>) -> Result<Vec<DevBuf>> {
+        let n = bt.branches.first().map_or(0, |b| b.n);
+        self.forward_spans(nsd, st, si, &[(0, n, si)], bt, lats, cond, tap)
+    }
+
+    /// `forward` with the image rows in spans at their own step rows of `st`: (first image row, rows, step row) - a
+    /// rolling window's chunks at their own noise levels (MovieRoll). The text stream and the token refiner take step
+    /// row `si`. One span over every image row at `si` is `forward`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_spans(&self, nsd: &Nsd, st: &Steps, si: usize, spans: &[(usize, usize, usize)], bt: &Batch, lats: &[&DevBuf], cond: &DevBuf,
+                         tap: &mut dyn FnMut(&str, &DevBuf, usize, usize) -> Result<()>) -> Result<Vec<DevBuf>> {
         let k = &self.k;
         let branches = &bt.branches;
-        if si >= st.n {
-            return Err(Error(format!("step {si} of {}", st.n)));
+        if si >= st.n || spans.iter().any(|x| x.2 >= st.n) {
+            return Err(Error(format!("a step row past the {} given", st.n)));
+        }
+        // the spans tile the image rows, in order
+        let n = branches.first().map_or(0, |b| b.n);
+        let mut at = 0;
+        for (r0, rows, _) in spans {
+            if *r0 != at || *rows == 0 {
+                return Err(Error(format!("spans must tile the {n} image rows in order ({spans:?})")));
+            }
+            at += rows;
+        }
+        if at != n {
+            return Err(Error(format!("spans cover {at} of the {n} image rows")));
         }
         if lats.len() != branches.len() {
             return Err(Error(format!("{} latents for {} branches", lats.len(), branches.len())));
@@ -553,12 +575,18 @@ impl Dit {
         let sc = &self.scratch;
         for (bi, d) in self.doubles.iter().enumerate() {
             let (mi, mt) = (&st.dbl[bi].0, &st.dbl[bi].1);
-            let md = |m: &DevBuf, j: usize| -> *const f32 { fptr(m, si * 6 * DIM + j * DIM) };
+            let md = |m: &DevBuf, s: usize, j: usize| -> *const f32 { fptr(m, s * 6 * DIM + j * DIM) };
             let parts = |b: &Branch| [(b.r0, b.n), (b.r0 + b.n, b.t)];
             let streams = [(&d.img, mi), (&d.txt, mt)];
+            // each stream's modulated row ranges: the image's spans, the text's at si
+            let mod_parts = |b: &Branch| -> Vec<(usize, &DevBuf, usize, usize, usize)> {
+                let mut v: Vec<(usize, &DevBuf, usize, usize, usize)> = spans.iter().map(|(r0, rows, s)| (0, mi, b.r0 + r0, *rows, *s)).collect();
+                v.push((1, mt, b.r0 + b.n, b.t, si));
+                v
+            };
             for b in branches {
-                for ((_, m), (r0, rows)) in streams.iter().zip(parts(b)) {
-                    k.ln_mod(fptr(&bt.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, 1), md(m, 0), hptr(&bt.h, r0 * DIM), T::F16)?;
+                for (_, m, r0, rows, s) in mod_parts(b) {
+                    k.ln_mod(fptr(&bt.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, s, 1), md(m, s, 0), hptr(&bt.h, r0 * DIM), T::F16)?;
                 }
                 for ((s, _), (r0, rows)) in streams.iter().zip(parts(b)) {
                     s.qkv.mm(nsd, k, sc, &bt.tmp, hptr(&bt.h, r0 * DIM), DIM, rows, hptr(&bt.big, r0 * 3 * DIM), 3 * DIM, Post::Half)?;
@@ -570,11 +598,12 @@ impl Dit {
                 nsd.rms_rope(hptr(&bt.big, q + b.n * 3 * DIM + DIM), Dt::F16, b.t, HEADS, HEAD, 3 * DIM, d.txt.k_norm.ptr(), EPS, b.cs.ptr(), 0)?;
                 nsd.attention_qk(hptr(&bt.big, q), s, 3 * DIM, hptr(&bt.big, q + DIM), hptr(&bt.big, q + 2 * DIM), s, 3 * DIM, Dt::F16, HEADS, HEAD,
                                  hptr(&bt.att, b.r0 * DIM), Dt::F16)?;
-                for ((s, m), (r0, rows)) in streams.iter().zip(parts(b)) {
-                    s.proj.mm(nsd, k, sc, &bt.tmp, hptr(&bt.att, r0 * DIM), DIM, rows, fptr(&bt.x, r0 * DIM).cast(), DIM, Post::Gate(md(m, 2)))?;
-                    k.ln_mod(fptr(&bt.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, 4), md(m, 3), hptr(&bt.h, r0 * DIM), T::F16)?;
-                    s.fc1.mm(nsd, k, sc, &bt.tmp, hptr(&bt.h, r0 * DIM), DIM, rows, hptr(&bt.mlp, r0 * FFN), FFN, Post::Gelu)?;
-                    s.fc2.mm(nsd, k, sc, &bt.tmp, hptr(&bt.mlp, r0 * FFN), FFN, rows, fptr(&bt.x, r0 * DIM).cast(), DIM, Post::Gate(md(m, 5)))?;
+                for (which, m, r0, rows, s) in mod_parts(b) {
+                    let st_ = streams[which].0;
+                    st_.proj.mm(nsd, k, sc, &bt.tmp, hptr(&bt.att, r0 * DIM), DIM, rows, fptr(&bt.x, r0 * DIM).cast(), DIM, Post::Gate(md(m, s, 2)))?;
+                    k.ln_mod(fptr(&bt.x, r0 * DIM), rows, DIM, EPS, std::ptr::null(), std::ptr::null(), md(m, s, 4), md(m, s, 3), hptr(&bt.h, r0 * DIM), T::F16)?;
+                    st_.fc1.mm(nsd, k, sc, &bt.tmp, hptr(&bt.h, r0 * DIM), DIM, rows, hptr(&bt.mlp, r0 * FFN), FFN, Post::Gelu)?;
+                    st_.fc2.mm(nsd, k, sc, &bt.tmp, hptr(&bt.mlp, r0 * FFN), FFN, rows, fptr(&bt.x, r0 * DIM).cast(), DIM, Post::Gate(md(m, s, 5)))?;
                 }
             }
             if bi == 0 {
@@ -586,8 +615,10 @@ impl Dit {
         let mut out = Vec::with_capacity(branches.len());
         let o = DevBuf::f32(&nsd.gpu, b0.n * DIM)?;
         for b in branches {
-            k.ln_mod(fptr(&bt.x, b.r0 * DIM), b.n, DIM, EPS, std::ptr::null(), std::ptr::null(), fptr(&st.fin, si * 2 * DIM + DIM), fptr(&st.fin, si * 2 * DIM),
-                     o.ptr(), T::F32)?;
+            for (r0, rows, s) in spans {
+                k.ln_mod(fptr(&bt.x, (b.r0 + r0) * DIM), *rows, DIM, EPS, std::ptr::null(), std::ptr::null(), fptr(&st.fin, s * 2 * DIM + DIM),
+                         fptr(&st.fin, s * 2 * DIM), fptr(&o, r0 * DIM).cast(), T::F32)?;
+            }
             let v = DevBuf::f32(&nsd.gpu, b.n * LATENT)?;
             nsd.linear(o.ptr(), Dt::F32, b.n, DIM, w32(&self.final_lin)?, LATENT, bias(&self.final_lin), v.ptr(), Dt::F32)?;
             out.push(v);
