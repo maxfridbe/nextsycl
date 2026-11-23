@@ -21,8 +21,9 @@ pub struct Sampling {
 
 /// the score's (GenerationConfig.abc)
 pub const ABC: Sampling = Sampling { temperature: 0.7, top_p: 0.9, top_k: 30, penalty: 1.005, window: 100, min_tokens: 32, max_tokens: 4096 };
-/// the codes' (GenerationConfig.semantic): 25 a second, six minutes at most
-pub const SEMANTIC: Sampling = Sampling { temperature: 1.0, top_p: 0.95, top_k: 100, penalty: 1.2, window: 50, min_tokens: 200, max_tokens: 9000 };
+/// the codes' (GenerationConfig.semantic, but for the most: upstream's 9000, six minutes, is a setting; here ten minutes,
+/// the longest a request may ask - `MAX_SECONDS` x `FPS`): 25 a second
+pub const SEMANTIC: Sampling = Sampling { temperature: 1.0, top_p: 0.95, top_k: 100, penalty: 1.2, window: 50, min_tokens: 200, max_tokens: 15000 };
 
 pub struct Rng(Mt19937);
 

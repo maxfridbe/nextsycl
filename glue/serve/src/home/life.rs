@@ -171,6 +171,12 @@ fn controls(m: &Value, cards: &[Value], caps: &[&str]) -> Value {
     if registry::kind_of(m) == "image" && caps.contains(&"generate") { from_card(m, cards, "controls") } else { Value::Null }
 }
 
+/// An audio model's longest request, seconds (its entry's, else its model card's `max_seconds`); null for other kinds
+/// and audio models whose card states none
+fn max_seconds(m: &Value, cards: &[Value]) -> Value {
+    if registry::kind_of(m) == "audio" { from_card(m, cards, "max_seconds") } else { Value::Null }
+}
+
 /// A field of a model's registry entry, else of its model card (the card it was pulled from, else the one of its id);
 /// null when neither has it
 fn from_card(m: &Value, cards: &[Value], k: &str) -> Value {
@@ -992,6 +998,7 @@ impl Home {
                    "pinned": pinned, "held_s": held_s,
                    "capabilities": caps, "methods": methods,
                    "lockstep": m["speech"].as_array().is_some_and(|a| a.iter().any(|x| x == "lockstep")),
+                   "max_seconds": max_seconds(m, lc),
                    "max_pixels": limits.map(|l| l.0), "min_side": limits.map(|l| l.1), "max_side": limits.map(|l| l.2), "grid": limits.map(|l| l.3),
                    "vouch_mb": vouch.iter().map(|(g, mb)| (g.to_string(), json!(mb))).collect::<serde_json::Map<String, Value>>(),
                    "measured": measured,
@@ -1957,6 +1964,18 @@ mod tests {
         assert_eq!(super::from_card(&m, &cards, "annotations")[0]["syntax"], "[laughter]");
         assert_eq!(super::from_card(&m, &cards, "annotations_note"), "n");
         assert!(super::from_card(&json!({"id": "other", "kind": "audio"}), &cards, "annotations").is_null());
+    }
+
+    /// An audio row's longest request: its entry's, else its card's max_seconds (YuE2's 600); other kinds, or none: null
+    #[test]
+    fn an_audio_rows_longest_request_comes_from_its_card() {
+        use serde_json::json;
+        let cards = vec![json!({"id": "yue2-3b-q8", "kind": "audio", "max_seconds": 600.0}), json!({"id": "img", "kind": "image", "max_seconds": 5.0})];
+        assert_eq!(super::max_seconds(&json!({"id": "yue2-3b-q8", "kind": "audio", "arch": "yue2"}), &cards), json!(600.0));
+        assert_eq!(super::max_seconds(&json!({"id": "x", "kind": "audio", "catalog": "yue2-3b-q8"}), &cards), json!(600.0), "pulled from the card");
+        assert_eq!(super::max_seconds(&json!({"id": "yue2-3b-q8", "kind": "audio", "max_seconds": 420.0}), &cards), json!(420.0), "the entry's own");
+        assert!(super::max_seconds(&json!({"id": "other", "kind": "audio"}), &cards).is_null(), "no card says");
+        assert!(super::max_seconds(&json!({"id": "img", "kind": "image"}), &cards).is_null(), "not audio");
     }
 
     #[test]

@@ -76,6 +76,7 @@ impl Catalog {
                     crate::controls::check(c).map_err(|e| format!("{}: {e}", p.display()))?;
                 }
                 span_check(&v).map_err(|e| format!("{}: {e}", p.display()))?;
+                seconds_check(&v).map_err(|e| format!("{}: {e}", p.display()))?;
                 cards.push((p, v));
             }
         }
@@ -587,6 +588,16 @@ fn span_check(v: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// A card's `max_seconds` (an audio model's longest request, seconds: system.models rows carry it): audio only, a
+/// number above 0
+fn seconds_check(v: &Value) -> Result<(), String> {
+    match v.get("max_seconds") {
+        None => Ok(()),
+        Some(x) if s(v, "kind") == "audio" && x.as_f64().is_some_and(|n| n > 0.0) => Ok(()),
+        Some(_) => Err(format!("max_seconds: an audio model's longest request, seconds above 0 (this one: kind {})", s(v, "kind"))),
+    }
+}
+
 /// A made-locally part's path: `NS_<ROLE>` style settings in nextsycl.conf are the engine's own (the MTP layer:
 /// NS_QW_MTP), else what another registry entry uses for the same setting
 fn find_local(cfg: &Config, installed: &[Value], m: &Value, role: &str) -> Option<String> {
@@ -815,6 +826,16 @@ mod tests {
         let mut plain = card.clone();
         plain.as_object_mut().unwrap().retain(|k, _| k != "spans" && k != "vram_gib_per_card");
         assert!(span_check(&plain).is_ok());
+    }
+
+    #[test]
+    fn a_cards_longest_request_is_an_audio_models_positive_seconds() {
+        assert!(seconds_check(&json!({"kind": "audio", "max_seconds": 600.0})).is_ok());
+        assert!(seconds_check(&json!({"kind": "audio", "max_seconds": 600})).is_ok());
+        assert!(seconds_check(&json!({"kind": "audio"})).is_ok());
+        assert!(seconds_check(&json!({"kind": "audio", "max_seconds": 0})).is_err());
+        assert!(seconds_check(&json!({"kind": "audio", "max_seconds": "600"})).is_err());
+        assert!(seconds_check(&json!({"kind": "image", "max_seconds": 600})).is_err());
     }
 
     #[test]

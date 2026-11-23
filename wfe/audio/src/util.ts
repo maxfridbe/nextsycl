@@ -16,4 +16,4 @@ export const clamp = (x: number, lo: number, hi: number): number => Math.max(lo,
 export const TAGS = ["intro", "verse", "pre-chorus", "chorus", "bridge", "instrumental", "solo", "outro"];
 
 /** Length presets, seconds. */
-export const LENGTHS: [string, number][] = [["0:30", 30], ["1:00", 60], ["2:00", 120], ["3:00", 180], ["4:00", 240], ["6:00", 360]];
+export const LENGTHS: [string, number][] = [["0:30", 30], ["1:00", 60], ["2:00", 120], ["3:00", 180], ["4:00", 240], ["6:00", 360], ["7:00", 420], ["10:00", 600]];

@@ -103,13 +103,71 @@ pub fn negative(tok: &Tokenizer, cot: Cot, abc: &[u32]) -> Vec<u32> {
     v
 }
 
-/// chunk_ranges: the song's frames in chunks a context holds beside the prompt (whole songs are one in practice)
+/// frames two neighbouring chunks of the flow share (10 s), and where in them the song passes from one to the next: a
+/// crossfade of `FADE` frames (2 s) from `FADE_AT` frames (4 s) in. Each chunk's flow is solved alone, so cut end to end
+/// the latents step at the cut (2026-11-23, 600 s songs cut at 362.9 s: the step between the two frames at the 97th / 92nd
+/// percentile of the song's frame-to-frame steps, B70 / B65); crossfaded, the step in the middle of the fade sat at the
+/// 3rd. The join also keeps the frames next to a chunk's own LATENT_START / LATENT_END out of the song
+pub const OVERLAP: usize = 250;
+pub const FADE_AT: usize = 100;
+pub const FADE: usize = 50;
+
+/// The song's frames in chunks a context holds beside the prompt (one up to (24576 - prompt - 3) / 2 frames: ~7 minutes
+/// beside a short prompt; a ten-minute song is two). Upstream's chunk_ranges cut them end to end; here each next chunk
+/// starts `OVERLAP` frames before the last one ends (end to end only when a chunk is too short to share that much)
 pub fn chunks(frames: usize, prompt: usize, context: usize) -> Vec<(usize, usize)> {
     let size = ((context.saturating_sub(prompt + 3)) / 2).min(context);
     if size == 0 {
         return Vec::new();
     }
-    (0..frames).step_by(size).map(|a| (a, (a + size).min(frames))).collect()
+    let overlap = if size > 2 * OVERLAP { OVERLAP } else { 0 };
+    let mut v = Vec::new();
+    let mut a = 0;
+    loop {
+        let b = (a + size).min(frames);
+        v.push((a, b));
+        if b >= frames {
+            return v;
+        }
+        a = b - overlap;
+    }
+}
+
+/// The chunks' latents ([b - a, width] each, in `chunks` order) as one song's [frames, width]: where two share frames,
+/// the first alone up to `FADE_AT` frames into the shared ones, then a linear crossfade of `FADE` frames, then the next
+pub fn join(frames: usize, width: usize, parts: &[((usize, usize), Vec<f32>)]) -> Vec<f32> {
+    let mut out = vec![0f32; frames * width];
+    // the weight of part i at frame t: rising from its shared start (if any), falling where the next one rises
+    let rise = |i: usize, t: usize| -> f32 {
+        if i == 0 {
+            return 1.0;
+        }
+        let (a, prev_b) = (parts[i].0 .0, parts[i - 1].0 .1);
+        if prev_b <= a {
+            return 1.0;
+        }
+        let (at, n) = if prev_b - a >= FADE_AT + FADE { (FADE_AT, FADE) } else { (0, prev_b - a) };
+        let (s, e) = (a + at, a + at + n);
+        if t < s {
+            0.0
+        } else if t >= e {
+            1.0
+        } else {
+            (t - s) as f32 / n as f32 + 0.5 / n as f32
+        }
+    };
+    for (i, ((a, b), lat)) in parts.iter().enumerate() {
+        for t in *a..*b {
+            let w = rise(i, t) * if i + 1 < parts.len() && t >= parts[i + 1].0 .0 { 1.0 - rise(i + 1, t) } else { 1.0 };
+            if w == 0.0 {
+                continue;
+            }
+            for (o, x) in out[t * width..(t + 1) * width].iter_mut().zip(&lat[(t - a) * width..(t - a + 1) * width]) {
+                *o += w * x;
+            }
+        }
+    }
+    out
 }
 
 /// Whether a voice's lines hold a note (a pitch letter outside the chord symbols' quotes; rests are z / Z / x)
@@ -318,9 +376,39 @@ mod tests {
     fn the_chunks_cover_the_frames() {
         assert_eq!(chunks(9000, 3000, 24576), vec![(0, 9000)]);
         let c = chunks(9000, 10000, 24576);
-        assert_eq!(c.first(), Some(&(0, 7286)));
-        assert_eq!(c.last(), Some(&(7286, 9000)));
+        assert_eq!(c, vec![(0, 7286), (7036, 9000)]);
         assert!(chunks(10, 24575, 24576).is_empty());
+        // ten minutes beside a 3000-token prompt: two chunks sharing OVERLAP frames
+        assert_eq!(chunks(15000, 3000, 24576), vec![(0, 10786), (10536, 15000)]);
+        // a chunk too short to share: end to end
+        assert_eq!(chunks(1000, 24576 - 3 - 800, 24576), vec![(0, 400), (400, 800), (800, 1000)]);
+        // every frame is in a chunk, each chunk within the context beside the prompt
+        for (f, p) in [(15000, 4519), (10500, 6000), (15000, 9000), (3, 100)] {
+            let c = chunks(f, p, 24576);
+            assert_eq!((c[0].0, c.last().unwrap().1), (0, f));
+            assert!(c.windows(2).all(|w| w[1].0 < w[0].1 && w[1].0 > w[0].0));
+            assert!(c.iter().all(|(a, b)| p + 2 * (b - a) + 3 <= 24576));
+        }
+    }
+
+    #[test]
+    fn the_chunks_join_with_a_crossfade() {
+        // one chunk: as it is
+        let one = vec![((0, 4), vec![1.0, 2.0, 3.0, 4.0])];
+        assert_eq!(join(4, 1, &one), vec![1.0, 2.0, 3.0, 4.0]);
+        // end to end: each its own
+        assert_eq!(join(4, 1, &[((0, 2), vec![1.0, 1.0]), ((2, 4), vec![2.0, 2.0])]), vec![1.0, 1.0, 2.0, 2.0]);
+        // sharing OVERLAP frames: the first alone up to FADE_AT in, a FADE-frame ramp, then the second; the weights sum to one
+        let (n, a) = (1000, 700);
+        let parts = [((0, a + OVERLAP), vec![1.0; a + OVERLAP]), ((a, n), vec![3.0; n - a])];
+        let j = join(n, 1, &parts);
+        assert!(j[..a + FADE_AT].iter().all(|x| *x == 1.0));
+        assert!(j[a + FADE_AT + FADE..].iter().all(|x| *x == 3.0));
+        let ramp = &j[a + FADE_AT..a + FADE_AT + FADE];
+        assert!(ramp.windows(2).all(|w| w[1] > w[0]) && ramp.iter().all(|x| *x > 1.0 && *x < 3.0));
+        // two channels a frame stay together
+        let two = join(2, 2, &[((0, 2), vec![1.0, 2.0, 3.0, 4.0])]);
+        assert_eq!(two, vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]

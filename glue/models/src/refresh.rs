@@ -40,7 +40,7 @@ const USER_SET: &[&str] = &["gpus"];
 
 /// Card fields the front door reads from the card when an entry lacks them: brought up to the card only where an
 /// entry has its own
-const LIVE: &[&str] = &["license", "commercial", "license_note", "controls", "annotations", "annotations_note"];
+const LIVE: &[&str] = &["license", "commercial", "license_note", "controls", "annotations", "annotations_note", "max_seconds"];
 
 /// The cards directory as an entry's record names it
 pub fn cards_tag(cfg: &Config) -> String {

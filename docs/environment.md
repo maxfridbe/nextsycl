@@ -362,9 +362,9 @@ ACE-Step 1.5 (`NS_ACE_`), YuE2 (`NS_YUE2_`), MiniMax Music 3 (`NS_MM3_`), Qwen3-
 |---|---|---|---|
 | `NS_AUDIO_OUT` | ~/.local/share/nextsycl/audio | where songs, speech and saved voices are kept | cli (audio), serve |
 | `NS_VOICE_TRANSCRIBE` | 1 | the front door hears each saved voice that has no text or no word times (never heard) once with the enabled recogniser (Whisper large-v3-turbo: an `audio.transcribe` job labelled "voice transcript: NAME", priority -5, one at a time; a minute after the start, then every 10 min, and at once after `audio.voices.add` without text) and keeps the transcript with it: `text` filled when it had none (a text given stays), `words` (their times: an in-context clone cuts the recording between two words and takes that part's transcript from them), `transcribed` {model, at, text}; 0: the voices are left as they are | serve |
-| `NS_YUE2_DUMP` | off | Debug: a folder to write each song's abc.u32, codes.u32 and latents.f32 into (raw little-endian), to compare runs stage by stage | audio yue2 |
+| `NS_YUE2_DUMP` | off | Debug: a folder to write each song's abc.u32, codes.u32 and latents.f32 into (raw little-endian), to compare runs stage by stage, and chunks.txt (the flow's chunks, first and end frame a line) | audio yue2 |
 | `NS_YUE2_ACT` | half | the flow's and prefill's product inputs: half, or bf16 with NS_SILO=0 only (coarser: oneDNN's product stays in the type) | audio yue2 |
-| `NS_YUE2_MIN_CODES` | 200 | Debug: the song may not end before this many codes: the 360 s worst case, for measuring memory | audio yue2 |
+| `NS_YUE2_MIN_CODES` | 200 | Debug: the song may not end before this many codes: the worst case (15000, the 600 s cap; 9000 = 360 s), for measuring memory | audio yue2 |
 | `NS_YUE2_SS2_ANGLES` | bf16 | Debug: SheetSage2's rotary table: bf16 (upstream's transcribe, under bf16 autocast), or fp32 (a reference dumped without autocast) | audio yue2 |
 | `NS_YUE2_COT` | full | what YuE2 writes before the music: full (a melody and chords score), melody, off (--opt-cot; a request's `cot` wins) | audio yue2 |
 | `NS_ACE_CHECKPOINT` | acestep-v15-turbo | the ACE-Step DiT checkpoint a model directory loads (acestep-v15-base: the base model, for lego) | audio acestep |

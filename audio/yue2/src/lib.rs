@@ -50,8 +50,16 @@ pub const ARCH: &str = "yue2";
 pub const ROLES: &[&str] = &["lm", "vae", "sheetsage"];
 /// codes a second
 pub const FPS: f32 = 25.0;
-/// the longest song: the semantic phase's 9000 codes
-pub const MAX_SECONDS: f32 = 360.0;
+/// the length asked for when a request names none: upstream's semantic phase default, 9000 codes (the model ends the
+/// song when the lyrics are sung, so this is only the most)
+pub const DEFAULT_SECONDS: f32 = 360.0;
+/// the longest a request may ask: 15000 codes (`sample::SEMANTIC.max_tokens`). Upstream's 9000 is a setting, not the
+/// model's limit; the model's is the context (24576 tokens), shared by the prompt, the score and the codes, so a
+/// request whose lyrics and score leave less is refused with what does fit (`latents`). Past one chunk of the context
+/// the flow works in chunks (`prompt::chunks`): checked on both cards at 420 and 600 s (docs/ports/yue2.md, Long songs)
+pub const MAX_SECONDS: f32 = 600.0;
+/// the most `score-tokens` may ask (the context decides what fits)
+pub const SCORE_MAX: usize = 12_288;
 pub const ODE_STEPS: u32 = 32;
 /// an instrumental cover's guidance when the request names none (the style's "no vocals" held against the instruction)
 pub const INSTRUMENTAL_CFG: f32 = 1.3;
@@ -61,7 +69,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "abc", env: "", value: "TEXT", help: "a score (ABC) to sing over instead of one drawn (cot melody or full): a cover's melody, or the score of an earlier song (its `score`) to sing it again with new words - same seed and style", at: At::Request },
     EngineOption { name: "sing-lead", env: "", value: "1|0", help: "a cover of an instrumental recording: its lead line (SheetSage2's Ins voice) moved to the voice YuE2 sings (on; 0: the score as transcribed - an instrumental cover)", at: At::Request },
     EngineOption { name: "instrumental", env: "", value: "true|false", help: "a cover played, not sung: the recording's lead stays where an instrument plays it (SheetSage2's Ins voice), the voice YuE2 sings is left all rests and the lyrics are the score's sections, empty - no words needed (any given are not used); the style is the arrangement; guided by 1.3 unless cfg is given. Needs a recording (source)", at: At::Request },
-    EngineOption { name: "score-tokens", env: "", value: "4096", help: "the most tokens the score may take (32 to 4096; a longer score is cut and closed)", at: At::Request },
+    EngineOption { name: "score-tokens", env: "", value: "4096", help: "the most tokens the score may take (32 to 12288; a longer score is cut and closed). Default 4096 (upstream's) for up to six minutes asked, in proportion past it (6827 at ten: a score cut at its budget is closed there and the song ends with it), as far as the context leaves room beside the codes", at: At::Request },
     EngineOption { name: "score-only", env: "", value: "true|false", help: "with a recording (source): only its score - SheetSage2's transcription, the melody for cot melody, melody and chords for cot full - comes back (the answer's score), no song is made", at: At::Request },
 ];
 
@@ -136,8 +144,44 @@ pub struct Song {
     /// the semantic phase's guidance (1: one branch)
     pub cfg: f32,
     pub max_codes: usize,
-    pub max_score: usize,
+    /// the score's budget asked (`score-tokens`); None: `score_budget`'s default
+    pub max_score: Option<usize>,
     pub steps: usize,
+}
+
+impl Song {
+    /// The most tokens the score may take beside a prompt of `prefix` tokens: the one asked, else upstream's 4096 for up
+    /// to `DEFAULT_SECONDS` and in proportion past it (the takes measured wrote 6 to 13.5 tokens a second of song; a score
+    /// cut at its budget is closed there and the song ends with it), cut to what the context leaves beside the codes
+    /// (never under 4096: a prompt leaving less than that is refused by the context check)
+    pub fn score_budget(&self, prefix: usize) -> usize {
+        if let Some(n) = self.max_score {
+            return n;
+        }
+        let default_codes = (DEFAULT_SECONDS * FPS) as usize;
+        let want = (sample::ABC.max_tokens * self.max_codes).div_ceil(default_codes).max(sample::ABC.max_tokens);
+        let room = CONTEXT.saturating_sub(prefix + 2 + self.max_codes);
+        want.min(room.max(sample::ABC.max_tokens))
+    }
+}
+
+/// The length asked (none: `DEFAULT_SECONDS`), refused outside 1 to `MAX_SECONDS`. The refusal's "from 1 to N s" is read by
+/// clients (the platform takes N from it): keep that form
+pub fn seconds_asked(seconds: Option<f32>) -> Result<f32> {
+    let seconds = seconds.unwrap_or(DEFAULT_SECONDS);
+    if !(1.0..=MAX_SECONDS).contains(&seconds) {
+        return Err(Error(format!("{seconds} s: from 1 to {MAX_SECONDS} s (the song may end sooner: the model decides)")));
+    }
+    Ok(seconds)
+}
+
+/// The context check's refusal: the prompt with its score room (`sem_upper` tokens) and `codes` codes past the context,
+/// with the most seconds that do fit beside that prompt
+pub fn too_long(sem_upper: usize, codes: usize) -> String {
+    let fits = CONTEXT.saturating_sub(sem_upper) as f32 / FPS;
+    let what = if fits >= 1.0 { format!("at most {} s fit with these lyrics and this score", fits.floor()) } else { "these lyrics and this score leave no room for a song".into() };
+    format!("the prompt ({sem_upper} tokens with its score) and {codes} codes ({:.0} s) are past the model's context ({CONTEXT} tokens): {what} - shorter lyrics, a shorter score (score-tokens, or a score given: abc) or a shorter song",
+            codes as f32 / FPS)
 }
 
 /// What the stages made (the check and the score read it)
@@ -216,7 +260,7 @@ impl Yue2 {
     }
 
     /// The request as a song: the pipeline's defaults where it says nothing (cot full, guidance 1 - 1.01 for cot off -,
-    /// up to six minutes: the model ends the song, 32 ODE steps)
+    /// six minutes unless asked, ten at most: the model ends the song, 32 ODE steps)
     pub fn song(&self, req: &AudioRequest) -> Result<Song> {
         // a cover's own default: the melody (upstream's recommendation - the recording's chords are the new style's)
         let cot_s = req.extra.get("cot").cloned().filter(|v| !v.trim().is_empty())
@@ -253,13 +297,10 @@ impl Yue2 {
         // an instrumental has no words to sing: lyrics given are left out; its lyrics are the score's sections, written
         // once it is transcribed (generate)
         let lyrics = if instrumental { String::new() } else { req.lyrics.clone().unwrap_or_default() };
-        let seconds = req.seconds.unwrap_or(MAX_SECONDS);
-        if !(1.0..=MAX_SECONDS).contains(&seconds) {
-            return Err(Error(format!("{seconds} s: from 1 to {MAX_SECONDS} s (the song may end sooner: the model decides)")));
-        }
+        let seconds = seconds_asked(req.seconds)?;
         let max_score = match self.opt(req, "score-tokens", "") {
-            Some(v) => v.trim().parse::<usize>().map_err(|_| Error(format!("score-tokens {v}: a whole number")))?.clamp(32, sample::ABC.max_tokens),
-            None => sample::ABC.max_tokens,
+            Some(v) => Some(v.trim().parse::<usize>().map_err(|_| Error(format!("score-tokens {v}: a whole number")))?.clamp(32, SCORE_MAX)),
+            None => None,
         };
         // an instrumental cover is guided by default: unguided, some takes mumble a wordless voice over their last third
         // (nextcuda 2026-11-11, Paganini's Caprice 24: 38 s and 95 s in 2 of 5 takes); the same take guided by 1.3 dropped it
@@ -272,9 +313,10 @@ impl Yue2 {
     }
 
     /// The score's draw from the first phase's prompt in `c` (its last row's logits given): its tokens
-    fn draw_score(&self, s: &mut Scratch, c: &mut Cache, first: Vec<f32>, song: &Song, t0: Instant, progress: &mut dyn FnMut(Step) -> Result<()>)
+    #[allow(clippy::too_many_arguments)]
+    fn draw_score(&self, s: &mut Scratch, c: &mut Cache, first: Vec<f32>, song: &Song, budget: usize, t0: Instant, progress: &mut dyn FnMut(Step) -> Result<()>)
                   -> Result<Vec<u32>> {
-        let samp = Sampling { max_tokens: song.max_score, min_tokens: sample::ABC.min_tokens.min(song.max_score), ..sample::ABC };
+        let samp = Sampling { max_tokens: budget, min_tokens: sample::ABC.min_tokens.min(budget), ..sample::ABC };
         let mut rng = Rng::new(song.seed);
         let (mut hist, mut out) = (Vec::new(), Vec::new());
         let mut logits = first;
@@ -387,15 +429,15 @@ impl Yue2 {
                 return Err(Error("abc: an empty score, or one past the text vocabulary".into()));
             }
         }
+        let budget = song.score_budget(made.prefix.len());
         let score_room = match (&given, song.cot) {
             (_, Cot::Off) => 0,
             (Some(g), _) => g.len() + 2,
-            (None, _) => song.max_score + 2,
+            (None, _) => budget + 2,
         };
         let sem_upper = made.prefix.len() + score_room;
         if sem_upper + song.max_codes > CONTEXT {
-            return Err(Error(format!("the prompt ({} tokens with its score) and {} codes are past the model's context ({CONTEXT}): shorter lyrics or a shorter song",
-                                     sem_upper, song.max_codes)));
+            return Err(Error(too_long(sem_upper, song.max_codes)));
         }
         // the song's cache: the prompt, the score, the codes, MUSIC_END, then the flow's rows (one chunk), within the context
         let cap = (sem_upper + 2 * song.max_codes + 4).min(CONTEXT);
@@ -417,7 +459,7 @@ impl Yue2 {
                 let x = self.lm.prefill(&mut s, &mut pos, &made.prefix, &[made.prefix.len() - 1])?;
                 let first = self.lm.logits_of(&mut s, &x, 0, ABC_END as usize + 1)?;
                 progress(Step { phase: "prompt", at: 1, of: 1, seconds: el() })?;
-                made.abc = self.draw_score(&mut s, &mut pos, first, song, t0, progress)?;
+                made.abc = self.draw_score(&mut s, &mut pos, first, song, budget, t0, progress)?;
                 made.sem_prefix = prompt::semantic(&made.prefix, song.cot, &made.abc);
                 // the score closed in the cache: its last token (unless the draw stopped at the budget before feeding it),
                 // ABC_END and MUSIC_START
@@ -446,11 +488,17 @@ impl Yue2 {
         if made.codes.is_empty() {
             return Err(Error("the model ended the song before its first code".into()));
         }
-        // the flow: one noise draw for the whole song, cut at the chunks
+        // the flow: one noise draw for the whole song, cut at the chunks (frames two chunks share get the same noise),
+        // the chunks' latents joined with a crossfade where they overlap (prompt::join)
         let frames = made.codes.len();
         let noise = Mt19937::new(song.seed).randn(frames * LATENT);
         let chunks = prompt::chunks(frames, made.sem_prefix.len(), CONTEXT);
-        let mut lat = Vec::with_capacity(frames * LATENT);
+        if let Ok(d) = std::env::var("NS_YUE2_DUMP") {
+            // (debug) where the flow's chunks start and end, frames
+            let txt: String = chunks.iter().map(|(a, b)| format!("{a} {b}\n")).collect();
+            std::fs::write(Path::new(&d).join("chunks.txt"), txt).map_err(|e| Error(e.to_string()))?;
+        }
+        let mut parts = Vec::with_capacity(chunks.len());
         let total = chunks.len() * song.steps;
         for (ci, (a, b)) in chunks.iter().enumerate() {
             let codes: Vec<u32> = made.codes[*a..*b].iter().map(|c| c + CODEC_OFFSET).collect();
@@ -474,9 +522,9 @@ impl Yue2 {
             let part = self.solve(&mut s, &pos, &noise[a * LATENT..b * LATENT], song.steps, |i, _, _| {
                 progress(Step { phase: "flow", at: (ci * song.steps + i + 1) as u32, of: total as u32, seconds: el() })
             })?;
-            lat.extend(part);
+            parts.push(((*a, *b), part));
         }
-        made.latents = lat;
+        made.latents = prompt::join(frames, LATENT, &parts);
         s.clear();
         Ok(())
     }
@@ -495,7 +543,7 @@ impl AudioEngine for Yue2 {
         ARCH
     }
     fn defaults(&self) -> Defaults {
-        Defaults { seconds: MAX_SECONDS, max_seconds: MAX_SECONDS, steps: ODE_STEPS, cfg: 1.0, rate: RATE }
+        Defaults { seconds: DEFAULT_SECONDS, max_seconds: MAX_SECONDS, steps: ODE_STEPS, cfg: 1.0, rate: RATE }
     }
     fn lyrics(&self) -> bool {
         true
@@ -570,6 +618,51 @@ mod tests {
     use super::*;
 
     const INS_SCORE: &str = "X:1\nV: Vocal clef=treble name=\"Vocal Melody\"\nV: Ins clef=treble name=\"Ins Melody\"\nK:C\n% intro\nV: Vocal\nZ2|\nV: Ins\nG4A4|c8|\n";
+
+    fn song(seconds: f32, score: Option<usize>) -> Song {
+        Song { cot: Cot::Full, style: "folk".into(), lyrics: String::new(), abc: None, instrumental: false, seed: 1, cfg: 1.0,
+               max_codes: (seconds * FPS).ceil() as usize, max_score: score, steps: ODE_STEPS as usize }
+    }
+
+    #[test]
+    fn the_longest_song_is_the_codes_phase_most() {
+        assert_eq!(sample::SEMANTIC.max_tokens, (MAX_SECONDS * FPS) as usize);
+        const { assert!(sample::SEMANTIC.max_tokens < CONTEXT) };
+        assert_eq!(seconds_asked(None).unwrap(), DEFAULT_SECONDS);
+        assert_eq!(seconds_asked(Some(MAX_SECONDS)).unwrap(), MAX_SECONDS);
+        // the form a client reads the most from: "from 1 to N s"
+        assert_eq!(seconds_asked(Some(601.0)).unwrap_err().0, "601 s: from 1 to 600 s (the song may end sooner: the model decides)");
+        assert!(seconds_asked(Some(0.5)).is_err());
+    }
+
+    #[test]
+    fn the_card_states_the_engines_longest_song() {
+        let card = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../model-cards/audio/yue2-3b-q8.yml")).unwrap();
+        let v = card.lines().find_map(|l| l.strip_prefix("max_seconds:")).map(|v| v.split('#').next().unwrap().trim().parse::<f32>().unwrap());
+        assert_eq!(v, Some(MAX_SECONDS), "model-cards/audio/yue2-3b-q8.yml max_seconds");
+    }
+
+    #[test]
+    fn a_long_songs_score_gets_room_as_the_context_leaves_it() {
+        // up to six minutes: upstream's 4096
+        assert_eq!(song(240.0, None).score_budget(300), 4096);
+        assert_eq!(song(DEFAULT_SECONDS, None).score_budget(300), 4096);
+        // seven and ten minutes: in proportion, beside the codes and a 300-token prompt
+        assert_eq!(song(420.0, None).score_budget(300), 4779);
+        assert_eq!(song(600.0, None).score_budget(300), 6827);
+        // a long prompt: what the context leaves, never under 4096 (then refused by the check)
+        assert_eq!(song(600.0, None).score_budget(4000), CONTEXT - 4000 - 2 - 15000);
+        assert_eq!(song(600.0, None).score_budget(6000), 4096);
+        // asked: as asked
+        assert_eq!(song(600.0, Some(12_288)).score_budget(300), 12_288);
+    }
+
+    #[test]
+    fn the_context_refusal_says_what_fits() {
+        let e = too_long(10_000, 15_000);
+        assert!(e.contains("at most 583 s fit with these lyrics"), "{e}");
+        assert!(too_long(24_576, 1).contains("leave no room"));
+    }
 
     #[test]
     fn the_instrumental_flag_reads() {

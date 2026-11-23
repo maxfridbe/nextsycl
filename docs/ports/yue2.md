@@ -138,6 +138,32 @@ The split gains nothing in time on these cards; it only moves memory. A guided s
 
 | one card at the 360 s cap, B65 (9000 codes forced, `NS_YUE2_MIN_CODES`; 181.6 s) | 8.27 GiB | |
 
+## Long songs (600 s cap, 2026-11-23)
+
+The longest request is 600 s (`MAX_SECONDS`, `SEMANTIC.max_tokens` 15000); the default stays 360. The real limit is the
+context (24576): prompt + score room + codes; past it the refusal says how many seconds fit. A score drawn for a song
+asked past 360 s gets upstream's 4096 tokens in proportion (6827 at 600 s), as the context leaves room. Past one chunk
+((24576 - prompt - 3) / 2 frames) the flow runs in chunks; here neighbouring chunks share 250 frames and the join
+crossfades 2 s from 4 s in (`prompt::chunks` / `join`; upstream cuts end to end).
+
+Forced length (`NS_YUE2_MIN_CODES=15000`), seed 7, folk rock, build copy `~/src/nextsycl-yue2long`, one card each:
+
+| Run | Card | Score | Codes tg | Flow, 2 chunks | VAE | Total | Peak VRAM |
+|---|---|---|---|---|---|---|---|
+| 772-word lyrics, 600 s | B70 | 19.2 s | 110.3 codes/s | 195.7 s | 6.6 s | 358.2 s | 8830 MiB |
+| 772-word lyrics, 600 s | B65 | 26.2 s | 88.7 codes/s | 307.7 s | 9.1 s | 513.1 s | 8845 MiB |
+| 1206-word lyrics, 600 s, end to end | B70 | | | | | 423 s wall | 8792 MiB |
+| 1206-word lyrics, 600 s, end to end | B65 | 40.1 s | 81.5 codes/s | 367.3 s | 9.3 s | 603 s | 8815 MiB |
+| 1206-word lyrics, 600 s, crossfade | B70 | 28.7 s | 99.7 codes/s | 237.2 s | 6.8 s | 424 s | 8798 MiB |
+
+The shorter lyrics' song ended at ~390 s (the forced rest is near silence, -85 dB), so its chunk join (401 s) fell in
+silence; the longer lyrics put it in the music (362.9 s). End to end, the latent step at the cut was at the 97th (B70) /
+92nd (B65) percentile of the song's frame steps, level and spectral flux unremarkable (a dip before the B70 cut is the
+music's own: the same codes solved inside chunk 2 dip the same). Crossfaded (B70): the step mid-fade at the 3rd
+percentile, level jump 13th, flux 30th; Whisper over 330-390 s hears the same 11 lines with either join, the line sung
+through the crossfade whole. Not yet measured when this was written: the crossfade on the B65, 420 s on both cards,
+guided (cfg 1.2) peak VRAM at the cap.
+
 A free-running song never reached the cap (long lyrics ended at 98 and 234 s). `concurrency` and `coexistence` are not on the card: not measured.
 
 ## Instrumental covers (`instrumental`, 2026-11-11)

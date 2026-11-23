@@ -79,8 +79,8 @@ nextsycl audio gen "-" --model yue2-3b-q8 --source song.mp3 --opt-score-only tru
 ```
 
 ## Length, guidance, steps
-`seconds` is the most it makes (up to 360; the model ends the song when the lyrics are sung - a verse and two choruses
-run about a minute and a half). `cfg` guides the codes against the instruction alone (1: none; try 1.2 for a closer
+`seconds` is the most it makes (360 unless asked, up to 600; the model ends the song when the lyrics are sung - a verse and two choruses
+run about a minute and a half). A song asked past six minutes gets a longer score budget in proportion (`score-tokens`, 6827 at 600 s); the model's context holds the lyrics, the score and the codes together, so with long lyrics a long request may be refused with how many seconds do fit. `cfg` guides the codes against the instruction alone (1: none; try 1.2 for a closer
 reading of the style). `steps` are the flow's (32, upstream's). Each song is one seed: the same request and seed make the
 same WAV on the same card; the B70 and the B65 draw different songs from one seed (their rounding differs, and the codes are
 drawn from it). A score sung again with new words keeps its melody; the same score and the same words do not repeat the
