@@ -14,6 +14,12 @@
 //! causal conv: two copies of the first frame before it, the frame's border repeated around it (replicate padding)
 //! ```
 //!
+//! A **stream** decodes a video a few latent frames at a time and gives the same frames as one decode of the whole
+//! (the decoder is causal in time): each causal convolution keeps the last two frames of its padded input for the next
+//! chunk, the middle attention its keys and values of the frames before, and the upsamples treat only the stream's
+//! first frame as the video's first (MovieRoll's T-cache streaming decode; `stream_begin`, `stream_chunk`,
+//! `stream_end`). A stream is not tiled.
+//!
 //! The pipeline decodes under memory_efficient_context: latents wider or taller than 16 are cut in tiles of 16 x 16
 //! latents (256 pixels) every 14, each decoded whole in time, blended over 32 pixels with its upper and left
 //! neighbours and cut to 224 - done the same here, the blending on the host.
@@ -80,9 +86,21 @@ struct Encoder {
     conv_out: Conv,
 }
 
+/// A streaming decode's carried state (`stream_begin`): each causal convolution's last two padded input frames (by
+/// the convolution), the middle attention's keys and values so far, whether a chunk went through yet
+#[derive(Default)]
+struct Stream {
+    convs: std::collections::HashMap<usize, DevBuf>,
+    kv: Option<(DevBuf, DevBuf)>,
+    rows: usize,
+    started: bool,
+}
+
 pub struct Vae {
     k: K,
     enc: Option<Encoder>,
+    /// the stream when one is open (`stream_begin`)
+    stream: std::sync::Mutex<Option<Stream>>,
     conv_in: Conv,
     mid: [Resnet; 2],
     att: Att,
@@ -218,7 +236,7 @@ impl Vae {
         };
         log(format!("vae: the decoder{} ({:.2} GiB, half) on {} in {:.1} s", if enc.is_some() { " and the encoder" } else { "" }, bytes as f64 / (1u64 << 30) as f64,
                     gpu.name, t0.elapsed().as_secs_f64()));
-        Ok(Vae { k: k.clone(), enc, conv_in, mid, att, levels, norm_out, conv_out, bytes })
+        Ok(Vae { k: k.clone(), enc, stream: Default::default(), conv_in, mid, att, levels, norm_out, conv_out, bytes })
     }
 
     /// A causal 3x3x3 convolution (or a 1x1x1 one: a linear over the channels)
@@ -233,8 +251,19 @@ impl Vae {
             return Ok(o);
         }
         let p = DevBuf::new(gpu, (x.t + 2) * (x.h + 2) * (x.w + 2) * x.c * 2)?;
-        self.k.pad_causal(x.b.ptr(), x.t, x.h, x.w, x.c, p.ptr())?;
+        let mut st = self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))?;
+        let key = c as *const Conv as usize;
+        // a stream carries each convolution's last two padded frames into its next chunk
+        let prev = st.as_ref().and_then(|s| s.convs.get(&key)).map_or(std::ptr::null(), |b| b.ptr() as *const std::ffi::c_void);
+        self.k.pad_causal(x.b.ptr(), prev, x.t, x.h, x.w, x.c, p.ptr())?;
         nsd.conv3d_ex(p.ptr(), Dt::F16, (x.t + 2, x.h + 2, x.w + 2), c.ci, c.w.ptr(), c.co, (3, 3, 3), (1, 1, 1), c.b.ptr(), o.b.ptr())?;
+        if let Some(s) = st.as_mut() {
+            let frame = (x.h + 2) * (x.w + 2) * x.c * 2;
+            let keep = DevBuf::new(gpu, 2 * frame)?;
+            keep.copy_within(0, &p, x.t * frame, 2 * frame)?;
+            nsd.wait()?;
+            s.convs.insert(key, keep);
+        }
         Ok(o)
     }
 
@@ -265,34 +294,58 @@ impl Vae {
         let hw = x.h * x.w;
         let h = self.norm(nsd, &x, &a.norm, false)?;
         let q = self.conv(nsd, &a.q, &h)?;
-        let k = self.conv(nsd, &a.k, &h)?;
-        let v = self.conv(nsd, &a.v, &h)?;
+        let mut k = self.conv(nsd, &a.k, &h)?.b;
+        let mut v = self.conv(nsd, &a.v, &h)?.b;
         drop(h);
-        let vt = DevBuf::new(gpu, n * c * 2)?;
-        self.k.transpose(v.b.ptr(), n, c, vt.ptr())?;
-        drop(v);
+        // a stream: the frames before this chunk's keys and values in front of its own (the queries' rows after them)
+        let mut before = 0;
+        {
+            let mut st = self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))?;
+            if let Some(s) = st.as_mut() {
+                if let Some((pk, pv)) = s.kv.take() {
+                    let all = |prev: &DevBuf, cur: &DevBuf| -> Result<DevBuf> {
+                        let b = DevBuf::new(gpu, (s.rows + n) * c * 2)?;
+                        b.copy_within(0, prev, 0, s.rows * c * 2)?;
+                        b.copy_within(s.rows * c * 2, cur, 0, n * c * 2)?;
+                        Ok(b)
+                    };
+                    k = all(&pk, &k)?;
+                    v = all(&pv, &v)?;
+                    before = s.rows;
+                }
+                nsd.wait()?;
+                s.rows = before + n;
+            }
+        }
+        let na = before + n;
+        let vt = DevBuf::new(gpu, na * c * 2)?;
+        self.k.transpose(v.ptr(), na, c, vt.ptr())?;
         let o = Vol::new(gpu, x.t, x.h, x.w, c)?;
         // query rows a call: whole frames, the scores within SCORE_BYTES
-        let frames = (SCORE_BYTES / (n * 4 * hw)).clamp(1, x.t);
+        let frames = (SCORE_BYTES / (na * 4 * hw)).clamp(1, x.t);
         let rows = frames * hw;
-        let s = DevBuf::f32(gpu, rows * n)?;
-        let p = DevBuf::new(gpu, rows * n * 2)?;
+        let s = DevBuf::f32(gpu, rows * na)?;
+        let p = DevBuf::new(gpu, rows * na * 2)?;
         let of = DevBuf::f32(gpu, rows * c)?;
         let scale = 1.0 / (c as f32).sqrt();
         let mut r0 = 0;
         while r0 < n {
             let m = rows.min(n - r0);
-            // the keys this block of queries sees: every frame up to its last
-            let nk = ((r0 + m - 1) / hw + 1) * hw;
+            // the keys this block of queries sees: every frame up to its last (the stream's earlier frames first)
+            let nk = ((before + r0 + m - 1) / hw + 1) * hw;
             let qp = q.b.ptr().cast::<u16>().wrapping_add(r0 * c).cast();
-            self.k.linear_f32(qp, m, c, k.b.ptr(), 0, nk, std::ptr::null(), s.fp(), nk)?;
-            self.k.softmax_causal(s.fp(), m, nk, r0, hw, scale, p.ptr())?;
-            self.k.linear_f32(p.ptr(), m, nk, vt.ptr(), n, c, std::ptr::null(), of.fp(), c)?;
+            self.k.linear_f32(qp, m, c, k.ptr(), 0, nk, std::ptr::null(), s.fp(), nk)?;
+            self.k.softmax_causal(s.fp(), m, nk, before + r0, hw, scale, p.ptr())?;
+            self.k.linear_f32(p.ptr(), m, nk, vt.ptr(), na, c, std::ptr::null(), of.fp(), c)?;
             self.k.to_half(of.fp(), o.b.ptr().cast::<u16>().wrapping_add(r0 * c).cast(), m * c, 1.0)?;
             r0 += m;
         }
         let y = self.conv(nsd, &a.proj, &o)?;
         self.k.add(y.b.ptr(), x.b.ptr(), n * c)?;
+        nsd.wait()?;
+        if let Some(s) = self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))?.as_mut() {
+            s.kv = Some((k, v));
+        }
         Ok(y)
     }
 
@@ -312,8 +365,11 @@ impl Vae {
             if let Some((c, temporal)) = &l.up {
                 let conv = self.conv(nsd, c, &x)?;
                 let co = c.co / if *temporal { 8 } else { 4 };
-                let o = Vol::new(&nsd.gpu, if *temporal { 2 * x.t - 1 } else { x.t }, 2 * x.h, 2 * x.w, co)?;
-                self.k.upsample(conv.b.ptr(), x.b.ptr(), x.t, x.h, x.w, co, x.c, *temporal, o.b.ptr())?;
+                // the video's first frame becomes one frame, every other two: in a stream only its first chunk has it
+                let first = self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))?.as_ref().is_none_or(|s| !s.started);
+                let to = if !*temporal { x.t } else if first { 2 * x.t - 1 } else { 2 * x.t };
+                let o = Vol::new(&nsd.gpu, to, 2 * x.h, 2 * x.w, co)?;
+                self.k.upsample(conv.b.ptr(), x.b.ptr(), x.t, x.h, x.w, co, x.c, *temporal, first, o.b.ptr())?;
                 x = o;
             }
             nsd.wait()?;
@@ -323,7 +379,43 @@ impl Vae {
         drop(x);
         let out = self.conv(nsd, &self.conv_out, &h)?;
         nsd.wait()?;
+        if let Some(s) = self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))?.as_mut() {
+            s.started = true;
+        }
         Ok(out)
+    }
+
+    /// Opens a streaming decode (any open one dropped): `stream_chunk` then takes the video's latent frames in order
+    pub fn stream_begin(&self) -> Result<()> {
+        *self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))? = Some(Stream::default());
+        Ok(())
+    }
+
+    /// Ends the stream, giving its carried state back
+    pub fn stream_end(&self) -> Result<()> {
+        *self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))? = None;
+        Ok(())
+    }
+
+    /// The next `f` latent frames of the open stream (float32 [f, h, w, 32], not yet divided by the scaling) -> their
+    /// frames float32 [To, 16h, 16w, 3] in [-1, 1]: 4 (f - 1) + 1 for the first chunk, 4 f after (the same frames a
+    /// decode of the whole video gives there)
+    pub fn stream_chunk(&self, nsd: &Nsd, lat: &[f32], f: usize, h: usize, w: usize) -> Result<(Vec<f32>, usize)> {
+        if self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))?.is_none() {
+            return Err(Error("stream_chunk without stream_begin".into()));
+        }
+        if lat.len() != f * h * w * Z {
+            return Err(Error(format!("{} latent values for {f} x {h} x {w} x {Z}", lat.len())));
+        }
+        let gpu = &nsd.gpu;
+        let zf = DevBuf::from_f32(gpu, lat)?;
+        let z = Vol::new(gpu, f, h, w, Z)?;
+        self.k.to_half(zf.fp(), z.b.ptr(), lat.len(), 1.0 / SCALING)?;
+        let v = self.decode_vol(nsd, z, &mut |_| {})?;
+        let of = DevBuf::f32(gpu, v.n() * 3)?;
+        self.k.to_float(v.b.ptr(), of.fp(), v.n() * 3)?;
+        nsd.wait()?;
+        Ok((of.to_f32()?, v.t))
     }
 
     /// One picture (float32 [H, W, 3] in [-1, 1], sides multiples of 16) through the encoder: its latent's mean times the

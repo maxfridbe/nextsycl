@@ -187,9 +187,11 @@ impl HunyuanVideo15 {
         let size = |r: &str| -> Result<u64> { std::fs::metadata(role(files, r)?).map(|m| m.len()).map_err(|e| Error(format!("{r}: {e}"))) };
         // the plan before anything is allocated (the driver has no out-of-memory error): the DiT's float32 file as Q8_0
         // (a quarter, plus scales), 26 of the text encoder's 28 layers, byT5 in float32, the VAE's decoder in half (an
-        // eighth of the float32 file: half of it the decoder) and its reordered copy, the activations of a 480p clip
-        // (measured: docs/ports/hunyuanvideo15.md)
-        let need = size("denoiser")? * 34 / 128 + size("text-encoder")? * 26 / 28 + size("byt5")? * 2 + size("vae")? / 4 + (10u64 << 30);
+        // eighth of the float32 file: half of it the decoder) and its reordered copy, I2V's SigLIP tower (half of its
+        // file) and encoder, and the work of a 480p 5 s clip: 3.6 GiB measured over the 15.1 GiB loaded on the B70 (a
+        // CFG pass twice that), 5 GiB here (docs/ports/hunyuanvideo15.md)
+        let vision = if files.contains_key("vision") { size("vision")? / 2 + size("vae")? / 16 } else { 0 };
+        let need = size("denoiser")? * 34 / 128 + size("text-encoder")? * 26 / 28 + size("byt5")? * 2 + size("vae")? / 4 + vision + (5u64 << 30);
         let (total, free) = gpu.memory()?;
         let free = free.unwrap_or(total);
         if need > free {

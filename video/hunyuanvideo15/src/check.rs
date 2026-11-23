@@ -277,6 +277,31 @@ pub fn job(m: &HunyuanVideo15, spec: &Value, ctl: &mut JobCtl) -> Result<Value> 
         (r.log)(format!("vae: {to} frames {w}x{h} in {:.1} s", t0.elapsed().as_secs_f64()));
         r.line("video", &v, &read_npy(&dir.join("video.npy"))?.1);
     }
+    if has("stream") {
+        // the decoder as a stream (MovieRoll's chunked decode): the latents in chunks - 1 frame, then `chunk` at a time
+        // - against the whole video's decode (the reference's, untiled: small sizes)
+        let d = json_file(&dir.join("dit.json"))?;
+        let lat = d["latent"].as_array().ok_or_else(|| Error("dit.json: no latent".into()))?;
+        let (f, h, w) = (lat[0].as_u64().unwrap_or(1) as usize, lat[1].as_u64().unwrap_or(1) as usize, lat[2].as_u64().unwrap_or(1) as usize);
+        let steps = d["steps"].as_u64().unwrap_or(1);
+        let (_, z) = read_npy(&dir.join(format!("latents_{}.npy", steps - 1)))?;
+        let chunk = spec.get("chunk").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+        let plane = h * w * crate::vae::Z;
+        m.vae.stream_begin()?;
+        let mut out = Vec::new();
+        let mut at = 0;
+        let t0 = std::time::Instant::now();
+        while at < f {
+            let n = if at == 0 { 1 } else { chunk.min(f - at) };
+            let (v, to) = m.vae.stream_chunk(nsd, &z[at * plane..(at + n) * plane], n, h, w)?;
+            (r.log)(format!("stream: latent frames {at}..{} -> {to} frames", at + n));
+            out.extend(v);
+            at += n;
+        }
+        m.vae.stream_end()?;
+        (r.log)(format!("stream: {f} latent frames in {:.1} s", t0.elapsed().as_secs_f64()));
+        r.line(&format!("stream (1 + {chunk}s)"), &out, &read_npy(&dir.join("video.npy"))?.1);
+    }
     (r.log)(format!("worst relative error {:.2e}", r.worst));
     Ok(json!({"worst_rel_rms": if r.worst.is_finite() { json!(r.worst) } else { json!("inf") }, "stages": r.rows}))
 }

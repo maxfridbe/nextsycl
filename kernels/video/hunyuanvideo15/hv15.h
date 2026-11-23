@@ -41,9 +41,10 @@ int ns_video_hv15_to_float(ns_gpu* g, const void* x, float* out, int64_t n);
 int ns_video_hv15_q8_0_float(ns_gpu* g, const void* src, int64_t n, float* out);
 
 /* ---- the VAE's: channels-last volumes [T, H, W, C] of half ----------------------------------------------------- */
-/* out [T + 2, H + 2, W + 2, C] = x padded for a causal 3x3x3 convolution: two frames before the first (copies of it),
- * one pixel around each frame (the border repeated) - CausalConv3d's replicate padding */
-int ns_video_hv15_pad_causal(ns_gpu* g, const void* x, int64_t T, int64_t H, int64_t W, int64_t C, void* out);
+/* out [T + 2, H + 2, W + 2, C] = x padded for a causal 3x3x3 convolution: two frames before the first - copies of
+ * it (CausalConv3d's replicate padding), or with prev ([2, H + 2, W + 2, C], already padded: the last two frames of the
+ * previous chunk's padded input) those, a stream carried on - and one pixel around each frame (the border repeated) */
+int ns_video_hv15_pad_causal(ns_gpu* g, const void* x, const void* prev, int64_t T, int64_t H, int64_t W, int64_t C, void* out);
 /* out [N, C] = x / max(|x|, 1e-12) * sqrt(C) * gamma (F.normalize over the channels, RMS_norm), then SiLU when silu;
  * C at most 1024 */
 int ns_video_hv15_rms_channels(ns_gpu* g, const void* x, int64_t N, int64_t C, const float* gamma, int silu, void* out);
@@ -60,6 +61,10 @@ int ns_video_hv15_add(ns_gpu* g, void* x, const void* y, int64_t n);
  *     To = T. */
 int ns_video_hv15_upsample(ns_gpu* g, const void* conv, const void* x, int64_t T, int64_t H, int64_t W, int64_t C, int64_t Ci, int temporal,
                            void* out);
+/* ns_video_hv15_upsample with first = 0: a chunk after the stream's first, whose frame 0 is not the video's: every frame
+ * becomes two (To = 2T) */
+int ns_video_hv15_upsample_ex(ns_gpu* g, const void* conv, const void* x, int64_t T, int64_t H, int64_t W, int64_t C, int64_t Ci, int temporal,
+                              int first, void* out);
 /* The encoder's Downsample of one frame (I2V's picture): conv [H, W, Cc] (its convolution's output, Cc = Cout / 8 in
  * time and space, Cout / 4 in space) and x [H, W, Ci] -> out [H / 2, W / 2, Cout]: conv's "(r2 r3 c)" space-to-depth
  * (in time: twice over, the first frame's channels repeated), plus x's "(r2 r3 c)" averaged over groups of 4 Ci / Cout

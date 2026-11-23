@@ -89,12 +89,30 @@ steps of the cfg-distilled DiT; I2V: the step-distilled DiT, a 1024 x 1024 pictu
 | latents after step 1 / 2 | 1.4e-4 / 6.0e-4 | 6.3e-4 / 4.2e-3 | 1.000000 |
 | 320 x 320: latents after 2 steps | 1.2e-3 | 2.3e-2 | 0.999999 |
 | VAE decode (one tile / 2 x 2 tiles) | 1.4e-3 / 2.7e-3 | 1.6e-2 / 5.1e-2 | 0.999999 / 0.999996 |
-I2V_ROWS
-Q8_ROWS
+| I2V: SigLIP tokens (from the reference's 384 x 384 pixels) | 6.2e-5 | 1.1e-2 | 1.000000 |
+| I2V: the first frame's latent (VAE encoder) | 7.9e-4 | 4.2e-3 | 1.000000 |
+| I2V: after the 54 blocks / velocity / latents after 2 steps / decode | 9.0e-4 / 2.9e-4 / 5.3e-4 / 3.5e-4 | 6.2e-3 / 4.1e-3 / 5.3e-3 / 3.9e-3 | 1.000000 |
+| *the quantization itself*: the reference on Q8_0 against the reference on the float32 file - after the 54 blocks / velocity / latents after 1 and 2 steps | 1.5e-2 / 6.2e-3 / 2.3e-3 / 1.4e-2 | 0.13 / 6.1e-2 / 1.0e-2 / 0.19 | 0.99989 / 0.99998 / 0.999997 / 0.99990 |
+
+Every stage is the reference's to within the engine's rounding (half products, oneDNN's sums); the gap Q8_0 itself
+opens against the float32 weights is ten times larger - the usual for int8 weights (1e-2 - 3e-2) - and the 50-step
+fox clip is clean (a coherent fox walking through the snow, the camera tracking it).
 
 ### Speed and memory (one card; the clip 848 x 480, 121 frames, 50 steps, the cfg-distilled card)
 
-SPEED_ROWS
+| Card | Load | 50 steps | a step (49,290 tokens) | VAE decode (12 tiles) | Clip | Peak on the card |
+|---|---|---|---|---|---|---|
+| Arc Pro B70 | 26 - 66 s | 642.5 s | 12.85 s | 34.5 s | 677.6 s (11.3 min) | 18.7 GiB |
+| Arc Pro B65 | 40 s | 1015.8 s | 20.32 s | 61.8 s | 1078.3 s (18.0 min) | 18.5 GiB |
+
+Measured with `video job generate --seconds 5 --steps 50 --seed 7` (the fox prompt), one run each; the load is the
+33 GB float32 file read and quantized (66 s cold, 26 s with the file in the page cache). The B65 is 1.58x the B70 a
+step, as for H3 (1.5x). The base card (CFG 6) runs two passes a step: twice the step time.
+
+The card's memory ("vouch"): the cfg-distilled card states `vram_gib: 19.5` (18.7 GiB measured + margin); the engine's
+own check before it allocates asks for the files' share plus 5 GiB of work (~20.6 GiB) and refuses with the numbers
+when the card has less free. The worker's room check reads the card's `vram_gib` (its float32 file would otherwise ask
+for 41 GiB: more than a card).
 
 The memory figure is the card's whole use while the clip ran (total less the driver's free): the DiT's 8.2 GiB, the
 text encoders' 4.2 GiB and the VAE's 1.6 GiB stay loaded (15.1 GiB before the first step), the rest is the 49K-token
@@ -133,4 +151,28 @@ pulled (`nextsycl models pull hunyuanvideo-1.5-480p-t2v-distilled-q8 --dir <the 
 
 ### What MovieRoll (phase 2) needs on top of this engine
 
-MOVIEROLL
+Not started: MovieRoll's weights are gated (403, checked again 2026-11-23), and its rolling window only means
+anything with them - HunyuanVideo-1.5's own weights were never trained on mixed noise levels or a causal history, so
+machinery built against them could be run but not checked. What its public code (github Tencent-Hunyuan/MovieRoll,
+`movieroll_transformer.py` `forward_inference`, `streaming_attention.py` `chunk_inference_attention`,
+`movieroll_dmd_pipeline.py`) asks of this engine, in order:
+
+1. **Per-chunk timesteps**: a window of 5 chunks (4 latent frames each) at rising noise levels - `vec` (hence every
+   block's modulations) a row per chunk. The engine's modulations are already one row per step (`Steps`); a window
+   takes a row per chunk, and each norm / gated product is called per chunk over its contiguous rows (5 calls where
+   there is 1).
+2. **Attention over a cached history**: the window's image queries over `[cached history K, V | window image | text]`,
+   the text queries over `[window image | text]` only (the history unseen by the text). `nsd.attention_qk` takes
+   queries and keys / values apart already; the cache is a per-block buffer of post-RoPE K and V rows the window's own
+   are written after (one call for the image queries, one for the text's). RoPE positions run on with the frame index
+   (the table's frame axis offset by the history's length).
+3. **The cache (HieraKV)**: blocks 0 - 5 keep every finished chunk; blocks 6 - 53 a sink (the first chunk) and the
+   recent ones; at 18 cached chunks a recompute re-encodes the sink, representative middle chunks and the 3 most
+   recent at t = 0 without text (`forward_kv_recompute`, the K / V only, no text stream). Memory (movieroll.md): ~13 GB
+   bf16 at 480 x 864 - a second card or int8 K / V when it does not fit beside the 8.2 GiB DiT.
+4. **Events**: one prompt a window; a new prompt re-encodes the text (cheap: 0.1 s here) and triggers a recompute.
+5. **Streaming decode**: the VAE decoder is causal in time (causal convs, frame-causal attention), so a chunk can be
+   decoded as it leaves the window if each causal conv keeps its last two input frames and the middle attention its K
+   / V of the frames before (MovieRoll's PS-VAE `streaming_vae.py` does this with its own decoder - to read when the
+   weights come: it may not be this VAE).
+6. **Phase 3** (`video.roll`, `video.rollAppend`, `video.rollEnd`, fragmented MP4 + HLS while it runs) sits on 1 - 5.

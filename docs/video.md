@@ -2,7 +2,11 @@
 
 [← nextsycl](../README.md)
 
-MiniMax H3's engine, daemon, studio and tools (the sycl-h3 studio) as `nextsycl video`:
+MiniMax H3's engine, daemon, studio and tools (the sycl-h3 studio) as `nextsycl video`. A second engine,
+**HunyuanVideo-1.5** (`video/hunyuanvideo15`: silent 480p text to video and image to video, 5 s clips; cards
+`hunyuanvideo-1.5-480p-t2v-distilled-q8`, `-480p-t2v-q8`, `-480p-i2v-step-distilled-q8`), runs behind the same daemon
+and studio: added to `NS_VIDEO_ENGINES`, `video.generate` takes it as `engine: "HV15"` / `"HV15-CFG"` / `"HV15-I2V"`
+(docs/ports/hunyuanvideo15.md).
 
 ```sh
 nextsycl models pull minimax-h3 [--dir DIR] [--from DIR]      # --from: adopt copies already on the machine

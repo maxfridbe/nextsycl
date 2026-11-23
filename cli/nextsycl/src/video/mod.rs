@@ -309,9 +309,14 @@ fn worker(cfg: &Config, args: &[String]) -> Result<(), String> {
             cancel.store(true, Ordering::SeqCst);
         });
     }
-    // the card's room first: the denoiser and 8 GiB of work (the card's size at most)
+    // the card's room first: the model's measured memory when its entry has one (vram_gib: a denoiser kept in another
+    // form than its file - HunyuanVideo-1.5's float32 file is held as Q8_0), else the denoiser and 8 GiB of work (the
+    // card's size at most)
     nextsycl_core::use_kind("video");
-    let den: u64 = files.get("denoiser").and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
+    let den: u64 = match m["vram_gib"].as_f64().filter(|g| *g > 0.0) {
+        Some(g) => ((g * (1u64 << 30) as f64) as u64).saturating_sub(8u64 << 30),
+        None => files.get("denoiser").and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len()),
+    };
     {
         // one context to ask the card with, let go before the engine opens its own
         let g = nextsycl_core::Gpu::open(gpu).map_err(|e| e.0)?;

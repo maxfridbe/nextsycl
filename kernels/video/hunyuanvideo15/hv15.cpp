@@ -211,15 +211,21 @@ int ns_video_hv15_q8_0_float(ns_gpu* g, const void* src, int64_t n, float* out) 
 
 // ---- the VAE's ----------------------------------------------------------------------------------------------------
 
-int ns_video_hv15_pad_causal(ns_gpu* g, const void* x, int64_t T, int64_t H, int64_t W, int64_t C, void* out) {
+int ns_video_hv15_pad_causal(ns_gpu* g, const void* x, const void* prev, int64_t T, int64_t H, int64_t W, int64_t C, void* out) {
     NS_TRY
     if (T <= 0 || H <= 0 || W <= 0 || C <= 0) return ns_fail("ns_video_hv15_pad_causal: an empty volume");
     const half* s = (const half*) x;
+    const half* pv = (const half*) prev;
     half* o = (half*) out;
     const int64_t To = T + 2, Ho = H + 2, Wo = W + 2;
     g->q.parallel_for(sycl::range<2>((size_t) (To * Ho * Wo), (size_t) C), [=](sycl::id<2> id) {
         const int64_t p = id[0], c = id[1];
         const int64_t t = p / (Ho * Wo), y = (p / Wo) % Ho, xx = p % Wo;
+        if (pv && t < 2) {
+            // the previous chunk's last two padded frames, as they were
+            o[p * C + c] = pv[p * C + c];
+            return;
+        }
         // replicate: the source index clamped into the volume
         const int64_t ts = t < 2 ? 0 : t - 2;
         const int64_t ys = y < 1 ? 0 : (y - 1 >= H ? H - 1 : y - 1), xs = xx < 1 ? 0 : (xx - 1 >= W ? W - 1 : xx - 1);
@@ -290,6 +296,11 @@ int ns_video_hv15_add(ns_gpu* g, void* x, const void* y, int64_t n) {
 
 int ns_video_hv15_upsample(ns_gpu* g, const void* conv, const void* x, int64_t T, int64_t H, int64_t W, int64_t C, int64_t Ci, int temporal,
                            void* out) {
+    return ns_video_hv15_upsample_ex(g, conv, x, T, H, W, C, Ci, temporal, 1, out);
+}
+
+int ns_video_hv15_upsample_ex(ns_gpu* g, const void* conv, const void* x, int64_t T, int64_t H, int64_t W, int64_t C, int64_t Ci, int temporal,
+                              int first, void* out) {
     NS_TRY
     if (T <= 0 || H <= 0 || W <= 0 || C <= 0 || Ci <= 0) return ns_fail("ns_video_hv15_upsample: an empty volume");
     const int64_t factor = temporal ? 8 : 4;
@@ -300,19 +311,21 @@ int ns_video_hv15_upsample(ns_gpu* g, const void* conv, const void* x, int64_t T
     const half* cv = (const half*) conv;
     const half* s = (const half*) x;
     half* o = (half*) out;
-    const int64_t To = temporal ? 2 * T - 1 : T, Ho = 2 * H, Wo = 2 * W;
+    const int64_t To = temporal ? (first ? 2 * T - 1 : 2 * T) : T, Ho = 2 * H, Wo = 2 * W;
+    // a chunk after the first: its frame 0 is an ordinary frame (frame t of the output reads input frame t / 2)
+    const int64_t lead = first ? 1 : 0;
     g->q.parallel_for(sycl::range<2>((size_t) (To * Ho * Wo), (size_t) C), [=](sycl::id<2> id) {
         const int64_t p = id[0], c = id[1];
         const int64_t to = p / (Ho * Wo), y = (p / Wo) % Ho, xx = p % Wo;
         const int64_t h = y / 2, w = xx / 2, r23 = (y % 2) * 2 + (xx % 2);
         float a, b;
-        if (temporal && to == 0) {
+        if (temporal && first && to == 0) {
             // "(r2 r3 c)": c of 2C, c < C kept; the shortcut's c of Ci / 4, repeated rep / 2 times
             const size_t q = (size_t) (h * W + w);
             a = (float) cv[q * Cc + r23 * 2 * C + c];
             b = (float) s[q * Ci + r23 * (Ci / 4) + c / (rep / 2)];
         } else if (temporal) {
-            const int64_t t = 1 + (to - 1) / 2, r1 = (to - 1) % 2;
+            const int64_t t = lead + (to - lead) / 2, r1 = (to - lead) % 2;
             const size_t q = (size_t) ((t * H + h) * W + w);
             const int64_t r = r1 * 4 + r23;
             a = (float) cv[q * Cc + r * C + c];

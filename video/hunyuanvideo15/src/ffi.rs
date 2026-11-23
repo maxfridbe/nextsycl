@@ -24,11 +24,11 @@ struct Api {
     to_half: unsafe extern "C" fn(G, *const f32, M, i64, f32) -> c_int,
     to_float: unsafe extern "C" fn(G, P, *mut f32, i64) -> c_int,
     q8_0_float: unsafe extern "C" fn(G, P, i64, *mut f32) -> c_int,
-    pad_causal: unsafe extern "C" fn(G, P, i64, i64, i64, i64, M) -> c_int,
+    pad_causal: unsafe extern "C" fn(G, P, P, i64, i64, i64, i64, M) -> c_int,
     rms_channels: unsafe extern "C" fn(G, P, i64, i64, *const f32, c_int, M) -> c_int,
     rep_add: unsafe extern "C" fn(G, M, P, i64, i64, i64, i64) -> c_int,
     add: unsafe extern "C" fn(G, M, P, i64) -> c_int,
-    upsample: unsafe extern "C" fn(G, P, P, i64, i64, i64, i64, i64, c_int, M) -> c_int,
+    upsample: unsafe extern "C" fn(G, P, P, i64, i64, i64, i64, i64, c_int, c_int, M) -> c_int,
     transpose: unsafe extern "C" fn(G, P, i64, i64, M) -> c_int,
     downsample: unsafe extern "C" fn(G, P, P, i64, i64, i64, i64, i64, M) -> c_int,
     group_mean_add: unsafe extern "C" fn(G, M, P, i64, i64, i64) -> c_int,
@@ -71,7 +71,7 @@ fn api() -> Result<&'static Api> {
             rms_channels: sym!("ns_video_hv15_rms_channels"),
             rep_add: sym!("ns_video_hv15_rep_add"),
             add: sym!("ns_video_hv15_add"),
-            upsample: sym!("ns_video_hv15_upsample"),
+            upsample: sym!("ns_video_hv15_upsample_ex"),
             transpose: sym!("ns_video_hv15_transpose"),
             downsample: sym!("ns_video_hv15_downsample"),
             group_mean_add: sym!("ns_video_hv15_group_mean_add"),
@@ -270,10 +270,12 @@ impl K {
         check(unsafe { (self.k.q8_0_float)(self.g(), src, n as i64, out) }, "q8_0 to float")
     }
 
-    /// x [t, h, w, c] -> out [t + 2, h + 2, w + 2, c] (causal replicate padding)
-    pub fn pad_causal(&self, x: P, t: usize, h: usize, w: usize, c: usize, out: M) -> Result<()> {
-        // SAFETY: x and out hold the volumes named.
-        check(unsafe { (self.k.pad_causal)(self.g(), x, t as i64, h as i64, w as i64, c as i64, out) }, "causal padding")
+    /// x [t, h, w, c] -> out [t + 2, h + 2, w + 2, c] (causal replicate padding; with prev, a padded [2, h + 2, w + 2,
+    /// c], those frames first: a stream carried on)
+    #[allow(clippy::too_many_arguments)]
+    pub fn pad_causal(&self, x: P, prev: P, t: usize, h: usize, w: usize, c: usize, out: M) -> Result<()> {
+        // SAFETY: x, prev (or null) and out hold the volumes named.
+        check(unsafe { (self.k.pad_causal)(self.g(), x, prev, t as i64, h as i64, w as i64, c as i64, out) }, "causal padding")
     }
 
     pub fn rms_channels(&self, x: P, n: usize, c: usize, gamma: *const f32, silu: bool, out: M) -> Result<()> {
@@ -292,9 +294,10 @@ impl K {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn upsample(&self, conv: P, x: P, t: usize, h: usize, w: usize, c: usize, ci: usize, temporal: bool, out: M) -> Result<()> {
-        // SAFETY: conv [t, h, w, 8c or 4c], x [t, h, w, ci], out [2t - 1 or t, 2h, 2w, c].
-        check(unsafe { (self.k.upsample)(self.g(), conv, x, t as i64, h as i64, w as i64, c as i64, ci as i64, temporal as c_int, out) }, "upsample")
+    pub fn upsample(&self, conv: P, x: P, t: usize, h: usize, w: usize, c: usize, ci: usize, temporal: bool, first: bool, out: M) -> Result<()> {
+        // SAFETY: conv [t, h, w, 8c or 4c], x [t, h, w, ci], out [2t - 1 (2t after the first chunk) or t, 2h, 2w, c].
+        check(unsafe { (self.k.upsample)(self.g(), conv, x, t as i64, h as i64, w as i64, c as i64, ci as i64, temporal as c_int, first as c_int, out) },
+              "upsample")
     }
 
     /// conv [h, w, cc] and x [h, w, ci] -> out [h / 2, w / 2, cout] (one frame's Downsample)
