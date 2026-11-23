@@ -40,6 +40,16 @@ Engine `llm/inkling2` (`inkling2_loop`), cards `inkling-2-mini-q4kxl` / `-q8kxl`
   - Cost: days. A new decode path in the silo beside the current one (kept as the fallback and reference), exact on
     both cards and both quants. The technique would carry over to other engines' decode.
 
+## Port: MovieRoll long-form video, on HunyuanVideo-1.5 (user asked 2026-11-23)
+
+Plan: [docs/ports/movieroll.md](docs/ports/movieroll.md).
+
+- [ ] Phase 0: the user accepts MovieRoll's licence on HF (403 today); files to the 4 TB; CPU reference dumps
+- [ ] Phase 1: `video/hunyuanvideo15` on `video.generate` (T2V / I2V 480p, distilled cards; encoders from hunyuanimage21)
+- [ ] Phase 2: MovieRoll's rolling window, HieraKV, recompute, events, streaming VAE decode
+- [ ] Phase 3: `video.roll` / `video.rollAppend` / `video.rollEnd`, HLS output while it generates
+- [ ] Phase 4: speed (int8 XMX, Sage attention, int8 KV, two cards)
+
 ## Review another DeepSeek engine: Promethevs (2026-11-02)
 
 Findings: [docs/reviews/promethevs.md](docs/reviews/promethevs.md).
