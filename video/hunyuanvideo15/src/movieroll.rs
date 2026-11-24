@@ -359,8 +359,10 @@ impl Sink {
                   "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
         if hls {
             let (m3u8, init, segs) = live_names(path);
-            // a key frame every second (24 frames): segments of whole GOPs, 2 s each
-            cmd.args(["-g", "24", "-keyint_min", "24", "-sc_threshold", "0", "-map", "0:v", "-f", "tee"]);
+            // a key frame every second (24 frames): segments of whole GOPs, 2 s each. zerolatency: no look-ahead and no
+            // B-frames, so a segment is written when its frames are (2026-11-24: x264's 40-frame look-ahead held back a
+            // live film's first 80 frames while it waited for its next event - nothing to watch)
+            cmd.args(["-tune", "zerolatency", "-g", "24", "-keyint_min", "24", "-sc_threshold", "0", "-map", "0:v", "-f", "tee"]);
             cmd.arg(format!("[f=mp4:movflags=+faststart]{}|[f=hls:hls_time=2:hls_list_size=0:hls_playlist_type=event:hls_segment_type=fmp4:\
                              hls_fmp4_init_filename={init}:hls_segment_filename={}]{}", path.display(), segs.display(), m3u8.display()));
         } else {

@@ -364,7 +364,7 @@ impl Studio {
                 l[i + 4..].split_whitespace().next()?.parse().ok()
             })
         };
-        let steps_total = job.rec["steps"].as_u64().unwrap_or(8);
+        let mut steps_total = job.rec["steps"].as_u64().unwrap_or(8);
         let (mut pct, mut stage) = (2.0, "starting".to_string());
         if state == "queued" {
             stage = "waiting for the engine (loading or another job)".into();
@@ -400,6 +400,12 @@ impl Studio {
         if has("audio  :") {
             pct = 95.0;
             stage = "audio decoded, muxing".into();
+        }
+        // a MovieRoll film (video.roll): its chunks made of those it has so far (a steered film's grow), and whether it waits
+        // for its next event - its own lines, not H3's (2026-11-24: its status said "starting, 0 / 5" all the way)
+        let film = film_progress(&job.rec, &j["progress"], &log);
+        if let Some(f) = &film {
+            (pct, steps_done, steps_total, stage) = (f.pct, f.done, f.total, f.stage.clone());
         }
         let done = state == "done";
         // the studio's watchdog stopped it (the engine hung): a failure, not a cancel - the daemon says cancelled because it
@@ -470,10 +476,20 @@ impl Studio {
             stage = "failed".into();
         }
         let elapsed = now() - job.rec["started"].as_f64().unwrap_or(now());
+        // a film's pace counts from its first chunk (the load and the first window before it)
+        let mut film = film;
+        if let Some(f) = film.as_mut() {
+            if f.done >= 1 && job.rec["first_chunk_s"].is_null() {
+                job.rec["first_chunk_s"] = json!(elapsed);
+            }
+            f.first_s = job.rec["first_chunk_s"].as_f64();
+        }
         let frames = frames_of(job.rec["seconds"].as_f64().unwrap_or(5.0));
         let regen = !s(&job.rec, "regen2k").is_empty();
         let eta = if done || failed {
             0.0
+        } else if let Some(f) = &film {
+            f.eta(elapsed)
         } else if regen {
             // its steps as they ended ("step   : 1/3 in 581.5 s (window 1/2)"): the pace of the rest
             let step_s: Vec<f64> = log.iter().filter(|l| l.starts_with("step   :")).filter_map(|l| l.split(" in ").nth(1)?.split_whitespace().next()?.parse().ok()).collect();
@@ -785,6 +801,48 @@ fn card_energy(tele: &Value, gpu: usize, pci: &str) -> Option<f64> {
     row.and_then(|r| r["energy_j"].as_f64()).or(if gpu == 0 || (!pci.is_empty() && tele["pci"] == pci) { tele["energy_j"].as_f64() } else { None })
 }
 
+/// A MovieRoll film's progress from its engine job: chunks made of those it has (progress done / total), its stage
+pub struct FilmProgress {
+    pub done: u64,
+    pub total: u64,
+    pub pct: f64,
+    pub stage: String,
+    pub waiting: bool,
+    /// seconds from the job's start to its first chunk's (the load, the text, the first window) - unknown before it
+    pub first_s: Option<f64>,
+}
+
+impl FilmProgress {
+    /// The seconds left: at its pace a chunk so far (after the first's), the load and the first window's estimate before
+    /// (~60 s, 17 s a chunk on the B65); a live film waiting for an event: what is left of its chunks (the wait is not
+    /// known)
+    pub fn eta(&self, elapsed: f64) -> f64 {
+        let left = self.total.saturating_sub(self.done) as f64;
+        match (self.done, self.first_s) {
+            (d, Some(f)) if d > 1 && elapsed > f => (elapsed - f) / (d - 1) as f64 * left,
+            _ => (60.0 - elapsed).max(0.0) + 17.0 * left,
+        }
+    }
+}
+
+pub fn film_progress(rec: &Value, progress: &Value, log: &[String]) -> Option<FilmProgress> {
+    if !rec["events"].is_array() {
+        return None;
+    }
+    let (done, total) = (progress["done"].as_u64().unwrap_or(0), progress["total"].as_u64().unwrap_or(0));
+    let waiting = log.iter().rev().find(|l| l.contains("movieroll:")).is_some_and(|l| l.contains("live - "));
+    let stage = if waiting {
+        format!("live: {done} of {total} chunks made, waiting for the next event (video.rollAppend)")
+    } else if total == 0 {
+        "starting".into()
+    } else {
+        format!("rolling: {done} of {total} chunks made")
+    };
+    let pct = if total == 0 { 2.0 } else { 3.0 + 96.0 * done as f64 / total as f64 };
+    let first_s = rec["first_chunk_s"].as_f64();
+    Some(FilmProgress { done, total, pct, stage, waiting, first_s })
+}
+
 /// A film's live HLS playlist (`/out/<name>.live.m3u8`) once it lists a segment, else null: a player given it sooner
 /// gets a 404 or an empty list. 2026-11-24: status said nothing of it (running_clips' rows left it out)
 pub fn live_url(out: &std::path::Path, name: &str, hls: bool) -> Value {
@@ -837,6 +895,26 @@ pub fn failure(state: &str, error: &str, log: &[String], hung: Option<u64>) -> V
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_films_status_says_its_chunks_its_wait_and_its_pace() {
+        use super::film_progress;
+        use serde_json::json;
+        let rec = json!({"events": [{"prompt": "a fox", "seconds": 3}]});
+        let log = |l: &str| vec!["movieroll: 864x480".to_string(), l.to_string()];
+        // not a film: none
+        assert!(film_progress(&json!({}), &json!({"done": 1, "total": 2}), &[]).is_none());
+        let f = film_progress(&rec, &json!({"done": 3, "total": 10}), &log("movieroll: KV recompute at 3 chunks")).unwrap();
+        assert_eq!((f.done, f.total, f.waiting), (3, 10, false));
+        assert!(f.stage.contains("3 of 10") && (f.pct - (3.0 + 96.0 * 0.3)).abs() < 1e-9, "{}", f.stage);
+        // live, out of events: waiting, said so
+        let f = film_progress(&rec, &json!({"done": 5, "total": 5}), &log("movieroll: live - waiting for the next event (60 s)")).unwrap();
+        assert!(f.waiting && f.stage.contains("waiting for the next event"), "{}", f.stage);
+        // the pace: from the first chunk on (here 20 s a chunk after a first at 100 s)
+        let mut f = film_progress(&rec, &json!({"done": 3, "total": 10}), &[]).unwrap();
+        f.first_s = Some(100.0);
+        assert!((f.eta(140.0) - 140.0).abs() < 1e-9);
+    }
+
     #[test]
     fn a_films_live_playlist_shows_from_its_first_segment_in_status_and_its_row() {
         use super::{live_url, row};
