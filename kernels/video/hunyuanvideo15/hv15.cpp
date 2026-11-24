@@ -173,6 +173,48 @@ int ns_video_hv15_axpy(ns_gpu* g, float* x, const float* y, int64_t n, float a) 
     NS_CATCH
 }
 
+// ---- MovieRoll's int8 KV cache: a sub-group of 16 a (row, head), 8 values a lane ----------------------------------
+
+int ns_video_hv15_kv_q8(ns_gpu* g, const void* src, int64_t rows, int64_t heads, int64_t src_rs, int8_t* dst, float* scale) {
+    NS_TRY
+    if (rows <= 0 || heads <= 0) return 0;
+    if (src_rs < heads * 128 || src_rs % 8 != 0) return ns_fail("ns_video_hv15_kv_q8: rows of whole heads of 128, 16-byte aligned");
+    const half* x = (const half*) src;
+    g->q.parallel_for(sycl::nd_range<1>((size_t) (rows * heads * 16), 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        const int64_t rh = it.get_group(0), r = rh / heads, h = rh % heads;
+        const int l = (int) it.get_local_id(0);
+        const sycl::vec<half, 8> v = *reinterpret_cast<const sycl::vec<half, 8>*>(x + r * src_rs + h * 128 + l * 8);
+        float m = 0.0f;
+        for (int j = 0; j < 8; ++j) m = sycl::fmax(m, sycl::fabs((float) v[j]));
+        m = sycl::reduce_over_group(it.get_sub_group(), m, sycl::maximum<float>());
+        const float inv = m > 0.0f ? 127.0f / m : 0.0f;
+        sycl::vec<int8_t, 8> o;
+        for (int j = 0; j < 8; ++j) o[j] = (int8_t) sycl::clamp(sycl::rint((float) v[j] * inv), -127.0f, 127.0f);
+        *reinterpret_cast<sycl::vec<int8_t, 8>*>(dst + (r * heads + h) * 128 + l * 8) = o;
+        if (l == 0) scale[r * heads + h] = m / 127.0f;
+    });
+    return 0;
+    NS_CATCH
+}
+
+int ns_video_hv15_kv_dq8(ns_gpu* g, const int8_t* src, const float* scale, int64_t rows, int64_t heads, void* dst, int64_t dst_rs) {
+    NS_TRY
+    if (rows <= 0 || heads <= 0) return 0;
+    if (dst_rs < heads * 128 || dst_rs % 8 != 0) return ns_fail("ns_video_hv15_kv_dq8: rows of whole heads of 128, 16-byte aligned");
+    half* y = (half*) dst;
+    g->q.parallel_for(sycl::range<1>((size_t) (rows * heads * 16)), [=](sycl::id<1> id) {
+        const int64_t rh = (int64_t) id[0] / 16, r = rh / heads, h = rh % heads;
+        const int l = (int) (id[0] % 16);
+        const sycl::vec<int8_t, 8> v = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(src + rh * 128 + l * 8);
+        const float s = scale[rh];
+        sycl::vec<half, 8> o;
+        for (int j = 0; j < 8; ++j) o[j] = (half) ((float) v[j] * s);
+        *reinterpret_cast<sycl::vec<half, 8>*>(y + r * dst_rs + h * 128 + l * 8) = o;
+    });
+    return 0;
+    NS_CATCH
+}
+
 int ns_video_hv15_to_half(ns_gpu* g, const float* x, void* out, int64_t n, float s) {
     NS_TRY
     if (n <= 0) return 0;

@@ -39,7 +39,7 @@ pub const IN: usize = 2 * LATENT + 1;
 pub const TEXT: usize = 3584;
 pub const BYT5: usize = 1472;
 pub const VISION: usize = 1152;
-const EPS: f32 = 1e-6;
+pub(crate) const EPS: f32 = 1e-6;
 const THETA: f64 = 256.0;
 /// the RoPE's features by axis (t, h, w)
 const ROPE: [usize; 3] = [16, 56, 56];
@@ -63,19 +63,19 @@ fn qkv_perm(r: usize) -> usize {
     }
 }
 
-struct Stream {
-    modulation: Lin,
-    qkv: Lin,
-    q_norm: DevBuf,
-    k_norm: DevBuf,
-    proj: Lin,
-    fc1: Lin,
-    fc2: Lin,
+pub(crate) struct Stream {
+    pub(crate) modulation: Lin,
+    pub(crate) qkv: Lin,
+    pub(crate) q_norm: DevBuf,
+    pub(crate) k_norm: DevBuf,
+    pub(crate) proj: Lin,
+    pub(crate) fc1: Lin,
+    pub(crate) fc2: Lin,
 }
 
-struct Double {
-    img: Stream,
-    txt: Stream,
+pub(crate) struct Double {
+    pub(crate) img: Stream,
+    pub(crate) txt: Stream,
 }
 
 /// A TimestepEmbedder or a TextProjection: linear, SiLU, linear
@@ -95,9 +95,9 @@ struct RefinerBlock {
 }
 
 pub struct Dit {
-    k: K,
-    doubles: Vec<Double>,
-    img_in: Lin,
+    pub(crate) k: K,
+    pub(crate) doubles: Vec<Double>,
+    pub(crate) img_in: Lin,
     time_in: Mlp2,
     time_r_in: Option<Mlp2>,
     ref_in: Lin,
@@ -109,10 +109,10 @@ pub struct Dit {
     vision: Option<(DevBuf, DevBuf, Lin, Lin, DevBuf, DevBuf)>,
     /// cond_type_embedding [3, 2048] on the host
     cond: Vec<f32>,
-    final_ada: Lin,
-    final_lin: Lin,
+    pub(crate) final_ada: Lin,
+    pub(crate) final_lin: Lin,
     /// the shared products' half matrix (none on the silo), and their float32 output
-    scratch: DevBuf,
+    pub(crate) scratch: DevBuf,
     pub meanflow: bool,
     pub bytes: usize,
     /// where a pass's time goes (NS_HV15_PROFILE=1)
@@ -184,11 +184,11 @@ impl Text {
 
 /// What every step's pass reads from the timestep
 pub struct Steps {
-    n: usize,
+    pub n: usize,
     /// [n, 6 x 2048] for each double block's image and text streams
-    dbl: Vec<(DevBuf, DevBuf)>,
+    pub(crate) dbl: Vec<(DevBuf, DevBuf)>,
     /// [n, 2 x 2048]: shift, scale
-    fin: DevBuf,
+    pub(crate) fin: DevBuf,
     /// the refiner's t_embedder(t) [n, 2048]
     tref: DevBuf,
     pub vec: DevBuf,
@@ -236,7 +236,7 @@ pub struct Branch<'a> {
     pub n: usize,
     pub t: usize,
     pub r0: usize,
-    cs: DevBuf,
+    pub(crate) cs: DevBuf,
 }
 
 /// One pass's inputs and working buffers for every branch: each branch's rows [image | text] after the previous one's
@@ -245,35 +245,35 @@ pub struct Batch<'a> {
     pub rows: usize,
     /// the latent grid (frames, rows, columns)
     pub grid: (usize, usize, usize),
-    x: DevBuf,
-    h: DevBuf,
-    big: DevBuf,
-    att: DevBuf,
-    mlp: DevBuf,
+    pub(crate) x: DevBuf,
+    pub(crate) h: DevBuf,
+    pub(crate) big: DevBuf,
+    pub(crate) att: DevBuf,
+    pub(crate) mlp: DevBuf,
     /// img_in's input [n, 65]
-    inp: DevBuf,
+    pub(crate) inp: DevBuf,
     /// the refiner's buffers
-    rx: DevBuf,
+    pub(crate) rx: DevBuf,
     /// the shared products' float32 output (none on the silo)
-    tmp: DevBuf,
+    pub(crate) tmp: DevBuf,
 }
 
-fn hptr(b: &DevBuf, at: usize) -> *mut std::ffi::c_void {
+pub(crate) fn hptr(b: &DevBuf, at: usize) -> *mut std::ffi::c_void {
     b.ptr().cast::<u16>().wrapping_add(at).cast()
 }
 
-fn fptr(b: &DevBuf, at: usize) -> *mut f32 {
+pub(crate) fn fptr(b: &DevBuf, at: usize) -> *mut f32 {
     b.fp().wrapping_add(at)
 }
 
-fn w32(l: &Lin) -> Result<*const std::ffi::c_void> {
+pub(crate) fn w32(l: &Lin) -> Result<*const std::ffi::c_void> {
     match &l.w {
         crate::w::Wt::F32(b) => Ok(b.ptr()),
         _ => Err(Error("a float32 matrix was expected".into())),
     }
 }
 
-fn bias(l: &Lin) -> *const std::ffi::c_void {
+pub(crate) fn bias(l: &Lin) -> *const std::ffi::c_void {
     l.bias.as_ref().map_or(none(), |b| b.ptr() as *const _)
 }
 
@@ -288,17 +288,21 @@ impl Dit {
             DevBuf::from_f32(gpu, &v)
         };
         let mlp2 = |p: &str, a: &str, b: &str| -> Result<Mlp2> { Ok(Mlp2 { l1: one(&format!("{p}.{a}"), Keep::F32)?, l2: one(&format!("{p}.{b}"), Keep::F32)? }) };
-        let doubles_n = (0..).take_while(|i| st.has(&format!("double_blocks.{i}.img_attn_q.weight"))).count();
+        // HunyuanVideo-1.5's files hold q, k and v apart; MovieRoll's (its fine-tune) one fused qkv [3 x 2048, 2048]
+        let fused = st.has("double_blocks.0.img_attn_qkv.weight");
+        let first = if fused { "img_attn_qkv" } else { "img_attn_q" };
+        let doubles_n = (0..).take_while(|i| st.has(&format!("double_blocks.{i}.{first}.weight"))).count();
         if doubles_n == 0 || st.has("single_blocks.0.linear1_q.weight") {
             return Err(Error(format!("{}: not a HunyuanVideo-1.5 DiT (54 double blocks, no single ones)", st.0.path.display())));
         }
-        let q = st.0.need("double_blocks.0.img_attn_q.weight").map_err(crate::w::se)?;
-        if q.shape != [DIM as u64, DIM as u64] {
-            return Err(Error(format!("double_blocks.0.img_attn_q.weight is {:?}: not the 2048-wide DiT", q.shape)));
+        let q = st.0.need(&format!("double_blocks.0.{first}.weight")).map_err(crate::w::se)?;
+        if q.shape != [if fused { 3 * DIM } else { DIM } as u64, DIM as u64] {
+            return Err(Error(format!("double_blocks.0.{first}.weight is {:?}: not the 2048-wide DiT", q.shape)));
         }
         let stream = |p: &str| -> Result<Stream> {
-            let names = ["q", "k", "v"].map(|x| format!("{p}_attn_{x}.weight")).to_vec();
-            let biases = ["q", "k", "v"].map(|x| format!("{p}_attn_{x}.bias")).to_vec();
+            let parts: &[&str] = if fused { &["qkv"] } else { &["q", "k", "v"] };
+            let names: Vec<String> = parts.iter().map(|x| format!("{p}_attn_{x}.weight")).collect();
+            let biases: Vec<String> = parts.iter().map(|x| format!("{p}_attn_{x}.bias")).collect();
             Ok(Stream {
                 modulation: one(&format!("{p}_mod.linear"), Keep::Q8Blocks)?,
                 qkv: Lin::load(st, k, &names, &biases, Some(&qkv_perm), Keep::Q8)?,
@@ -531,7 +535,7 @@ impl Dit {
     /// The token refiner for step row `si` into branch b's text rows (after the vision / glyph rows), plus the
     /// condition type embedding 0: x = input_embedder rows; c = t_embedder(t) + c_embedder(mean); per block: gates from
     /// SiLU(c), x += gate_msa attn(LN1(x)), x += gate_mlp mlp(LN2(x)) (SiLU)
-    fn refine(&self, nsd: &Nsd, st: &Steps, si: usize, bt: &Batch, b: &Branch, tap: &mut dyn FnMut(&str, &DevBuf, usize, usize) -> Result<()>) -> Result<()> {
+    pub(crate) fn refine(&self, nsd: &Nsd, st: &Steps, si: usize, bt: &Batch, b: &Branch, tap: &mut dyn FnMut(&str, &DevBuf, usize, usize) -> Result<()>) -> Result<()> {
         let gpu = &nsd.gpu;
         let tq = b.text.tq;
         let x = fptr(&bt.x, (b.r0 + b.n + b.text.tb) * DIM);

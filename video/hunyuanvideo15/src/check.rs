@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use nextsycl_core::DevBuf;
-use nextsycl_hunyuan_text::{byt5, te};
+use nextsycl_hunyuan_text::byt5;
 use nextsycl_video::{Error, JobCtl, Result};
 use serde_json::{json, Value};
 
@@ -194,10 +194,11 @@ pub fn job(m: &HunyuanVideo15, spec: &Value, ctl: &mut JobCtl) -> Result<Value> 
         bench(m, spec, &mut *r.log)?;
     }
     if has("te") {
+        m.with_text(|te, _| {
         let toks = json_file(&dir.join("tokens.json"))?;
         let crop = toks["crop"].as_u64().unwrap_or(0) as usize;
-        (r.log)(format!("crop: {} here, {crop} in the reference", m.te.template.crop));
-        if crop != m.te.template.crop {
+        (r.log)(format!("crop: {} here, {crop} in the reference", te.template.crop));
+        if crop != te.template.crop {
             r.worst = f64::INFINITY;
         }
         for (p, key) in [("", "ids"), ("neg_", "neg_ids")] {
@@ -206,16 +207,18 @@ pub fn job(m: &HunyuanVideo15, spec: &Value, ctl: &mut JobCtl) -> Result<Value> 
                 continue;
             }
             let prompt = toks[if p.is_empty() { "prompt" } else { "negative" }].as_str().unwrap_or("");
-            let mine = m.te.ids(prompt);
+            let mine = te.ids(prompt);
             (r.log)(format!("{p}tokens: {} here, {} in the reference{}", mine.len(), want.len(), if mine == want { " - the same" } else { " - DIFFERENT" }));
             if mine != want {
                 r.worst = f64::INFINITY;
             }
-            let l0 = m.te.run(nsd, &want, 1)?.to_f32()?;
+            let l0 = te.run(nsd, &want, 1)?.to_f32()?;
             r.line(&format!("{p}te layer 0"), &l0, &read_npy(&dir.join(format!("{p}te_layer0.npy")))?.1);
-            let all = m.te.run(nsd, &want, te::LAYERS_USED)?.to_f32()?;
-            r.line(&format!("{p}te embeds"), &all[crop * te::DIM..], &read_npy(&dir.join(format!("{p}embeds.npy")))?.1);
+            let all = te.run(nsd, &want, nextsycl_hunyuan_text::te::LAYERS_USED)?.to_f32()?;
+            r.line(&format!("{p}te embeds"), &all[crop * nextsycl_hunyuan_text::te::DIM..], &read_npy(&dir.join(format!("{p}embeds.npy")))?.1);
         }
+        Ok(())
+        })?;
     }
     if has("byt5") {
         let b = json_file(&dir.join("byt5.json"))?;
@@ -233,7 +236,7 @@ pub fn job(m: &HunyuanVideo15, spec: &Value, ctl: &mut JobCtl) -> Result<Value> 
                 (r.log)("byt5 ids differ".into());
                 r.worst = f64::INFINITY;
             }
-            let got = m.byt5.encode(nsd, &want)?;
+            let got = m.with_text(|_, b5| b5.encode(nsd, &want))?;
             r.line("byt5", &got, &read_npy(&dir.join("byt5.npy"))?.1);
         }
     }

@@ -22,6 +22,8 @@ struct Api {
     linear_f32: unsafe extern "C" fn(G, P, i64, i64, P, i64, i64, *const f32, *mut f32, i64) -> c_int,
     linear32: unsafe extern "C" fn(G, *const f32, i64, i64, *const f32, i64, *const f32, *mut f32) -> c_int,
     axpy: unsafe extern "C" fn(G, *mut f32, *const f32, i64, f32) -> c_int,
+    kv_q8: unsafe extern "C" fn(G, P, i64, i64, i64, *mut i8, *mut f32) -> c_int,
+    kv_dq8: unsafe extern "C" fn(G, *const i8, *const f32, i64, i64, M, i64) -> c_int,
     to_half: unsafe extern "C" fn(G, *const f32, M, i64, f32) -> c_int,
     to_float: unsafe extern "C" fn(G, P, *mut f32, i64) -> c_int,
     q8_0_float: unsafe extern "C" fn(G, P, i64, *mut f32) -> c_int,
@@ -66,6 +68,8 @@ fn api() -> Result<&'static Api> {
             linear_f32: sym!("ns_video_hv15_linear_f32"),
             linear32: sym!("ns_video_hv15_linear32"),
             axpy: sym!("ns_video_hv15_axpy"),
+            kv_q8: sym!("ns_video_hv15_kv_q8"),
+            kv_dq8: sym!("ns_video_hv15_kv_dq8"),
             to_half: sym!("ns_video_hv15_to_half"),
             to_float: sym!("ns_video_hv15_to_float"),
             q8_0_float: sym!("ns_video_hv15_q8_0_float"),
@@ -123,7 +127,11 @@ struct Silo {
     bench_gemm: Option<unsafe extern "C" fn(G, c_int, i64, i64, i64, c_int, *mut f64) -> c_int>,
     /// the joint attention (silo.h), when this build has it
     attention: Option<(unsafe extern "C" fn(G) -> c_int, AttnFn)>,
+    /// queries and keys apart (silo.h attention2)
+    attention2: Option<Attn2Fn>,
 }
+
+type Attn2Fn = unsafe extern "C" fn(G, P, i64, i64, P, P, i64, i64, i64, i64, M, i64, c_int, c_int) -> c_int;
 
 type AttnFn = unsafe extern "C" fn(G, P, i64, i64, i64, i64, M, i64, c_int, c_int) -> c_int;
 
@@ -159,6 +167,11 @@ fn silo() -> Result<Option<&'static Silo>> {
                 (!t.is_null() && !a.is_null()).then(|| unsafe {
                     (std::mem::transmute::<*mut c_void, unsafe extern "C" fn(G) -> c_int>(t), std::mem::transmute::<*mut c_void, AttnFn>(a))
                 })
+            },
+            attention2: {
+                let p = lib.symbol("ns_video_hv15_silo_attention2");
+                // SAFETY: declared in silo.h with this signature.
+                (!p.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, Attn2Fn>(p) })
             },
             bench_gemm: {
                 let p = lib.symbol("ns_video_hv15_silo_bench_gemm");
@@ -233,6 +246,22 @@ impl K {
         check(unsafe { f(self.g(), qkv, s as i64, h as i64, d as i64, stride as i64, out, o_rs as i64, sage as c_int, tile as c_int) }, "attention (silo)")
     }
 
+    /// Whether the silo has the attention over queries and keys apart
+    pub fn has_attention2(&self) -> bool {
+        self.silo.and_then(|s| s.attention2).is_some() && self.attention_tiles() > 0
+    }
+
+    /// Attention of `sq` query rows (q, `qs` halves apart) over `skv` key / value rows (k, v, `kvs` apart): out half
+    /// rows `o_rs` apart; sage: int8 q, k
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention2(&self, q: P, qs: usize, sq: usize, k: P, v: P, kvs: usize, skv: usize, h: usize, d: usize, out: M, o_rs: usize, sage: bool, tile: usize)
+                      -> Result<()> {
+        let f = self.silo.and_then(|s| s.attention2).ok_or_else(|| Error("the silo has no attention2 (rebuild it)".into()))?;
+        // SAFETY: q holds sq rows of qs halves, k and v skv rows of kvs, out sq rows of o_rs.
+        check(unsafe { f(self.g(), q, qs as i64, sq as i64, k, v, kvs as i64, skv as i64, h as i64, d as i64, out, o_rs as i64, sage as c_int, tile as c_int) },
+              "attention (silo, apart)")
+    }
+
     /// oneDNN's plain product [m, k] x [k, n] (int8: int8 -> int32, else half -> half): milliseconds a run, mean of `iters`
     pub fn bench_gemm(&self, int8: bool, m: usize, n: usize, k: usize, iters: usize) -> Result<f64> {
         let f = self.silo.and_then(|s| s.bench_gemm).ok_or_else(|| Error("the silo has no bench_gemm (rebuild it)".into()))?;
@@ -298,6 +327,18 @@ impl K {
     pub fn linear32(&self, x: P, m: usize, k: usize, w: P, n: usize, bias: P, out: M) -> Result<()> {
         // SAFETY: x [m, k], w [n, k], out [m, n] floats, bias [n] or null.
         check(unsafe { (self.k.linear32)(self.g(), x.cast(), m as i64, k as i64, w.cast(), n as i64, bias.cast(), out.cast()) }, "linear (float32)")
+    }
+
+    /// rows of `heads` heads of 128 halves (`src_rs` apart) -> int8 [rows, heads x 128] + a float32 scale a (row, head)
+    pub fn kv_q8(&self, src: P, rows: usize, heads: usize, src_rs: usize, dst: M, scale: M) -> Result<()> {
+        // SAFETY: src rows x src_rs halves, dst rows x heads x 128 bytes, scale rows x heads floats.
+        check(unsafe { (self.k.kv_q8)(self.g(), src, rows as i64, heads as i64, src_rs as i64, dst.cast(), scale.cast()) }, "kv int8")
+    }
+
+    /// The other way: int8 + scales -> half rows `dst_rs` apart
+    pub fn kv_dq8(&self, src: P, scale: P, rows: usize, heads: usize, dst: M, dst_rs: usize) -> Result<()> {
+        // SAFETY: as kv_q8's.
+        check(unsafe { (self.k.kv_dq8)(self.g(), src.cast(), scale.cast(), rows as i64, heads as i64, dst, dst_rs as i64) }, "kv int8 -> half")
     }
 
     pub fn axpy(&self, x: *mut f32, y: *const f32, n: usize, a: f32) -> Result<()> {

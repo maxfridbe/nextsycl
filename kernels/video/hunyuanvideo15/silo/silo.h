@@ -59,6 +59,10 @@ int ns_video_hv15_silo_linear(ns_gpu* g, const ns_hv15_mm* a);
 int ns_video_hv15_silo_attention_tiles(ns_gpu* g);
 int ns_video_hv15_silo_attention(ns_gpu* g, const void* qkv, int64_t S, int64_t H, int64_t D, int64_t stride, void* out, int64_t o_rs,
                                  int mode, int tile);
+/* The same over queries and keys apart (MovieRoll's window over [history | window | text]): q Sq rows q_rs apart, k
+ * and v Skv rows kv_rs apart, out Sq rows o_rs apart; strides multiples of 8 */
+int ns_video_hv15_silo_attention2(ns_gpu* g, const void* q, int64_t q_rs, int64_t Sq, const void* k, const void* v, int64_t kv_rs, int64_t Skv,
+                                  int64_t H, int64_t D, void* out, int64_t o_rs, int mode, int tile);
 
 /* The yardstick (bench.cpp): oneDNN's plain product [M, K] x [K, N] on scratch buffers, kind 0 half -> half, 1 int8 ->
  * int32; *ms the mean of `iters` runs (1..1000) */

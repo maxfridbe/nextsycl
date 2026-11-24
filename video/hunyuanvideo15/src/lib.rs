@@ -19,7 +19,9 @@
 pub mod check;
 pub mod dit;
 mod ffi;
+pub mod movieroll;
 pub mod prof;
+pub mod roll;
 pub mod vae;
 pub mod vision;
 mod w;
@@ -41,7 +43,7 @@ pub const ARCH: &str = "hunyuanvideo-1.5";
 /// `vision` (SigLIP so400m-patch14-384's safetensors: the image encoder)
 pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "byt5", "vae"];
 
-const GIB: f64 = (1u64 << 30) as f64;
+pub(crate) const GIB: f64 = (1u64 << 30) as f64;
 
 /// The options it takes (`--opt-NAME`)
 pub const OPTIONS: &[EngineOption] = &[
@@ -205,8 +207,10 @@ pub struct Encoded {
 pub struct HunyuanVideo15 {
     pub nsd: Nsd,
     k: ffi::K,
-    pub te: te::TextEncoder,
-    pub byt5: byt5::Byt5,
+    /// the text encoders (Qwen2.5-VL, byT5): loaded with the engine; MovieRoll drops them for a film's run (4.2 GiB)
+    /// and they load again for the next prompt
+    pub text: std::sync::Mutex<Option<(te::TextEncoder, byt5::Byt5)>>,
+    text_files: (PathBuf, PathBuf, PathBuf),
     pub dit: dit::Dit,
     pub vae: vae::Vae,
     /// I2V's image encoder (a card with a vision file)
@@ -226,6 +230,12 @@ pub struct HunyuanVideo15 {
 
 impl HunyuanVideo15 {
     pub fn load(files: &ModelFiles, gpu: &Arc<Gpu>, o: &LoadOptions, log: &mut dyn FnMut(String)) -> Result<HunyuanVideo15> {
+        Self::load_with(files, gpu, o, false, log)
+    }
+
+    /// `load`, with the VAE's encoder loaded even without a vision file (MovieRoll's image to video: the picture is
+    /// the first chunk, no SigLIP)
+    pub fn load_with(files: &ModelFiles, gpu: &Arc<Gpu>, o: &LoadOptions, encoder: bool, log: &mut dyn FnMut(String)) -> Result<HunyuanVideo15> {
         let t0 = Instant::now();
         nextsycl_core::use_kind("video");
         let size = |r: &str| -> Result<u64> { std::fs::metadata(role(files, r)?).map(|m| m.len()).map_err(|e| Error(format!("{r}: {e}"))) };
@@ -255,25 +265,49 @@ impl HunyuanVideo15 {
         let dit = dit::Dit::load(&st, &k, log)?;
         drop(st);
         dit::Attn::parse(Some(&attention), dit.tiles).map_err(Error)?;
-        let kern: Arc<dyn nextsycl_hunyuan_text::Kern> = Arc::new(k.clone());
-        let mut te = te::TextEncoder::load(role(files, "text-encoder")?, role(files, "tokenizer")?, &nsd, kern.clone(), template(), log)?;
-        // the pipeline's text_len: 1000 tokens after the crop
-        te.template.max_tokens = te.template.crop + 1000;
-        let byt5 = byt5::Byt5::load(role(files, "byt5")?, &nsd, kern, log)?;
+        let text_files = (role(files, "text-encoder")?.to_path_buf(), role(files, "tokenizer")?.to_path_buf(), role(files, "byt5")?.to_path_buf());
+        let (te, byt5) = Self::load_text(&nsd, &k, &text_files, log)?;
         let i2v = files.contains_key("vision");
         if i2v && !dit.has_vision() {
             return Err(Error(format!("{ARCH}: a vision file with a DiT that has no vision projection")));
         }
-        let vae = vae::Vae::load(role(files, "vae")?, &k, i2v, log)?;
+        let vae = vae::Vae::load(role(files, "vae")?, &k, i2v || encoder, log)?;
         let vision = if i2v { Some(vision::Vision::load(role(files, "vision")?, &k, log)?) } else { None };
         let load_s = t0.elapsed().as_secs_f64();
         log(format!("{ARCH}: loaded in {load_s:.1} s (cfg {cfg}, {steps} steps, shift {shift}, attention {:?}{})",
                     dit::Attn::parse(Some(&attention), dit.tiles).unwrap_or(dit.attn), if cache.is_empty() { String::new() } else { format!(", cache {cache}") }));
-        Ok(HunyuanVideo15 { nsd, k, te, byt5, dit, vae, vision, cfg, steps, shift, cache, attention, loaded: Instant::now(), load_s, peak: Default::default() })
+        Ok(HunyuanVideo15 { nsd, k, text: std::sync::Mutex::new(Some((te, byt5))), text_files, dit, vae, vision, cfg, steps, shift, cache, attention,
+                            loaded: Instant::now(), load_s, peak: Default::default() })
+    }
+
+    fn load_text(nsd: &Nsd, k: &ffi::K, f: &(PathBuf, PathBuf, PathBuf), log: &mut dyn FnMut(String)) -> Result<(te::TextEncoder, byt5::Byt5)> {
+        let kern: Arc<dyn nextsycl_hunyuan_text::Kern> = Arc::new(k.clone());
+        let mut te = te::TextEncoder::load(&f.0, &f.1, nsd, kern.clone(), template(), log)?;
+        // the pipeline's text_len: 1000 tokens after the crop
+        te.template.max_tokens = te.template.crop + 1000;
+        let byt5 = byt5::Byt5::load(&f.2, nsd, kern, log)?;
+        Ok((te, byt5))
+    }
+
+    /// The text encoders, loaded again when they were dropped
+    pub fn with_text<R>(&self, f: impl FnOnce(&te::TextEncoder, &byt5::Byt5) -> Result<R>) -> Result<R> {
+        let mut g = self.text.lock().map_err(|_| Error("the text encoders' lock".into()))?;
+        if g.is_none() {
+            *g = Some(Self::load_text(&self.nsd, &self.k, &self.text_files, &mut |l| eprintln!("{l}"))?);
+        }
+        let (te, b) = g.as_ref().ok_or_else(|| Error("no text encoders".into()))?;
+        f(te, b)
+    }
+
+    /// Their memory back to the card (the next `encode` loads them again)
+    pub fn unload_text(&self) -> Result<()> {
+        self.nsd.wait()?;
+        *self.text.lock().map_err(|_| Error("the text encoders' lock".into()))? = None;
+        Ok(())
     }
 
     /// The card's memory in use now, kept as the clip's peak when it is the most seen
-    fn note(&self) -> u64 {
+    pub(crate) fn note(&self) -> u64 {
         let used = self.nsd.gpu.memory().map_or(0, |(t, f)| t - f.unwrap_or(t));
         self.peak.fetch_max(used, std::sync::atomic::Ordering::Relaxed);
         used
@@ -281,11 +315,14 @@ impl HunyuanVideo15 {
 
     /// The prompt through both text encoders and the DiT's prompt-only layers
     pub fn encode(&self, prompt: &str, vision: Option<&[f32]>) -> Result<Encoded> {
-        let q = self.te.encode(&self.nsd, prompt)?;
-        let b = match byt5::quoted(prompt, byt5::Quotes::InOrder) {
-            Some(t) => Some(self.byt5.encode(&self.nsd, &byt5::ids(&t, 256))?),
-            None => None,
-        };
+        let (q, b) = self.with_text(|te, b5| {
+            let q = te.encode(&self.nsd, prompt)?;
+            let b = match byt5::quoted(prompt, byt5::Quotes::InOrder) {
+                Some(t) => Some(b5.encode(&self.nsd, &byt5::ids(&t, 256))?),
+                None => None,
+            };
+            Ok((q, b))
+        })?;
         Ok(Encoded { text: self.dit.text(&self.nsd, &q, b.as_deref(), vision)? })
     }
 
@@ -527,7 +564,7 @@ impl VideoEngine for HunyuanVideo15 {
     }
     fn report(&self) -> Vec<String> {
         vec![format!("{ARCH} on {} (loaded {:.0} s ago; {:.1} GiB of weights)", self.nsd.gpu.name, self.loaded.elapsed().as_secs_f64(),
-                     (self.dit.bytes + self.te.bytes + self.byt5.bytes + self.vae.bytes) as f64 / GIB)]
+                     (self.dit.bytes + self.vae.bytes + self.text.lock().ok().and_then(|g| g.as_ref().map(|(t, b)| t.bytes + b.bytes)).unwrap_or(0)) as f64 / GIB)]
     }
 }
 

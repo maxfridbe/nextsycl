@@ -359,6 +359,12 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 | `NS_HV15_ATTN` | half | HunyuanVideo-1.5's attention: `half` (the silo's, ARK's half flash: the same bits as the shared kernel), `half:N` (its tile N, 0 - 4: debugging), `shared` (the shared kernels' call), `sage` (SageAttention v1, int8 q and k: 1.5x the attention, 1.3x the clip; approximate - docs/ports/hunyuanvideo15.md); a request's `attention` first (--opt-attention) | video hunyuanvideo15 |
 | `NS_HV15_CACHE` | off | HunyuanVideo-1.5's step caching: `deepcache` (upstream's: steps 11 - 44 of 50 reuse block 53's input but every 4th - 25 of 50 cached, 1.9x the steps; scaled to other step counts), `deepcache:START,END,INTERVAL[,BLOCKS]`; approximate; a request's `cache` first (--opt-cache) | video hunyuanvideo15 |
 | `NS_HV15_PROFILE` | unset | Debug: 1 = HunyuanVideo-1.5 drains the queue between the parts of a DiT pass and logs each part's device time a step after the steps (slower) | video hunyuanvideo15 |
+| `NS_MR_MODE` | distilled | MovieRoll's sampling chain, the card's file's: `distilled` (the 5-step ladder, no guidance) or `base` (50 steps, 10 a round, AnnealCFG 4 -> 1 over an empty negative prompt) (--opt-mode) | video movieroll |
+| `NS_MR_CONTEXT_NOISE` | 0.15 (base 0.05) | MovieRoll's context noise: the clean history re-noised by this sigma before it enters the KV cache (distilled t2v 0.15, i2v 0, base 0.05: upstream's released values); a job's `context_noise` first (--opt-context-noise) | video movieroll |
+| `NS_MR_THRESHOLD` | 18 | MovieRoll: cached chunks that trigger a KV recompute (the first chunk, every event's middle and the 3 newest re-encoded; 2 to 40); a job's `threshold` first (--opt-threshold) | video movieroll |
+| `NS_MR_ATTN` | half | MovieRoll's attention: `half` (the silo's half flash over queries and keys apart), `sage` (int8 q and k: approximate), `shared` (the shared kernels'); a job's `attention` first (--opt-attention) | video movieroll |
+| `NS_MR_KV` | auto | MovieRoll's KV cache of the history: `half`, `int8` (K and V int8 with a float32 scale a row and head: half the memory, ~5.8 instead of 11.5 GiB at 864 x 480), `auto` (half when it fits the card with 3.5 GiB left for the decode and to spare, else int8); a job's `kv` first (--opt-kv) | video movieroll |
+| `NS_MR_IMAGE` | 0 | MovieRoll: 1 loads the VAE's encoder (the image-to-video card: the picture is the film's first chunk); 0 leaves it out (0.7 GiB) (--opt-image) | video movieroll |
 
 ## Audio
 

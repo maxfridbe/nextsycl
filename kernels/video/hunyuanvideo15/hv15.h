@@ -34,6 +34,11 @@ int ns_video_hv15_linear_f32(ns_gpu* g, const void* x, int64_t M, int64_t K, con
 int ns_video_hv15_linear32(ns_gpu* g, const float* x, int64_t M, int64_t K, const float* w, int64_t N, const float* bias, float* out);
 /* x float32 += a * y float32, n values */
 int ns_video_hv15_axpy(ns_gpu* g, float* x, const float* y, int64_t n, float a);
+/* MovieRoll's int8 KV cache: rows of `heads` heads of 128 halves (rows src_rs halves apart) -> int8 [rows, heads x 128]
+ * and one float32 scale a (row, head) (max |x| / 127, round to nearest, clamp to 127); and back to half (rows dst_rs
+ * apart) */
+int ns_video_hv15_kv_q8(ns_gpu* g, const void* src, int64_t rows, int64_t heads, int64_t src_rs, int8_t* dst, float* scale);
+int ns_video_hv15_kv_dq8(ns_gpu* g, const int8_t* src, const float* scale, int64_t rows, int64_t heads, void* dst, int64_t dst_rs);
 /* float32 -> half (times s), half -> float32 */
 int ns_video_hv15_to_half(ns_gpu* g, const float* x, void* out, int64_t n, float s);
 int ns_video_hv15_to_float(ns_gpu* g, const void* x, float* out, int64_t n);

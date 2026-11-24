@@ -1,0 +1,32 @@
+# MovieRoll base T2V, the reference (Q8_0 products; 50 steps with AnnealCFG; films up to 60 s at 480p from a prompt or a list of events; Tencent Hunyuan Community License)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+id: movieroll-base-t2v-q8
+kind: video
+arch: movieroll
+license: tencent-hunyuan-community
+commercial: true
+license_note: 'Tencent Hunyuan Community License (MovieRoll, a fine-tune of HunyuanVideo-1.5): not licensed in the European Union, the United Kingdom or South Korea; a licence from Tencent above 100 million monthly active users; its Acceptable Use Policy; outputs may not improve another AI model. Gated on Hugging Face (yunyangge/MovieRoll: the licence accepted on the account that downloads it). The DiT is the official float32 file (quantized to Q8_0 as it loads); the VAE and the text encoders are HunyuanVideo-1.5''s card''s.'
+title: 'MovieRoll base T2V, the reference (Q8_0 products; 50 steps with AnnealCFG; films up to 60 s at 480p, events; Tencent Hunyuan Community License)'
+about: 'Tencent''s MovieRoll - HunyuanVideo-1.5''s 8.3B DiT fine-tuned for rolling diffusion (chunks of 16 frames, a window of 5, a bounded KV cache of the clean history) before distillation: 50 steps a chunk''s ladder with AnnealCFG (guidance 4 -> 1) over an empty negative prompt, ~20x the distilled card''s work - a reference for checks, not served - films up to 60 s at 864 x 480 or 480 x 864, a prompt or an ordered list of events split evenly over the film'
+gpus: '0'
+vram_gib: 30.0                   # the DiT, the text encoders, the VAE (15 GiB) + the history's KV cache and the window's buffers at 864 x 480: measured in docs/ports/movieroll.md
+defaults:
+  steps: 50
+  seconds: 10.0
+  size: 864x480
+env:
+  NS_MR_MODE: base
+  NS_MR_CONTEXT_NOISE: '0.05'
+  NS_MR_THRESHOLD: '18'
+files:
+  denoiser:
+    key: movieroll-base
+    url: https://huggingface.co/yunyangge/MovieRoll/resolve/fe3150d9233e54c504c04b4b42e12ebbc76b7765/base/model.safetensors
+    size: 33291800480
+    sha256: bbd5d1ec06483fc956a555cc08f0ee2f60f1e5d27d07d3a3025437d9194c3c30
+    path: movieroll/base/model.safetensors
+  text-encoder: hunyuanimage-21-qwen25vl-q40
+  tokenizer: qwen25-vl-tokenizer
+  byt5: hunyuanimage-21-byt5-f16
+  vae: hunyuanvideo15-vae
+guide: guides/movieroll.md
