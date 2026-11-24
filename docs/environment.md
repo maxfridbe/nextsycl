@@ -571,6 +571,7 @@ The `model3d` kind (meshes from pictures, rigging, animation) and its engines' s
 | `NSD_ATTN_TABLE_MB` | 1536 | the most score-table memory (MiB, at least 64) a chunk of unfused attention may take | kernels:diffusion (image, audio, video) |
 | `NSD_FLASH` | on | 0: no flash attention (libnextsycl-flash.so); oneDNN's fused SDPA instead | kernels:diffusion (image, audio, video) |
 | `NSD_MEM_FRACTION` | 0.94 | the share of the card (0.05-0.97) the kernels' allocations and scratch may hold (--opt-mem-fraction, video) | kernels:diffusion (image, audio, video) |
+| `NSD_MEM_RESERVE_MB` | 1536 | the card memory every engine leaves free (MiB): the cap never reaches into it, an allocation that would leave the card itself less is refused after the kernels give back their caches; on every card, shared or not | kernels:diffusion (image, audio, video), crates/h3 budget |
 | `NSD_NORM_SCALAR` | off | Debug: set: the element-a-work-item norm and RMS-RoPE kernels, not the 16-byte vector ones | kernels:diffusion (image, audio, video) |
 | `NSD_POISON` | off | Debug: set: every allocation filled with 0xff (finds reads of unwritten memory) | kernels:diffusion (image, audio, video) |
 | `NSD_PROFILE` | off | set: the kernels' times by part (int8 linears, attention) and the video decoder's, on stderr; waits after each (--opt-profile, video) | kernels:diffusion (image, audio, video), video h3 |
