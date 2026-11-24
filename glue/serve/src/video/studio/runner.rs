@@ -402,6 +402,10 @@ impl Studio {
             stage = "audio decoded, muxing".into();
         }
         let done = state == "done";
+        // the studio's watchdog stopped it (the engine hung): a failure, not a cancel - the daemon says cancelled because it
+        // was sent a cancel
+        let hung = job.rec["watchdog_stopped"].as_u64();
+        let state = if hung.is_some() && state == "cancelled" { "failed" } else { state };
         let failed = matches!(state, "failed" | "cancelled");
         let name = s(&job.rec, "name");
         if done {
@@ -453,7 +457,11 @@ impl Studio {
             }
         }
         let error = if failed {
-            Some(format!("{}{}\n{}", if state == "cancelled" { "cancelled" } else { "failed" }, j["error"].as_str().map(|e| format!(": {e}")).unwrap_or_default(),
+            let said = match hung {
+                Some(min) => format!(": the engine hung (no output for {min} min); the studio stopped it and the worker was restarted"),
+                None => j["error"].as_str().map(|e| format!(": {e}")).unwrap_or_default(),
+            };
+            Some(format!("{}{said}\n{}", if state == "cancelled" { "cancelled" } else { "failed" },
                          log.iter().rev().take(6).rev().cloned().collect::<Vec<_>>().join("\n")))
         } else {
             None
@@ -502,7 +510,7 @@ impl Studio {
             job.saved = true;
             self.invalidate();
         }
-        let kind = if failed { failure(state, j["error"].as_str().unwrap_or(""), &log) } else { Value::Null };
+        let kind = if failed { failure(state, j["error"].as_str().unwrap_or(""), &log, hung) } else { Value::Null };
         if failed {
             job.finished = true;
             // a failed or cancelled clip's record, once, kept out of the clips directory (its listing is the clips made):
@@ -640,6 +648,8 @@ impl Studio {
                 j.stall = (n, now());
             } else if now() - j.stall.1 > self.stall_s as f64 && j.last["state"] == "running" {
                 eprintln!("watchdog: {} wrote nothing for {} min, stopping it", s(&j.rec, "name"), self.stall_s / 60);
+                // not a user's cancel: the clip ends as a retryable failure, engine_hung (`failure`), never as cancelled
+                j.rec["watchdog_stopped"] = json!(self.stall_s / 60);
                 let id = j.engine_id;
                 let _ = self.engine("POST", &format!("/engine/jobs/{id}/cancel"), None);
                 j.stall.1 = now();
@@ -783,12 +793,26 @@ fn row(v: &Value) -> Value {
            "steps_done": v["steps_done"], "steps_total": v["steps_total"], "frames": v["frames"], "idle": v["idle"], "done": v["done"], "error": v["error"], "failure": v["failure"], "file": v["file"]})
 }
 
-/// A failed clip's kind: {code, retryable, message, hint}. Read from the engine's error and its last lines.
-pub fn failure(state: &str, error: &str, log: &[String]) -> Value {
+/// A failed clip's kind: {code, retryable, message, hint}. Read from the engine's error and its last lines. `hung`: the
+/// studio's watchdog stopped it after that many minutes without output - an engine that hung, whatever the daemon calls it
+pub fn failure(state: &str, error: &str, log: &[String], hung: Option<u64>) -> Value {
+    if let Some(min) = hung {
+        // 2026-11-24 job 134: a clip silent for 20 min was stopped by the watchdog and its worker killed; the platform read
+        // "stopped by video.cancel" and ended the take for good
+        let message = format!("the engine hung (no output for {min} min); the studio stopped it and the worker was restarted{}",
+                              if error.is_empty() { String::new() } else { format!(" ({error})") });
+        return json!({"code": "engine_hung", "retryable": true, "message": message, "hint": "the same request may work on the fresh worker"});
+    }
     let text = format!("{error}\n{}", log.iter().rev().take(8).cloned().collect::<Vec<_>>().join("\n")).to_lowercase();
     let has = |ps: &[&str]| ps.iter().any(|p| text.contains(p));
     let (code, retryable, hint) = if state == "cancelled" || error.starts_with("cancelled") {
         ("cancelled", false, "stopped by video.cancel")
+    } else if error.contains("too long for") {
+        ("too_long", false, "the clip does not fit on the card: fewer frames (the message says the most that fit), a smaller canvas or a smaller engine")
+    } else if crate::video::daemon::allocation_failure(error) {
+        // the daemon ends a worker the card refused memory and the next job gets a fresh one (whatever the old one held
+        // outside its book goes with it): the same clip may well fit there
+        ("out_of_memory", true, "the card refused memory; the worker was restarted and the same request may work on the fresh one")
     } else if has(&["memory cap", "out of memory", "out_of_device_memory", "out of device memory", "refused a scratch buffer", "cannot allocate"]) {
         ("out_of_memory", false, "the same clip will not fit again: fewer frames, a smaller canvas or a smaller engine (q6k, q4km)")
     } else if has(&["does not answer", "ended unexpectedly", "does not listen", "closed its output", "broken pipe", "connection reset", "killed"]) {
@@ -828,14 +852,33 @@ mod tests {
     #[test]
     fn failures_say_whether_to_retry() {
         let log = |l: &str| vec![l.to_string()];
-        let f = failure("failed", "nsd_alloc: 900 MiB would pass the device memory cap (30 GiB)", &[]);
-        assert_eq!((f["code"].as_str(), f["retryable"].as_bool()), (Some("out_of_memory"), Some(false)));
-        let f = failure("failed", "the engine process ended unexpectedly (signal: 9)", &[]);
+        // a refusal recycles the worker (the daemon): the clip may fit on the fresh one - retryable, never a cancel
+        let f = failure("failed", "nsd_alloc: 900 MiB would pass the device memory cap (30 GiB)", &[], None);
+        assert_eq!((f["code"].as_str(), f["retryable"].as_bool()), (Some("out_of_memory"), Some(true)));
+        let f = failure("failed", "nsd_alloc: the device refused 28 MiB", &[], None);
+        assert_eq!((f["code"].as_str(), f["retryable"].as_bool()), (Some("out_of_memory"), Some(true)));
+        // too long for the card: the same request never fits
+        let f = failure("failed", "736 frames at 832x480 (87084 tokens) are too long for this card: ...; at most 600 frames (25.00 s) fit", &[], None);
+        assert_eq!((f["code"].as_str(), f["retryable"].as_bool()), (Some("too_long"), Some(false)));
+        let f = failure("failed", "the engine process ended unexpectedly (signal: 9)", &[], None);
         assert_eq!((f["code"].as_str(), f["retryable"].as_bool()), (Some("engine_lost"), Some(true)));
-        let f = failure("cancelled", "", &log("sampling"));
+        let f = failure("cancelled", "", &log("sampling"), None);
         assert_eq!(f["code"], "cancelled");
-        let f = failure("failed", "first_frame: no such file", &[]);
+        let f = failure("failed", "first_frame: no such file", &[], None);
         assert_eq!(f["code"], "invalid_input");
-        assert_eq!(failure("failed", "something odd", &[])["code"], "engine_error");
+        assert_eq!(failure("failed", "something odd", &[], None)["code"], "engine_error");
+    }
+
+    #[test]
+    fn a_clip_the_watchdog_stopped_is_a_retryable_hang_not_a_cancel() {
+        // job 134 as the daemon ended it: cancelled (it was sent a cancel), the worker killed 180 s later
+        let f = failure("cancelled", "the engine process did not stop 180 s after the cancel and was killed", &["tokens : 32870 in the denoiser".into()], Some(20));
+        assert_eq!((f["code"].as_str(), f["retryable"].as_bool()), (Some("engine_hung"), Some(true)));
+        let m = f["message"].as_str().unwrap();
+        assert!(m.starts_with("the engine hung") && m.contains("the worker was restarted") && !m.contains("video.cancel"), "{m}");
+        // one that stopped at the next block after the watchdog's cancel: the same
+        assert_eq!(failure("cancelled", "cancelled", &[], Some(20))["code"], "engine_hung");
+        // a user's cancel stays a cancel
+        assert_eq!(failure("cancelled", "cancelled", &[], None)["code"], "cancelled");
     }
 }
