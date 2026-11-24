@@ -6,8 +6,8 @@ MiniMax H3's engine, daemon, studio and tools (the sycl-h3 studio) as `nextsycl 
 **HunyuanVideo-1.5** (`video/hunyuanvideo15`: silent 480p text to video and image to video, 5 s clips; cards
 `hunyuanvideo-1.5-480p-t2v-distilled-q8`, `-480p-t2v-q8`, `-480p-i2v-step-distilled-q8`), runs behind the same daemon
 and studio: added to `NS_VIDEO_ENGINES`, `video.generate` takes it as `engine: "HV15"` / `"HV15-CFG"` / `"HV15-I2V"`
-(docs/ports/hunyuanvideo15.md). **MovieRoll** (cards `movieroll-distilled-t2v-q8`, `-i2v-q8`, `movieroll-base-t2v-q8`: films up to 60 s by rolling
-diffusion on HunyuanVideo-1.5's engine) runs behind them too - video.generate as engine `MR` / `MR-I2V` / `MR-BASE` (the
+(docs/ports/hunyuanvideo15.md). **MovieRoll** (cards `movieroll-distilled-t2v-q8`, `-i2v-q8`, `movieroll-base-t2v-q8`: films by rolling
+diffusion - a minute from one prompt, any length from video.roll's events on HunyuanVideo-1.5's engine) runs behind them too - video.generate as engine `MR` / `MR-I2V` / `MR-BASE` (the
 prompt as its events), and video.roll / video.rollAppend / video.rollEnd for a film steered while it runs and watchable
 as it is made (an HLS playlist beside the clip) (docs/ports/movieroll.md).
 

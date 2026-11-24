@@ -550,7 +550,7 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
                               (404, "not_found", "a file named (first_frame, ref_images, control_video ...) is not in the clips directory"),
                               (409, "busy", "a clip is being made or a runnable one waits, and queue is not true")],
         "video.cancel" => &[(404, "not_found", "label: no running or queued clip with it"), (409, "ambiguous", "no clip named and two running: name one"), (409, "not_running", "no label and no clip is being made")],
-        "video.roll" => &[(400, "invalid_params", "not a MovieRoll model, no events or more than 64, an event's prompt empty or its seconds outside 0.67-60, more than 60 s at the start, a size not 864 x 480 or 480 x 864"),
+        "video.roll" => &[(400, "invalid_params", "not a MovieRoll model, no events or more than 64, an event's prompt empty or its seconds outside 0.67-60, a size not 864 x 480 or 480 x 864"),
                           (404, "not_found", "first_frame is not in the clips directory"),
                           (409, "busy", "no card is free and queue is false")],
         "video.rollAppend" | "video.rollEnd" => &[(400, "invalid_params", "neither label nor name; rollAppend: an event's prompt empty or its seconds outside 0.67-60"),

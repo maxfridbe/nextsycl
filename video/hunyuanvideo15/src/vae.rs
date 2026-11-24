@@ -42,6 +42,14 @@ const BLEND: usize = 32;
 const KEEP: usize = 224;
 /// the attention's score rows a call takes: at most this many bytes of float32 scores
 const SCORE_BYTES: usize = 512 << 20;
+/// The streaming decode's middle attention sees at most this many latent frames before a frame's own: upstream's
+/// DEFAULT_STREAMING_EXACT_ATTENTION_FRAMES (movieroll/models/autoencoders/streaming_vae.py) - exact up to a minute
+/// (1 + 1440 / 4), the latest 361 after ("a genuine approximation, since the bottleneck attention is near-uniform over
+/// history"). It bounds the decoder's memory whatever the film's length.
+pub const WINDOW_FRAMES: usize = 361;
+/// Frames of room past the window in the buffers, so the window moves back to the front once every this many frames
+/// (a copy of 2.4 GB at 864 x 480), not every frame
+pub const SLACK_FRAMES: usize = 64;
 
 /// A convolution: half weights [Co, Ci, k, k, k] (k 3, causal) or [Co, Ci] (k 1: a linear), float32 bias
 struct Conv {
@@ -91,12 +99,16 @@ struct Encoder {
 #[derive(Default)]
 struct Stream {
     convs: std::collections::HashMap<usize, DevBuf>,
-    /// the middle attention's keys [cap, c] and values transposed [c, cap] (half) of every frame so far: made for the
-    /// frames the stream was opened for (`stream_begin`), grown past them by half again (a steered film's added events);
-    /// a frame appends its rows in place (a minute's film: 361 latent frames of 1,620 rows, 2.4 GB at 864 x 480)
+    /// the middle attention's keys [cap, c] and values transposed [c, cap] (half) of the frames it attends to: every
+    /// frame so far up to WINDOW_FRAMES, then the latest WINDOW_FRAMES (upstream's streaming_vae: exact up to a minute,
+    /// a sliding window past it). Rows `start .. start + rows` of the buffers; a frame appends its rows in place, and
+    /// the window moves back to the front when the buffer's end is reached (a minute: 361 latent frames of 1,620 rows,
+    /// 2.4 GB at 864 x 480). Made for the frames the stream was opened for (`stream_begin`), grown past them by half
     kv: Option<(DevBuf, DevBuf, usize)>,
     /// the latent frames the stream was opened for (0: unknown)
     frames: usize,
+    /// the window's first row in the buffers, its rows
+    start: usize,
     rows: usize,
     started: bool,
 }
@@ -305,31 +317,52 @@ impl Vae {
         // a stream: the frames before this chunk's keys and values in front of its own (the queries' rows after them),
         // kept in buffers that grow by doubling - the new rows appended in place, not the whole history copied each call
         let mut before = 0;
+        let mut first = 0;
         let mut st = self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))?;
         let (k, vt, ldv) = match st.as_mut() {
             Some(s) => {
                 before = s.rows;
-                let need = before + n;
+                let window = WINDOW_FRAMES * hw;
                 let (mut kb, mut vb, mut cap) = s.kv.take().unwrap_or((DevBuf::new(gpu, 2)?, DevBuf::new(gpu, 2)?, 0));
-                if need > cap {
-                    // the frames it was opened for at once (2026-11-24: doubling from 64 to 128 frames at a film's 65th took
-                    // 850 MB beside the old 425 at its last chunk, on a card that had no more), else half again
-                    let ncap = need.max(cap + cap / 2).max(s.frames * hw).max(8 * hw);
-                    let k2 = DevBuf::new(gpu, ncap * c * 2)?;
-                    let v2 = DevBuf::new(gpu, ncap * c * 2)?;
-                    if before > 0 {
-                        k2.copy_within(0, &kb, 0, before * c * 2)?;
-                        // vt [c, cap] rows: each channel's `before` values to the wider pitch
-                        v2.copy_2d(0, ncap * 2, &vb, 0, cap * 2, before * 2, c)?;
+                let mut start = s.start;
+                if start + before + n > cap {
+                    if before + n <= cap && start > 0 {
+                        // the window back to the front, in pieces no longer than the distance it moves (never a piece
+                        // copied over itself; the queue keeps them in order)
+                        let mut at = 0;
+                        while at < before {
+                            let m = start.min(before - at);
+                            kb.copy_within(at * c * 2, &kb, (start + at) * c * 2, m * c * 2)?;
+                            vb.copy_2d(at * 2, cap * 2, &vb, (start + at) * 2, cap * 2, m * 2, c)?;
+                            at += m;
+                        }
+                    } else {
+                        // grown: to the frames it was opened for at once (2026-11-24: doubling from 64 to 128 frames at a
+                        // film's 65th took 850 MB beside the old 425 at its last chunk, on a card that had no more), else
+                        // by half again - never past the window and its slack
+                        let most = (window + SLACK_FRAMES * hw).max(before + n);
+                        let ncap = (before + n).max(cap + cap / 2).max(s.frames * hw).max(8 * hw).min(most);
+                        let k2 = DevBuf::new(gpu, ncap * c * 2)?;
+                        let v2 = DevBuf::new(gpu, ncap * c * 2)?;
+                        if before > 0 {
+                            k2.copy_within(0, &kb, start * c * 2, before * c * 2)?;
+                            // vt [c, cap] rows: each channel's window values to the wider pitch
+                            v2.copy_2d(0, ncap * 2, &vb, start * 2, cap * 2, before * 2, c)?;
+                        }
+                        (kb, vb, cap) = (k2, v2, ncap);
                     }
-                    (kb, vb, cap) = (k2, v2, ncap);
+                    start = 0;
                 }
-                kb.copy_within(before * c * 2, &k_new, 0, n * c * 2)?;
+                kb.copy_within((start + before) * c * 2, &k_new, 0, n * c * 2)?;
                 let t = DevBuf::new(gpu, n * c * 2)?;
                 self.k.transpose(v_new.ptr(), n, c, t.ptr())?;
-                vb.copy_2d(before * 2, cap * 2, &t, 0, n * 2, n * 2, c)?;
+                vb.copy_2d((start + before) * 2, cap * 2, &t, 0, n * 2, n * 2, c)?;
                 nsd.wait()?;
-                s.rows = need;
+                // after this call: the latest `window` rows (whole frames: n is)
+                let kept = (before + n).min(window.max(n));
+                s.start = start + before + n - kept;
+                s.rows = kept;
+                first = start;
                 (kb, vb, cap)
             }
             None => {
@@ -355,9 +388,12 @@ impl Vae {
             // the keys this block of queries sees: every frame up to its last (the stream's earlier frames first)
             let nk = ((before + r0 + m - 1) / hw + 1) * hw;
             let qp = q.b.ptr().cast::<u16>().wrapping_add(r0 * c).cast();
-            self.k.linear_f32(qp, m, c, k.ptr(), 0, nk, std::ptr::null(), s.fp(), nk)?;
+            // the window's rows: from `first` in the keys, from column `first` in the transposed values
+            let kp = k.ptr().cast::<u16>().wrapping_add(first * c).cast();
+            let vp = vt.ptr().cast::<u16>().wrapping_add(first).cast();
+            self.k.linear_f32(qp, m, c, kp, 0, nk, std::ptr::null(), s.fp(), nk)?;
             self.k.softmax_causal(s.fp(), m, nk, before + r0, hw, scale, p.ptr())?;
-            self.k.linear_f32(p.ptr(), m, nk, vt.ptr(), ldv, c, std::ptr::null(), of.fp(), c)?;
+            self.k.linear_f32(p.ptr(), m, nk, vp, ldv, c, std::ptr::null(), of.fp(), c)?;
             self.k.to_half(of.fp(), o.b.ptr().cast::<u16>().wrapping_add(r0 * c).cast(), m * c, 1.0)?;
             r0 += m;
         }
@@ -427,6 +463,12 @@ impl Vae {
     /// (half, the keys and the values transposed, 1,024 channels: 6.6 MB a frame at 864 x 480)
     pub fn stream_kv_bytes(&self, frames: usize, h: usize, w: usize) -> usize {
         2 * frames * h * w * self.att.q.co * 2
+    }
+
+    /// The latent frames a stream's keys are made for: a video's own up to the window, else (a longer one, or one whose
+    /// length is not known - a steered film) the window and its slack: the most they ever hold
+    pub fn stream_frames(total: usize, open_ended: bool) -> usize {
+        if open_ended || total > WINDOW_FRAMES { WINDOW_FRAMES + SLACK_FRAMES } else { total }
     }
 
     /// Ends the stream, giving its carried state back

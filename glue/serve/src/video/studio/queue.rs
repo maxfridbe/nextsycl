@@ -195,7 +195,13 @@ pub fn engine_rules(engine: &str) -> Option<Rules> {
 }
 
 /// video.roll's events: [{prompt, seconds}] - 1 to 64, each prompt 1 to 4,000 characters, 0.67 to 60 s (whole chunks of
-/// 16 frames in the engine)
+/// 16 frames in the engine). The limits and why (a film's length itself has none: the engine's memory is bounded
+/// whatever it is - movieroll.rs Room, kept_chunks, the decoder's window):
+/// - 64 events a call: each is encoded before the film starts (or before its chunk, appended), the card waiting - 64
+///   keeps that wait under a minute; a live film takes more with video.rollAppend, 64 a call again;
+/// - 60 s an event: an event's chunks stay in host memory from its middle on until it ends (a recompute takes its
+///   middle), 45 chunks at most then; longer, the same scene goes on as consecutive events;
+/// - 4,000 characters a prompt: the text encoder reads 1,000 tokens (MovieRoll's text_len) - more is cut anyway.
 pub fn roll_events(v: Option<&Value>) -> Result<Vec<Value>, RpcError> {
     let list = v.and_then(|v| v.as_array()).ok_or_else(|| RpcError::param("events: a list of {prompt, seconds}"))?;
     if list.is_empty() || list.len() > 64 {
@@ -585,15 +591,14 @@ impl Studio {
                 return Err(RpcError::param("events: a MovieRoll film's (video.roll, a movieroll model)"));
             }
             let ev = roll_events(p.get("events"))?;
+            // (no limit on their sum: 64 events of 60 s at most, and the engine's memory does not grow with the film)
             let chunks: u64 = ev.iter().map(|e| ((e["seconds"].as_f64().unwrap_or(10.0) * 24.0 / 16.0).round() as u64).max(1)).sum();
-            if chunks > 90 {
-                return Err(RpcError::param("events: at most 60 s together at the start (a live film takes more with video.rollAppend)"));
-            }
             let f = 16 * chunks + 1;
             it.insert("frames".into(), json!(f));
             it.insert("seconds".into(), json!(f as f64 / 24.0));
             it.insert("events".into(), json!(ev));
             it.insert("live".into(), json!(p["live"] == true));
+            // an hour at most: a live film waiting for its next event holds its card (nothing else runs there meanwhile)
             it.insert("max_idle_s".into(), num(p, "max_idle_s", 300.0, 0.0, 3600.0, false)?);
             it.insert("hls".into(), json!(true));
         }

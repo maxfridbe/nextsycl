@@ -1,4 +1,4 @@
-# MovieRoll (films up to 60 s at 480p)
+# MovieRoll (films at 480p by rolling: a minute from a prompt, any length by events)
 
 Tencent's MovieRoll: HunyuanVideo-1.5 fine-tuned to roll - a silent film made chunk by chunk (16 frames, 0.67 s each),
 each new chunk seeing the ones before it, so a minute holds together.

@@ -2643,7 +2643,7 @@ export interface VideoRollReq {
   /** the MovieRoll model by registry id (system.models): movieroll-distilled-t2v-q8, or movieroll-distilled-i2v-q8 with first_frame */
   model: string;
   /**
-   * the film's events, played one after another: each a prompt (upstream's style: the subject described in full every time, motion that can go on, one camera sentence) and how long it holds - whole chunks of 16 frames (0.67 s), at least one; together at most 60 s at the start
+   * the film's events, played one after another: each a prompt (upstream's style: the subject described in full every time, motion that can go on, one camera sentence) and how long it holds - whole chunks of 16 frames (0.67 s), at least one; no limit on their sum (a live film takes more with video.rollAppend)
    * @maxItems 64
    * @items {"properties":{"prompt":{"maxLength":4000,"minLength":1,"type":"string"},"seconds":{"default":10,"maximum":60,"minimum":0.67,"type":"number"}},"required":["prompt"],"type":"object"}
    * @minItems 1
@@ -3392,7 +3392,7 @@ export interface Methods {
    */
   "video.wait": { req: VideoWaitReq; resp: any };
   /**
-   * Start a long film (MovieRoll, by rolling diffusion): its events played one after another, each for its seconds, up to 60 s at the start; live: it waits for more (video.rollAppend). It runs as video.generate's clips do - queued when no card is free, video.status / wait / cancel on it by its label - and its pictures are watchable while it is made: the answer's and video.status's `live` is an HLS playlist (fragmented-MP4 segments of 2 s, growing) a browser or ffmpeg plays; the finished film is an mp4 as any clip. ETA: video.status's, from its measured seconds a chunk
+   * Start a long film (MovieRoll, by rolling diffusion): its events played one after another, each for its seconds (up to 64 events of 60 s; a film runs as long as its card holds it, which does not depend on its length); live: it waits for more (video.rollAppend). It runs as video.generate's clips do - queued when no card is free, video.status / wait / cancel on it by its label - and its pictures are watchable while it is made: the answer's and video.status's `live` is an HLS playlist (fragmented-MP4 segments of 2 s, growing) a browser or ffmpeg plays; the finished film is an mp4 as any clip. ETA: video.status's, from its measured seconds a chunk
    * @tags video
    * @example {"events":[{"prompt":"A red fox with a thick orange coat trots steadily through deep snow in a quiet pine forest at dawn. The camera tracks the red fox, continuously keeping the red fox centered. Cinematic photography realistic style.","seconds":10},{"prompt":"The red fox with a thick orange coat sits in the deep snow and grooms its front paw. The camera tracks the red fox, continuously keeping the red fox centered. Cinematic photography realistic style.","seconds":10}],"label":"fox film","live":false,"model":"movieroll-distilled-t2v-q8"}
    */
@@ -4078,7 +4078,7 @@ export function client(post: Post, raw?: PostRaw) {
      */
     "video.wait": (req: VideoWaitReq): Promise<any> => post("video.wait", req),
     /**
-     * Start a long film (MovieRoll, by rolling diffusion): its events played one after another, each for its seconds, up to 60 s at the start; live: it waits for more (video.rollAppend). It runs as video.generate's clips do - queued when no card is free, video.status / wait / cancel on it by its label - and its pictures are watchable while it is made: the answer's and video.status's `live` is an HLS playlist (fragmented-MP4 segments of 2 s, growing) a browser or ffmpeg plays; the finished film is an mp4 as any clip. ETA: video.status's, from its measured seconds a chunk
+     * Start a long film (MovieRoll, by rolling diffusion): its events played one after another, each for its seconds (up to 64 events of 60 s; a film runs as long as its card holds it, which does not depend on its length); live: it waits for more (video.rollAppend). It runs as video.generate's clips do - queued when no card is free, video.status / wait / cancel on it by its label - and its pictures are watchable while it is made: the answer's and video.status's `live` is an HLS playlist (fragmented-MP4 segments of 2 s, growing) a browser or ffmpeg plays; the finished film is an mp4 as any clip. ETA: video.status's, from its measured seconds a chunk
      * @tags video
      * @example {"events":[{"prompt":"A red fox with a thick orange coat trots steadily through deep snow in a quiet pine forest at dawn. The camera tracks the red fox, continuously keeping the red fox centered. Cinematic photography realistic style.","seconds":10},{"prompt":"The red fox with a thick orange coat sits in the deep snow and grooms its front paw. The camera tracks the red fox, continuously keeping the red fox centered. Cinematic photography realistic style.","seconds":10}],"label":"fox film","live":false,"model":"movieroll-distilled-t2v-q8"}
      */
