@@ -1,7 +1,144 @@
 # MovieRoll (and HunyuanVideo-1.5 under it): port plan
 
-Status: **plan** (2026-11-23, the user asked for a full port; HunyuanVideo-1.5 first, on the traditional video methods;
-MovieRoll's long form may need a new kind of endpoint).
+Status: phases 0 - 3 **built** (2026-11-24): HunyuanVideo-1.5 (docs/ports/hunyuanvideo15.md), MovieRoll on its engine
+(arch `movieroll`, cards `movieroll-distilled-t2v-q8`, `-i2v-q8`, `movieroll-base-t2v-q8`) through video.generate, and
+the long-form methods video.roll / rollAppend / rollEnd with a live HLS playlist. The plan as written first is kept
+below the built sections.
+
+## Phase 2 - built (2026-11-23)
+
+**Files** (`yunyangge/MovieRoll` @ fe3150d9, gated - the licence accepted on the token's account):
+`/var/mnt/4TBSSD/nextsycl-models/movieroll/{distilled/t2v, distilled/i2v, base}/model.safetensors` (33.3 GB each,
+float32; `REVISION` beside them). The config's `MovieRoll-16164-MMDiT` is HunyuanVideo-1.5-480P's DiT to the
+tensor - 54 double blocks of 2,048, 16 heads x 128, RoPE 16 / 56 / 56 at theta 256, `img_in` over 65 channels, the
+2-block token refiner, byT5's mapper, `cond_type_embedding` [3, 2048] - with q, k and v **fused** in the file
+(`img_attn_qkv` [6144, 2048], where HunyuanVideo-1.5 has `img_attn_q` / `_k` / `_v`), and no `vision_in` and no
+`time_r_in` (the image of image to video enters through the KV cache, not SigLIP). `Dit::load` reads either. The
+text encoders are HunyuanVideo-1.5's (the same video template, `hidden_states[-3]`) and the VAE is its VAE.
+
+**Code read** (github Tencent-Hunyuan/MovieRoll @ 0b5f73e2): `movieroll_transformer.py` (`forward` with
+`training=False`, `forward_inference`, `_forward_kv_recompute`), `streaming_attention.py`
+(`chunk_inference_attention`), `kv_cache.py`, `rope.py`, `movieroll_dmd_pipeline.py` (`_execute_rollout`, the
+distilled chain), `movieroll_pipeline.py` (`_select_recompute_chunks`, `_kv_recompute`), `context_noise.py`,
+`scheduling_flow_match_streaming.py`, and upstream's own port notes (`agent/movieroll-port`) and SGLang /
+vLLM-Omni ports (`sglang_movieroll/rolling`: the loop with no framework in it, "every function matches its movieroll
+original" - the reference drives the official transformer with it).
+
+**Engine** (`video/hunyuanvideo15/src/roll.rs` the three passes, `movieroll.rs` the loop and the engine, arch
+`movieroll`):
+
+- *denoise*: the window's chunks each at their own timestep - the image stream modulated chunk by chunk (spans), the
+  text stream and the token refiner at the window's first (cleanest) chunk's timestep; image queries over
+  `[history K, V | window | text]`, text queries over `[window | text]` (the text never sees the history, so one cache
+  serves every prompt).
+- *encode*: a clean chunk at t = 0 without text, its queries over `[history | chunk]`; its K (after RoPE) and V
+  appended to the block's cache. A sink-recent block trims its cache to the sink first.
+- *recompute*: the chosen chunks at t = 0, block-causal (chunk i over chunks 0..i); the 6 full-history blocks over all
+  of them, the 48 sink-recent blocks over the first and the last as block 5 left them.
+- RoPE compact, per block group: a block's cached chunks at frames 0.., the window after them; bounded by the grid's
+  120 frames (checked). The cache keeps K after its RoPE (a chunk's position never changes while it is cached).
+- HieraKV: blocks 0-5 the whole history (up to the threshold's chunks, or what an event-heavy recompute keeps), 6-53
+  the sink and one recent chunk. KV recompute at 18 cached chunks and at every event switch (distilled: even when it
+  drops nothing), keeping the first chunk, every event's middle and the 3 newest. Context noise on everything that
+  enters the cache (0.15 t2v, 0 i2v, 0.05 base). AnnealCFG for base (`w = 1 + 3 t / 1000` a chunk, over the empty
+  negative prompt). Events: the film split evenly between them (upstream's even split); the prompt of a round is the
+  cleanest chunk's event.
+- The loop is SGLang-MovieRoll's `run_rolling` (window schedule, Euler a chunk at its own sigma, the padding chunks
+  after the last). Noise: torch's CPU generator in bfloat16 from the seed, in the loop's order (the distilled chain's
+  stream - the check below finds it the same draws).
+- Each chunk leaving the window goes through the streaming VAE decode (`stream_chunk`, one latent frame a call) and on
+  to ffmpeg, so a film never holds its frames.
+- Memory: the cache `half` or `int8` (K and V int8 with a float32 scale a row and head: `kv_q8` / `kv_dq8`, applied as
+  the cache is written and as a block's history is read back); `auto` takes half when it fits with 7 GiB left for
+  the decode's and a pass's own allocations and to spare, else int8 (at 864 x 480: half 11.5 GiB, int8 5.8 GiB). The
+  text encoders (4.2 GiB) are dropped for the roll and load again for the next prompt (~5 s). The engine checks the
+  room before it allocates (the driver has no out-of-memory error).
+- The attention: the silo's ARK half flash over queries and keys apart (`ns_video_hv15_silo_attention2`), or its
+  SageAttention (`sage`: q and k int8, k less its mean over the keys).
+
+**Checks** (`reference/movieroll/ref.py`: the official transformer in float32 on the CPU at 128 x 224, its double
+blocks read one at a time, the matrices rounded to Q8_0 as the engine rounds them; SDPA for FlashAttention; driven by
+SGLang-MovieRoll's loop; every call dumped). One rollout covers it all: 7 chunks, 2 events (switch at chunk 3), the
+threshold lowered to 4 - 11 denoise rounds, 4 encodes, a recompute at the event switch and one at the threshold. The
+engine (`video job check --dir DIR`) makes the same film with the reference's noise, and replays every call on the
+reference's own input (teacher-forced: the cache built from the reference's encodes):
+
+| | velocity rel (each call, teacher-forced) | the film's latents |
+|---|---|---|
+| half cache | 2.7e-3 - 5.2e-3 (cos >= 0.999986) | rel 0.186, cos 0.983 |
+| int8 cache | 3.7e-3 - 6.7e-3 (cos >= 0.999977) | rel 0.193, cos 0.982 |
+| the reference against itself, Q8_0 weights vs float32 | 4.2e-2 at the first call | rel 0.419, cos 0.913 |
+
+Every call's error stays flat through the cache's growth, both recomputes and the event switch (teacher-forced); the
+free-running film drifts because the 5-step distilled chain amplifies any difference (the reference's own Q8_0 vs
+float32 weights drift twice as far as the engine from the reference). The calls, their order, the recomputes (at
+chunks 3 and 6, the same chunks kept) and the noise (the seed's stream, the same draws) match.
+
+**Films** (the fox prompt in upstream's style - one event: 10 s; four events, every 15 s: 60 s; seed 7; 864 x 480):
+
+| Card | Film | Chunks (rounds) | Denoise (a chunk) | Decode | The film | Cache | Peak on the card |
+|---|---|---|---|---|---|---|---|
+| B65 | 10 s, 1 event | 15 (20) | 252.9 s (16.86 s) | 67.9 s | 321.3 s | half (13.4 GiB with buffers) | 28.8 GiB |
+| B65 | 60 s, 4 events (switches at chunks 22, 45, 67; recomputes at 19, 22, 36, 45, 58, 67, 79) | 90 (95) | 1562.4 s (17.36 s) | 422.1 s | 1985.5 s (33 min) | int8 (9.0 GiB with buffers) | 27.3 GiB |
+| B65 | the steered roll below (6.7 s asked, one 3 s event added, then ended) | 15 (20) | 249.9 s (16.66 s) | 67.9 s | 318.3 s | int8 (9.1 GiB) | 28.8 GiB |
+| B70 | 10 s, 1 event | 15 (20) | 159.5 s (10.63 s) | 44.6 s | 204.5 s | half (13.4 GiB with buffers) | 28.9 GiB |
+| B70 | 60 s, 4 events (the same recomputes) | 90 (95) | 967.6 s (10.75 s) | 279.8 s | 1248.2 s (20.8 min) | int8 (9.0 GiB with buffers) | 27.3 GiB |
+| B70 | the steered roll (as on the B65) | 15 (20) | 156.5 s (10.43 s) | 44.6 s | 201.5 s | int8 (9.1 GiB) | 28.9 GiB |
+
+The load (the 33 GB float32 file to Q8_0, the text encoders, the VAE) is 31-77 s and not counted. A chunk is 16 frames
+(0.67 s): a second of film takes ~16 s of denoising on the B70 and ~26 s on the B65 (the paper's H20: ~12 s with
+FlashAttention-3); the whole 60 s film 20.8 min on the B70, 33 min on the B65. The parity check on the B70: every call
+within 2.9e-3 (teacher-forced), the film rel 0.134. The decode's time grows with the film (its middle
+attention sees every frame before: 4.5 s a chunk at 10 s of film, 4.7 s averaged over 60 s); the first 60 s attempt ran
+out of card memory at chunk 36 and a second took 3 h for 82 chunks because the stream copied and transposed the
+whole history's keys and values for every latent frame (fixed: they grow in place; the stream check is unchanged).
+
+Seams (`seams.sh`: the mean |luma difference| of neighbouring frames, at the joins of chunks against inside them):
+the 10 s film's 14 joins: mean |luma difference| across a join 10.08 against 10.11 between frames inside a chunk, the
+worst join 1.11x the median of its chunk's own pairs; the 60 s film's 89 joins: 7.66 against 7.74, the worst 1.62x (join
+55, frame 897 - the fox walking back into the frame from the edge, looked at: motion, not a seam); on the B70 10.22 /
+10.30 (worst 1.11x) and 6.31 / 6.44 (worst 1.54x). No seams at the joins,
+and none to see in the frames (sheets of every 10 s and the joins looked at).
+
+**Not done**: int8 KV quality beyond the check above; the base chain was not run as a film (50 steps: ~10x the
+distilled film's work - the reference card); MovieRoll's own SageAttention variant upstream (SageAttention 2, FP8 P V
+on Hopper) - ours is v1.
+
+## Phase 3 - built (2026-11-24): video.roll, video.rollAppend, video.rollEnd
+
+- **video.roll** `{model, events: [{prompt, seconds}], first_frame?, live?, max_idle_s?, seed?, width?, height?, label?,
+  project?, queue?, rsvp_s?, max_willing_to_wait_s?}`: a MovieRoll film. Each event holds for its seconds (whole chunks
+  of 16 frames, at least one), up to 60 s at the start. It is made as a video.generate clip with its events - the same
+  admission (a known wait over max_willing_to_wait_s declined), queue, reservation after it ends (rsvp_s), and
+  video.status / wait / cancel by its label - so the backplane treats it as any clip: it holds its card while it runs,
+  a live film included (rule 8).
+- **video.rollAppend** `{label | name, events}`: more events. A running film reads them from its control file
+  (`<name>.ctl.json` beside it, written atomically by the studio) between rounds (~17 s apart on the B65): they extend
+  the chunk layout and the event boundaries, and the switch to each recomputes the cache as upstream's does. A queued
+  film takes them before it starts.
+- **video.rollEnd** `{label | name}`: no chunk is begun after it; the window's (up to 5) finish and the mp4 closes. A
+  queued film leaves the queue. video.cancel stops a film at once.
+- **live**: out of events, the film waits for more up to `max_idle_s` (default 300, at most 3,600) before its window
+  flushes - holding its card and its cache - saying so once a minute (the studio's watchdog stops a job silent for
+  20 min). A live film keeps its text encoders loaded (the events it is sent are encoded as they come) and so takes the
+  int8 cache.
+- **Watching it as it is made**: ffmpeg's tee writes the mp4 and an HLS event playlist of fragmented-MP4 segments
+  (`<name>.live.m3u8`, `<name>.live.init.mp4`, `<name>.live.NNNN.m4s`: 2 s each, a key frame a second) in the clips
+  directory as the chunks are decoded; video.status's `live` (and its running_clips') is the playlist's URL
+  (`/v1/video/files/<name>.live.m3u8`), served uncached by the door and the studio. A browser plays it with hls.js (or
+  natively on Safari), ffmpeg / VLC directly.
+- **ETA**: video.status's, from the film's own pace once it has done a chunk (seconds a chunk x the chunks left + the
+  decode); before that the history's estimate for the model and length (system.eta).
+- **The limit on events**: a KV recompute keeps the middles of the latest 4 events (upstream: every event's) - the same
+  for up to 4, and a long or live film's cache stays bounded.
+
+**Checked** (the engine directly, as the studio's job runs it - the B65): a live film of 2 events of 3 s (10 chunks);
+at its 2nd chunk an event of 3 s was written into its control file, at its 6th the end. The film took the event at
+chunk 10 (15 chunks), recomputed its cache at both switches (chunks 5 and 10, as upstream's event switch does), ended at
+15 and closed its mp4 (241 frames, 318 s); its playlist grew a segment as each chunk was decoded (`roll_b65.live.m3u8`,
+6 segments, ENDLIST at the end) and plays in ffmpeg. The front door's three methods and the studio's steering are
+covered by the serve crate's tests (the events' checks, the rules); the studio was not run against the daemon here
+(a build-copy studio never dispatches to production's daemon).
 
 ## What the two models are
 
@@ -51,7 +188,7 @@ At ~40-50 TFLOPS sustained bf16 on the B70 that is **~40 min of compute per minu
 B70's dense bf16, took 16 min). int8 XMX products and a Sage-style attention (we have both) would cut it. The
 50-step base is ~10x that: a reference, not a served card.
 
-## Phase 0 - access, files, a reference (days 1-2)
+## Phase 0 - access, files, a reference (the plan)
 
 1. **User**: accept MovieRoll's licence on huggingface.co with the account of hardac1's token (403 today).
 2. Download to `/var/mnt/4TBSSD/nextsycl-models/` (741 GB free; the 2 TB has 78 GB): HunyuanVideo-1.5 `vae/`,
@@ -63,7 +200,7 @@ B70's dense bf16, took 16 min). int8 XMX products and a Sage-style attention (we
    DiT is 33 GB, the text encoder run separately first), dumping each stage. If the platform peer's NVIDIA box can
    run it at real sizes, ask it for dumps (its user's call).
 
-## Phase 1 - HunyuanVideo-1.5 on the traditional video methods (~1-2 weeks)
+## Phase 1 - HunyuanVideo-1.5 on the traditional video methods (the plan)
 
 - New engine `video/hunyuanvideo15` from `video/example` (the video kind's contract), kernels in
   `kernels/video/hunyuanvideo15` + silo. Reuse: `crates/diffusion` (flow-match Euler, shift), HunyuanImage 2.1's
@@ -75,7 +212,7 @@ B70's dense bf16, took 16 min). int8 XMX products and a Sage-style attention (we
   wait / cancel / timeline`; cards `hunyuanvideo-1.5-480p-t2v-distilled-q8`, `-i2v-step-distilled-q8`; vouch
   memory measured per card; merge-gate baselines on both cards. 720p and the SR upsamplers after.
 
-## Phase 2 - MovieRoll on that engine (~1-2 weeks)
+## Phase 2 - MovieRoll on that engine (the plan)
 
 - Same DiT code with MovieRoll's weights (`distilled/t2v`, `distilled/i2v`; base kept for checks): the rolling
   window scheduler (per-chunk noise levels, bidirectional in window / causal to history attention mask), the KV
@@ -85,7 +222,7 @@ B70's dense bf16, took 16 min). int8 XMX products and a Sage-style attention (we
 - Checks: one window against the reference dump, then a 3-window rollout (KV carried), then an event switch and a
   recompute; a 60 s film on both cards: time, peak VRAM, no seams at chunk joins.
 
-## Phase 3 - the long-form endpoint (~1 week)
+## Phase 3 - the long-form endpoint (the plan)
 
 A film is minutes of GPU time, many prompts and a growing output: the one-shot `video.generate` does not fit it.
 Proposed (rule 7: each method is its handler, the client generated):
