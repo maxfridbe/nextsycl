@@ -611,12 +611,9 @@ impl MovieRoll {
         let mut kv = Kv::new(gpu, blocks, FULL_HISTORY, tpf, full_frames, sr_frames, int8)?;
         let rb = RollBuf::new(&hv.dit, gpu, tpf, win_frames.max(recompute_frames), full_frames + win_frames, tt, tq)?;
         let kv_gib = (kv.bytes() + rb.bytes()) as f64 / GIB;
-        if std::env::var_os("NS_MR_MEMLOG").is_some() {
-            log(format!("memlog: start, card {:.2} GiB used, free {:?}, need half {:.2} int8 {:.2}, most frames {}", hv.note() as f64 / GIB,
-                        free.map(|f| f as f64 / GIB), room.need(false, total_frames) as f64 / GIB, room.need(true, total_frames) as f64 / GIB, plan.most_frames));
-        }
-        log(format!("{ARCH}: {} chunks {:?}, {} events (switches at chunks {:?}), {} steps, the cache ({}) and buffers {:.1} GiB", sizes.len(),
-                    &sizes[..sizes.len().min(3)], events.len(), splits, steps, if kv.int8() { "int8" } else { "half" }, kv_gib));
+        log(format!("{ARCH}: {} chunks {:?}, {} events (switches at chunks {:?}), {} steps, the cache ({}) and buffers {:.1} GiB; the plan {:.1} of {:.1} \
+                     GiB free", sizes.len(), &sizes[..sizes.len().min(3)], events.len(), splits, steps, if kv.int8() { "int8" } else { "half" }, kv_gib,
+                    room.need(int8, total_frames) as f64 / GIB, free.map_or(f64::NAN, |f| f as f64 / GIB)));
         let ctx = |clean: &[f32], noise: &mut dyn NoiseSource| -> Result<Vec<f32>> {
             if chain.context_noise <= 0.0 {
                 return Ok(clean.to_vec());
@@ -737,9 +734,6 @@ impl MovieRoll {
                 let last = decoded == num - 1;
                 let idx = finalized.len();
                 emit(idx, &clean, f, &mut finalized)?;
-                if std::env::var_os("NS_MR_MEMLOG").is_some() {
-                    log(format!("memlog: chunk {idx} decoded, card {:.2} GiB used, watermark {:.2}", hv.note() as f64 / GIB, WATER.load(std::sync::atomic::Ordering::Relaxed) as f64 / GIB));
-                }
                 decoded += 1;
                 progress(decoded, num)?;
                 if last {
@@ -764,9 +758,6 @@ impl MovieRoll {
                     let xb = DevBuf::from_f32(gpu, &x)?;
                     hv.dit.roll_pass(nsd, &st, &rb, &mut kv, &xb, &zero_spans(&frames), hw, Pass::Recompute, attn)?;
                     recomputes.push(done);
-                    if std::env::var_os("NS_MR_MEMLOG").is_some() {
-                        log(format!("memlog: recompute done, card {:.2} GiB used, watermark {:.2}", hv.note() as f64 / GIB, WATER.load(std::sync::atomic::Ordering::Relaxed) as f64 / GIB));
-                    }
                     log(format!("{ARCH}: KV recompute at {done} chunks ({}): kept {chosen:?}", if switch { "event switch" } else { "threshold" }));
                 } else {
                     let x = ctx(&clean, noise)?;
@@ -944,10 +935,6 @@ impl MovieRoll {
                     hv.nsd.trim()?;
                     for (text, secs) in &news {
                         add.push((hv.encode(text, None)?, chunks_for(*secs)));
-                    }
-                    if std::env::var_os("NS_MR_MEMLOG").is_some() {
-                        eprintln!("memlog: event encoded, card {:.2} GiB used, watermark {:.2}", hv.note() as f64 / GIB,
-                                  WATER.load(std::sync::atomic::Ordering::Relaxed) as f64 / GIB);
                     }
                     hv.unload_text()?;
                 }

@@ -364,7 +364,6 @@ The video daemon and the studio (`nextsycl video`) and the H3 engine (`video/h3`
 | `NS_MR_THRESHOLD` | 18 | MovieRoll: cached chunks that trigger a KV recompute (the first chunk, every event's middle and the 3 newest re-encoded; 2 to 40); a job's `threshold` first (--opt-threshold) | video movieroll |
 | `NS_MR_ATTN` | half (the cards: sage) | MovieRoll's attention: `half` (the silo's half flash over queries and keys apart), `sage` (int8 q and k: approximate - the cards' default, 1.25x the denoise, docs/ports/movieroll.md), `shared` (the shared kernels'); a job's `attention` first (--opt-attention) | video movieroll |
 | `NS_MR_KV` | auto | MovieRoll's KV cache of the history: `half`, `int8` (K and V int8 with a float32 scale a row and head: half the memory, ~5.8 instead of 11.5 GiB at 864 x 480), `auto` (half when the film fits the card with it - the passes, the decode and the card's last 1.5 GiB counted - else int8; a film that fits neither is refused as too long, with the most that fits); a job's `kv` first (--opt-kv) | video movieroll |
-| `NS_MR_MEMLOG` | unset | MovieRoll (debugging): 1 logs the card's use at every chunk, the sampled peak beside it, and the plan's numbers at the start | video movieroll |
 | `NS_MR_IMAGE` | 0 | MovieRoll: 1 loads the VAE's encoder (the image-to-video card: the picture is the film's first chunk); 0 leaves it out (0.7 GiB) (--opt-image) | video movieroll |
 
 ## Audio
