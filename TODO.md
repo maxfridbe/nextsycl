@@ -49,6 +49,11 @@ Plan: [docs/ports/movieroll.md](docs/ports/movieroll.md).
 - [ ] Phase 2: MovieRoll's rolling window, HieraKV, recompute, events, streaming VAE decode
 - [ ] Phase 3: `video.roll` / `video.rollAppend` / `video.rollEnd`, HLS output while it generates
 - [ ] Phase 4: speed (int8 XMX, Sage attention, int8 KV, two cards)
+- [ ] **Lip-sync after MovieRoll (user asked 2026-11-24).** MovieRoll is video only (no audio in or out), so its long takes
+  can't follow a voice the way H3's shots do. Port a lip-sync stage that redraws the mouth region of an existing clip to
+  match a voice track. Candidates: LatentSync, MuseTalk, Wav2Lip. Check each one's licence, quality on long moving shots
+  (several faces, profile views, a face leaving the frame), and speed per second on the B70. Serve it as a method that
+  takes a clip plus audio (or a MovieRoll film plus YuE2/TTS output) and returns the synced clip. Not started.
 
 ## Review another DeepSeek engine: Promethevs (2026-11-02)
 
