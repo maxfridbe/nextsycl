@@ -185,15 +185,20 @@ pub fn recompute_chunks(done: usize, splits: &[usize], recent: usize) -> Vec<usi
 
 /// What a film takes on the card beside what is loaded when it starts, over its cache and the passes' buffers: the
 /// streaming decoder's carried frames, the kernels' scratch, a pass's and a decoded frame's transients. Measured at
-/// 864 x 480 on the B65 by sampling the card every 2 ms (2026-11-24): 7.35 GiB over the cache and buffers at the most;
-/// 0.4 to spare. (The old check counted 5.5, read at chunk ends, which miss the decode's transients: the films peaked
-/// at 31.6 of 32 GiB and one failed when the decoder's keys grew.)
-pub const ROLL_OVER: u64 = 31 << 28;
+/// 864 x 480 on the B65 by sampling the card every 2 ms (2026-11-24): 7.35 GiB over the cache and buffers at the most
+/// with half attention, 0.4 of it the decoder's keys (counted apart: per_frame), ~0.4 more with sage (its int8 q and
+/// k); 0.5 to spare. (The old check counted 5.5, read at chunk ends, which miss the decode's transients: the films
+/// peaked at 31.6 of 32 GiB and one failed when the decoder's keys grew.)
+pub const ROLL_OVER: u64 = 63 << 27;
+/// Of ROLL_OVER, what comes and goes between two chunks (a pass's and a decoded frame's transients, the attention's
+/// scratch): what a steered film keeps free beside its decoder's keys when they grow for an added event. Measured: the
+/// card 24.47 GiB in use between chunks, 27.24 at the most in them (half; sage ~0.4 more)
+pub const ROLL_TRANSIENT: u64 = 7 << 29;
 /// A steered film loads the text encoders again for an event it is sent (they are off the card while it rolls): what
 /// that takes over the cache and buffers with the decoder's carried frames on the card, the kernels' scratch given back
 /// first - Qwen2.5-VL's 26 layers (3.4 GiB), byT5 (0.81) and the encode's own. Measured on the B65 (2026-11-24): the
 /// card at 27.10 GiB with them loaded, under the roll's own 27.24 - so no more than ROLL_OVER
-pub const STEER_OVER: u64 = 31 << 28;
+pub const STEER_OVER: u64 = 63 << 27;
 
 /// The card memory never touched (the box's rule; the kernels' NSD_MEM_RESERVE_MB)
 pub fn reserve() -> u64 {
@@ -607,8 +612,9 @@ impl MovieRoll {
             reserve: reserve(),
         };
         let total_frames: usize = sizes.iter().sum();
-        // the decoder's keys: the film's frames up to the window, the window past it; a steered film's length is open
-        let vae_frames = crate::vae::Vae::stream_frames(total_frames, steer.is_some());
+        // the decoder's keys: the film's frames up to the window, the window past it; a steered film's grow with the events
+        // it is sent, each growth checked against the card then (take, below)
+        let vae_frames = crate::vae::Vae::stream_frames(total_frames, false);
         // what the encodes left in the kernels' scratch back first (ROLL_OVER counts the scratch the film grows)
         nsd.trim()?;
         let free = gpu.memory().ok().and_then(|m| m.1);
@@ -682,12 +688,33 @@ impl MovieRoll {
         let mut steer = steer;
         let mut ended = false;
         // a steered film's news: events added after the chunks there are, or the end
-        // (no length limit: the cache, the decoder's keys and the finished chunks kept are bounded whatever the length)
-        let take = |p: Poll, sizes: &mut Vec<usize>, to_event: &mut Vec<usize>, splits: &mut Vec<usize>, events: &mut Vec<Option<Encoded>>, num: &mut usize,
+        // (no length limit: the cache, the decoder's keys and the finished chunks kept are bounded whatever the length. An
+        // added event that makes the decoder's keys grow - up to their window - needs the new buffers on the card beside
+        // the old while they are copied, and what comes and goes between chunks: the card is asked then, and an event
+        // it has no room for ends the film there, said so)
+        let mut keys_frames = vae_frames;
+        let (per_frame, reserve_b) = (room.per_frame, room.reserve);
+        let mut take = |p: Poll, sizes: &mut Vec<usize>, to_event: &mut Vec<usize>, splits: &mut Vec<usize>, events: &mut Vec<Option<Encoded>>, num: &mut usize,
                         ended: &mut bool, log: &mut dyn FnMut(String)| {
             for (e, n) in p.add {
                 if *ended || n == 0 {
                     continue;
+                }
+                let frames: usize = sizes.iter().sum::<usize>() + n * CHUNK;
+                let want = crate::vae::Vae::stream_frames(frames, false);
+                if want > keys_frames {
+                    // the stream grows by half again at least (vae.rs): the new buffers, the old still there while copied
+                    let new = want.max(keys_frames + keys_frames / 2).min(crate::vae::WINDOW_FRAMES + crate::vae::SLACK_FRAMES);
+                    let need = per_frame * (new + keys_frames) as u64 + reserve_b + ROLL_TRANSIENT;
+                    let free = gpu.memory().ok().and_then(|m| m.1);
+                    if free.is_some_and(|f| f < need) {
+                        log(format!("{ARCH}: an added event does not fit: the decoder's keys for {frames} latent frames need {:.1} GiB with what a chunk \
+                                     takes and the card's last {:.1} GiB, {:.1} GiB are free - the film ends here", need as f64 / GIB,
+                                    reserve_b as f64 / GIB, free.unwrap_or(0) as f64 / GIB));
+                        *ended = true;
+                        continue;
+                    }
+                    keys_frames = new;
                 }
                 // the boundary in output chunks (the anchor counted)
                 splits.push(*num + usize::from(anchor.is_some()));
