@@ -526,6 +526,9 @@ impl Studio {
                 }
             }
             "generate" => self.generate(p)?,
+            // a MovieRoll film started here as the front door's video.roll starts it: a clip whose prompt is its first
+            // event's (the roll page, served here and through the door's /open/, calls it by the generated client)
+            "roll" => self.generate(&roll_as_generate(p))?,
             "rollAppend" | "rollEnd" => self.steer(method, p)?,
             "queue.list" => json!({"queue": self.st.lock().unwrap().q.items}),
             "queue.pause" => self.hold(true, &ps("project"), &ps("batch"), &ps("by")),
@@ -875,6 +878,12 @@ impl Studio {
         }
         let respond_json = |v: &Value| http::respond(stream, 200, v);
         match path.as_str() {
+            // MovieRoll's page (wfe/roll): start a film, watch it as it is made, steer it
+            "/roll" => {
+                let html = crate::wfe::text(&self.ui, "roll/index.html").ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "the roll page is not built (./build.sh wfe)"))?;
+                let css = crate::wfe::text(&self.ui, "roll/style.css").unwrap_or_default();
+                http::respond_bytes(stream, 200, "text/html; charset=utf-8", html.replace("__CSS__", &css).as_bytes())
+            }
             "/" | "/index.html" => {
                 // nextsycl: the built front ends' root (dist/wfe), this one's page in video/
                 let html = crate::wfe::text(&self.ui, "video/index.html").ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "the video page is not built (./build.sh wfe)"))?;
@@ -1177,6 +1186,18 @@ fn record_of(v: &Value) -> Value {
            "stage": v["stage"], "pct": v["pct"], "eta": v["eta"], "elapsed": v["elapsed"], "steps_done": v["steps_done"], "steps_total": v["steps_total"],
            "position": v["position"], "gpu": v["gpu"], "waiting_for": v["waiting_for"], "preview": v["preview"], "file": v["file"],
            "error": v["error"], "failure": v["failure"]})
+}
+
+/// video.roll's body as the studio's generate takes it (the front door's handler does the same, methods.rs video_roll):
+/// the prompt is the first event's, queued unless it says otherwise
+pub fn roll_as_generate(p: &Value) -> Value {
+    let mut b = p.clone();
+    let first = p["events"].as_array().and_then(|a| a.first()).and_then(|e| e["prompt"].as_str()).unwrap_or("").to_string();
+    b["prompt"] = json!(first);
+    if b.get("queue").is_none_or(Value::is_null) {
+        b["queue"] = json!(true);
+    }
+    b
 }
 
 #[cfg(test)]

@@ -5,7 +5,8 @@
 # kind's server serves as they are (/ui/..., the page at /).
 #   ./build.sh [app...]    type-check + compile (default: every app)
 #   ./build.sh --check     also a page's smoke test against a running server (NS_WFE=http://host:port: an image or audio one)
-# video/ is the H3 studio's front end as it was (its server: nextsycl video serve).
+# video/ is the H3 studio's front end as it was (its server: nextsycl video serve); roll/ is MovieRoll's page, the studio's too (/roll;
+# through the front door /open/<model>/roll), on the front door's generated client (home/src/gen).
 set -euo pipefail
 cd "$(dirname "$0")"
 NODE="${NODE:-$(command -v node || echo "$HOME/.local/bin/node")}"
@@ -14,7 +15,7 @@ TSC="vendor/typescript/tsc.js"
 OUT=../dist/wfe
 check=0; apps=()
 for a in "$@"; do [ "$a" = "--check" ] && check=1 || apps+=("$a"); done
-[ ${#apps[@]} -eq 0 ] && apps=(home image ocr audio model3d video)
+[ ${#apps[@]} -eq 0 ] && apps=(home image ocr audio model3d video roll)
 mkdir -p "$OUT/vendor" "$OUT/static"
 rm -rf build
 for app in "${apps[@]}"; do
