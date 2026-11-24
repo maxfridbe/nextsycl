@@ -1009,6 +1009,9 @@ impl MovieRoll {
                         add.push((hv.encode(text, None)?, chunks_for(*secs)));
                     }
                     hv.unload_text()?;
+                    // and what the encodes left in the kernels' caches (their shapes' primitives, with the encoders' weights
+                    // reordered: 2026-11-24 a live film ran out of the card after an added event without this)
+                    hv.nsd.trim()?;
                 }
                 taken = taken.max(list.len());
                 Ok(Poll { add, end: v["end"] == true })

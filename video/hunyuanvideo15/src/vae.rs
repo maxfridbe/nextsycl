@@ -352,7 +352,10 @@ impl Vae {
                         // film's 65th took 850 MB beside the old 425 at its last chunk, on a card that had no more), else
                         // by half again - never past the window and its slack
                         let most = (window + SLACK_FRAMES * hw).max(before + n);
-                        let ncap = (before + n).max(cap + cap / 2).max(s.frames * hw).max(8 * hw).min(most);
+                        // (the rows a multiple of 64: the values' pitch is the products' leading dimension - an odd one
+                        // made oneDNN copy them into a scratch of its own, a new one each frame: 2026-11-24, ~330 MB a
+                        // latent frame once a steered film's keys had grown to 31.5 frames' rows)
+                        let ncap = (before + n).max(cap + cap / 2).max(s.frames * hw).max(8 * hw).min(most).next_multiple_of(64);
                         let k2 = DevBuf::new(gpu, ncap * c * 2)?;
                         let v2 = DevBuf::new(gpu, ncap * c * 2)?;
                         if before > 0 {
