@@ -183,6 +183,87 @@ pub fn recompute_chunks(done: usize, splits: &[usize], recent: usize) -> Vec<usi
     s.into_iter().collect()
 }
 
+/// What a film takes on the card beside what is loaded when it starts, over its cache and the passes' buffers: the
+/// streaming decoder's carried frames, the kernels' scratch, a pass's and a decoded frame's transients. Measured at
+/// 864 x 480 on the B65 by sampling the card every 2 ms (2026-11-24): 7.35 GiB over the cache and buffers at the most;
+/// 0.4 to spare. (The old check counted 5.5, read at chunk ends, which miss the decode's transients: the films peaked
+/// at 31.6 of 32 GiB and one failed when the decoder's keys grew.)
+pub const ROLL_OVER: u64 = 31 << 28;
+/// A steered film loads the text encoders again for an event it is sent (they are off the card while it rolls): what
+/// that takes over the cache and buffers with the decoder's carried frames on the card, the kernels' scratch given back
+/// first - Qwen2.5-VL's 26 layers (3.4 GiB), byT5 (0.81) and the encode's own. Measured on the B65 (2026-11-24): the
+/// card at 27.10 GiB with them loaded, under the roll's own 27.24 - so no more than ROLL_OVER
+pub const STEER_OVER: u64 = 31 << 28;
+/// The longest a steered film may grow to (its added events): two minutes, 180 chunks. Its decoder's keys are made for
+/// what it may reach at once (the plan's most frames, this at the most) - grown past, they would be copied, and a copy
+/// takes the old and the new together
+pub const STEER_MAX_FRAMES: usize = 1 + CHUNK * 180;
+
+/// The card memory never touched (the box's rule; the kernels' NSD_MEM_RESERVE_MB)
+pub fn reserve() -> u64 {
+    std::env::var("NSD_MEM_RESERVE_MB").ok().and_then(|v| v.parse::<u64>().ok()).map_or(1536 << 20, |m| m << 20)
+}
+
+/// A film's memory: its cache (half, int8), the passes' buffers, what it takes over them (ROLL_OVER / STEER_OVER),
+/// the decoder's keys a latent frame, the memory kept free
+#[derive(Clone, Copy, Debug)]
+pub struct Room {
+    pub cache_half: u64,
+    pub cache_int8: u64,
+    pub buffers: u64,
+    pub over: u64,
+    pub per_frame: u64,
+    pub reserve: u64,
+}
+
+/// A film's plan: the cache's kind and the most latent frames it may reach (a steered film's added events stop there)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Plan {
+    pub int8: bool,
+    pub most_frames: usize,
+}
+
+impl Room {
+    /// All the film needs on the card with `frames` latent frames (the memory kept free counted)
+    pub fn need(&self, int8: bool, frames: usize) -> u64 {
+        (if int8 { self.cache_int8 } else { self.cache_half }) + self.buffers + self.over + self.per_frame * frames as u64 + self.reserve
+    }
+
+    /// The most latent frames a film can have in `free` (1 + 4 a chunk), None when not even its first chunk fits
+    pub fn most_frames(&self, int8: bool, free: u64) -> Option<usize> {
+        let fixed = self.need(int8, 0);
+        let frames = free.checked_sub(fixed)? / self.per_frame.max(1);
+        let chunks = (frames.min(1 << 20) as usize).saturating_sub(1) / CHUNK;
+        (chunks >= 1).then_some(1 + CHUNK * chunks)
+    }
+
+    /// The plan of a film of `frames` latent frames in `free`: half when asked or (auto) when it fits, else int8; a film
+    /// that does not fit is refused with the most that would (the studio reads "too long for" as too_long)
+    pub fn plan(&self, kv: KvMode, frames: usize, free: u64, canvas: (usize, usize), card: &str) -> Result<Plan> {
+        let int8 = match kv {
+            KvMode::Half => false,
+            KvMode::Int8 => true,
+            KvMode::Auto => self.need(false, frames) > free,
+        };
+        match self.most_frames(int8, free) {
+            Some(most) if most >= frames => Ok(Plan { int8, most_frames: most }),
+            most => {
+                let video = |f: usize| 4 * (f - 1) + 1;
+                let fit = match most {
+                    Some(m) => format!("at most {} frames ({:.2} s) fit", video(m), video(m) as f64 / FPS as f64),
+                    None => "not even its first chunk fits".into(),
+                };
+                Err(Error(format!(
+                    "{ARCH}: {} frames at {}x{} are too long for this card ({card}): the film needs about {:.1} GiB (its cache, {}, {:.1}; the passes' \
+                     buffers {:.1}; the passes and the decode {:.1}; the decoder's keys {:.1}), {:.1} GiB can be had (the card keeps {:.1} GiB free); {fit}",
+                    video(frames), canvas.0, canvas.1, (self.need(int8, frames) - self.reserve) as f64 / GIB, if int8 { "int8" } else { "half" },
+                    (if int8 { self.cache_int8 } else { self.cache_half }) as f64 / GIB, self.buffers as f64 / GIB, self.over as f64 / GIB,
+                    (self.per_frame * frames as u64) as f64 / GIB, free.saturating_sub(self.reserve) as f64 / GIB, self.reserve as f64 / GIB)))
+            }
+        }
+    }
+}
+
 /// The events of a prompt: a JSON list of strings, or lines `@@@EVENT_BREAK@@@` between them, else one
 pub fn events_of(prompt: &str) -> Vec<String> {
     let p = prompt.trim();
@@ -496,29 +577,42 @@ impl MovieRoll {
             (events.iter().chain(negative).map(|e| e.text.tq).max().unwrap_or(1), events.iter().chain(negative).map(|e| e.text.tokens()).max().unwrap_or(1))
         };
         // the room first (the driver has no out-of-memory error, and a card nearly full hangs the box): the cache, the
-        // pass's buffers (its rows x 44 KB, the attention's keys and values x 8 KB) and 1.5 GiB to spare
+        // pass's buffers (its rows x 44 KB, the attention's keys and values x 8 KB), what the passes and the decode take
+        // over them, the decoder's keys a frame, and the card's last 1.5 GiB never touched
         let blocks = hv.dit.doubles.len();
         let rows = win_frames.max(recompute_frames) * tpf + tt;
         let buf_need = rows * (dit::DIM * 4 + dit::DIM * 2 * 3 + dit::DIM * 3 * 2 + dit::FFN * 2) + ((full_frames + win_frames) * tpf + tt) * dit::DIM * 4;
-        // besides: what a pass allocates as it goes (the final layer's rows, the RoPE tables) and the streaming decode of a
-        // latent frame - 5.3 GiB over the cache and buffers measured at 864 x 480 on the B65, so 5.5 - and 1.5 GiB never touched
-        let reserve = (11u64 << 29) + (3u64 << 29);
-        let free = gpu.memory().ok().and_then(|m| m.1);
-        let need = |int8: bool| (Kv::need(blocks, FULL_HISTORY, tpf, full_frames, sr_frames, int8) + buf_need) as u64 + reserve;
-        let int8 = match kv_mode {
-            KvMode::Half => false,
-            KvMode::Int8 => true,
-            KvMode::Auto => free.is_some_and(|f| need(false) > f),
+        let frame_kv = hv.vae.stream_kv_bytes(1, hw.0, hw.1) as u64;
+        let room = Room {
+            cache_half: Kv::need(blocks, FULL_HISTORY, tpf, full_frames, sr_frames, false) as u64,
+            cache_int8: Kv::need(blocks, FULL_HISTORY, tpf, full_frames, sr_frames, true) as u64,
+            buffers: buf_need as u64,
+            over: if steer.is_some() { ROLL_OVER.max(STEER_OVER) } else { ROLL_OVER },
+            per_frame: frame_kv,
+            reserve: reserve(),
         };
-        if let Some(f) = free {
-            if need(int8) > f {
-                return Err(Error(format!("{ARCH}: the film's cache ({}) and buffers need {:.1} GiB with 7 for the decode and to spare; {:.1} GiB are free on {}",
-                                         if int8 { "int8" } else { "half" }, need(int8) as f64 / GIB, f as f64 / GIB, gpu.name)));
-            }
-        }
+        let total_frames: usize = sizes.iter().sum();
+        // what the encodes left in the kernels' scratch back first (ROLL_OVER counts the scratch the film grows)
+        nsd.trim()?;
+        let free = gpu.memory().ok().and_then(|m| m.1);
+        let plan = match free {
+            Some(f) => room.plan(kv_mode, total_frames, f, (hw.1 * 16, hw.0 * 16), &gpu.name)?,
+            // a driver that cannot tell: as asked (auto: int8), and no more than asked
+            None => Plan { int8: kv_mode != KvMode::Half, most_frames: total_frames },
+        };
+        let int8 = plan.int8;
+        // the decoder's keys made for the film's frames, or a steered film's most (its added events stop there: each
+        // takes whole chunks)
+        let most_frames = if steer.is_some() { plan.most_frames.min(STEER_MAX_FRAMES).max(total_frames) } else { total_frames };
+        hv.vae.stream_reserve(most_frames)?;
+        let most_chunks = (most_frames.saturating_sub(1) / CHUNK).max(sizes.len() - usize::from(anchor.is_some()));
         let mut kv = Kv::new(gpu, blocks, FULL_HISTORY, tpf, full_frames, sr_frames, int8)?;
         let rb = RollBuf::new(&hv.dit, gpu, tpf, win_frames.max(recompute_frames), full_frames + win_frames, tt, tq)?;
         let kv_gib = (kv.bytes() + rb.bytes()) as f64 / GIB;
+        if std::env::var_os("NS_MR_MEMLOG").is_some() {
+            log(format!("memlog: start, card {:.2} GiB used, free {:?}, need half {:.2} int8 {:.2}, most frames {}", hv.note() as f64 / GIB,
+                        free.map(|f| f as f64 / GIB), room.need(false, total_frames) as f64 / GIB, room.need(true, total_frames) as f64 / GIB, plan.most_frames));
+        }
         log(format!("{ARCH}: {} chunks {:?}, {} events (switches at chunks {:?}), {} steps, the cache ({}) and buffers {:.1} GiB", sizes.len(),
                     &sizes[..sizes.len().min(3)], events.len(), splits, steps, if kv.int8() { "int8" } else { "half" }, kv_gib));
         let ctx = |clean: &[f32], noise: &mut dyn NoiseSource| -> Result<Vec<f32>> {
@@ -572,6 +666,13 @@ impl MovieRoll {
                         ended: &mut bool, log: &mut dyn FnMut(String)| {
             for (e, n) in p.add {
                 if *ended || n == 0 {
+                    continue;
+                }
+                // no more than the card holds (the decoder's keys grow with the film): what fits of it, then the end
+                let n = n.min(most_chunks.saturating_sub(*num));
+                if n == 0 {
+                    log(format!("{ARCH}: an added event does not fit: this card holds {most_chunks} chunks; the film ends there"));
+                    *ended = true;
                     continue;
                 }
                 // the boundary in output chunks (the anchor counted)
@@ -634,6 +735,9 @@ impl MovieRoll {
                 let last = decoded == num - 1;
                 let idx = finalized.len();
                 emit(idx, &clean, f, &mut finalized)?;
+                if std::env::var_os("NS_MR_MEMLOG").is_some() {
+                    log(format!("memlog: chunk {idx} decoded, card {:.2} GiB used, watermark {:.2}", hv.note() as f64 / GIB, WATER.load(std::sync::atomic::Ordering::Relaxed) as f64 / GIB));
+                }
                 decoded += 1;
                 progress(decoded, num)?;
                 if last {
@@ -658,6 +762,9 @@ impl MovieRoll {
                     let xb = DevBuf::from_f32(gpu, &x)?;
                     hv.dit.roll_pass(nsd, &st, &rb, &mut kv, &xb, &zero_spans(&frames), hw, Pass::Recompute, attn)?;
                     recomputes.push(done);
+                    if std::env::var_os("NS_MR_MEMLOG").is_some() {
+                        log(format!("memlog: recompute done, card {:.2} GiB used, watermark {:.2}", hv.note() as f64 / GIB, WATER.load(std::sync::atomic::Ordering::Relaxed) as f64 / GIB));
+                    }
                     log(format!("{ARCH}: KV recompute at {done} chunks ({}): kept {chosen:?}", if switch { "event switch" } else { "threshold" }));
                 } else {
                     let x = ctx(&clean, noise)?;
@@ -716,6 +823,10 @@ impl MovieRoll {
     }
 }
 
+/// The card's use while a film runs, sampled every 5 ms (a pass's and a decoded frame's transients come and go between
+/// the chunk ends where `note` reads it: those read 28.8 GiB where the card had 31.6 in use)
+static WATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl MovieRoll {
     fn attn(&self, v: Option<&str>) -> Result<Attn> {
         Attn::parse(Some(v.unwrap_or(&self.attention)), self.hv.dit.tiles).map_err(Error)
@@ -758,11 +869,10 @@ impl MovieRoll {
         }
         let negative = if chain.guided { Some(hv.encode("", None)?) } else { None };
         let steered = ask.control.is_some() || ask.live;
-        if !steered {
-            // the text encoders' 4.2 GiB back to the card for the film (the next prompt loads them again, ~5 s); a steered
-            // film keeps them for the events it is sent
-            hv.unload_text()?;
-        }
+        // the text encoders' 4.2 GiB back to the card for the film (the next prompt loads them again, ~5 s); a steered
+        // film loads them for an event it is sent and gives them back after (its plan holds room for that: STEER_OVER).
+        // 2026-11-24: a steered film kept them, and its 2 x 5 s film ran the card out at its last chunk
+        hv.unload_text()?;
         let anchor = match ask.image {
             Some(p) => Some(self.anchor(p, w, h)?),
             None => None,
@@ -774,8 +884,22 @@ impl MovieRoll {
         let frames = 4 * (latent - 1) + 1;
         log(format!("{ARCH}: {w}x{h}, {frames} frames ({} s, {latent} latent), {} event(s){}, seed {seed}, attention {attn:?}; text in {:.1} s",
                     frames as f32 / FPS as f32, events.len(), if ask.live { ", live" } else { "" }, t0.elapsed().as_secs_f64()));
+        // the film's true peak: the card's use sampled every 5 ms (WATER) while it runs
+        WATER.store(0, std::sync::atomic::Ordering::Relaxed);
+        let water_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let water = {
+            let (g, stop) = (hv.nsd.gpu.clone(), water_stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok((t, Some(f))) = g.memory() {
+                        WATER.fetch_max(t.saturating_sub(f), std::sync::atomic::Ordering::Relaxed);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        };
         let mut sink = Sink::open(ask.out, w, h, ask.hls)?;
-        hv.vae.stream_begin()?;
+        hv.vae.stream_begin(latent)?;
         let mut keep = keep;
         let mut noise = SeedNoise::new(seed);
         let tpf = hw.0 * hw.1;
@@ -808,12 +932,22 @@ impl MovieRoll {
                 };
                 let list = v["events"].as_array().cloned().unwrap_or_default();
                 let mut add = Vec::new();
-                for e in list.iter().skip(taken) {
-                    let text = e["prompt"].as_str().unwrap_or("").trim().to_string();
-                    let secs = e["seconds"].as_f64().unwrap_or(10.0) as f32;
-                    if !text.is_empty() {
-                        add.push((hv.encode(&text, None)?, chunks_for(secs)));
+                let news: Vec<(String, f32)> = list.iter().skip(taken)
+                    .map(|e| (e["prompt"].as_str().unwrap_or("").trim().to_string(), e["seconds"].as_f64().unwrap_or(10.0) as f32))
+                    .filter(|(t, _)| !t.is_empty())
+                    .collect();
+                if !news.is_empty() {
+                    // the encoders back for these, the kernels' scratch given back first (the plan's STEER_OVER), then off
+                    // the card again
+                    hv.nsd.trim()?;
+                    for (text, secs) in &news {
+                        add.push((hv.encode(text, None)?, chunks_for(*secs)));
                     }
+                    if std::env::var_os("NS_MR_MEMLOG").is_some() {
+                        eprintln!("memlog: event encoded, card {:.2} GiB used, watermark {:.2}", hv.note() as f64 / GIB,
+                                  WATER.load(std::sync::atomic::Ordering::Relaxed) as f64 / GIB);
+                    }
+                    hv.unload_text()?;
                 }
                 taken = taken.max(list.len());
                 Ok(Poll { add, end: v["end"] == true })
@@ -822,11 +956,13 @@ impl MovieRoll {
             self.film(&chain, Script { events, chunks, latent_frames: latent }, negative.as_ref(), anchor.as_deref(), hw, attn, kv, &mut noise, progress,
                       &mut emit, None, steer, log)
         };
+        water_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = water.join();
         hv.vae.stream_end()?;
         let mut film = film?;
         let written = sink.frames;
         sink.finish()?;
-        film.peak = hv.peak.load(std::sync::atomic::Ordering::Relaxed);
+        film.peak = hv.peak.load(std::sync::atomic::Ordering::Relaxed).max(WATER.load(std::sync::atomic::Ordering::Relaxed));
         Ok((film, written, w, h))
     }
 
@@ -1185,6 +1321,52 @@ mod tests {
         assert_eq!(m3u8, PathBuf::from("/out/mr_1.live.m3u8"));
         assert_eq!(init, "mr_1.live.init.mp4");
         assert_eq!(segs, PathBuf::from("/out/mr_1.live.%04d.m4s"));
+    }
+
+    /// The film of 2026-11-24 08:07 (video.roll, 2 events of 5 s: 65 latent frames, steered) on a 32 GiB card, from
+    /// its log: the cache and buffers 9.1 GiB (int8), the card 15.1 GiB in use at the start with the text encoders on it
+    fn rolled() -> Room {
+        let g = 1u64 << 30;
+        Room { cache_half: 9_960_000_000, cache_int8: 5_950_000_000, buffers: 3_840_000_000, over: ROLL_OVER.max(STEER_OVER),
+               per_frame: 6_635_520, reserve: 3 * g / 2 }
+    }
+
+    #[test]
+    fn a_film_fits_with_the_reserve_kept_or_is_refused_with_what_fits() {
+        let g = 1u64 << 30;
+        let r = rolled();
+        // as it ran: the encoders on the card (16.9 GiB free) - no longer fits: refused up front with what would
+        let e = r.plan(KvMode::Auto, 65, 16_915_435_791, (864, 480), "B65").unwrap_err().0;
+        assert!(e.contains("too long for this card"), "{e}");
+        assert!(e.contains("not even its first chunk fits") || e.contains("at most"), "{e}");
+        // with them off the card (4.2 GiB more): int8, room for well past its 65 frames, the reserve untouched
+        let free = 16_915_435_791 + 4_500_000_000;
+        let p = r.plan(KvMode::Auto, 65, free, (864, 480), "B65").unwrap();
+        assert!(p.int8 && p.most_frames >= 65 && (p.most_frames - 1).is_multiple_of(CHUNK), "{p:?}");
+        assert!(r.need(true, p.most_frames) <= free && r.need(true, p.most_frames + CHUNK) > free);
+        assert!(free - (r.need(true, 65) - r.reserve) >= 3 * g / 2);
+        // half asked for where it does not fit: refused, with the most frames that would fit in half
+        let e = r.plan(KvMode::Half, 65, free, (864, 480), "B65").unwrap_err().0;
+        assert!(e.contains("too long for") && e.contains("half"), "{e}");
+        // a film past what fits: refused, naming the frames (and seconds) that do
+        let most = r.most_frames(true, free).unwrap();
+        let e = r.plan(KvMode::Auto, most + CHUNK, free, (864, 480), "B65").unwrap_err().0;
+        let frames = 4 * (most - 1) + 1;
+        assert!(e.contains(&format!("at most {frames} frames ({:.2} s) fit", frames as f64 / 24.0)), "{e}");
+        // a minute's video.roll (361 latent frames) on the B65 as measured with the encoders off (21.17 GiB free): int8
+        let p = r.plan(KvMode::Auto, 361, 22_731_000_000, (864, 480), "B65").unwrap();
+        assert!(p.int8 && p.most_frames >= 361, "{p:?}");
+        // nothing fits on a card that has almost nothing free
+        assert_eq!(r.most_frames(true, 2 * g), None);
+        assert!(r.plan(KvMode::Int8, 5, 2 * g, (864, 480), "B65").unwrap_err().0.contains("not even its first chunk fits"));
+    }
+
+    #[test]
+    fn the_reserve_follows_the_kernels() {
+        // NSD_MEM_RESERVE_MB unset in the tests: the box's 1.5 GiB
+        if std::env::var_os("NSD_MEM_RESERVE_MB").is_none() {
+            assert_eq!(reserve(), 1536 << 20);
+        }
     }
 
     #[test]

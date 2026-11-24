@@ -371,7 +371,7 @@ pub fn job(m: &HunyuanVideo15, spec: &Value, ctl: &mut JobCtl) -> Result<Value> 
         let (_, z) = read_npy(&dir.join(format!("latents_{}.npy", steps - 1)))?;
         let chunk = spec.get("chunk").and_then(Value::as_f64).unwrap_or(1.0).max(1.0) as usize;
         let plane = h * w * crate::vae::Z;
-        m.vae.stream_begin()?;
+        m.vae.stream_begin(0)?;
         let mut out = Vec::new();
         let mut at = 0;
         let t0 = std::time::Instant::now();

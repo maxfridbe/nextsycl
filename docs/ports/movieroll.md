@@ -49,10 +49,10 @@ original" - the reference drives the official transformer with it).
 - Each chunk leaving the window goes through the streaming VAE decode (`stream_chunk`, one latent frame a call) and on
   to ffmpeg, so a film never holds its frames.
 - Memory: the cache `half` or `int8` (K and V int8 with a float32 scale a row and head: `kv_q8` / `kv_dq8`, applied as
-  the cache is written and as a block's history is read back); `auto` takes half when it fits with 7 GiB left for
-  the decode's and a pass's own allocations and to spare, else int8 (at 864 x 480: half 11.5 GiB, int8 5.8 GiB). The
-  text encoders (4.2 GiB) are dropped for the roll and load again for the next prompt (~5 s). The engine checks the
-  room before it allocates (the driver has no out-of-memory error).
+  the cache is written and as a block's history is read back); `auto` takes half when the film fits with it, else
+  int8 (at 864 x 480: half 11.5 GiB, int8 5.8 GiB). The text encoders (4.2 GiB) are off the card while the film rolls:
+  a steered film loads them for an event it is sent (the kernels' scratch given back first) and drops them after. The
+  engine plans the room before it allocates (the driver has no out-of-memory error): see "Memory" below.
 - The attention: the silo's ARK half flash over queries and keys apart (`ns_video_hv15_silo_attention2`), or its
   SageAttention (`sage`: q and k int8, k less its mean over the keys).
 
@@ -92,6 +92,36 @@ within 2.9e-3 (teacher-forced), the film rel 0.134. The decode's time grows with
 attention sees every frame before: 4.5 s a chunk at 10 s of film, 4.7 s averaged over 60 s); the first 60 s attempt ran
 out of card memory at chunk 36 and a second took 3 h for 82 chunks because the stream copied and transposed the
 whole history's keys and values for every latent frame (fixed: they grow in place; the stream check is unchanged).
+
+Memory (2026-11-24). The first film through the front door (video.roll, 2 events of 5 s, steered, the B70) failed at
+its last chunk: the card refused 204 MB to the decoder. Again on the B65 with the card's use sampled every 2 ms: the
+films ran at **31.6 of 32 GiB** - the old check counted 5.5 GiB over the cache and buffers, read at chunk ends, which
+miss a pass's and a decoded frame's transients (the tables above read 28.8 GiB the same way), and it kept the text
+encoders on the card for a steered film. This film's 65th latent frame then doubled the decoder's middle-attention keys
+(64 -> 128 frames: 850 MB made beside the old 425) and the card had no more. Now (`Room` / `plan` in movieroll.rs, tested):
+- the text encoders are off the card for every film; a steered one loads them for its added events and drops them after;
+- the plan counts the cache, the passes' buffers, `ROLL_OVER` 7.75 GiB over them (7.35 measured: the decoder's carried
+  frames, the kernels' scratch, the transients), the decoder's keys a frame (6.6 MB, made at once for the film's frames -
+  a steered film's for the most it may reach, two minutes at the most - never grown by a copy), and the card's last
+  1.5 GiB (`NSD_MEM_RESERVE_MB`) never touched;
+- `auto` takes half when that fits, else int8; a film that fits neither is refused before it starts, "... too long for
+  this card ...; at most N frames (S s) fit" (the studio answers it `too_long`, not retryable);
+- a steered film's added events stop at the frames that fit (the film ends there, logged);
+- the peak a film reports is the sampled one (every 5 ms), not the chunk ends'. `NS_MR_MEMLOG=1` logs the card's use at
+  every chunk.
+
+After, on the B65, as video.roll runs them (steered: a control file, HLS), peaks sampled every 5 ms:
+
+| Film | Chunks | Cache | Keys made for | Denoise (a chunk) | Decode | Total | Peak (free) | Seams: join / inside, worst |
+|---|---|---|---|---|---|---|---|---|
+| 10 s, 2 events of 5 s (the failed one) | 16 | int8 | 433 frames | 267.5 s (16.72 s) | 73.0 s | 341.1 s | 29.7 GiB (2.3) | 8.40 / 8.49, 1.20x |
+| 61 s, 4 events of 15 s | 92 | int8 | 429 frames | 1598.0 s (17.37 s) | 462.2 s | 2061.2 s (34 min) | 29.7 GiB (2.3) | 7.58 / 7.62, 3.04x |
+
+The 61 s film's worst join (66, frame ~1073) is the fox's head and leg sweeping into the frame close to the camera: the
+background is continuous across it (looked at), motion, not a seam. A steered film's added event (the encoders loaded
+for it, then dropped; a test of 2 x 3 s + 3 s added): the card at 27.10 GiB while it encoded, under the roll's 27.24.
+The 10 s film with its keys made for its own 65 frames peaked at 27.4 GiB; a steered film's are made for what it may
+reach (here ~2.4 GB more).
 
 Seams (`seams.sh`: the mean |luma difference| of neighbouring frames, at the joins of chunks against inside them):
 the 10 s film's 14 joins: mean |luma difference| across a join 10.08 against 10.11 between frames inside a chunk, the

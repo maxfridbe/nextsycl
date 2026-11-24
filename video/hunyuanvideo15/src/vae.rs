@@ -91,9 +91,12 @@ struct Encoder {
 #[derive(Default)]
 struct Stream {
     convs: std::collections::HashMap<usize, DevBuf>,
-    /// the middle attention's keys [cap, c] and values transposed [c, cap] (half) of every frame so far, grown by
-    /// doubling: a frame appends its rows in place (a minute's film: 361 latent frames of 1,620 rows)
+    /// the middle attention's keys [cap, c] and values transposed [c, cap] (half) of every frame so far: made for the
+    /// frames the stream was opened for (`stream_begin`), grown past them by half again (a steered film's added events);
+    /// a frame appends its rows in place (a minute's film: 361 latent frames of 1,620 rows, 2.4 GB at 864 x 480)
     kv: Option<(DevBuf, DevBuf, usize)>,
+    /// the latent frames the stream was opened for (0: unknown)
+    frames: usize,
     rows: usize,
     started: bool,
 }
@@ -309,7 +312,9 @@ impl Vae {
                 let need = before + n;
                 let (mut kb, mut vb, mut cap) = s.kv.take().unwrap_or((DevBuf::new(gpu, 2)?, DevBuf::new(gpu, 2)?, 0));
                 if need > cap {
-                    let ncap = need.max(cap * 2).max(8 * hw);
+                    // the frames it was opened for at once (2026-11-24: doubling from 64 to 128 frames at a film's 65th took
+                    // 850 MB beside the old 425 at its last chunk, on a card that had no more), else half again
+                    let ncap = need.max(cap + cap / 2).max(s.frames * hw).max(8 * hw);
                     let k2 = DevBuf::new(gpu, ncap * c * 2)?;
                     let v2 = DevBuf::new(gpu, ncap * c * 2)?;
                     if before > 0 {
@@ -403,10 +408,25 @@ impl Vae {
         Ok(out)
     }
 
-    /// Opens a streaming decode (any open one dropped): `stream_chunk` then takes the video's latent frames in order
-    pub fn stream_begin(&self) -> Result<()> {
-        *self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))? = Some(Stream::default());
+    /// Opens a streaming decode (any open one dropped) of a video of `frames` latent frames (0: unknown; more may come,
+    /// at the price of a copy): `stream_chunk` then takes its latent frames in order
+    pub fn stream_begin(&self, frames: usize) -> Result<()> {
+        *self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))? = Some(Stream { frames, ..Stream::default() });
         Ok(())
+    }
+
+    /// The latent frames the open stream's keys are made for (a film's plan, once it knows them; before its first frame)
+    pub fn stream_reserve(&self, frames: usize) -> Result<()> {
+        if let Some(s) = self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))?.as_mut() {
+            s.frames = frames;
+        }
+        Ok(())
+    }
+
+    /// The card memory the middle attention's keys and values of a stream of `frames` latent frames of h x w take
+    /// (half, the keys and the values transposed, 1,024 channels: 6.6 MB a frame at 864 x 480)
+    pub fn stream_kv_bytes(&self, frames: usize, h: usize, w: usize) -> usize {
+        2 * frames * h * w * self.att.q.co * 2
     }
 
     /// Ends the stream, giving its carried state back
