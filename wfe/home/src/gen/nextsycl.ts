@@ -2337,7 +2337,7 @@ export interface VideoGenerateReq {
   /** a ControlNet control clip (file); not with Ref2VA */
   control_video?: string | null;
   /**
-   * the denoiser, by video.engines.list's quant (Q8_0 is read as INT8); REF2VA is chosen by itself when ref_images or ref_videos are given. MPEG (minimax-h3-mpeg): a fast draft on two tracks - half resolution, then full resolution on the subject the model picks; it takes keyframes, guides and sound (first_frame, last_frame, guide_clip, first_audio, soundtrack), not references ("REF2VA is not supported by MPEG yet"), ControlNet, masked runs or other samplers; width and height multiples of 64. HV15 (hunyuanvideo-1.5-480p-t2v-distilled-q8) / HV15-CFG (hunyuanvideo-1.5-480p-t2v-q8): HunyuanVideo-1.5 text to video, no sound - the 480p frame nearest the width x height asked in shape (16:9: 848 x 480; default 848 x 480), 4k + 1 frames (5 s: 121, at most 10 s), 50 steps; prompt, seconds or frames, steps and seed are what it reads
+   * the denoiser, by video.engines.list's quant (Q8_0 is read as INT8); REF2VA is chosen by itself when ref_images or ref_videos are given. MPEG (minimax-h3-mpeg): a fast draft on two tracks - half resolution, then full resolution on the subject the model picks; it takes keyframes, guides and sound (first_frame, last_frame, guide_clip, first_audio, soundtrack), not references ("REF2VA is not supported by MPEG yet"), ControlNet, masked runs or other samplers; width and height multiples of 64. MR (movieroll-distilled-t2v-q8) / MR-I2V (movieroll-distilled-i2v-q8: first_frame is the film's first frame) / MR-BASE (movieroll-base-t2v-q8, the 50-step reference): MovieRoll films up to 60 s by rolling diffusion, no sound - 864 x 480 or 480 x 864, 16k + 1 frames, the distilled cards' 5 steps, the prompt as its events; prompt, seconds or frames, seed, first_frame are what it reads. HV15 (hunyuanvideo-1.5-480p-t2v-distilled-q8) / HV15-CFG (hunyuanvideo-1.5-480p-t2v-q8): HunyuanVideo-1.5 text to video, no sound - the 480p frame nearest the width x height asked in shape (16:9: 848 x 480; default 848 x 480), 4k + 1 frames (5 s: 121, at most 10 s), 50 steps; prompt, seconds or frames, steps and seed are what it reads
    * @default "INT8"
    */
   engine?: string | null;
@@ -2426,7 +2426,7 @@ export interface VideoGenerateReq {
    * @maxLength 60
    */
   project?: string | null;
-  /** read as written - tokenized whole, no template, no sections parsed. H3 was trained on three fields in a fixed order: integrated_multimodal_description (shots, actions, camera, dialogue), overall_soundscape, non_diegetic_music; video.describePromptGuideMD has the form and its rules */
+  /** read as written - tokenized whole, no template, no sections parsed. H3 was trained on three fields in a fixed order: integrated_multimodal_description (shots, actions, camera, dialogue), overall_soundscape, non_diegetic_music; video.describePromptGuideMD has the form and its rules. MovieRoll (MR...): the film's events, played one after another and split evenly over it - one prompt, a JSON list of prompts in the string (["...", "..."]), or prompts with a line @@@EVENT_BREAK@@@ between them (upstream's form) */
   prompt: string;
   /**
    * queue the clip when it cannot start now, the default (false: 409 busy instead)
@@ -2483,9 +2483,9 @@ export interface VideoGenerateReq {
   /** H3: `pika-flex` is the model's six-step mode in one word (the Pika H3 Flex adapter, the lcm sampler on its knots, six steps; the adapter must be pulled: nextsycl models pull pika-h3-flex-fl2va); standard: as the other options say */
   speed?: H3Speed | null;
   /**
-   * length; snapped up to the model's frame grid (17k + 5 frames at 24 fps: 4 s -> 107 frames); the model is trained on 5.2-15.1 s. The answer's frames and seconds say what is made
-   * @minimum 1
-   * @maximum 15.1
+   * length; snapped up to the model's frame grid (17k + 5 frames at 24 fps: 4 s -> 107 frames); the model is trained on 5.2-15.1 s. HunyuanVideo-1.5 (HV15...): 4k + 1 frames, at most 10 s; MovieRoll (MR, MR-I2V, MR-BASE): chunks of 16 frames (16k + 1), up to 60 s. The answer's frames and seconds say what is made
+   * @minimum 0.2
+   * @maximum 60
    * @default 10
    */
   seconds?: number | null;

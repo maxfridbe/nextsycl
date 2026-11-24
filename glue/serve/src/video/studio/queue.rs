@@ -170,6 +170,36 @@ pub fn hv15_rules(engine: &str) -> Option<(f64, f64)> {
 /// HunyuanVideo-1.5's frame counts: 4k + 1, 5 s is 121 (what it was trained on), at most 10 s
 pub const HV15_FRAMES: (u64, u64) = (5, 241);
 
+/// The request rules of the engines on HunyuanVideo-1.5's code (HV15..., MovieRoll's MR...): default and most steps,
+/// the frames (least, most) on a grid of `grid` frames + 1, the default canvas
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rules {
+    pub steps: (f64, f64),
+    pub frames: (u64, u64),
+    pub grid: u64,
+    pub canvas: (f64, f64),
+}
+
+pub fn engine_rules(engine: &str) -> Option<Rules> {
+    if let Some(steps) = hv15_rules(engine) {
+        return Some(Rules { steps, frames: HV15_FRAMES, grid: 4, canvas: (848.0, 480.0) });
+    }
+    // MovieRoll (video/hunyuanvideo15 movieroll.rs): chunks of 16 frames, 1 s to 60 s, 864 x 480 or 480 x 864; the
+    // distilled cards' fixed 5-step ladder, the base card's 50 (a multiple of the window's 5)
+    let mr = |steps| Some(Rules { steps, frames: (17, 1441), grid: 16, canvas: (864.0, 480.0) });
+    match engine {
+        "MR" | "MR-I2V" => mr((5.0, 5.0)),
+        "MR-BASE" => mr((50.0, 100.0)),
+        _ => None,
+    }
+}
+
+/// The frames for `seconds` on a grid of `grid` + 1 (snapped up), at most `max`
+pub fn grid_frames(seconds: f64, grid: u64, max: u64) -> u64 {
+    let f = ((seconds * 24.0).round() as u64).max(1);
+    ((f - 1).div_ceil(grid) * grid + 1).min(max)
+}
+
 /// HunyuanVideo-1.5's frames for `seconds` (the engine's frames_for: 24 fps, up to the next 4k + 1)
 pub fn hv15_frames(seconds: f64) -> u64 {
     let f = ((seconds * 24.0).round() as u64).max(1);
@@ -386,6 +416,14 @@ pub fn quant_of(id: &str) -> &'static str {
             _ => "HV15",
         };
     }
+    // MovieRoll's (films up to 60 s on HunyuanVideo-1.5's code)
+    if let Some(rest) = id.strip_prefix("movieroll-") {
+        return match rest {
+            "distilled-i2v-q8" => "MR-I2V",
+            "base-t2v-q8" => "MR-BASE",
+            _ => "MR",
+        };
+    }
     match id.rsplit('-').next().unwrap_or("") {
         "q6k" => "Q6_K",
         "q4km" => "Q4_K_M",
@@ -450,9 +488,9 @@ impl Studio {
             let _ = self.engines(); // the daemon's list (a model added since the studio started)
             engine_id_known(id)
         })?;
-        // HunyuanVideo-1.5 (engine HV15...): its own canvas, length and step rules (hv15_rules)
-        let hv = hv15_rules(&requested);
-        let (dw, dh) = hv.map_or((768.0, 576.0), |_| (848.0, 480.0));
+        // HunyuanVideo-1.5 (engine HV15...) and MovieRoll (MR...): their own canvas, length and step rules
+        let hv = engine_rules(&requested);
+        let (dw, dh) = hv.map_or((768.0, 576.0), |r| r.canvas);
         let width = num(p, "width", dw, 256.0, 1344.0, true)?;
         let height = num(p, "height", dh, 256.0, 1344.0, true)?;
         match hv {
@@ -493,15 +531,18 @@ impl Studio {
         // frames, when given, set the length exactly (seconds = frames / 24); else seconds snapped up to the grid
         match p.get("frames").filter(|v| !v.is_null()) {
             Some(f) if hv.is_some() => {
-                let f = f.as_u64().filter(|f| f % 4 == 1 && (HV15_FRAMES.0..=HV15_FRAMES.1).contains(f))
-                    .ok_or_else(|| RpcError::param(&format!("frames: HunyuanVideo-1.5 makes 4k + 1 frames ({}-{})", HV15_FRAMES.0, HV15_FRAMES.1)))?;
+                let r = hv.unwrap_or(Rules { steps: (0.0, 0.0), frames: HV15_FRAMES, grid: 4, canvas: (0.0, 0.0) });
+                let f = f.as_u64().filter(|f| f % r.grid == 1 && (r.frames.0..=r.frames.1).contains(f))
+                    .ok_or_else(|| RpcError::param(&format!("frames: engine {requested} makes {}k + 1 frames ({}-{})", r.grid, r.frames.0, r.frames.1)))?;
                 it.insert("seconds".into(), json!(f as f64 / 24.0));
                 it.insert("frames".into(), json!(f));
             }
             None if hv.is_some() => {
-                let sec = num(p, "seconds", 5.0, 0.2, HV15_FRAMES.1 as f64 / 24.0, false)?;
-                it.insert("frames".into(), json!(hv15_frames(sec.as_f64().unwrap_or(5.0))));
-                it.insert("seconds".into(), sec);
+                let r = hv.unwrap_or(Rules { steps: (0.0, 0.0), frames: HV15_FRAMES, grid: 4, canvas: (0.0, 0.0) });
+                let sec = num(p, "seconds", if r.grid == 16 { 10.0 } else { 5.0 }, 0.2, r.frames.1 as f64 / 24.0, false)?;
+                let f = grid_frames(sec.as_f64().unwrap_or(5.0), r.grid, r.frames.1);
+                it.insert("frames".into(), json!(f));
+                it.insert("seconds".into(), json!(f as f64 / 24.0));
             }
             Some(f) => {
                 let f = check_frames(f.as_u64().ok_or_else(|| RpcError::param("frames: a whole number"))?)?;
@@ -523,7 +564,7 @@ impl Studio {
             },
             None => it.insert("clip".into(), Value::Null),
         };
-        let (dsteps, max_steps) = hv.unwrap_or((10.0, 40.0));
+        let (dsteps, max_steps) = hv.map_or((10.0, 40.0), |r| r.steps);
         it.insert("steps".into(), num(p, "steps", dsteps, 1.0, max_steps, true)?);
         it.insert("seed".into(), num(p, "seed", 0.0, -2147483648.0, 2147483648.0, true)?);
         it.insert("te".into(), json!(te));
@@ -938,6 +979,25 @@ mod tests {
         assert_eq!(hv15_frames(5.0), 121);
         assert_eq!(hv15_frames(1.0), 25);
         assert!(check_canvas_16(848, 480).is_ok() && check_canvas_16(850, 480).is_err());
+        assert_eq!(engine_rules("HV15").map(|r| r.grid), Some(4));
+    }
+
+    /// MovieRoll's models by id, and its rules: 16k + 1 frames up to 60 s, its fixed 5 steps (base 50), 864 x 480
+    #[test]
+    fn movieroll_engines_have_their_own_rules() {
+        use super::*;
+        assert_eq!(quant_of("movieroll-distilled-t2v-q8"), "MR");
+        assert_eq!(quant_of("movieroll-distilled-i2v-q8"), "MR-I2V");
+        assert_eq!(quant_of("movieroll-base-t2v-q8"), "MR-BASE");
+        let r = engine_rules("MR").unwrap();
+        assert_eq!((r.steps, r.frames, r.grid, r.canvas), ((5.0, 5.0), (17, 1441), 16, (864.0, 480.0)));
+        assert_eq!(engine_rules("MR-BASE").unwrap().steps, (50.0, 100.0));
+        assert_eq!(grid_frames(10.0, 16, 1441), 241);
+        assert_eq!(grid_frames(60.0, 16, 1441), 1441);
+        assert_eq!(grid_frames(9.0, 16, 1441), 225);
+        assert_eq!(grid_frames(5.0, 4, 241), 121);
+        assert_eq!(grid_frames(90.0, 16, 1441), 1441);
+        assert!(engine_rules("INT8").is_none());
     }
 
     /// A regen2k draft: the platform's 864x480 10.125 s clip is two windows, all of it; a portrait one, a 3 s one and a

@@ -199,11 +199,11 @@ pub fn events_of(prompt: &str) -> Vec<String> {
     }
 }
 
-/// The frames of a film of `seconds`: 16n + 1 (n chunks), at least one chunk, at most 60 s
+/// The frames of a film of `seconds`: snapped up to 16n + 1 (n chunks) as the studio snaps them, at least one chunk,
+/// at most 60 s
 pub fn frames_for(seconds: f32) -> usize {
-    let s = seconds.clamp(0.0, MAX_SECONDS);
-    let n = ((s * FPS as f32 - 1.0) / 16.0).round().max(1.0) as usize;
-    16 * n + 1
+    let f = ((seconds.clamp(0.0, MAX_SECONDS) * FPS as f32).round() as usize).max(1);
+    16 * (f - 1).div_ceil(16).clamp(1, 90) + 1
 }
 
 pub struct MovieRoll {
@@ -929,6 +929,8 @@ mod tests {
         assert_eq!(frames_for(10.0), 241);
         assert_eq!(frames_for(60.0), 1441);
         assert_eq!(frames_for(0.1), 17);
+        assert_eq!(frames_for(9.0), 225);
+        assert_eq!(frames_for(240.0 / 24.0), 241);
         assert_eq!(events_of("a @@@EVENT_BREAK@@@ b"), vec!["a", "b"]);
         assert_eq!(events_of(r#"["a", "b", " "]"#), vec!["a", "b"]);
         assert_eq!(events_of("one"), vec!["one"]);
