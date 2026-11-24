@@ -65,7 +65,7 @@ for a chat model. Measured speeds: tg (token generation, decode) / pp (prompt pr
 | `unimate` | **UniMate** the skeleton of a rigged mesh set in motion by a sentence, as a glTF skeletal animation (`model3d.rig` with a prompt; weights CC BY-NC) | a 28-joint humanoid, 60 frames: 13 s |
 | `minimax-h3` | **MiniMax H3** video with sound | 896x672, 4.5 s: ~90 s |
 | `hunyuanvideo-1.5-480p-t2v-distilled-q8` (also `-480p-t2v-q8`, `-480p-i2v-step-distilled-q8`) | **HunyuanVideo-1.5** silent 480p video from text, or from a picture (8 steps) | 848x480, 5 s, 50 steps: B70 11.3 min (12.8 s a step), B65 18.0 min; with 30 steps + step caching + int8 attention 3.1 / 4.9 min |
-| `movieroll-distilled-t2v-q8` (also `-i2v-q8`, `movieroll-base-t2v-q8`) | **MovieRoll** silent films at 480p by rolling diffusion (a minute from a prompt; video.roll: as long as its events go) - events, steered while it runs (video.roll), watchable as it is made (HLS) | 864x480, 60 s, 4 events: B70 20.8 min, B65 33 min (10 s: 3.4 / 5.4 min) |
+| `movieroll-distilled-t2v-q8` (also `-i2v-q8`, `movieroll-base-t2v-q8`) | **MovieRoll** silent films at 480p by rolling diffusion (a minute from a prompt; video.roll: as long as its events go) - events, steered while it runs (video.roll), watchable as it is made (HLS) | 864x480, 60 s, 4 events: B70 15.7 min, B65 23.6 min (10 s: 2.6 / 3.9 min) |
 | `minimax-music3-int8` | **MiniMax Music 3** songs | a minute of song: 89 s |
 | `yue2-3b-q8` | **YuE2-3B** songs with vocals, English and Mandarin; non-commercial (CC BY-NC 4.0) | 142 s of song: 39 s (B70), 54 s (B65) |
 | `qwen3-tts-custom` | **Qwen3-TTS** speech | a minute of speech: 10.7 s (8.2 s int8); a sentence: 0.64 s |
