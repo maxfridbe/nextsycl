@@ -602,7 +602,15 @@ impl MovieRoll {
                 // live, out of chunks: wait for the next event (or the end, or the idle limit) before the window flushes
                 if s.live && !ended && round >= num {
                     let t = Instant::now();
+                    // a line a minute while it waits: the studio's watchdog stops a job that writes nothing for 20 min
+                    let mut said = 0u64;
+                    log(format!("{ARCH}: live - out of events at chunk {num}: waiting up to {:.0} s for more", s.max_idle_s));
                     while round >= num && !ended {
+                        let waited = t.elapsed().as_secs();
+                        if waited / 60 > said {
+                            said = waited / 60;
+                            log(format!("{ARCH}: live - waiting for the next event ({waited} s)"));
+                        }
                         if (s.cancelled)() {
                             return Err(Error("cancelled".into()));
                         }
