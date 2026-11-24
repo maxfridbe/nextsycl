@@ -91,7 +91,9 @@ struct Encoder {
 #[derive(Default)]
 struct Stream {
     convs: std::collections::HashMap<usize, DevBuf>,
-    kv: Option<(DevBuf, DevBuf)>,
+    /// the middle attention's keys [cap, c] and values transposed [c, cap] (half) of every frame so far, grown by
+    /// doubling: a frame appends its rows in place (a minute's film: 361 latent frames of 1,620 rows)
+    kv: Option<(DevBuf, DevBuf, usize)>,
     rows: usize,
     started: bool,
 }
@@ -294,36 +296,50 @@ impl Vae {
         let hw = x.h * x.w;
         let h = self.norm(nsd, &x, &a.norm, false)?;
         let q = self.conv(nsd, &a.q, &h)?;
-        let mut k = self.conv(nsd, &a.k, &h)?.b;
-        let mut v = self.conv(nsd, &a.v, &h)?.b;
+        let k_new = self.conv(nsd, &a.k, &h)?.b;
+        let v_new = self.conv(nsd, &a.v, &h)?.b;
         drop(h);
-        // a stream: the frames before this chunk's keys and values in front of its own (the queries' rows after them)
+        // a stream: the frames before this chunk's keys and values in front of its own (the queries' rows after them),
+        // kept in buffers that grow by doubling - the new rows appended in place, not the whole history copied each call
         let mut before = 0;
-        {
-            let mut st = self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))?;
-            if let Some(s) = st.as_mut() {
-                if let Some((pk, pv)) = s.kv.take() {
-                    let all = |prev: &DevBuf, cur: &DevBuf| -> Result<DevBuf> {
-                        let b = DevBuf::new(gpu, (s.rows + n) * c * 2)?;
-                        b.copy_within(0, prev, 0, s.rows * c * 2)?;
-                        b.copy_within(s.rows * c * 2, cur, 0, n * c * 2)?;
-                        Ok(b)
-                    };
-                    k = all(&pk, &k)?;
-                    v = all(&pv, &v)?;
-                    before = s.rows;
+        let mut st = self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))?;
+        let (k, vt, ldv) = match st.as_mut() {
+            Some(s) => {
+                before = s.rows;
+                let need = before + n;
+                let (mut kb, mut vb, mut cap) = s.kv.take().unwrap_or((DevBuf::new(gpu, 2)?, DevBuf::new(gpu, 2)?, 0));
+                if need > cap {
+                    let ncap = need.max(cap * 2).max(8 * hw);
+                    let k2 = DevBuf::new(gpu, ncap * c * 2)?;
+                    let v2 = DevBuf::new(gpu, ncap * c * 2)?;
+                    if before > 0 {
+                        k2.copy_within(0, &kb, 0, before * c * 2)?;
+                        // vt [c, cap] rows: each channel's `before` values to the wider pitch
+                        v2.copy_2d(0, ncap * 2, &vb, 0, cap * 2, before * 2, c)?;
+                    }
+                    (kb, vb, cap) = (k2, v2, ncap);
                 }
+                kb.copy_within(before * c * 2, &k_new, 0, n * c * 2)?;
+                let t = DevBuf::new(gpu, n * c * 2)?;
+                self.k.transpose(v_new.ptr(), n, c, t.ptr())?;
+                vb.copy_2d(before * 2, cap * 2, &t, 0, n * 2, n * 2, c)?;
                 nsd.wait()?;
-                s.rows = before + n;
+                s.rows = need;
+                (kb, vb, cap)
             }
-        }
+            None => {
+                let vt = DevBuf::new(gpu, n * c * 2)?;
+                self.k.transpose(v_new.ptr(), n, c, vt.ptr())?;
+                (k_new, vt, n)
+            }
+        };
+        // (the stream's lock let go: the convolutions below take it)
+        let streaming = st.is_some();
+        drop(st);
         let na = before + n;
-        let vt = DevBuf::new(gpu, na * c * 2)?;
-        self.k.transpose(v.ptr(), na, c, vt.ptr())?;
         let o = Vol::new(gpu, x.t, x.h, x.w, c)?;
-        // query rows a call: whole frames, the scores within SCORE_BYTES
-        let frames = (SCORE_BYTES / (na * 4 * hw)).clamp(1, x.t);
-        let rows = frames * hw;
+        // query rows a call: the scores within SCORE_BYTES (whole frames when they fit; the causal mask is per row)
+        let rows = (SCORE_BYTES / (na * 4)).clamp(1, n.max(1));
         let s = DevBuf::f32(gpu, rows * na)?;
         let p = DevBuf::new(gpu, rows * na * 2)?;
         let of = DevBuf::f32(gpu, rows * c)?;
@@ -336,15 +352,17 @@ impl Vae {
             let qp = q.b.ptr().cast::<u16>().wrapping_add(r0 * c).cast();
             self.k.linear_f32(qp, m, c, k.ptr(), 0, nk, std::ptr::null(), s.fp(), nk)?;
             self.k.softmax_causal(s.fp(), m, nk, before + r0, hw, scale, p.ptr())?;
-            self.k.linear_f32(p.ptr(), m, nk, vt.ptr(), na, c, std::ptr::null(), of.fp(), c)?;
+            self.k.linear_f32(p.ptr(), m, nk, vt.ptr(), ldv, c, std::ptr::null(), of.fp(), c)?;
             self.k.to_half(of.fp(), o.b.ptr().cast::<u16>().wrapping_add(r0 * c).cast(), m * c, 1.0)?;
             r0 += m;
         }
         let y = self.conv(nsd, &a.proj, &o)?;
         self.k.add(y.b.ptr(), x.b.ptr(), n * c)?;
         nsd.wait()?;
-        if let Some(s) = self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))?.as_mut() {
-            s.kv = Some((k, v));
+        if streaming {
+            if let Some(s) = self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))?.as_mut() {
+                s.kv = Some((k, vt, ldv));
+            }
         }
         Ok(y)
     }
