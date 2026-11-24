@@ -139,6 +139,51 @@ pub struct RollBuf {
     tq_max: usize,
 }
 
+/// NS_MR_PROFILE=1: a pass's stages timed (the queue drained at each stage's end - slower, for the breakdown only), summed
+/// by pass kind and stage until `profile_take`
+static PROFILE: std::sync::Mutex<Vec<(String, f64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn profiling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NS_MR_PROFILE").is_ok_and(|v| v == "1"))
+}
+
+/// `dt` seconds more for `key` (NS_MR_PROFILE)
+pub(crate) fn profile_add(key: &str, dt: f64) {
+    let mut p = PROFILE.lock().unwrap_or_else(|e| e.into_inner());
+    match p.iter_mut().find(|e| e.0 == key) {
+        Some(e) => {
+            e.1 += dt;
+            e.2 += 1;
+        }
+        None => p.push((key.to_string(), dt, 1)),
+    }
+}
+
+/// The stages' seconds and counts so far, emptied
+pub fn profile_take() -> Vec<(String, f64, usize)> {
+    std::mem::take(&mut *PROFILE.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+struct Stage<'a> {
+    nsd: &'a Nsd,
+    kind: &'static str,
+    t: std::time::Instant,
+}
+
+impl Stage<'_> {
+    /// the time since the last mark, as `stage` of this pass's kind
+    fn mark(&mut self, stage: &str) -> Result<()> {
+        if !profiling() {
+            return Ok(());
+        }
+        self.nsd.wait()?;
+        profile_add(&format!("{} {stage}", self.kind), self.t.elapsed().as_secs_f64());
+        self.t = std::time::Instant::now();
+        Ok(())
+    }
+}
+
 impl RollBuf {
     /// Room for passes of `pass_frames` latent frames (a window, a recompute's chunks) and `text` text rows (`tq` of
     /// them Qwen's), attending over `kv_frames` (the most cached + a window)
@@ -171,9 +216,7 @@ impl RollBuf {
 
 /// RoPE (cos, sin) rows of `f` latent frames of h x w from frame `f0` of the grid
 pub fn rope_rows(f0: usize, f: usize, h: usize, w: usize) -> Vec<f32> {
-    let mut cs = crate::dit::rope_table(f0 + f, h, w, 0);
-    cs.drain(..f0 * h * w * HEAD);
-    cs
+    crate::dit::rope_rows(f0, f, h, w)
 }
 
 impl Dit {
@@ -208,9 +251,15 @@ impl Dit {
         if matches!(pass, Pass::Recompute) {
             kv.clear();
         }
+        let mut sg = Stage { nsd, kind: match pass { Pass::Denoise { .. } => "denoise", Pass::Encode => "encode", Pass::Recompute => "recompute" },
+                             t: std::time::Instant::now() };
+        if profiling() {
+            nsd.wait()?;
+            sg.t = std::time::Instant::now();
+        }
         // the hidden states: img_in over [latents | zeros (the condition copy, unused at inference) | 0 (the mask)]
         rb.inp.fill(0)?;
-        rb.inp.copy_2d(0, IN * 4, lat, 0, LATENT * 4, LATENT * 4, n)?;
+        k.copy_rows(&rb.inp, 0, IN * 4, lat, 0, LATENT * 4, LATENT * 4, n)?;
         k.linear32(rb.inp.ptr(), n, IN, w32(&self.img_in)?, DIM, bias(&self.img_in), rb.x.ptr())?;
         let mut text_pass = None;
         if let Pass::Denoise { text, tsi } = &pass {
@@ -232,6 +281,7 @@ impl Dit {
             self.refine(nsd, st, *tsi, &bt, &bt.branches[0], &mut |_, _, _, _| Ok(()))?;
             text_pass = Some(*tsi);
         }
+        sg.mark("in+refiner")?;
         // the image rows of each chunk and their step rows
         let mut spans_rows: Vec<(usize, usize, usize)> = Vec::with_capacity(spans.len());
         let mut r = 0;
@@ -290,6 +340,7 @@ impl Dit {
                 nsd.rms_rope(hptr(&rb.big, n * 3 * DIM), Dt::F16, t, HEADS, HEAD, 3 * DIM, d.txt.q_norm.ptr(), EPS, cs, 0)?;
                 nsd.rms_rope(hptr(&rb.big, n * 3 * DIM + DIM), Dt::F16, t, HEADS, HEAD, 3 * DIM, d.txt.k_norm.ptr(), EPS, cs, 0)?;
             }
+            sg.mark("modulate+qkv+rope")?;
             // the keys and values [history | window | text]
             let total = hrows + n + t;
             if total > rb.kv_rows {
@@ -309,8 +360,9 @@ impl Dit {
                 }
             }
             let rows_in = n + t;
-            rb.sk.copy_2d(hrows * DIM * 2, DIM * 2, &rb.big, DIM * 2, 3 * DIM * 2, DIM * 2, rows_in)?;
-            rb.sv.copy_2d(hrows * DIM * 2, DIM * 2, &rb.big, 2 * DIM * 2, 3 * DIM * 2, DIM * 2, rows_in)?;
+            k.copy_rows(&rb.sk, hrows * DIM * 2, DIM * 2, &rb.big, DIM * 2, 3 * DIM * 2, DIM * 2, rows_in)?;
+            k.copy_rows(&rb.sv, hrows * DIM * 2, DIM * 2, &rb.big, 2 * DIM * 2, 3 * DIM * 2, DIM * 2, rows_in)?;
+            sg.mark("history in")?;
             let q = |row: usize| hptr(&rb.big, row * 3 * DIM).cast_const();
             let kr = |row: usize| hptr(&rb.sk, row * DIM).cast_const();
             let vr = |row: usize| hptr(&rb.sv, row * DIM).cast_const();
@@ -335,6 +387,7 @@ impl Dit {
                     }
                 }
             }
+            sg.mark("attention")?;
             // into the cache: the chunk appended, or the rebuilt chunks
             match &pass {
                 Pass::Encode | Pass::Recompute => {
@@ -366,6 +419,7 @@ impl Dit {
                 }
                 Pass::Denoise { .. } => {}
             }
+            sg.mark("cache out")?;
             // the rest of the block: projection and gated residual, norm, MLP
             for (r0, rows, s) in &spans_rows {
                 d.img.proj.mm(nsd, k, sc, &rb.tmp, hptr(&rb.att, r0 * DIM), DIM, *rows, fptr(&rb.x, r0 * DIM).cast(), DIM, Post::Gate(md(mi, *s, 2)))?;
@@ -380,6 +434,7 @@ impl Dit {
                 d.txt.fc1.mm(nsd, k, sc, &rb.tmp, hptr(&rb.h, r0 * DIM), DIM, t, hptr(&rb.mlp, r0 * FFN), FFN, Post::Gelu)?;
                 d.txt.fc2.mm(nsd, k, sc, &rb.tmp, hptr(&rb.mlp, r0 * FFN), FFN, t, fptr(&rb.x, r0 * DIM).cast(), DIM, Post::Gate(md(mt, tsi, 5)))?;
             }
+            sg.mark("proj+mlp")?;
         }
         if !matches!(pass, Pass::Denoise { .. }) {
             nsd.wait()?;
@@ -394,6 +449,7 @@ impl Dit {
         let v = DevBuf::f32(gpu, n * LATENT)?;
         k.linear32(o.ptr(), n, DIM, w32(&self.final_lin)?, LATENT, bias(&self.final_lin), v.ptr())?;
         nsd.wait()?;
+        sg.mark("final")?;
         Ok(Some(v))
     }
 }
@@ -407,5 +463,10 @@ mod tests {
         let part = super::rope_rows(2, 2, h, w);
         assert_eq!(part.len(), 2 * h * w * head);
         assert_eq!(&part[..], &all[2 * h * w * head..]);
+        // at MovieRoll's size and frames late in its grid: the same bits as the whole table's
+        let (h, w) = (30, 54);
+        let all = crate::dit::rope_table(94, h, w, 0);
+        let part = super::rope_rows(73, 21, h, w);
+        assert!(part.iter().zip(&all[73 * h * w * head..]).all(|(a, b)| a.to_bits() == b.to_bits()));
     }
 }

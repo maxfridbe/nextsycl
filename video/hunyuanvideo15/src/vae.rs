@@ -98,6 +98,8 @@ struct Encoder {
 /// the convolution), the middle attention's keys and values so far, whether a chunk went through yet
 #[derive(Default)]
 struct Stream {
+    /// each convolution's last two padded input frames: read into its next call's padded input, then overwritten by
+    /// that call's (the queue in order: no call waits for it, none allocates it again)
     convs: std::collections::HashMap<usize, DevBuf>,
     /// the middle attention's keys [cap, c] and values transposed [c, cap] (half) of the frames it attends to: every
     /// frame so far up to WINDOW_FRAMES, then the latest WINDOW_FRAMES (upstream's streaming_vae: exact up to a minute,
@@ -267,20 +269,29 @@ impl Vae {
             nsd.linear(x.b.ptr(), Dt::F16, x.n(), c.ci, c.w.ptr(), c.co, c.b.ptr(), o.b.ptr(), Dt::F16)?;
             return Ok(o);
         }
-        let p = DevBuf::new(gpu, (x.t + 2) * (x.h + 2) * (x.w + 2) * x.c * 2)?;
+        let bytes = (x.t + 2) * (x.h + 2) * (x.w + 2) * x.c * 2;
         let mut st = self.stream.lock().map_err(|_| Error("the VAE's stream lock".into()))?;
+        let Some(s) = st.as_mut() else {
+            // a whole video: its own padded input
+            let p = DevBuf::new(gpu, bytes)?;
+            self.k.pad_causal(x.b.ptr(), std::ptr::null(), x.t, x.h, x.w, x.c, p.ptr())?;
+            nsd.conv3d_ex(p.ptr(), Dt::F16, (x.t + 2, x.h + 2, x.w + 2), c.ci, c.w.ptr(), c.co, (3, 3, 3), (1, 1, 1), c.b.ptr(), o.b.ptr())?;
+            return Ok(o);
+        };
+        // a stream: the convolution's last two padded frames from its last call in front of the new ones, then this
+        // call's last two into the same buffer - after the padding read it (2026-11-24: a new buffer each call and a wait
+        // for the queue before letting the old one go; two buffers alternating took 2.7 GB more)
+        let p = DevBuf::new(gpu, bytes)?;
         let key = c as *const Conv as usize;
-        // a stream carries each convolution's last two padded frames into its next chunk
-        let prev = st.as_ref().and_then(|s| s.convs.get(&key)).map_or(std::ptr::null(), |b| b.ptr() as *const std::ffi::c_void);
+        let frame = (x.h + 2) * (x.w + 2) * x.c * 2;
+        let prev = s.convs.get(&key).map_or(std::ptr::null(), |b| b.ptr() as *const std::ffi::c_void);
         self.k.pad_causal(x.b.ptr(), prev, x.t, x.h, x.w, x.c, p.ptr())?;
         nsd.conv3d_ex(p.ptr(), Dt::F16, (x.t + 2, x.h + 2, x.w + 2), c.ci, c.w.ptr(), c.co, (3, 3, 3), (1, 1, 1), c.b.ptr(), o.b.ptr())?;
-        if let Some(s) = st.as_mut() {
-            let frame = (x.h + 2) * (x.w + 2) * x.c * 2;
-            let keep = DevBuf::new(gpu, 2 * frame)?;
-            keep.copy_within(0, &p, x.t * frame, 2 * frame)?;
-            nsd.wait()?;
-            s.convs.insert(key, keep);
-        }
+        let keep = match s.convs.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(DevBuf::new(gpu, 2 * frame)?),
+        };
+        keep.copy_within(0, &p, x.t * frame, 2 * frame)?;
         Ok(o)
     }
 
@@ -333,7 +344,7 @@ impl Vae {
                         while at < before {
                             let m = start.min(before - at);
                             kb.copy_within(at * c * 2, &kb, (start + at) * c * 2, m * c * 2)?;
-                            vb.copy_2d(at * 2, cap * 2, &vb, (start + at) * 2, cap * 2, m * 2, c)?;
+                            self.k.copy_rows(&vb, at * 2, cap * 2, &vb, (start + at) * 2, cap * 2, m * 2, c)?;
                             at += m;
                         }
                     } else {
@@ -347,7 +358,7 @@ impl Vae {
                         if before > 0 {
                             k2.copy_within(0, &kb, start * c * 2, before * c * 2)?;
                             // vt [c, cap] rows: each channel's window values to the wider pitch
-                            v2.copy_2d(0, ncap * 2, &vb, start * 2, cap * 2, before * 2, c)?;
+                            self.k.copy_rows(&v2, 0, ncap * 2, &vb, start * 2, cap * 2, before * 2, c)?;
                         }
                         (kb, vb, cap) = (k2, v2, ncap);
                     }
@@ -356,7 +367,7 @@ impl Vae {
                 kb.copy_within((start + before) * c * 2, &k_new, 0, n * c * 2)?;
                 let t = DevBuf::new(gpu, n * c * 2)?;
                 self.k.transpose(v_new.ptr(), n, c, t.ptr())?;
-                vb.copy_2d((start + before) * 2, cap * 2, &t, 0, n * 2, n * 2, c)?;
+                self.k.copy_rows(&vb, (start + before) * 2, cap * 2, &t, 0, n * 2, n * 2, c)?;
                 nsd.wait()?;
                 // after this call: the latest `window` rows (whole frames: n is)
                 let kept = (before + n).min(window.max(n));
@@ -491,7 +502,15 @@ impl Vae {
         let zf = DevBuf::from_f32(gpu, lat)?;
         let z = Vol::new(gpu, f, h, w, Z)?;
         self.k.to_half(zf.fp(), z.b.ptr(), lat.len(), 1.0 / SCALING)?;
-        let v = self.decode_vol(nsd, z, &mut |_| {})?;
+        // NS_MR_PROFILE: the decoder's parts (it drains the queue at each already)
+        let mut t = std::time::Instant::now();
+        let prof = crate::roll::profiling();
+        let v = self.decode_vol(nsd, z, &mut |part| {
+            if prof {
+                crate::roll::profile_add(&format!("decode {part}"), t.elapsed().as_secs_f64());
+                t = std::time::Instant::now();
+            }
+        })?;
         let of = DevBuf::f32(gpu, v.n() * 3)?;
         self.k.to_float(v.b.ptr(), of.fp(), v.n() * 3)?;
         nsd.wait()?;

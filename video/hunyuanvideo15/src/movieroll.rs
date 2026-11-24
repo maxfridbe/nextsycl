@@ -649,6 +649,8 @@ impl MovieRoll {
         let mut recomputes = Vec::new();
         let mut sizes = sizes;
         let t0 = Instant::now();
+        // seconds in the denoise passes, the encodes, the recomputes
+        let mut pt = [0f64; 3];
         let decode_s = std::cell::Cell::new(0.0f64);
         let mut emit = |i: usize, lat: &[f32], f: usize, finalized: &mut Vec<Option<Vec<f32>>>| -> Result<()> {
             let t = Instant::now();
@@ -774,14 +776,18 @@ impl MovieRoll {
                     let x = ctx(&hist, noise)?;
                     call("recompute", &x, None)?;
                     let xb = DevBuf::from_f32(gpu, &x)?;
+                    let tp = Instant::now();
                     hv.dit.roll_pass(nsd, &st, &rb, &mut kv, &xb, &zero_spans(&frames), hw, Pass::Recompute, attn)?;
+                    pt[2] += tp.elapsed().as_secs_f64();
                     recomputes.push(done);
                     log(format!("{ARCH}: KV recompute at {done} chunks ({}): kept {chosen:?}", if switch { "event switch" } else { "threshold" }));
                 } else {
                     let x = ctx(&clean, noise)?;
                     call("encode", &x, None)?;
                     let xb = DevBuf::from_f32(gpu, &x)?;
+                    let tp = Instant::now();
                     hv.dit.roll_pass(nsd, &st, &rb, &mut kv, &xb, &zero_spans(&[f]), hw, Pass::Encode, attn)?;
+                    pt[1] += tp.elapsed().as_secs_f64();
                 }
             }
             if round >= WINDOW && !keep_all {
@@ -810,6 +816,7 @@ impl MovieRoll {
                 let lat: Vec<f32> = queue.iter().flat_map(|(_, l)| l.iter().copied()).collect();
                 let lb = DevBuf::from_f32(gpu, &lat)?;
                 let tsi = spans[0].1;
+                let tp = Instant::now();
                 let mut v = hv.dit.roll_pass(nsd, &st, &rb, &mut kv, &lb, &spans, hw, Pass::Denoise { text: &event.text, tsi }, attn)?
                     .ok_or_else(|| Error("no velocity".into()))?
                     .to_f32()?;
@@ -828,6 +835,7 @@ impl MovieRoll {
                         r += rows;
                     }
                 }
+                pt[0] += tp.elapsed().as_secs_f64();
                 call("denoise", &lat, Some(&v))?;
                 // Euler, chunk by chunk at its own sigma
                 let mut r = 0;
@@ -844,6 +852,11 @@ impl MovieRoll {
         }
         let decode_s = decode_s.get();
         let denoise_s = t0.elapsed().as_secs_f64() - decode_s;
+        log(format!("{ARCH}: time by part: denoise passes {:.1} s, encodes {:.1} s, recomputes {:.1} s, decode {decode_s:.1} s, the rest (noise, \
+                     the host's sums, copies) {:.1} s", pt[0], pt[1], pt[2], (denoise_s - pt[0] - pt[1] - pt[2]).max(0.0)));
+        for (k, sec, n) in crate::roll::profile_take() {
+            log(format!("{ARCH}: profile {k}: {sec:.2} s over {n} ({:.2} ms each)", 1000.0 * sec / n.max(1) as f64));
+        }
         Ok(Film { events: events.len(), latents, chunks: chunk_frames, recomputes, denoise_s, decode_s, rounds, peak: 0, kv_gib })
     }
 }

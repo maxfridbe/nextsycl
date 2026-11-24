@@ -6,7 +6,7 @@
 use std::ffi::{c_int, c_void};
 use std::sync::OnceLock;
 
-use nextsycl_core::{Error, Gpu, Result};
+use nextsycl_core::{DevBuf, Error, Gpu, Result};
 
 type G = *mut c_void;
 type M = *mut c_void;
@@ -24,6 +24,7 @@ struct Api {
     axpy: unsafe extern "C" fn(G, *mut f32, *const f32, i64, f32) -> c_int,
     kv_q8: unsafe extern "C" fn(G, P, i64, i64, i64, *mut i8, *mut f32) -> c_int,
     kv_dq8: unsafe extern "C" fn(G, *const i8, *const f32, i64, i64, M, i64) -> c_int,
+    copy_rows: unsafe extern "C" fn(G, M, i64, P, i64, i64, i64) -> c_int,
     to_half: unsafe extern "C" fn(G, *const f32, M, i64, f32) -> c_int,
     to_float: unsafe extern "C" fn(G, P, *mut f32, i64) -> c_int,
     q8_0_float: unsafe extern "C" fn(G, P, i64, *mut f32) -> c_int,
@@ -70,6 +71,7 @@ fn api() -> Result<&'static Api> {
             axpy: sym!("ns_video_hv15_axpy"),
             kv_q8: sym!("ns_video_hv15_kv_q8"),
             kv_dq8: sym!("ns_video_hv15_kv_dq8"),
+            copy_rows: sym!("ns_video_hv15_copy_rows"),
             to_half: sym!("ns_video_hv15_to_half"),
             to_float: sym!("ns_video_hv15_to_float"),
             q8_0_float: sym!("ns_video_hv15_q8_0_float"),
@@ -339,6 +341,24 @@ impl K {
     pub fn kv_dq8(&self, src: P, scale: P, rows: usize, heads: usize, dst: M, dst_rs: usize) -> Result<()> {
         // SAFETY: as kv_q8's.
         check(unsafe { (self.k.kv_dq8)(self.g(), src.cast(), scale.cast(), rows as i64, heads as i64, dst, dst_rs as i64) }, "kv int8 -> half")
+    }
+
+    /// `height` rows of `width` bytes, `src` + `src_at` (rows `src_pitch` apart) to `dst` + `at` (`dst_pitch` apart), both
+    /// buffers' bounds checked: DevBuf::copy_2d's job, with every work-item 16 bytes instead of a row
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_rows(&self, dst: &DevBuf, at: usize, dst_pitch: usize, src: &DevBuf, src_at: usize, src_pitch: usize, width: usize, height: usize) -> Result<()> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        let (dn, sn) = ((height - 1) * dst_pitch + width, (height - 1) * src_pitch + width);
+        if at + dn > dst.len || src_at + sn > src.len {
+            return Err(Error(format!("copy_rows: {height} rows of {width} bytes past a buffer ({at} + {dn} of {}, {src_at} + {sn} of {})", dst.len, src.len)));
+        }
+        // SAFETY: both ranges inside their buffers (checked), on this GPU.
+        check(unsafe {
+            (self.k.copy_rows)(self.g(), dst.ptr().cast::<u8>().wrapping_add(at).cast(), dst_pitch as i64, src.ptr().cast::<u8>().wrapping_add(src_at).cast_const().cast(),
+                               src_pitch as i64, width as i64, height as i64)
+        }, "copying rows")
     }
 
     pub fn axpy(&self, x: *mut f32, y: *const f32, n: usize, a: f32) -> Result<()> {

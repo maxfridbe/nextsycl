@@ -39,6 +39,10 @@ int ns_video_hv15_axpy(ns_gpu* g, float* x, const float* y, int64_t n, float a);
  * apart) */
 int ns_video_hv15_kv_q8(ns_gpu* g, const void* src, int64_t rows, int64_t heads, int64_t src_rs, int8_t* dst, float* scale);
 int ns_video_hv15_kv_dq8(ns_gpu* g, const int8_t* src, const float* scale, int64_t rows, int64_t heads, void* dst, int64_t dst_rs);
+// `height` rows of `width` bytes from src (rows `src_pitch` bytes apart) to dst (`dst_pitch` apart): every work-item 16
+// bytes (or 2, when a pitch or an end is not 16-aligned) of a row - the shared ns_copy_2d copies a row a work-item, a byte
+// at a time (MovieRoll's 35,000 rows of 4 KiB a block: 1.4 s of a 17 s chunk on the B65)
+int ns_video_hv15_copy_rows(ns_gpu* g, void* dst, int64_t dst_pitch, const void* src, int64_t src_pitch, int64_t width, int64_t height);
 /* float32 -> half (times s), half -> float32 */
 int ns_video_hv15_to_half(ns_gpu* g, const float* x, void* out, int64_t n, float s);
 int ns_video_hv15_to_float(ns_gpu* g, const void* x, float* out, int64_t n);

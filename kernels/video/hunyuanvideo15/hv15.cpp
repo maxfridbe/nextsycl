@@ -215,6 +215,31 @@ int ns_video_hv15_kv_dq8(ns_gpu* g, const int8_t* src, const float* scale, int64
     NS_CATCH
 }
 
+int ns_video_hv15_copy_rows(ns_gpu* g, void* dst, int64_t dst_pitch, const void* src, int64_t src_pitch, int64_t width, int64_t height) {
+    NS_TRY
+    if (width <= 0 || height <= 0) return 0;
+    if (width % 2 != 0 || dst_pitch % 2 != 0 || src_pitch % 2 != 0 || ((uintptr_t) dst | (uintptr_t) src) % 2 != 0)
+        return ns_fail("ns_video_hv15_copy_rows: rows of 2-byte elements, 2-byte aligned");
+    uint8_t* d = (uint8_t*) dst;
+    const uint8_t* s = (const uint8_t*) src;
+    const bool v16 = width % 16 == 0 && dst_pitch % 16 == 0 && src_pitch % 16 == 0 && ((uintptr_t) dst | (uintptr_t) src) % 16 == 0;
+    if (v16) {
+        const int64_t per = width / 16;
+        g->q.parallel_for(sycl::range<2>((size_t) height, (size_t) per), [=](sycl::id<2> i) {
+            const int64_t r = (int64_t) i[0], c = (int64_t) i[1];
+            *reinterpret_cast<sycl::uint4*>(d + r * dst_pitch + c * 16) = *reinterpret_cast<const sycl::uint4*>(s + r * src_pitch + c * 16);
+        });
+    } else {
+        const int64_t per = width / 2;
+        g->q.parallel_for(sycl::range<2>((size_t) height, (size_t) per), [=](sycl::id<2> i) {
+            const int64_t r = (int64_t) i[0], c = (int64_t) i[1];
+            *reinterpret_cast<uint16_t*>(d + r * dst_pitch + c * 2) = *reinterpret_cast<const uint16_t*>(s + r * src_pitch + c * 2);
+        });
+    }
+    return 0;
+    NS_CATCH
+}
+
 int ns_video_hv15_to_half(ns_gpu* g, const float* x, void* out, int64_t n, float s) {
     NS_TRY
     if (n <= 0) return 0;

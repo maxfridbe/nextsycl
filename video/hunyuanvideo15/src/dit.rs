@@ -209,6 +209,38 @@ pub fn sinusoid(t: f32) -> [f32; 256] {
 /// The RoPE's (cos, sin) for an f x h x w grid (row-major), then `text` unrotated rows: pair i of a head (features i,
 /// 64 + i after the permutation; 2i, 2i + 1 before) turns with the frame (i < 8), the row (i < 36) or the column, at
 /// theta^(-2j / d) for its axis' d features and its index j there - as get_nd_rotary_pos_embed's float32 tables
+/// Rows `f0 * h * w ..` of `rope_table(f0 + f, h, w, 0)`, the same bits: each axis's angles computed once (a frame's,
+/// a row's, a column's) and the rows put together from them - MovieRoll asks for a block group's rows every pass, and
+/// the table's every-element pow, cos and sin over the whole history were ~0.5 s of a pass on the host
+pub fn rope_rows(f0: usize, f: usize, h: usize, w: usize) -> Vec<f32> {
+    let freq = |d: usize, j: usize| -> f32 { 1.0 / (THETA as f32).powf((2 * j) as f32 / d as f32) };
+    // (cos, sin) by axis: [position][pair]
+    let axis = |a: usize, from: usize, len: usize| -> Vec<(f32, f32)> {
+        let pairs = ROPE[a] / 2;
+        let mut t = Vec::with_capacity(len * pairs);
+        for p in from..from + len {
+            for j in 0..pairs {
+                let x = p as f32 * freq(ROPE[a], j);
+                t.push((x.cos(), x.sin()));
+            }
+        }
+        t
+    };
+    let (ft, ht, wt) = (axis(0, f0, f), axis(1, 0, h), axis(2, 0, w));
+    let (p0, p1, p2) = (ROPE[0] / 2, ROPE[1] / 2, ROPE[2] / 2);
+    let mut cs = vec![0f32; f * h * w * HEAD];
+    for r in 0..f * h * w {
+        let (t, y, x) = (r / (h * w), (r / w) % h, r % w);
+        let row = &mut cs[r * HEAD..(r + 1) * HEAD];
+        let parts = ft[t * p0..(t + 1) * p0].iter().chain(&ht[y * p1..(y + 1) * p1]).chain(&wt[x * p2..(x + 1) * p2]);
+        for (i, (c, s)) in parts.enumerate() {
+            row[2 * i] = *c;
+            row[2 * i + 1] = *s;
+        }
+    }
+    cs
+}
+
 pub fn rope_table(f: usize, h: usize, w: usize, text: usize) -> Vec<f32> {
     let n = f * h * w;
     let mut cs = vec![0f32; (n + text) * HEAD];
@@ -652,8 +684,8 @@ impl Dit {
         }
         for (b, lat) in branches.iter().zip(lats).filter(|_| reuse.is_none()) {
             // img_in over [latents | condition | mask]
-            bt.inp.copy_2d(0, IN * 4, lat, 0, LATENT * 4, LATENT * 4, b.n)?;
-            bt.inp.copy_2d(LATENT * 4, IN * 4, cond, 0, (IN - LATENT) * 4, (IN - LATENT) * 4, b.n)?;
+            self.k.copy_rows(&bt.inp, 0, IN * 4, lat, 0, LATENT * 4, LATENT * 4, b.n)?;
+            self.k.copy_rows(&bt.inp, LATENT * 4, IN * 4, cond, 0, (IN - LATENT) * 4, (IN - LATENT) * 4, b.n)?;
             self.k.linear32(bt.inp.ptr(), b.n, IN, w32(&self.img_in)?, DIM, bias(&self.img_in), fptr(&bt.x, b.r0 * DIM).cast())?;
             self.refine(nsd, st, si, bt, b, tap)?;
         }
