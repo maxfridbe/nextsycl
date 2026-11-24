@@ -54,8 +54,15 @@ pub fn should_trim(outside: u64) -> bool {
 pub const MLP_CHUNK: usize = 8192;
 
 /// Card memory the kernels and the runtime take beside the buffers counted below, for any sequence: oneDNN's
-/// primitives and scratchpads, the attention's small tables. Measured margin (see the tests' numbers).
-pub const MARGIN: u64 = 1 << 30;
+/// primitives and scratchpads, new shapes' kernels during the clip, the estimate's error. The card's reserve (1.5 GiB)
+/// is kept on top of it.
+pub const MARGIN: u64 = 512 << 20;
+
+/// The rest a token costs, measured: the final layer's and the sampler's per-row buffers, the rotation tables. On the
+/// B70 (2026-11-23, 832x480, 3 pictures, the book above the loaded model at its peak): 41725 tokens 9.43 GiB and
+/// 47779 tokens 10.78 GiB at once (242.5 KB a token against 233.7 counted), 73865 tokens with the MLP 8192 rows at a time
+/// 11.43 GiB (154 KB a token against 140.5 counted and 0.82 GiB of chunk buffers)
+pub const EXTRA_PER_TOKEN: usize = 12_000;
 
 /// Bytes the denoiser holds for a `tokens`-long sequence with the MLP `mlp_rows` at a time: its stream and scratch
 /// (`Scratch::bytes`), and the kernels' scratch - the SageAttention path's int8 q and k, its 16-bit v and result
@@ -67,7 +74,7 @@ pub fn denoise_bytes(cfg: &Config, tokens: usize, mlp_rows: usize) -> u64 {
     let stream = 2 * tokens * cfg.hidden;
     let attention = 6 * w * tokens;
     let linears = (w * tokens).max(cfg.ffn * mr);
-    (Scratch::bytes(cfg, tokens, mlp_rows) + stream + attention + linears) as u64 + MARGIN
+    (Scratch::bytes(cfg, tokens, mlp_rows) + stream + attention + linears + EXTRA_PER_TOKEN * tokens) as u64 + MARGIN
 }
 
 /// Bytes the video decoder holds: its weights (its file's size: they are kept in the file's type) and a batch of tiles'
@@ -76,8 +83,9 @@ pub fn decode_bytes(vae_file: u64) -> u64 {
     vae_file + DECODE_ACTIVATIONS + MARGIN
 }
 
-/// A batch of tiles' activations in the video decoder (measured on the B70, 832x480: see the tests)
-pub const DECODE_ACTIVATIONS: u64 = 2 << 30;
+/// A batch of tiles' activations in the video decoder (the B70, 832x480: the book 5.2 GiB above its clip-to-clip level
+/// while a 124-frame clip decoded, 4.5 GiB of it the weights)
+pub const DECODE_ACTIVATIONS: u64 = 1 << 30;
 
 /// A clip's sequence: `other` tokens that do not grow with it (text, references, keyframes), its audio rows and its
 /// video's 2x2 patches
@@ -198,9 +206,9 @@ mod tests {
         let a = denoise_bytes(&cfg, 20_000, 20_000);
         let b = denoise_bytes(&cfg, 40_000, 40_000);
         assert!(b > a && (b - MARGIN) == 2 * (a - MARGIN), "linear in tokens");
-        // about 228 KiB a token at once
+        // about 245 KB a token at once (242.5 measured)
         let per = (a - MARGIN) / 20_000;
-        assert!((220_000..240_000).contains(&per), "{per}");
+        assert!((240_000..250_000).contains(&per), "{per}");
         assert!(denoise_bytes(&cfg, 40_000, MLP_CHUNK) + 2 * GIB < b, "the MLP in chunks saves over 2 GiB at 40k tokens");
         // a short sequence: chunking changes nothing
         assert_eq!(denoise_bytes(&cfg, 4000, MLP_CHUNK), denoise_bytes(&cfg, 4000, 4000));
@@ -219,6 +227,18 @@ mod tests {
         // a short clip: the decoder is the larger need
         let p = plan(&cfg, 5000, VAE, 30 * GIB).unwrap();
         assert_eq!(p.need, decode_bytes(VAE));
+    }
+
+    #[test]
+    fn the_measured_clips_fit_their_estimates() {
+        // the B70 runs of 2026-11-23 (the book above the model at the clip's peak): every estimate covers what was used,
+        // and none by more than the margin and 0.5 GiB
+        let cfg = h3();
+        for (tokens, rows, used_gib) in [(41_725, 41_725, 9.43), (47_779, 47_779, 10.78), (73_865, MLP_CHUNK, 11.43)] {
+            let used = (used_gib * GIB as f64) as u64;
+            let est = denoise_bytes(&cfg, tokens, rows);
+            assert!(est >= used && est - used <= MARGIN + GIB / 2, "{tokens} tokens: estimate {est}, used {used}");
+        }
     }
 
     #[test]
