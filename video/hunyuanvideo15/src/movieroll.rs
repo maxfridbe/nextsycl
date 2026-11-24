@@ -217,11 +217,10 @@ pub struct Room {
     pub reserve: u64,
 }
 
-/// A film's plan: the cache's kind and the most latent frames it may reach (a steered film's added events stop there)
+/// A film's plan: the cache's kind
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Plan {
     pub int8: bool,
-    pub most_frames: usize,
 }
 
 impl Room {
@@ -249,7 +248,7 @@ impl Room {
             KvMode::Auto => self.need(false, frames) > free,
         };
         match self.most_frames(int8, free) {
-            Some(most) if most >= frames => Ok(Plan { int8, most_frames: most }),
+            Some(most) if most >= frames => Ok(Plan { int8 }),
             most => {
                 let video = |f: usize| 4 * (f - 1) + 1;
                 let fit = match most {
@@ -621,7 +620,7 @@ impl MovieRoll {
         let plan = match free {
             Some(f) => room.plan(kv_mode, vae_frames, f, (hw.1 * 16, hw.0 * 16), &gpu.name)?,
             // a driver that cannot tell: as asked (auto: int8)
-            None => Plan { int8: kv_mode != KvMode::Half, most_frames: vae_frames },
+            None => Plan { int8: kv_mode != KvMode::Half },
         };
         let int8 = plan.int8;
         hv.vae.stream_reserve(vae_frames)?;
@@ -1422,8 +1421,9 @@ mod tests {
         // with them off the card (4.2 GiB more): int8, room for well past its 65 frames, the reserve untouched
         let free = 16_915_435_791 + 4_500_000_000;
         let p = r.plan(KvMode::Auto, 65, free, (864, 480), "B65").unwrap();
-        assert!(p.int8 && p.most_frames >= 65 && (p.most_frames - 1).is_multiple_of(CHUNK), "{p:?}");
-        assert!(r.need(true, p.most_frames) <= free && r.need(true, p.most_frames + CHUNK) > free);
+        let most = r.most_frames(true, free).unwrap();
+        assert!(p.int8 && most >= 65 && (most - 1).is_multiple_of(CHUNK), "{p:?}");
+        assert!(r.need(true, most) <= free && r.need(true, most + CHUNK) > free);
         assert!(free - (r.need(true, 65) - r.reserve) >= 3 * g / 2);
         // half asked for where it does not fit: refused, with the most frames that would fit in half
         let e = r.plan(KvMode::Half, 65, free, (864, 480), "B65").unwrap_err().0;
@@ -1435,7 +1435,7 @@ mod tests {
         assert!(e.contains(&format!("at most {frames} frames ({:.2} s) fit", frames as f64 / 24.0)), "{e}");
         // a minute's video.roll (361 latent frames) on the B65 as measured with the encoders off (21.17 GiB free): int8
         let p = r.plan(KvMode::Auto, 361, 22_731_000_000, (864, 480), "B65").unwrap();
-        assert!(p.int8 && p.most_frames >= 361, "{p:?}");
+        assert!(p.int8 && r.most_frames(true, 22_731_000_000).is_some_and(|m| m >= 361), "{p:?}");
         // nothing fits on a card that has almost nothing free
         assert_eq!(r.most_frames(true, 2 * g), None);
         assert!(r.plan(KvMode::Int8, 5, 2 * g, (864, 480), "B65").unwrap_err().0.contains("not even its first chunk fits"));
