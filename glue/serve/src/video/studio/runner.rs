@@ -550,8 +550,9 @@ impl Studio {
         out.insert("per_step".into(), Value::Null);
         out.insert("metrics".into(), json!([]));
         out.insert("file".into(), if done { json!(format!("/out/{name}.mp4")) } else { Value::Null });
-        // a MovieRoll film (video.roll): its live HLS playlist, growing while it is made (fragmented-MP4 segments of 2 s)
-        out.insert("live".into(), if job.rec["hls"] == true { json!(format!("/out/{name}.live.m3u8")) } else { Value::Null });
+        // a MovieRoll film (video.roll): its live HLS playlist, growing while it is made (fragmented-MP4 segments of 2 s),
+        // from its first segment on
+        out.insert("live".into(), live_url(&self.out, &name, job.rec["hls"] == true));
         // while it samples: the engine's picture of the shot so far (its latents' middle frame, each step)
         let pv = self.out.join(format!("{name}.preview.png"));
         let pv_at = (!idle).then(|| std::fs::metadata(&pv).and_then(|m| m.modified()).ok()).flatten()
@@ -784,13 +785,22 @@ fn card_energy(tele: &Value, gpu: usize, pci: &str) -> Option<f64> {
     row.and_then(|r| r["energy_j"].as_f64()).or(if gpu == 0 || (!pci.is_empty() && tele["pci"] == pci) { tele["energy_j"].as_f64() } else { None })
 }
 
+/// A film's live HLS playlist (`/out/<name>.live.m3u8`) once it lists a segment, else null: a player given it sooner
+/// gets a 404 or an empty list. 2026-11-24: status said nothing of it (running_clips' rows left it out)
+pub fn live_url(out: &std::path::Path, name: &str, hls: bool) -> Value {
+    let m3u8 = format!("{name}.live.m3u8");
+    let listed = hls && std::fs::read_to_string(out.join(&m3u8)).is_ok_and(|t| t.lines().any(|l| l.starts_with("#EXTINF")));
+    if listed { json!(format!("/out/{m3u8}")) } else { Value::Null }
+}
+
 /// A clip's line in `running_clips` and `ended_clips`
 fn row(v: &Value) -> Value {
     let j = &v["job"];
     json!({"label": j["label"], "title": j["title"], "name": j["name"], "project": j["project"], "reentrant_id": j["reentrant_id"], "engine": j["engine"], "seconds": j["seconds"], "steps": j["steps"],
            "width": j["width"], "height": j["height"], "energy_wh": j["energy_wh"], "job": j,
            "stage": v["stage"], "pct": v["pct"], "eta": v["eta"], "elapsed": v["elapsed"], "gpu": v["gpu"], "waiting_for": v["waiting_for"], "preview": v["preview"],
-           "steps_done": v["steps_done"], "steps_total": v["steps_total"], "frames": v["frames"], "idle": v["idle"], "done": v["done"], "error": v["error"], "failure": v["failure"], "file": v["file"]})
+           "steps_done": v["steps_done"], "steps_total": v["steps_total"], "frames": v["frames"], "idle": v["idle"], "done": v["done"], "error": v["error"], "failure": v["failure"], "file": v["file"],
+           "live": v["live"]})
 }
 
 /// A failed clip's kind: {code, retryable, message, hint}. Read from the engine's error and its last lines. `hung`: the
@@ -827,6 +837,28 @@ pub fn failure(state: &str, error: &str, log: &[String], hung: Option<u64>) -> V
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_films_live_playlist_shows_from_its_first_segment_in_status_and_its_row() {
+        use super::{live_url, row};
+        use serde_json::json;
+        let d = std::env::temp_dir().join(format!("ns-live-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let name = "h3_20261124_120000";
+        // not yet written, or written without a segment: nothing to play
+        assert!(live_url(&d, name, true).is_null());
+        std::fs::write(d.join(format!("{name}.live.m3u8")), "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"x.init.mp4\"\n").unwrap();
+        assert!(live_url(&d, name, true).is_null());
+        // the first segment listed: the playlist
+        std::fs::write(d.join(format!("{name}.live.m3u8")), "#EXTM3U\n#EXTINF:2.0,\nx.live.0000.m4s\n").unwrap();
+        assert_eq!(live_url(&d, name, true), json!(format!("/out/{name}.live.m3u8")));
+        // a clip without HLS has none
+        assert!(live_url(&d, name, false).is_null());
+        // and running_clips' rows carry it (the watcher matched rows by label and never saw it)
+        let v = json!({"job": {"label": "fox film", "name": name}, "live": live_url(&d, name, true)});
+        assert_eq!(row(&v)["live"], json!(format!("/out/{name}.live.m3u8")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     use super::failure;
     use super::regen_eta;
     use serde_json::json;
