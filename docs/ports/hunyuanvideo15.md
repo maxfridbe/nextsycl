@@ -28,10 +28,13 @@ Text to video and image to video at 480p, 8.3B, Tencent Hunyuan Community Licens
 - **The DiT is quantized as it loads**: the double blocks' matrices (qkv, proj, MLP and the modulations: 8.1B of the
   8.3B values) to Q8_0 (ggml's `quantize_row_q8_0_ref`), everything else float32. No converted file to publish or
   keep: the cards name the official files. Load: 26 - 57 s on hardac1 (the 33 GB file read and quantized; ~26 s warm).
-- **The I2V image encoder**: the pipeline loads `FLUX.1-Redux-dev`'s `image_encoder` (SigLIP so400m-patch14-384),
-  **gated** - 403 for our token. Google's open `siglip-so400m-patch14-384` is the same architecture; whether Redux's
-  weights equal it is **not checked** (the reference ran on google's file too). Accepting Redux's licence on the
-  token's account would settle it (one tensor compared).
+- **The I2V image encoder**: the pipeline loads `FLUX.1-Redux-dev`'s `image_encoder` (SigLIP so400m-patch14-384,
+  `SiglipVisionModel` in fp16; gated). **Checked 2026-11-23: it is google's `siglip-so400m-patch14-384` vision tower
+  rounded to bfloat16** - all 448 of its tensors (Redux rev 11deb8ff, `image_encoder/model.safetensors`, 856,506,120
+  bytes, sha256 d769e3a3...) equal google's float32 `vision_model.*` tensors rounded to bfloat16, bit for bit; no
+  tensor missing either side (`~/src/hv15/redcmp.py` on hardac1). So the card keeps google's open file (Apache-2.0):
+  the same weights, at float32 rather than Redux's bfloat16 (upstream then runs them in fp16) - the difference from
+  upstream is the rounding only. Redux's file stays on the drive (`hunyuanvideo15/image_encoder/`), unused.
 - MovieRoll (`yunyangge/MovieRoll`): still 403 (checked 2026-11-23); its code (github, public) was read for phase 2.
 
 ### Architecture (hunyuanvideo_1_5_transformer.py, hunyuanvideo_15_vae.py, hunyuan_video_pipeline.py)
