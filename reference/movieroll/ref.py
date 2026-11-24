@@ -4,6 +4,12 @@
     git clone https://github.com/Tencent-Hunyuan/MovieRoll MR && git -C MR checkout 0b5f73e2   (the official code)
     python ref.py roll --dit distilled/t2v/model.safetensors --mr MR --text DIR0 [--text DIR1 ...] --out DIR
                        [--chunks 7] [--height 128] [--width 224] [--threshold 18] [--seed 7] [--weights q8|fp32]
+                       [--anchor cond_latent.npy --context-noise 0]   (image to video: distilled/i2v/model.safetensors)
+
+Image to video: --anchor is the picture's latent [h w, 32] as reference/hunyuanvideo15/ref.py's `i2v` stage wrote it
+(the VAE encoder's mode x its scaling - MovieRoll's MovieRollImageVAEEncodingStage does the same), the layout anchored
+([1, 4, 4, ...]: the anchor is the first chunk, encoded into the cache at t = 0 before the first window) and the i2v
+model folder's context noise 0 (no context-noise draws then, as upstream's noise_functions gives none).
 
 The text: each --text DIR holds one event's prompt as reference/hunyuanvideo15/ref.py's `te` / `byt5` stages wrote it
 (embeds.npy, byt5.npy when the prompt quotes text) - MovieRoll's text encoder is HunyuanVideo-1.5's (the same video
@@ -46,7 +52,6 @@ torch.set_num_threads(int(os.environ.get("REF_THREADS", "0")) or (os.cpu_count()
 
 LADDER = [1000, 800, 600, 400, 200]
 SHIFT = 5.0
-CONTEXT_NOISE = 0.15
 
 
 def save(out, name, t):
@@ -258,7 +263,13 @@ def run_roll(a):
 
     h, w = a.height // 16, a.width // 16
     video_length = 16 * a.chunks + 1                       # 1 + 4 x chunks latent frames
-    sizes = chunk_layout(video_length, 4, anchored=False, strict=True)
+    anchored = a.anchor is not None
+    sizes = chunk_layout(video_length, 4, anchored=anchored, strict=True)
+    anchor = None
+    if anchored:
+        an = np.load(a.anchor).astype(np.float32)          # [h w, 32]
+        anchor = torch.from_numpy(an).reshape(1, h, w, 32).permute(3, 0, 1, 2)[None].contiguous()   # [1, 32, 1, h, w]
+        save(a.out, "anchor.npy", an)
     splits, kept = event_split_indices(len(sizes), a.text if len(a.text) > 1 else None)
     events = []
     for i in kept:
@@ -286,19 +297,20 @@ def run_roll(a):
         eps = torch.randn(lat.shape, generator=gen, dtype=torch.bfloat16)
         save(a.out, f"ctxeps_{draws['ctx']:03d}.npy", Ops.tok(eps))
         draws["ctx"] += 1
-        return ((1 - CONTEXT_NOISE) * lat + CONTEXT_NOISE * eps.float()).contiguous()
+        return ((1 - a.context_noise) * lat + a.context_noise * eps.float()).contiguous()
 
     profile = RollingProfile(mode="distilled", steps_per_window=1, kv_recompute_enabled=True, kv_recompute_threshold=a.threshold,
                              kv_recompute_recent_k=3, force_recompute_at_event=True, noise_anchor=True)
     ops = Ops(m, a.out, h, w)
     done = []
     res = run_rolling(denoiser=ops, cache=CacheView(m), profile=profile, events=events, chunk_sizes=sizes, event_split_indices=splits,
-                      sigmas=sigmas, timesteps=timesteps, noise_fn=noise_fn, context_noise_fn=ctx_fn,
+                      sigmas=sigmas, timesteps=timesteps, noise_fn=noise_fn, context_noise_fn=ctx_fn if a.context_noise > 0 else None,
+                      anchor=anchor,
                       on_chunk=lambda d, t: (done.append(d), print(f"chunk {d}/{t}", flush=True)))
     save(a.out, "latents.npy", Ops.tok(res.latents))
     json.dump({"height": a.height, "width": a.width, "latent": [int(res.latents.shape[2]), h, w], "chunks": sizes, "splits": splits,
                "events": [os.path.abspath(a.text[i]) for i in kept], "ladder": LADDER, "shift": SHIFT, "sigmas": sigmas.tolist(),
-               "context_noise": CONTEXT_NOISE, "threshold": a.threshold, "recomputes": res.recomputes, "seed": a.seed, "weights": a.weights,
+               "context_noise": a.context_noise, "threshold": a.threshold, "anchor": os.path.abspath(a.anchor) if anchored else None, "recomputes": res.recomputes, "seed": a.seed, "weights": a.weights,
                "noise_draws": draws["noise"], "ctx_draws": draws["ctx"], "ops": ops.log},
               open(os.path.join(a.out, "roll.json"), "w"), indent=1)
     print("recomputes at", res.recomputes, flush=True)
@@ -317,6 +329,8 @@ def main():
     p.add_argument("--threshold", type=int, default=18)
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--weights", default="q8", choices=["q8", "fp32"])
+    p.add_argument("--anchor", help="image to video: the picture's latent [h w, 32] (reference/hunyuanvideo15/ref.py i2v's cond_latent.npy)")
+    p.add_argument("--context-noise", type=float, default=0.15, help="the chain's context noise (t2v 0.15, i2v 0)")
     a = p.parse_args()
     os.makedirs(a.out, exist_ok=True)
     run_roll(a)

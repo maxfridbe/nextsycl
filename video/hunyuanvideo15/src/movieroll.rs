@@ -1120,20 +1120,36 @@ impl MovieRoll {
         };
         // teacher-forced: every call of the reference made here on the reference's own input (the cache built from
         // the reference's encodes): each op's own error, with nothing carried from the ops before
+        // image to video: the reference's anchor (the reference VAE's latent of the picture) drives the film here too, so
+        // the DiT is checked on its own; the picture (`image`) through this engine's anchor path against it
+        let anchor = match meta["anchor"].as_str() {
+            Some(a) => Some(read_npy(&dir.join("anchor.npy")).or_else(|_| read_npy(Path::new(a)))?.1),
+            None => None,
+        };
+        let mut anchor_rel = None;
+        if let (Some(want), Some(img)) = (anchor.as_ref(), spec.get("image").and_then(Value::as_str)) {
+            let pic = Picture::decode(&std::fs::read(img).map_err(|e| Error(format!("{img}: {e}")))?).map_err(|e| Error(format!("{img}: {e}")))?;
+            let (hh, ww) = (meta["height"].as_u64().unwrap_or(0) as usize, meta["width"].as_u64().unwrap_or(0) as usize);
+            let got = self.anchor(&pic, ww, hh)?;
+            let (r, m, c) = compare(&got, want);
+            log(format!("anchor: {img} through the engine's picture -> VAE encoder path against the reference's latent: rel {r:.2e} max {m:.2e} cos {c:.6}"));
+            anchor_rel = Some(json!({"rel": r, "max": m, "cos": c}));
+        }
         let kv = spec.get("kv").and_then(Value::as_str).map_or(Ok(self.kv), KvMode::parse).map_err(Error)?;
         let teacher = self.replay(&dir, &ops, &events, &chain, (h, w), self.attn(spec.get("attention").and_then(Value::as_str))?, kv == KvMode::Int8, log)?;
         let mut noise = DumpNoise { dir: dir.clone(), noise: 0, ctx: 0 };
         let mut sink = |_: usize, _: &[f32], _: usize| -> Result<()> { Ok(()) };
         let attn = self.attn(spec.get("attention").and_then(Value::as_str))?;
-        let film = self.film(&chain, Script { events, chunks: None, latent_frames: lf }, None, None, (h, w), attn, kv, &mut noise, &mut |_, _| Ok(()),
-                             &mut sink, Some(&mut tap), None, log)?;
+        let film = self.film(&chain, Script { events, chunks: None, latent_frames: lf }, None, anchor.as_deref(), (h, w), attn, kv, &mut noise,
+                             &mut |_, _| Ok(()), &mut sink, Some(&mut tap), None, log)?;
         for l in lines {
             log(l);
         }
         let (_, want) = read_npy(&dir.join("latents.npy"))?;
         let (r, m, c) = compare(&film.latents, &want);
         log(format!("film latents: rel {r:.2e} max {m:.2e} cos {c:.6}; recomputes here {:?}, in the reference {}", film.recomputes, meta["recomputes"]));
-        Ok(json!({"ops": rows, "teacher": teacher, "latents_rel": r, "latents_cos": c, "worst_velocity_rel": worst, "recomputes": film.recomputes}))
+        Ok(json!({"ops": rows, "teacher": teacher, "latents_rel": r, "latents_cos": c, "worst_velocity_rel": worst, "recomputes": film.recomputes,
+                  "anchor": anchor_rel}))
     }
 
     /// reference/movieroll/ref.py's calls one by one on its own inputs (roll.json's ops): each denoise's velocity
