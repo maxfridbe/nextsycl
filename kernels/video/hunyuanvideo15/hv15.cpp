@@ -285,6 +285,25 @@ int ns_video_hv15_pad_causal(ns_gpu* g, const void* x, const void* prev, int64_t
     const half* pv = (const half*) prev;
     half* o = (half*) out;
     const int64_t To = T + 2, Ho = H + 2, Wo = W + 2;
+    if (C % 8 == 0 && To * Ho * Wo < (1ll << 31)) {
+        // a work-item 8 channels of a voxel (16 bytes), its position from 32-bit divisions (2026-11-24: an element a
+        // work-item with three 64-bit divisions each was a good part of the decoder's full-size levels)
+        const uint32_t c8 = (uint32_t) (C / 8), ho = (uint32_t) Ho, wo = (uint32_t) Wo;
+        g->q.parallel_for(sycl::range<2>((size_t) (To * Ho * Wo), (size_t) c8), [=](sycl::id<2> id) {
+            const uint32_t p = (uint32_t) id[0], v = (uint32_t) id[1];
+            const uint32_t t = p / (ho * wo), y = (p / wo) % ho, xx = p % wo;
+            using V = sycl::vec<uint16_t, 8>;
+            V* dst = reinterpret_cast<V*>(o + (int64_t) p * C) + v;
+            if (pv && t < 2) {
+                *dst = *(reinterpret_cast<const V*>(pv + (int64_t) p * C) + v);
+                return;
+            }
+            const int64_t ts = t < 2 ? 0 : t - 2;
+            const int64_t ys = y < 1 ? 0 : ((int64_t) y - 1 >= H ? H - 1 : y - 1), xs = xx < 1 ? 0 : ((int64_t) xx - 1 >= W ? W - 1 : xx - 1);
+            *dst = *(reinterpret_cast<const V*>(s + ((ts * H + ys) * W + xs) * C) + v);
+        });
+        return 0;
+    }
     g->q.parallel_for(sycl::range<2>((size_t) (To * Ho * Wo), (size_t) C), [=](sycl::id<2> id) {
         const int64_t p = id[0], c = id[1];
         const int64_t t = p / (Ho * Wo), y = (p / Wo) % Ho, xx = p % Wo;
@@ -310,6 +329,41 @@ int ns_video_hv15_rms_channels(ns_gpu* g, const void* x, int64_t N, int64_t C, c
     const half* s = (const half*) x;
     half* o = (half*) out;
     const float root = sycl::sqrt((float) C);
+    if (C % 16 == 0 && C <= 512) {
+        // up to 512 channels (the decoder's three larger levels): a sub-group of 16 a voxel, 16 voxels a work-group - a
+        // work-group of 64 a voxel with its barrier was most of a norm there (1.7 million voxels a latent frame)
+        constexpr int SG = 16, VOX = 16, MAXP = 32;
+        const int per = (int) (C / SG);
+        const size_t groups = (size_t) ((N + VOX - 1) / VOX);
+        g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * VOX * SG), sycl::range<1>(VOX * SG)),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const auto sg = it.get_sub_group();
+            const int64_t r = (int64_t) it.get_group(0) * VOX + sg.get_group_linear_id();
+            if (r >= N) return;
+            const int l = (int) sg.get_local_linear_id();
+            float v[MAXP];
+            float ss = 0.0f;
+#pragma unroll
+            for (int j = 0; j < MAXP; ++j) {
+                if (j < per) {
+                    v[j] = (float) s[r * C + j * SG + l];
+                    ss += v[j] * v[j];
+                }
+            }
+            ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+            const float k = root / sycl::fmax(sycl::sqrt(ss), 1e-12f);
+#pragma unroll
+            for (int j = 0; j < MAXP; ++j) {
+                if (j < per) {
+                    const int64_t i = (int64_t) j * SG + l;
+                    float y = v[j] * k * gamma[i];
+                    if (silu) y = y / (1.0f + sycl::exp(-y));
+                    o[r * C + i] = (half) y;
+                }
+            }
+        });
+        return 0;
+    }
     g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) N * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
         const size_t r = it.get_group(0);
         const int l = (int) it.get_local_id(0);
@@ -356,6 +410,18 @@ int ns_video_hv15_add(ns_gpu* g, void* x, const void* y, int64_t n) {
     if (n <= 0) return 0;
     half* a = (half*) x;
     const half* b = (const half*) y;
+    if (n % 8 == 0 && ((uintptr_t) x | (uintptr_t) y) % 16 == 0) {
+        // 8 a work-item (16 bytes): the same sums
+        g->q.parallel_for(sycl::range<1>((size_t) (n / 8)), [=](sycl::id<1> i) {
+            using V = sycl::vec<half, 8>;
+            V* pa = reinterpret_cast<V*>(a) + i[0];
+            const V vb = *(reinterpret_cast<const V*>(b) + i[0]);
+            V va = *pa;
+            for (int j = 0; j < 8; ++j) va[j] = (half) ((float) va[j] + (float) vb[j]);
+            *pa = va;
+        });
+        return 0;
+    }
     g->q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { a[i] = (half) ((float) a[i] + (float) b[i]); });
     return 0;
     NS_CATCH
@@ -381,9 +447,18 @@ int ns_video_hv15_upsample_ex(ns_gpu* g, const void* conv, const void* x, int64_
     const int64_t To = temporal ? (first ? 2 * T - 1 : 2 * T) : T, Ho = 2 * H, Wo = 2 * W;
     // a chunk after the first: its frame 0 is an ordinary frame (frame t of the output reads input frame t / 2)
     const int64_t lead = first ? 1 : 0;
+    // (the output's position from 32-bit divisions where it fits: 64-bit ones an element were most of its time)
+    const bool small = To * Ho * Wo < (1ll << 31);
+    const uint32_t ho32 = (uint32_t) Ho, wo32 = (uint32_t) Wo;
     g->q.parallel_for(sycl::range<2>((size_t) (To * Ho * Wo), (size_t) C), [=](sycl::id<2> id) {
         const int64_t p = id[0], c = id[1];
-        const int64_t to = p / (Ho * Wo), y = (p / Wo) % Ho, xx = p % Wo;
+        int64_t to, y, xx;
+        if (small) {
+            const uint32_t q = (uint32_t) p;
+            to = q / (ho32 * wo32), y = (q / wo32) % ho32, xx = q % wo32;
+        } else {
+            to = p / (Ho * Wo), y = (p / Wo) % Ho, xx = p % Wo;
+        }
         const int64_t h = y / 2, w = xx / 2, r23 = (y % 2) * 2 + (xx % 2);
         float a, b;
         if (temporal && first && to == 0) {
