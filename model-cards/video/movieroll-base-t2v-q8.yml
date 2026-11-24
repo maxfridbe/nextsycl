@@ -18,6 +18,12 @@ env:
   NS_MR_MODE: base
   NS_MR_CONTEXT_NOISE: '0.05'
   NS_MR_THRESHOLD: '18'
+  # SageAttention v1 over the window and the history (int8 q and k, the silo's): the fast default, as HunyuanVideo-1.5's
+  # cards have it. B65, the 10 s 2-event film, seed 7 (2026-11-24): denoise 13.42 s a chunk against half's 16.82 (1.25x),
+  # the film 270 s against 322; PSNR to half's film 22.2 dB mean (25.0 the first second, 18.1 the last) where half against
+  # itself with only its last bits changed (attention tile 1) falls to 14.7 dB by the end - the film diverges chaotically
+  # whatever the change; the same scene by eye, no seams (worst join 1.10x). half: NS_MR_ATTN=half (--opt-attention)
+  NS_MR_ATTN: sage
 files:
   denoiser:
     key: movieroll-base

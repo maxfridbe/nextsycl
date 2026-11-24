@@ -49,7 +49,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "mode", env: "NS_MR_MODE", value: "distilled|base", help: "the sampling chain of the card's file: distilled (5 steps) or base (50, AnnealCFG)", at: At::Load },
     EngineOption { name: "context-noise", env: "NS_MR_CONTEXT_NOISE", value: "X", help: "the clean history's context noise sigma (distilled t2v 0.15, i2v 0, base 0.05)", at: At::Both },
     EngineOption { name: "threshold", env: "NS_MR_THRESHOLD", value: "N", help: "cached chunks that trigger a KV recompute (18)", at: At::Both },
-    EngineOption { name: "attention", env: "NS_MR_ATTN", value: "KERNEL", help: "the attention: half (default), sage (int8 q and k) or shared", at: At::Both },
+    EngineOption { name: "attention", env: "NS_MR_ATTN", value: "KERNEL", help: "the attention: half (the engine's default), sage (int8 q and k: the cards' default, 1.25x the denoise) or shared", at: At::Both },
     EngineOption { name: "kv", env: "NS_MR_KV", value: "auto|half|int8",
                    help: "the history's KV cache: half, int8 (a scale a row and head: half the memory), auto (half when it fits the card with room for the decode)",
                    at: At::Both },
