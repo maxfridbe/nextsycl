@@ -473,7 +473,7 @@ impl Home {
     /// `base`: scheme://host as the caller reached this door (the files an answer links)
     fn studio_rpc(&self, name: &str, b: &Value, base: &str) -> Option<(u16, Value)> {
         // video.upscale is the image servers' (an upscaler's job), not the studio's; so is video.control's depth
-        let method = name.strip_prefix("video.").filter(|m| !matches!(*m, "upload" | "describePromptGuideMD" | "upscale"))?;
+        let method = studio_method(name)?;
         if super::control::by_model(name, b) {
             return None;
         }
@@ -2181,5 +2181,28 @@ mod file_type_tests {
         assert_eq!(super::file_type("audio", "x.png"), None);
         assert_eq!(super::file_type("image", "jobs.json"), None);
         assert_eq!(super::file_type("audio", "noext"), None);
+    }
+}
+
+/// The studio's own method for a front-door `video.*` call, or None for those the door answers itself: upload and
+/// the guide, upscale (the image servers'), and roll - a video.roll is its handler's (methods.rs: the film as a
+/// video.generate clip with its events), which the studio has no method for (sent as "roll" it answered "unknown
+/// method roll", 2026-11-24)
+fn studio_method(name: &str) -> Option<&str> {
+    name.strip_prefix("video.").filter(|m| !matches!(*m, "upload" | "describePromptGuideMD" | "upscale" | "roll"))
+}
+
+#[cfg(test)]
+mod studio_method_tests {
+    #[test]
+    fn a_roll_goes_through_its_handler_and_its_steering_to_the_studio() {
+        use super::studio_method;
+        assert_eq!(studio_method("video.roll"), None);
+        assert_eq!(studio_method("video.generate"), Some("generate"));
+        assert_eq!(studio_method("video.rollAppend"), Some("rollAppend"));
+        assert_eq!(studio_method("video.rollEnd"), Some("rollEnd"));
+        assert_eq!(studio_method("video.status"), Some("status"));
+        assert_eq!(studio_method("video.upload"), None);
+        assert_eq!(studio_method("image.generate"), None);
     }
 }
