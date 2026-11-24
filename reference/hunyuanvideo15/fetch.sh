@@ -8,11 +8,12 @@
 set -eu
 DIR=${1:?usage: fetch.sh DIR [PART...]}
 shift
-TOKEN=$(cat "$HOME/.cache/huggingface/token")
+HDR=$(mktemp "$HOME/.hf-header.XXXXXX"); chmod 600 "$HDR"; trap 'rm -f "$HDR"' EXIT INT TERM HUP
+printf "Authorization: Bearer %s\n" "$(cat "$HOME/.cache/huggingface/token")" > "$HDR"
 get() {  # repo path
   mkdir -p "$DIR/$(dirname "$2")"
   echo "== $1/$2"
-  curl -sfL --retry 20 --retry-delay 5 -C - -H "Authorization: Bearer $TOKEN" -o "$DIR/$2" "https://huggingface.co/$1/resolve/main/$2"
+  curl -sfL --retry 20 --retry-delay 5 -C - -H @"$HDR" -o "$DIR/$2" "https://huggingface.co/$1/resolve/main/$2"
 }
 H=tencent/HunyuanVideo-1.5
 PARTS=${*:-"vae 480p_t2v_distilled 480p_t2v 480p_i2v_step_distilled redux"}
