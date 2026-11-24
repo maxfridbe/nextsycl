@@ -2615,6 +2615,102 @@ export interface VideoQueueResumeReq {
   [key: string]: unknown;
 }
 
+/** What video.rollAppend takes. */
+export interface VideoRollAppendReq {
+  /** the film's label (one of label and name) */
+  label?: string | null;
+  /** the film's name (mr_..., as video.status says) */
+  name?: string | null;
+  /**
+   * events to play after those it has, as video.roll's
+   * @maxItems 64
+   * @items {"properties":{"prompt":{"maxLength":4000,"minLength":1,"type":"string"},"seconds":{"default":10,"maximum":60,"minimum":0.67,"type":"number"}},"required":["prompt"],"type":"object"}
+   * @minItems 1
+   */
+  events: unknown[];
+}
+
+/** What video.rollEnd takes. */
+export interface VideoRollEndReq {
+  /** the film's label (one of label and name) */
+  label?: string | null;
+  /** the film's name */
+  name?: string | null;
+}
+
+/** What video.roll takes. */
+export interface VideoRollReq {
+  /** the MovieRoll model by registry id (system.models): movieroll-distilled-t2v-q8, or movieroll-distilled-i2v-q8 with first_frame */
+  model: string;
+  /**
+   * the film's events, played one after another: each a prompt (upstream's style: the subject described in full every time, motion that can go on, one camera sentence) and how long it holds - whole chunks of 16 frames (0.67 s), at least one; together at most 60 s at the start
+   * @maxItems 64
+   * @items {"properties":{"prompt":{"maxLength":4000,"minLength":1,"type":"string"},"seconds":{"default":10,"maximum":60,"minimum":0.67,"type":"number"}},"required":["prompt"],"type":"object"}
+   * @minItems 1
+   */
+  events: unknown[];
+  /** a picture as the film's first frame (an image-to-video model): an anchor or a file of the clips directory, as video.generate's first_frame */
+  first_frame?: string | null;
+  /**
+   * out of events, the film waits for more (video.rollAppend) up to max_idle_s before it ends - holding its card meanwhile
+   * @default false
+   */
+  live?: boolean | null;
+  /**
+   * how long a live film waits for its next event
+   * @minimum 0
+   * @maximum 3600
+   * @default 300
+   */
+  max_idle_s?: number | null;
+  /**
+   *
+   * @minimum -2147483648
+   * @maximum 2147483648
+   * @default 0
+   */
+  seed?: number | null;
+  /**
+   * 864 (landscape, the default) or 480 (portrait)
+   * @minimum 480
+   * @maximum 864
+   * @default 864
+   */
+  width?: number | null;
+  /**
+   * 480 (landscape, the default) or 864 (portrait)
+   * @minimum 480
+   * @maximum 864
+   * @default 480
+   */
+  height?: number | null;
+  /**
+   * the film's label (video.status, video.rollAppend, video.rollEnd and video.cancel find it by it)
+   * @maxLength 200
+   */
+  label?: string | null;
+  /**
+   * a project the film belongs to
+   * @maxLength 60
+   */
+  project?: string | null;
+  /**
+   * queue it when no card is free (false: 409 busy)
+   * @default true
+   */
+  queue?: boolean | null;
+  /**
+   * hold the model this long after the film ends (as video.generate's)
+   * @minimum 0
+   */
+  rsvp_s?: number | null;
+  /**
+   * the longest this request may wait to START (as video.generate's)
+   * @minimum 0
+   */
+  max_willing_to_wait_s?: number | null;
+}
+
 /** What video.status takes. */
 export interface VideoStatusReq {
   /** one clip's status: its label. The top-level fields are then its own (running, lately ended, queued, or its record); none named: the first running clip, every one in running_clips */
@@ -3296,6 +3392,24 @@ export interface Methods {
    */
   "video.wait": { req: VideoWaitReq; resp: any };
   /**
+   * Start a long film (MovieRoll, by rolling diffusion): its events played one after another, each for its seconds, up to 60 s at the start; live: it waits for more (video.rollAppend). It runs as video.generate's clips do - queued when no card is free, video.status / wait / cancel on it by its label - and its pictures are watchable while it is made: the answer's and video.status's `live` is an HLS playlist (fragmented-MP4 segments of 2 s, growing) a browser or ffmpeg plays; the finished film is an mp4 as any clip. ETA: video.status's, from its measured seconds a chunk
+   * @tags video
+   * @example {"events":[{"prompt":"A red fox with a thick orange coat trots steadily through deep snow in a quiet pine forest at dawn. The camera tracks the red fox, continuously keeping the red fox centered. Cinematic photography realistic style.","seconds":10},{"prompt":"The red fox with a thick orange coat sits in the deep snow and grooms its front paw. The camera tracks the red fox, continuously keeping the red fox centered. Cinematic photography realistic style.","seconds":10}],"label":"fox film","live":false,"model":"movieroll-distilled-t2v-q8"}
+   */
+  "video.roll": { req: VideoRollReq; resp: any };
+  /**
+   * Add events to a film video.roll made, by its label or name: a running film plays them after those it has (it reads them between its chunks, ~10 s apart; a live one waiting for more starts on them), a queued one takes them before it starts
+   * @tags video
+   * @example {"events":[{"prompt":"The red fox with a thick orange coat leaps into the deep snow head first. The camera tracks the red fox, continuously keeping the red fox centered. Cinematic photography realistic style.","seconds":5}],"label":"fox film"}
+   */
+  "video.rollAppend": { req: VideoRollAppendReq; resp: any };
+  /**
+   * End a film video.roll made, by its label or name: no chunk is started after this, those begun finish (about five more, ~1 min) and the mp4 is closed; a queued film leaves the queue. video.cancel stops it at once instead (its frames so far kept)
+   * @tags video
+   * @example {"label":"fox film"}
+   */
+  "video.rollEnd": { req: VideoRollEndReq; resp: any };
+  /**
    * Stop a running clip at its next step; with a label, name or reentrant_id, that clip only: stopped if it runs, dropped from the queue if it waits. Naming none with two running is refused (ambiguous)
    * @tags video
    * @example {"label":"Fox 02/03: the den"}
@@ -3963,6 +4077,24 @@ export function client(post: Post, raw?: PostRaw) {
      * @example {"timeout_s":30,"version":""}
      */
     "video.wait": (req: VideoWaitReq): Promise<any> => post("video.wait", req),
+    /**
+     * Start a long film (MovieRoll, by rolling diffusion): its events played one after another, each for its seconds, up to 60 s at the start; live: it waits for more (video.rollAppend). It runs as video.generate's clips do - queued when no card is free, video.status / wait / cancel on it by its label - and its pictures are watchable while it is made: the answer's and video.status's `live` is an HLS playlist (fragmented-MP4 segments of 2 s, growing) a browser or ffmpeg plays; the finished film is an mp4 as any clip. ETA: video.status's, from its measured seconds a chunk
+     * @tags video
+     * @example {"events":[{"prompt":"A red fox with a thick orange coat trots steadily through deep snow in a quiet pine forest at dawn. The camera tracks the red fox, continuously keeping the red fox centered. Cinematic photography realistic style.","seconds":10},{"prompt":"The red fox with a thick orange coat sits in the deep snow and grooms its front paw. The camera tracks the red fox, continuously keeping the red fox centered. Cinematic photography realistic style.","seconds":10}],"label":"fox film","live":false,"model":"movieroll-distilled-t2v-q8"}
+     */
+    "video.roll": (req: VideoRollReq): Promise<any> => post("video.roll", req),
+    /**
+     * Add events to a film video.roll made, by its label or name: a running film plays them after those it has (it reads them between its chunks, ~10 s apart; a live one waiting for more starts on them), a queued one takes them before it starts
+     * @tags video
+     * @example {"events":[{"prompt":"The red fox with a thick orange coat leaps into the deep snow head first. The camera tracks the red fox, continuously keeping the red fox centered. Cinematic photography realistic style.","seconds":5}],"label":"fox film"}
+     */
+    "video.rollAppend": (req: VideoRollAppendReq): Promise<any> => post("video.rollAppend", req),
+    /**
+     * End a film video.roll made, by its label or name: no chunk is started after this, those begun finish (about five more, ~1 min) and the mp4 is closed; a queued film leaves the queue. video.cancel stops it at once instead (its frames so far kept)
+     * @tags video
+     * @example {"label":"fox film"}
+     */
+    "video.rollEnd": (req: VideoRollEndReq): Promise<any> => post("video.rollEnd", req),
     /**
      * Stop a running clip at its next step; with a label, name or reentrant_id, that clip only: stopped if it runs, dropped from the queue if it waits. Naming none with two running is refused (ambiguous)
      * @tags video

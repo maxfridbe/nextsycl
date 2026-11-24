@@ -2974,6 +2974,86 @@ pub struct VideoWaitReq {
     pub rest: serde_json::Map<String, serde_json::Value>,
 }
 
+/// What video.roll takes.
+#[derive(Deserialize, Serialize, Rpc)]
+#[allow(non_snake_case)]
+pub struct VideoRollReq {
+    /// the MovieRoll model by registry id (system.models): movieroll-distilled-t2v-q8, or movieroll-distilled-i2v-q8 with first_frame
+    pub model: String,
+    /// the film's events, played one after another: each a prompt (upstream's style: the subject described in full every time, motion that can go on, one camera sentence) and how long it holds - whole chunks of 16 frames (0.67 s), at least one; together at most 60 s at the start
+    #[schema(json = r#"{"items": {"properties": {"prompt": {"type": "string", "minLength": 1, "maxLength": 4000}, "seconds": {"type": "number", "minimum": 0.67, "maximum": 60, "default": 10}}, "required": ["prompt"], "type": "object"}, "minItems": 1, "maxItems": 64}"#)]
+    pub events: Vec<serde_json::Value>,
+    /// a picture as the film's first frame (an image-to-video model): an anchor or a file of the clips directory, as video.generate's first_frame
+    #[serde(rename = "first_frame", default, skip_serializing_if = "Option::is_none")]
+    pub first_frame: Option<String>,
+    /// out of events, the film waits for more (video.rollAppend) up to max_idle_s before it ends - holding its card meanwhile
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = false)]
+    pub live: Option<bool>,
+    /// how long a live film waits for its next event
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0, max = 3600, default = 300)]
+    pub max_idle_s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = -2147483648, max = 2147483648, default = 0)]
+    pub seed: Option<i64>,
+    /// 864 (landscape, the default) or 480 (portrait)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = 480, max = 864, default = 864)]
+    pub width: Option<i64>,
+    /// 480 (landscape, the default) or 864 (portrait)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "rpcgen::de::opt_int")]
+    #[schema(min = 480, max = 864, default = 480)]
+    pub height: Option<i64>,
+    /// the film's label (video.status, video.rollAppend, video.rollEnd and video.cancel find it by it)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 200)]
+    pub label: Option<String>,
+    /// a project the film belongs to
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(max_length = 60)]
+    pub project: Option<String>,
+    /// queue it when no card is free (false: 409 busy)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(default = true)]
+    pub queue: Option<bool>,
+    /// hold the model this long after the film ends (as video.generate's)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub rsvp_s: Option<f64>,
+    /// the longest this request may wait to START (as video.generate's)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min = 0)]
+    pub max_willing_to_wait_s: Option<f64>,
+}
+
+/// What video.rollAppend takes.
+#[derive(Deserialize, Serialize, Rpc)]
+#[allow(non_snake_case)]
+pub struct VideoRollAppendReq {
+    /// the film's label (one of label and name)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// the film's name (mr_..., as video.status says)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// events to play after those it has, as video.roll's
+    #[schema(json = r#"{"items": {"properties": {"prompt": {"type": "string", "minLength": 1, "maxLength": 4000}, "seconds": {"type": "number", "minimum": 0.67, "maximum": 60, "default": 10}}, "required": ["prompt"], "type": "object"}, "minItems": 1, "maxItems": 64}"#)]
+    pub events: Vec<serde_json::Value>,
+}
+
+/// What video.rollEnd takes.
+#[derive(Deserialize, Serialize, Rpc)]
+#[allow(non_snake_case)]
+pub struct VideoRollEndReq {
+    /// the film's label (one of label and name)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// the film's name
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// What video.cancel takes.
 #[derive(Deserialize, Serialize, Rpc)]
 #[allow(non_snake_case)]
@@ -3746,6 +3826,31 @@ fn video_wait(h: &Arc<Home>, req: VideoWaitReq) -> Answer {
     h.legacy("video.wait", req)
 }
 
+/// Start a long film (MovieRoll, by rolling diffusion): its events played one after another, each for its seconds, up to 60 s at the start; live: it waits for more (video.rollAppend). It runs as video.generate's clips do - queued when no card is free, video.status / wait / cancel on it by its label - and its pictures are watchable while it is made: the answer's and video.status's `live` is an HLS playlist (fragmented-MP4 segments of 2 s, growing) a browser or ffmpeg plays; the finished film is an mp4 as any clip. ETA: video.status's, from its measured seconds a chunk
+#[rpc(name = "video.roll", tags = "video", example = r#"{"model": "movieroll-distilled-t2v-q8", "label": "fox film", "events": [{"prompt": "A red fox with a thick orange coat trots steadily through deep snow in a quiet pine forest at dawn. The camera tracks the red fox, continuously keeping the red fox centered. Cinematic photography realistic style.", "seconds": 10}, {"prompt": "The red fox with a thick orange coat sits in the deep snow and grooms its front paw. The camera tracks the red fox, continuously keeping the red fox centered. Cinematic photography realistic style.", "seconds": 10}], "live": false}"#)]
+fn video_roll(h: &Arc<Home>, req: VideoRollReq) -> Answer {
+    // a video.generate clip with its events: the same admission, queue, ETA and reservation
+    let mut b = serde_json::to_value(&req).map_err(|e| RpcFail((500, format!("video.roll: {e}"))))?;
+    let first = req.events.first().and_then(|e| e["prompt"].as_str()).unwrap_or("").to_string();
+    b["prompt"] = serde_json::json!(first);
+    if b.get("queue").is_none() {
+        b["queue"] = serde_json::json!(true);
+    }
+    h.legacy("video.generate", b)
+}
+
+/// Add events to a film video.roll made, by its label or name: a running film plays them after those it has (it reads them between its chunks, ~10 s apart; a live one waiting for more starts on them), a queued one takes them before it starts
+#[rpc(name = "video.rollAppend", tags = "video", example = r#"{"label": "fox film", "events": [{"prompt": "The red fox with a thick orange coat leaps into the deep snow head first. The camera tracks the red fox, continuously keeping the red fox centered. Cinematic photography realistic style.", "seconds": 5}]}"#)]
+fn video_roll_append(h: &Arc<Home>, req: VideoRollAppendReq) -> Answer {
+    h.legacy("video.rollAppend", req)
+}
+
+/// End a film video.roll made, by its label or name: no chunk is started after this, those begun finish (about five more, ~1 min) and the mp4 is closed; a queued film leaves the queue. video.cancel stops it at once instead (its frames so far kept)
+#[rpc(name = "video.rollEnd", tags = "video", example = r#"{"label": "fox film"}"#)]
+fn video_roll_end(h: &Arc<Home>, req: VideoRollEndReq) -> Answer {
+    h.legacy("video.rollEnd", req)
+}
+
 /// Stop a running clip at its next step; with a label, name or reentrant_id, that clip only: stopped if it runs, dropped from the queue if it waits. Naming none with two running is refused (ambiguous)
 #[rpc(name = "video.cancel", tags = "video", example = r#"{"label": "Fox 02/03: the den"}"#)]
 fn video_cancel(h: &Arc<Home>, req: VideoCancelReq) -> Answer {
@@ -3875,7 +3980,7 @@ rpcgen::rpc_methods![sync Arc<Home>, RpcFail;
     model3d_generate, model3d_refine, model3d_rig, model3d_tool, model3d_info, model3d_progress, model3d_history,
     model3d_status, model3d_jobs, model3d_queue_list, model3d_queue_move, model3d_queue_pause, model3d_queue_resume,
     model3d_upload, model3d_cancel, model3d_describe_prompt_guide_md, video_generate, video_status, video_wait,
-    video_cancel, video_queue_list, video_queue_move, video_queue_remove, video_queue_pause, video_queue_resume,
+    video_roll, video_roll_append, video_roll_end, video_cancel, video_queue_list, video_queue_move, video_queue_remove, video_queue_pause, video_queue_resume,
     video_queue_clear, video_jobs_list, video_jobs_get, video_timeline, video_projects_list, video_films_list,
     video_templates_list, video_engines_list, video_canvases_list, video_summary, video_upload, video_control, video_describe_prompt_guide_md,
 ];

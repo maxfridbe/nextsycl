@@ -194,6 +194,29 @@ pub fn engine_rules(engine: &str) -> Option<Rules> {
     }
 }
 
+/// video.roll's events: [{prompt, seconds}] - 1 to 64, each prompt 1 to 4,000 characters, 0.67 to 60 s (whole chunks of
+/// 16 frames in the engine)
+pub fn roll_events(v: Option<&Value>) -> Result<Vec<Value>, RpcError> {
+    let list = v.and_then(|v| v.as_array()).ok_or_else(|| RpcError::param("events: a list of {prompt, seconds}"))?;
+    if list.is_empty() || list.len() > 64 {
+        return Err(RpcError::param("events: 1 to 64 of them"));
+    }
+    list.iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let prompt = e["prompt"].as_str().map(str::trim).unwrap_or("");
+            if prompt.is_empty() || prompt.chars().count() > 4000 {
+                return Err(RpcError::param(&format!("events[{i}].prompt: 1 to 4,000 characters")));
+            }
+            let sec = e["seconds"].as_f64().unwrap_or(10.0);
+            if !(0.6..=60.0).contains(&sec) {
+                return Err(RpcError::param(&format!("events[{i}].seconds: 0.67 to 60 (chunks of 16 frames)")));
+            }
+            Ok(json!({"prompt": prompt, "seconds": sec}))
+        })
+        .collect()
+}
+
 /// The frames for `seconds` on a grid of `grid` + 1 (snapped up), at most `max`
 pub fn grid_frames(seconds: f64, grid: u64, max: u64) -> u64 {
     let f = ((seconds * 24.0).round() as u64).max(1);
@@ -554,6 +577,25 @@ impl Studio {
                 it.insert("frames".into(), json!(super::runner::frames_of(sec.as_f64().unwrap_or(10.0))));
                 it.insert("seconds".into(), sec);
             }
+        }
+        // MovieRoll's video.roll: the film's events (each its seconds), live (it waits for more), its HLS playlist; the
+        // length is the events' (whole chunks)
+        if p.get("events").is_some_and(|v| !v.is_null()) {
+            if !requested.starts_with("MR") {
+                return Err(RpcError::param("events: a MovieRoll film's (video.roll, a movieroll model)"));
+            }
+            let ev = roll_events(p.get("events"))?;
+            let chunks: u64 = ev.iter().map(|e| ((e["seconds"].as_f64().unwrap_or(10.0) * 24.0 / 16.0).round() as u64).max(1)).sum();
+            if chunks > 90 {
+                return Err(RpcError::param("events: at most 60 s together at the start (a live film takes more with video.rollAppend)"));
+            }
+            let f = 16 * chunks + 1;
+            it.insert("frames".into(), json!(f));
+            it.insert("seconds".into(), json!(f as f64 / 24.0));
+            it.insert("events".into(), json!(ev));
+            it.insert("live".into(), json!(p["live"] == true));
+            it.insert("max_idle_s".into(), num(p, "max_idle_s", 300.0, 0.0, 3600.0, false)?);
+            it.insert("hls".into(), json!(true));
         }
         it.insert("reentrant_id".into(), reentrant(p).map_or(Value::Null, |r| json!(r)));
         // the clip's place in its project's edit (1 and up): the timeline's n, stated rather than read from the label
@@ -983,6 +1025,17 @@ mod tests {
     }
 
     /// MovieRoll's models by id, and its rules: 16k + 1 frames up to 60 s, its fixed 5 steps (base 50), 864 x 480
+    #[test]
+    fn roll_events_are_checked() {
+        use super::*;
+        let ok = roll_events(Some(&json!([{"prompt": "a fox", "seconds": 10}, {"prompt": " sits ", "seconds": 5}]))).unwrap();
+        assert_eq!(ok, vec![json!({"prompt": "a fox", "seconds": 10.0}), json!({"prompt": "sits", "seconds": 5.0})]);
+        assert!(roll_events(Some(&json!([]))).is_err());
+        assert!(roll_events(Some(&json!([{"prompt": "", "seconds": 5}]))).is_err());
+        assert!(roll_events(Some(&json!([{"prompt": "x", "seconds": 61}]))).is_err());
+        assert!(roll_events(None).is_err());
+    }
+
     #[test]
     fn movieroll_engines_have_their_own_rules() {
         use super::*;

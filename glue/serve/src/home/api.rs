@@ -529,7 +529,7 @@ impl Home {
         self.video_annotate(method, &mut v);
         let url = |kind: &str, n: &str| format!("{base}/v1/video/{kind}/{n}");
         let r = &mut v["result"];
-        for k in ["file", "preview"] {
+        for k in ["file", "preview", "live"] {
             if let Some(f) = r[k].as_str().and_then(|f| f.strip_prefix("/out/")).map(str::to_string) {
                 r[k] = json!(url("files", &f));
             }
@@ -1668,7 +1668,9 @@ impl Home {
                 need("video")?;
                 let name = p["/v1/video/files/".len()..].split('?').next().unwrap_or("");
                 let still = name.ends_with(".preview.png") || name.ends_with(".last.png");
-                if name.is_empty() || name.contains('/') || !(name.ends_with(".mp4") || still) {
+                // a film's live HLS playlist and its segments (video.roll)
+                let live = name.contains(".live.") && (name.ends_with(".m3u8") || name.ends_with(".m4s"));
+                if name.is_empty() || name.contains('/') || !(name.ends_with(".mp4") || still || live) {
                     return Err((404, format!("no clip {name}")));
                 }
                 let head = String::from_utf8_lossy(&req.head).into_owned();

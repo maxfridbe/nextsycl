@@ -478,6 +478,11 @@ pub fn result(method: &str) -> Option<String> {
   {{"type": "object", "description": "started (or reentered: running, or done with name and file)", "properties": {{"queued": {{"type": "boolean", "enum": [false]}}, "job": {JOB},
     "name": {{"type": "string", "description": "reentered, done: the clip"}}, "file": {{"type": "string", "description": "reentered, done: its URL"}}, {common}}}}}]}}"#)
         }
+        // a film: video.generate's answer (its events taken)
+        "video.roll" => result("video.generate")?,
+        "video.rollAppend" | "video.rollEnd" => r#"{"type": "object", "properties": {"state": {"type": "string", "enum": ["running", "queued", "removed"], "description": "where the film is: running (it reads the change between chunks), queued (it takes it before it starts), removed (rollEnd on a queued film: it left the queue)"},
+  "name": {"type": "string", "description": "running: the film"}, "label": {"type": "string"}, "added": {"type": "integer", "description": "events added now"},
+  "ended": {"type": "boolean", "description": "rollEnd: no chunk is started after this"}, "events": {"type": "integer", "description": "the events it has been sent since it was started (running) or in all (queued)"}}}"#.into(),
         "video.status" => status(),
         "video.wait" => status().replacen(r#""required": ["idle","#, r#""required": ["changed", "idle","#, 1)
             .replacen(r#""properties": {"idle""#, r#""properties": {"changed": {"type": "boolean", "description": "false: the timeout passed"}, "idle""#, 1),
@@ -545,6 +550,12 @@ pub fn errors(method: &str) -> &'static [(u16, &'static str, &'static str)] {
                               (404, "not_found", "a file named (first_frame, ref_images, control_video ...) is not in the clips directory"),
                               (409, "busy", "a clip is being made or a runnable one waits, and queue is not true")],
         "video.cancel" => &[(404, "not_found", "label: no running or queued clip with it"), (409, "ambiguous", "no clip named and two running: name one"), (409, "not_running", "no label and no clip is being made")],
+        "video.roll" => &[(400, "invalid_params", "not a MovieRoll model, no events or more than 64, an event's prompt empty or its seconds outside 0.67-60, more than 60 s at the start, a size not 864 x 480 or 480 x 864"),
+                          (404, "not_found", "first_frame is not in the clips directory"),
+                          (409, "busy", "no card is free and queue is false")],
+        "video.rollAppend" | "video.rollEnd" => &[(400, "invalid_params", "neither label nor name; rollAppend: an event's prompt empty or its seconds outside 0.67-60"),
+                                                  (404, "not_found", "no running or queued film by that label or name"),
+                                                  (409, "not_a_roll", "that clip was not made by video.roll")],
         "video.queue.move" | "video.queue.remove" => &[(404, "not_found", "no queued clip with that label")],
         "video.jobs.get" => &[(404, "not_found", "no clip by that name: not running, queued, made, failed or cancelled")],
         "video.upload" => &[(400, "invalid_params", "not a picture, clip or sound (png jpg jpeg webp mp4 mov webm mkv wav mp3 flac m4a ogg), or empty")],

@@ -343,6 +343,59 @@ impl Studio {
         Ok(with(json!({"queued": false, "job": st.running.last().map(|j| j.rec.clone()), "reentered": false})))
     }
 
+    /// video.rollAppend / video.rollEnd: a MovieRoll film's events added, or its end, by its label or name - a running
+    /// film reads them from its control file (`<name>.ctl.json` beside it) between rounds; a queued one takes them before
+    /// it starts
+    fn steer(&self, method: &str, p: &Value) -> Result<Value, RpcError> {
+        let (label, name) = (s(p, "label"), s(p, "name"));
+        if label.is_empty() && name.is_empty() {
+            return Err(RpcError::param("label or name: the film"));
+        }
+        let hit = |rec: &Value| (!label.is_empty() && s(rec, "label") == label) || (!name.is_empty() && s(rec, "name") == name);
+        let add: Vec<Value> = if method == "rollAppend" {
+            queue::roll_events(p.get("events"))?
+        } else {
+            Vec::new()
+        };
+        let mut st = self.st.lock().unwrap();
+        if let Some(j) = st.running.iter().find(|j| hit(&j.rec)) {
+            if !j.rec["events"].is_array() {
+                return Err(RpcError::new("not_a_roll", "that clip is not a film made by video.roll", 409));
+            }
+            let n = s(&j.rec, "name");
+            let path = self.out.join(format!("{n}.ctl.json"));
+            let mut ctl: Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| json!({"events": []}));
+            if !ctl["events"].is_array() {
+                ctl["events"] = json!([]);
+            }
+            if let Some(list) = ctl["events"].as_array_mut() {
+                list.extend(add.iter().cloned());
+            }
+            if method == "rollEnd" {
+                ctl["end"] = json!(true);
+            }
+            write_atomic(&path, &serde_json::to_vec(&ctl).unwrap_or_default()).map_err(|e| RpcError::new("internal", &format!("{}: {e}", path.display()), 500))?;
+            return Ok(json!({"state": "running", "name": n, "label": j.rec["label"], "added": add.len(), "ended": method == "rollEnd",
+                             "events": ctl["events"].as_array().map_or(0, Vec::len)}));
+        }
+        let at = st.q.items.iter().position(hit).ok_or_else(|| RpcError::not_found(&format!("no running or queued film {}", if name.is_empty() { &label } else { &name })))?;
+        let it = &mut st.q.items[at];
+        if !it["events"].is_array() {
+            return Err(RpcError::new("not_a_roll", "that clip is not a film made by video.roll", 409));
+        }
+        if method == "rollEnd" {
+            // not started: nothing to end - it leaves the queue
+            st.q.items.remove(at);
+            st.q.save(&self.dir);
+            return Ok(json!({"state": "removed", "label": label, "added": 0, "ended": true}));
+        }
+        let mut list = it["events"].as_array().cloned().unwrap_or_default();
+        list.extend(add.iter().cloned());
+        it["events"] = json!(list);
+        st.q.save(&self.dir);
+        Ok(json!({"state": "queued", "label": label, "added": add.len(), "ended": false, "events": list.len()}))
+    }
+
     /// What keeps a clip from ever running as asked: a predecessor that failed or was cancelled (slots.rs)
     fn failed_dep(&self, st: &State, item: &Value) -> Option<String> {
         let ended: Vec<(&Value, bool)> = st.ended.iter().filter(|j| !j.retrying && j.engine_id != 0).map(|j| (&j.rec, j.view["done"] != true)).collect();
@@ -473,6 +526,7 @@ impl Studio {
                 }
             }
             "generate" => self.generate(p)?,
+            "rollAppend" | "rollEnd" => self.steer(method, p)?,
             "queue.list" => json!({"queue": self.st.lock().unwrap().q.items}),
             "queue.pause" => self.hold(true, &ps("project"), &ps("batch"), &ps("by")),
             "queue.resume" => self.hold(false, &ps("project"), &ps("batch"), &ps("by")),
@@ -906,6 +960,23 @@ impl Studio {
                     stream.write_all(&b).map_err(Into::into)
                 }
                 Err(_) => http::respond(stream, 404, &json!({"error": "no such picture"})),
+            };
+        }
+        // a film's live HLS playlist and its segments while it is made (MovieRoll: video.roll), never cached
+        let live = if name.ends_with(".live.m3u8") {
+            Some("application/vnd.apple.mpegurl")
+        } else if name.contains(".live.") && (name.ends_with(".m4s") || name.ends_with(".init.mp4")) {
+            Some(if name.ends_with(".m4s") { "video/iso.segment" } else { "video/mp4" })
+        } else {
+            None
+        };
+        if let Some(ct) = live {
+            return match std::fs::read(&p) {
+                Ok(b) => {
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", b.len())?;
+                    stream.write_all(&b).map_err(Into::into)
+                }
+                Err(_) => http::respond(stream, 404, &json!({"error": "no such part of the film"})),
             };
         }
         if !name.ends_with(".mp4") || !p.is_file() {

@@ -164,17 +164,20 @@ pub fn event_splits(chunks: usize, events: usize) -> (Vec<usize>, Vec<usize>) {
     (dedup, kept)
 }
 
-/// The chunks a KV recompute keeps: the first, the middle of every event, the `recent` newest
+/// The events whose middles a KV recompute keeps at most (the latest): upstream keeps every event's - the same up to
+/// this many, and a long or live film's cache (and its recompute's pass) stays bounded
+pub const MAX_MIDS: usize = 4;
+
+/// The chunks a KV recompute keeps: the first, the middle of every event (the latest MAX_MIDS), the `recent` newest
 pub fn recompute_chunks(done: usize, splits: &[usize], recent: usize) -> Vec<usize> {
     let mut s = std::collections::BTreeSet::new();
     s.insert(0);
     let mut b = vec![0];
     b.extend(splits.iter().copied().filter(|x| *x > 0 && *x < done));
     b.push(done);
-    for w in b.windows(2) {
-        if w[0] < w[1] {
-            s.insert((w[0] + w[1] - 1) / 2);
-        }
+    let segs: Vec<(usize, usize)> = b.windows(2).map(|w| (w[0], w[1])).filter(|(a, z)| a < z).collect();
+    for (a, z) in segs.iter().skip(segs.len().saturating_sub(MAX_MIDS)) {
+        s.insert((a + z - 1) / 2);
     }
     s.extend(done.saturating_sub(recent)..done);
     s.into_iter().collect()
@@ -206,6 +209,37 @@ pub fn frames_for(seconds: f32) -> usize {
     16 * (f - 1).div_ceil(16).clamp(1, 90) + 1
 }
 
+/// The chunks of an event of `seconds` (16 frames each, at least one)
+pub fn chunks_for(seconds: f32) -> usize {
+    ((seconds.max(0.0) * FPS as f32 / 16.0).round() as usize).clamp(1, 90)
+}
+
+/// A film asked for
+pub struct Ask<'a> {
+    /// one prompt, or its events (a JSON list, @@@EVENT_BREAK@@@ lines) split evenly - when `events` is None
+    pub prompt: &'a str,
+    /// video.roll's events, each with its seconds
+    pub events: Option<Vec<(String, f32)>>,
+    pub image: Option<&'a Picture>,
+    pub width: Option<usize>,
+    pub height: Option<usize>,
+    pub seconds: f32,
+    pub seed: u64,
+    pub steps: Option<usize>,
+    pub context_noise: Option<f32>,
+    pub threshold: Option<usize>,
+    pub attn: Attn,
+    pub kv: KvMode,
+    pub out: &'a Path,
+    /// the live HLS playlist beside the mp4 (live_names)
+    pub hls: bool,
+    /// the control file video.rollAppend / video.rollEnd write: {"events": [{"prompt", "seconds"}], "end": bool}
+    pub control: Option<PathBuf>,
+    /// out of chunks, wait for more events up to max_idle_s
+    pub live: bool,
+    pub max_idle_s: f64,
+}
+
 pub struct MovieRoll {
     pub hv: HunyuanVideo15,
     pub mode_distilled: bool,
@@ -223,18 +257,35 @@ pub struct Sink {
     pub frames: usize,
 }
 
+/// The live playlist's files beside a film's `<stem>.mp4`: `<stem>.live.m3u8`, its init segment `<stem>.live.init.mp4`
+/// and its segments `<stem>.live.NNNN.m4s` (2 s each), all in the film's folder (the front door serves them by name)
+pub fn live_names(out: &Path) -> (PathBuf, String, PathBuf) {
+    let stem = out.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "film".into());
+    let dir = out.parent().map(Path::to_path_buf).unwrap_or_default();
+    (dir.join(format!("{stem}.live.m3u8")), format!("{stem}.live.init.mp4"), dir.join(format!("{stem}.live.%04d.m4s")))
+}
+
 impl Sink {
-    pub fn open(path: &Path, w: usize, h: usize) -> Result<Sink> {
+    /// ffmpeg fed raw frames: the mp4 at `path`; with `hls`, also the live playlist (live_names) growing as the frames
+    /// come - an event playlist of fragmented-MP4 segments a browser plays while the film is made (one encode, two
+    /// outputs through ffmpeg's tee)
+    pub fn open(path: &Path, w: usize, h: usize, hls: bool) -> Result<Sink> {
         if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(d).map_err(|e| Error(format!("{}: {e}", d.display())))?;
         }
-        let child = Command::new("ffmpeg")
-            .args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{w}x{h}"), "-r", &FPS.to_string(), "-i", "-",
-                   "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
-            .arg(path)
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|e| Error(format!("starting ffmpeg: {e}")))?;
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{w}x{h}"), "-r", &FPS.to_string(), "-i", "-",
+                  "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
+        if hls {
+            let (m3u8, init, segs) = live_names(path);
+            // a key frame every second (24 frames): segments of whole GOPs, 2 s each
+            cmd.args(["-g", "24", "-keyint_min", "24", "-sc_threshold", "0", "-map", "0:v", "-f", "tee"]);
+            cmd.arg(format!("[f=mp4:movflags=+faststart]{}|[f=hls:hls_time=2:hls_list_size=0:hls_playlist_type=event:hls_segment_type=fmp4:\
+                             hls_fmp4_init_filename={init}:hls_segment_filename={}]{}", path.display(), segs.display(), m3u8.display()));
+        } else {
+            cmd.args(["-movflags", "+faststart"]).arg(path);
+        }
+        let child = cmd.stdin(Stdio::piped()).spawn().map_err(|e| Error(format!("starting ffmpeg: {e}")))?;
         Ok(Sink { child, w, h, frames: 0 })
     }
 
@@ -258,8 +309,35 @@ impl Sink {
     }
 }
 
+/// What a film is made of: its events and how many output chunks each drives (the first chunk counted in the first
+/// event's), or None: the film's `latent_frames` split evenly between them (upstream's even split)
+pub struct Script {
+    pub events: Vec<Encoded>,
+    pub chunks: Option<Vec<usize>>,
+    pub latent_frames: usize,
+}
+
+/// What a running film is told between rounds (video.rollAppend / video.rollEnd): events to add (each with its
+/// chunks), or to end - no more chunks after those begun
+#[derive(Default)]
+pub struct Poll {
+    pub add: Vec<(Encoded, usize)>,
+    pub end: bool,
+}
+
+/// A film's hook between rounds: `poll` asked each round; `live`: out of chunks, the film waits for more up to
+/// `max_idle_s` (asking every second) instead of ending
+pub struct Steer<'a> {
+    pub poll: &'a mut dyn FnMut() -> Result<Poll>,
+    pub live: bool,
+    pub max_idle_s: f64,
+    pub cancelled: &'a dyn Fn() -> bool,
+}
+
 /// What a film run reports
 pub struct Film {
+    /// the events the film played (a steered film's grow)
+    pub events: usize,
     pub latents: Vec<f32>,
     pub chunks: Vec<usize>,
     pub recomputes: Vec<usize>,
@@ -358,24 +436,41 @@ impl MovieRoll {
     /// A film: `events` encoded, `anchor` the image-to-video picture's latent (float32 [h w, 32]), `latent_frames`
     /// 4n + 1, each popped chunk handed to `out(chunk index, latents float32 [f h w, 32], frames)`
     #[allow(clippy::too_many_arguments)]
-    pub fn film(&self, chain: &Chain, events: &[Encoded], negative: Option<&Encoded>, anchor: Option<&[f32]>, latent_frames: usize, hw: (usize, usize),
-                attn: Attn, kv_mode: KvMode, noise: &mut dyn NoiseSource, progress: &mut dyn FnMut(usize, usize) -> Result<()>,
-                out: ChunkOut, tap: Option<OpTap>, log: &mut dyn FnMut(String)) -> Result<Film> {
+    pub fn film(&self, chain: &Chain, script: Script, negative: Option<&Encoded>, anchor: Option<&[f32]>, hw: (usize, usize), attn: Attn, kv_mode: KvMode,
+                noise: &mut dyn NoiseSource, progress: &mut dyn FnMut(usize, usize) -> Result<()>, out: ChunkOut, tap: Option<OpTap>,
+                steer: Option<Steer>, log: &mut dyn FnMut(String)) -> Result<Film> {
         let hv = &self.hv;
         let nsd = &hv.nsd;
         let gpu = &nsd.gpu;
         let tpf = hw.0 * hw.1;
-        let sizes = chunk_sizes(latent_frames, anchor.is_some())?;
-        let (splits, kept) = event_splits(sizes.len(), events.len());
-        if kept.len() != events.len() {
-            return Err(Error(format!("{ARCH}: {} events for {} chunks: every event needs a chunk", events.len(), sizes.len())));
+        let mut events = script.events;
+        if events.is_empty() {
+            return Err(Error(format!("{ARCH}: no events")));
         }
-        let mut to_event = vec![0usize; sizes.len()];
-        for (e, b) in splits.iter().enumerate() {
-            for c in to_event.iter_mut().skip(*b) {
-                *c = e + 1;
+        // the output chunks (the anchor's first), where each event starts, which event drives each chunk
+        let (sizes, mut splits) = match &script.chunks {
+            None => {
+                let sizes = chunk_sizes(script.latent_frames, anchor.is_some())?;
+                let (splits, kept) = event_splits(sizes.len(), events.len());
+                if kept.len() != events.len() {
+                    return Err(Error(format!("{ARCH}: {} events for {} chunks: every event needs a chunk", events.len(), sizes.len())));
+                }
+                (sizes, splits)
             }
-        }
+            Some(c) => {
+                if c.len() != events.len() || c.contains(&0) {
+                    return Err(Error(format!("{ARCH}: chunks {c:?} for {} events: one count an event, each at least 1", events.len())));
+                }
+                let total: usize = c.iter().sum::<usize>() + usize::from(anchor.is_some());
+                let mut sizes = vec![if anchor.is_some() { 1 } else { 1 + CHUNK }];
+                sizes.extend(std::iter::repeat_n(CHUNK, total - 1));
+                let mut b = usize::from(anchor.is_some());
+                let splits = c[..c.len() - 1].iter().map(|n| { b += n; b }).collect();
+                (sizes, splits)
+            }
+        };
+        let event_of = |splits: &[usize], i: usize| splits.iter().filter(|b| **b <= i).count();
+        let mut to_event: Vec<usize> = (0..sizes.len()).map(|i| event_of(&splits, i)).collect();
         let steps = chain.steps();
         // step rows: the ladder's timesteps, then 0 (the clean history's)
         let mut ts: Vec<(f32, Option<f32>)> = chain.timesteps.iter().map(|t| (*t, None)).collect();
@@ -385,7 +480,7 @@ impl MovieRoll {
         // the cache: the full-history blocks up to the threshold's chunks (or what an event-heavy recompute keeps: the
         // first chunk, every event's middle, the newest), the sink-recent ones the sink and one recent chunk; a
         // recompute's pass holds the chunks it keeps
-        let keep = 1 + events.len() + chain.recent_k;
+        let keep = 1 + if steer.is_some() { MAX_MIDS } else { events.len().min(MAX_MIDS) } + chain.recent_k;
         let full_frames = (1 + CHUNK) + (keep.max(chain.threshold) - 1) * CHUNK;
         let recompute_frames = (1 + CHUNK) + (keep - 1) * CHUNK;
         let sr_frames = (1 + CHUNK) + CHUNK;
@@ -394,8 +489,12 @@ impl MovieRoll {
             return Err(Error(format!("{ARCH}: {} events and a threshold of {} need {} cached frames: past the RoPE grid", events.len(), chain.threshold,
                                      full_frames)));
         }
-        let tq = events.iter().chain(negative).map(|e| e.text.tq).max().unwrap_or(1);
-        let tt = events.iter().chain(negative).map(|e| e.text.tokens()).max().unwrap_or(1);
+        // the text rows: a steered film's later events may be longer than its first ones - room for the encoders' most
+        let (tq, tt) = if steer.is_some() {
+            (crate::template().max_tokens.max(1100), 1100 + 256)
+        } else {
+            (events.iter().chain(negative).map(|e| e.text.tq).max().unwrap_or(1), events.iter().chain(negative).map(|e| e.text.tokens()).max().unwrap_or(1))
+        };
         // the room first (the driver has no out-of-memory error, and a card nearly full hangs the box): the cache, the
         // pass's buffers (its rows x 44 KB, the attention's keys and values x 8 KB) and 1.5 GiB to spare
         let blocks = hv.dit.doubles.len();
@@ -462,16 +561,65 @@ impl MovieRoll {
             sizes.remove(0);
             to_event.remove(0);
         }
-        let num = sizes.len();
+        let mut num = sizes.len();
         if num == 0 {
             return Err(Error("nothing to generate".into()));
         }
+        let mut steer = steer;
+        let mut ended = false;
+        // a steered film's news: events added after the chunks there are, or the end
+        let take = |p: Poll, sizes: &mut Vec<usize>, to_event: &mut Vec<usize>, splits: &mut Vec<usize>, events: &mut Vec<Encoded>, num: &mut usize,
+                        ended: &mut bool, log: &mut dyn FnMut(String)| {
+            for (e, n) in p.add {
+                if *ended || n == 0 {
+                    continue;
+                }
+                // the boundary in output chunks (the anchor counted)
+                splits.push(*num + usize::from(anchor.is_some()));
+                events.push(e);
+                for _ in 0..n {
+                    sizes.push(CHUNK);
+                    to_event.push(events.len() - 1);
+                }
+                *num += n;
+                log(format!("{ARCH}: event {} added: {n} chunks from chunk {}", events.len() - 1, splits.last().copied().unwrap_or(0)));
+            }
+            if p.end && !*ended {
+                *ended = true;
+                log(format!("{ARCH}: ended: {} chunks", *num));
+            }
+        };
         // the window: chunks in order, float32 [frames h w, 32] each
         let mut queue: Vec<(usize, Vec<f32>)> = Vec::new();
         let mut decoded = 0;
         let mut g = 0;
         let mut rounds = 0;
-        for round in 0..num + WINDOW {
+        let mut round = 0;
+        loop {
+            if let Some(s) = steer.as_mut() {
+                let p = (s.poll)()?;
+                take(p, &mut sizes, &mut to_event, &mut splits, &mut events, &mut num, &mut ended, log);
+                // live, out of chunks: wait for the next event (or the end, or the idle limit) before the window flushes
+                if s.live && !ended && round >= num {
+                    let t = Instant::now();
+                    while round >= num && !ended {
+                        if (s.cancelled)() {
+                            return Err(Error("cancelled".into()));
+                        }
+                        if t.elapsed().as_secs_f64() > s.max_idle_s {
+                            log(format!("{ARCH}: no new event in {:.0} s: the film ends", s.max_idle_s));
+                            ended = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        let p = (s.poll)()?;
+                        take(p, &mut sizes, &mut to_event, &mut splits, &mut events, &mut num, &mut ended, log);
+                    }
+                }
+            }
+            if round >= num + WINDOW {
+                break;
+            }
             rounds += 1;
             if round >= WINDOW {
                 let (f, clean) = queue.remove(0);
@@ -512,6 +660,7 @@ impl MovieRoll {
             }
             let f = if round < num { sizes[round] } else { sizes[num - 1] };
             queue.push((f, noise.chunk(f * tpf * LATENT)?));
+            round += 1;
             let event = &events[to_event[decoded.min(num - 1)]];
             for _ in 0..chain.steps_per_window {
                 let idx = step_index(g, steps, WINDOW);
@@ -555,7 +704,7 @@ impl MovieRoll {
         let decode_s = decode_s.get();
         let denoise_s = t0.elapsed().as_secs_f64() - decode_s;
         let chunks: Vec<usize> = finalized.iter().map(|c| c.len() / (tpf * LATENT)).collect();
-        Ok(Film { latents: finalized.concat(), chunks, recomputes, denoise_s, decode_s, rounds, peak: 0, kv_gib })
+        Ok(Film { events: events.len(), latents: finalized.concat(), chunks, recomputes, denoise_s, decode_s, rounds, peak: 0, kv_gib })
     }
 }
 
@@ -580,34 +729,44 @@ impl MovieRoll {
         self.hv.vae.encode(&self.hv.nsd, &px, h, w)
     }
 
-    /// A film to `out`: every chunk decoded as it leaves the window (the streaming VAE, one latent frame a call)
-    #[allow(clippy::too_many_arguments)]
-    pub fn make(&self, prompt: &str, image: Option<&Picture>, width: Option<usize>, height: Option<usize>, seconds: f32, seed: u64, steps: Option<usize>,
-                context_noise: Option<f32>, threshold: Option<usize>, attn: Attn, kv: KvMode, out: &Path, keep: Option<&mut Vec<f32>>,
-                progress: &mut dyn FnMut(usize, usize) -> Result<()>, log: &mut dyn FnMut(String)) -> Result<(Film, usize, usize, usize)> {
+    /// A film to `ask.out`: every chunk decoded as it leaves the window (the streaming VAE, one latent frame a call)
+    pub fn make(&self, ask: Ask, keep: Option<&mut Vec<f32>>, progress: &mut dyn FnMut(usize, usize) -> Result<()>, cancelled: &dyn Fn() -> bool,
+                log: &mut dyn FnMut(String)) -> Result<(Film, usize, usize, usize)> {
         let hv = &self.hv;
-        let (w, h) = Self::canvas(width, height);
+        let (w, h) = Self::canvas(ask.width, ask.height);
         let hw = (h / 16, w / 16);
-        let frames = frames_for(seconds);
-        let latent = (frames - 1) / 4 + 1;
-        let chain = self.chain(steps, context_noise.unwrap_or(self.context_noise), threshold.unwrap_or(self.threshold))?;
+        let chain = self.chain(ask.steps, ask.context_noise.unwrap_or(self.context_noise), ask.threshold.unwrap_or(self.threshold))?;
+        let (attn, kv, seed) = (ask.attn, ask.kv, ask.seed);
         let t0 = Instant::now();
         hv.peak.store(0, std::sync::atomic::Ordering::Relaxed);
-        let texts = events_of(prompt);
+        // the events: video.roll's, each with its seconds (whole chunks), else the prompt's split evenly over the film
+        let (texts, chunks): (Vec<String>, Option<Vec<usize>>) = match &ask.events {
+            Some(ev) if !ev.is_empty() => (ev.iter().map(|e| e.0.clone()).collect(), Some(ev.iter().map(|e| chunks_for(e.1)).collect())),
+            _ => (events_of(ask.prompt), None),
+        };
         let mut events = Vec::with_capacity(texts.len());
         for t in &texts {
             events.push(hv.encode(t, None)?);
         }
         let negative = if chain.guided { Some(hv.encode("", None)?) } else { None };
-        // the text encoders' 4.2 GiB back to the card for the film (the next prompt loads them again, ~5 s)
-        hv.unload_text()?;
-        let anchor = match image {
+        let steered = ask.control.is_some() || ask.live;
+        if !steered {
+            // the text encoders' 4.2 GiB back to the card for the film (the next prompt loads them again, ~5 s); a steered
+            // film keeps them for the events it is sent
+            hv.unload_text()?;
+        }
+        let anchor = match ask.image {
             Some(p) => Some(self.anchor(p, w, h)?),
             None => None,
         };
-        log(format!("{ARCH}: {w}x{h}, {frames} frames ({} s, {latent} latent), {} event(s), seed {seed}, attention {attn:?}; text in {:.1} s",
-                    frames as f32 / FPS as f32, events.len(), t0.elapsed().as_secs_f64()));
-        let mut sink = Sink::open(out, w, h)?;
+        let latent = match &chunks {
+            Some(c) => 1 + CHUNK * c.iter().sum::<usize>(),
+            None => (frames_for(ask.seconds) - 1) / 4 + 1,
+        };
+        let frames = 4 * (latent - 1) + 1;
+        log(format!("{ARCH}: {w}x{h}, {frames} frames ({} s, {latent} latent), {} event(s){}, seed {seed}, attention {attn:?}; text in {:.1} s",
+                    frames as f32 / FPS as f32, events.len(), if ask.live { ", live" } else { "" }, t0.elapsed().as_secs_f64()));
+        let mut sink = Sink::open(ask.out, w, h, ask.hls)?;
         hv.vae.stream_begin()?;
         let mut keep = keep;
         let mut noise = SeedNoise::new(seed);
@@ -624,7 +783,36 @@ impl MovieRoll {
                 hv.note();
                 Ok(())
             };
-            self.film(&chain, &events, negative.as_ref(), anchor.as_deref(), latent, hw, attn, kv, &mut noise, progress, &mut emit, None, log)
+            // a steered film's news: the control file (video.rollAppend / video.rollEnd write it), read when it changes
+            let mut taken = 0usize;
+            let mut seen: Option<std::time::SystemTime> = None;
+            let control = ask.control.clone();
+            let mut poll = || -> Result<Poll> {
+                let Some(path) = control.as_ref() else { return Ok(Poll::default()) };
+                let Ok(m) = std::fs::metadata(path).and_then(|m| m.modified()) else { return Ok(Poll::default()) };
+                if seen == Some(m) {
+                    return Ok(Poll::default());
+                }
+                seen = Some(m);
+                let Ok(v) = std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| e.to_string()))
+                else {
+                    return Ok(Poll::default());
+                };
+                let list = v["events"].as_array().cloned().unwrap_or_default();
+                let mut add = Vec::new();
+                for e in list.iter().skip(taken) {
+                    let text = e["prompt"].as_str().unwrap_or("").trim().to_string();
+                    let secs = e["seconds"].as_f64().unwrap_or(10.0) as f32;
+                    if !text.is_empty() {
+                        add.push((hv.encode(&text, None)?, chunks_for(secs)));
+                    }
+                }
+                taken = taken.max(list.len());
+                Ok(Poll { add, end: v["end"] == true })
+            };
+            let steer = steered.then_some(Steer { poll: &mut poll, live: ask.live, max_idle_s: ask.max_idle_s, cancelled });
+            self.film(&chain, Script { events, chunks, latent_frames: latent }, negative.as_ref(), anchor.as_deref(), hw, attn, kv, &mut noise, progress,
+                      &mut emit, None, steer, log)
         };
         hv.vae.stream_end()?;
         let mut film = film?;
@@ -666,10 +854,32 @@ impl MovieRoll {
         };
         let mut lat = Vec::new();
         let gate = s("logits-out").is_some();
-        let (film, frames, w, h) = self.make(&prompt, image.as_ref(), n("width").map(|x| x as usize), n("height").map(|x| x as usize), seconds,
-                                             n("seed").map_or(0, |x| x as i64 as u64), n("steps").map(|x| x as usize), n("context_noise").map(|x| x as f32),
-                                             n("threshold").map(|x| x as usize), attn, kv, &out, if gate { Some(&mut lat) } else { None }, &mut progress,
-                                             &mut |l| log(l))?;
+        // video.roll: events with their seconds; the control file; live; the HLS playlist
+        let events = spec.get("events").and_then(Value::as_array).map(|a| {
+            a.iter().filter_map(|e| Some((e["prompt"].as_str()?.trim().to_string(), e["seconds"].as_f64().unwrap_or(10.0) as f32))).filter(|e| !e.0.is_empty())
+                .collect::<Vec<_>>()
+        });
+        let ask = Ask {
+            prompt: &prompt,
+            events,
+            image: image.as_ref(),
+            width: n("width").map(|x| x as usize),
+            height: n("height").map(|x| x as usize),
+            seconds,
+            seed: n("seed").map_or(0, |x| x as i64 as u64),
+            steps: n("steps").map(|x| x as usize),
+            context_noise: n("context_noise").map(|x| x as f32),
+            threshold: n("threshold").map(|x| x as usize),
+            attn,
+            kv,
+            out: &out,
+            hls: spec.get("hls").and_then(Value::as_bool).unwrap_or(false),
+            control: s("control").map(PathBuf::from),
+            live: spec.get("live").and_then(Value::as_bool).unwrap_or(false),
+            max_idle_s: n("max_idle_s").unwrap_or(300.0).clamp(0.0, 3600.0),
+        };
+        let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+        let (film, frames, w, h) = self.make(ask, if gate { Some(&mut lat) } else { None }, &mut progress, &cancelled, &mut |l| log(l))?;
         let total = t0.elapsed().as_secs_f64();
         log(format!("{ARCH}: {} chunks in {} rounds: denoise {:.1} s ({:.2} s a chunk), decode {:.1} s, {frames} frames in {total:.1} s; recomputes at {:?}; \
                      the card's peak {:.1} GiB (cache + buffers {:.1} GiB)", film.chunks.len(), film.rounds, film.denoise_s,
@@ -680,6 +890,7 @@ impl MovieRoll {
                         (film.latents.len() / LATENT) as f64 / film.denoise_s));
         }
         Ok(json!({"out": out, "width": w, "height": h, "frames": frames, "fps": FPS, "seconds": total, "chunks": film.chunks.len(), "rounds": film.rounds,
+                  "events": film.events,
                   "recomputes": film.recomputes, "denoise_s": film.denoise_s, "decode_s": film.decode_s, "peak_gib": film.peak as f64 / GIB}))
     }
 }
@@ -770,7 +981,8 @@ impl MovieRoll {
         let mut noise = DumpNoise { dir: dir.clone(), noise: 0, ctx: 0 };
         let mut sink = |_: usize, _: &[f32], _: usize| -> Result<()> { Ok(()) };
         let attn = self.attn(spec.get("attention").and_then(Value::as_str))?;
-        let film = self.film(&chain, &events, None, None, lf, (h, w), attn, kv, &mut noise, &mut |_, _| Ok(()), &mut sink, Some(&mut tap), log)?;
+        let film = self.film(&chain, Script { events, chunks: None, latent_frames: lf }, None, None, (h, w), attn, kv, &mut noise, &mut |_, _| Ok(()),
+                             &mut sink, Some(&mut tap), None, log)?;
         for l in lines {
             log(l);
         }
@@ -888,10 +1100,26 @@ impl VideoEngine for MovieRoll {
         };
         let num = |k: &str| req.extra.get(k).and_then(|v| v.parse::<f64>().ok());
         let kv = req.extra.get("kv").map_or(Ok(self.kv), |v| KvMode::parse(v)).map_err(Error)?;
-        let (_, frames, w, h) = self.make(&req.prompt, image.as_ref(), req.width.map(|x| x as usize), req.height.map(|x| x as usize),
-                                          req.seconds.unwrap_or(10.0).min(MAX_SECONDS), req.seed, req.steps.map(|x| x as usize),
-                                          num("context-noise").map(|x| x as f32), num("threshold").map(|x| x as usize), attn, kv, &req.out, None, &mut p,
-                                          &mut |l| eprintln!("{l}"))?;
+        let ask = Ask {
+            prompt: &req.prompt,
+            events: None,
+            image: image.as_ref(),
+            width: req.width.map(|x| x as usize),
+            height: req.height.map(|x| x as usize),
+            seconds: req.seconds.unwrap_or(10.0).min(MAX_SECONDS),
+            seed: req.seed,
+            steps: req.steps.map(|x| x as usize),
+            context_noise: num("context-noise").map(|x| x as f32),
+            threshold: num("threshold").map(|x| x as usize),
+            attn,
+            kv,
+            out: &req.out,
+            hls: false,
+            control: None,
+            live: false,
+            max_idle_s: 0.0,
+        };
+        let (_, frames, w, h) = self.make(ask, None, &mut p, cancel, &mut |l| eprintln!("{l}"))?;
         Ok(Clip { path: req.out.clone(), width: w as u32, height: h as u32, frames: frames as u32, fps: FPS as f32, audio: false })
     }
     fn report(&self) -> Vec<String> {
@@ -934,6 +1162,21 @@ mod tests {
         assert_eq!(events_of("a @@@EVENT_BREAK@@@ b"), vec!["a", "b"]);
         assert_eq!(events_of(r#"["a", "b", " "]"#), vec!["a", "b"]);
         assert_eq!(events_of("one"), vec!["one"]);
+    }
+
+    #[test]
+    fn roll_events_take_whole_chunks_and_recomputes_stay_bounded() {
+        assert_eq!(chunks_for(10.0), 15);
+        assert_eq!(chunks_for(0.1), 1);
+        assert_eq!(chunks_for(1000.0), 90);
+        // seven events: the middles of the latest four only
+        let splits = [5, 10, 15, 20, 25, 30];
+        let kept = recompute_chunks(40, &splits, 3);
+        assert_eq!(kept, vec![0, 17, 22, 27, 34, 37, 38, 39]);
+        let (m3u8, init, segs) = live_names(Path::new("/out/mr_1.mp4"));
+        assert_eq!(m3u8, PathBuf::from("/out/mr_1.live.m3u8"));
+        assert_eq!(init, "mr_1.live.init.mp4");
+        assert_eq!(segs, PathBuf::from("/out/mr_1.live.%04d.m4s"));
     }
 
     #[test]

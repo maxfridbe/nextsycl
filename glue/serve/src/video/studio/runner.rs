@@ -190,6 +190,15 @@ impl Studio {
                 spec[k] = item[k].clone();
             }
         }
+        // a MovieRoll film (video.roll): its events, live, the HLS playlist beside it, the control file video.rollAppend
+        // and video.rollEnd write
+        if item["events"].is_array() {
+            spec["events"] = item["events"].clone();
+            spec["live"] = json!(item["live"] == true);
+            spec["max_idle_s"] = item["max_idle_s"].clone();
+            spec["hls"] = json!(item["hls"] == true);
+            spec["control"] = json!(format!("{}/{name}.ctl.json", self.out_in));
+        }
         if let Some(u) = item["upscale"].as_f64().or_else(|| item["upscale"].as_str().and_then(|v| v.parse().ok())).filter(|u| *u > 1.0) {
             spec["upscale"] = json!(u);
             // "upscaler": an ESRGAN-type network on the decoded frames - general-x4v3 by default (the user's pick,
@@ -533,6 +542,8 @@ impl Studio {
         out.insert("per_step".into(), Value::Null);
         out.insert("metrics".into(), json!([]));
         out.insert("file".into(), if done { json!(format!("/out/{name}.mp4")) } else { Value::Null });
+        // a MovieRoll film (video.roll): its live HLS playlist, growing while it is made (fragmented-MP4 segments of 2 s)
+        out.insert("live".into(), if job.rec["hls"] == true { json!(format!("/out/{name}.live.m3u8")) } else { Value::Null });
         // while it samples: the engine's picture of the shot so far (its latents' middle frame, each step)
         let pv = self.out.join(format!("{name}.preview.png"));
         let pv_at = (!idle).then(|| std::fs::metadata(&pv).and_then(|m| m.modified()).ok()).flatten()
