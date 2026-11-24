@@ -46,12 +46,17 @@ const char* nsd_device_name(void* ctx);
 /* ---- device memory -------------------------------------------------------------------------------------------- */
 
 /* The xe driver has no out-of-memory error: an over-commit stalls the whole machine. So allocations are counted, and
- * one that would pass the cap (0.94 of the card; NSD_MEM_FRACTION overrides) is refused here, with an error. The
- * kernels' own scratch buffers count against the same cap: a kernel call that needs more fails the same way. */
+ * one that would pass the cap (0.94 of the card and never into the last 1.5 GiB; NSD_MEM_FRACTION and
+ * NSD_MEM_RESERVE_MB override) is refused here, with an error - and so is one that would leave the card itself less
+ * than that 1.5 GiB free (asked of the card: memory outside the book and other processes count). Before refusing, and
+ * before giving up on a device refusal, the context gives back its caches (nsd_trim). The kernels' own scratch buffers
+ * count against the same cap: a kernel call that needs more fails the same way. */
 void* nsd_alloc(void* ctx, uint64_t bytes);
 void nsd_free(void* ctx, void* p);              /* waits for the queue first */
 uint64_t nsd_mem_used(void* ctx);
 uint64_t nsd_mem_cap(void* ctx);
+/* The part of nsd_mem_used that is the kernels' scratch (grown to the largest call so far, reused by the next calls) */
+uint64_t nsd_mem_scratch(void* ctx);
 /* What the whole card has free right now, every process counted (0 when the driver cannot tell: it needs
  * ZES_ENABLE_SYSMAN=1, which the image sets). For deciding whether to load beside whatever else holds the card. */
 uint64_t nsd_mem_free(void* ctx);

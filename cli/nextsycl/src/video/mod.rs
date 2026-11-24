@@ -377,7 +377,13 @@ fn worker(cfg: &Config, args: &[String]) -> Result<(), String> {
         current.store(0, Ordering::SeqCst);
         match out {
             Ok(v) => emit(json!({"event": "result", "job": job, "ok": true, "value": v})),
-            Err(err) => emit(json!({"event": "result", "job": job, "ok": false, "error": err.0, "cancelled": cancel.load(Ordering::SeqCst)})),
+            Err(err) => {
+                // the card refused memory: the daemon ends this process after the result and the next job gets a fresh
+                // one (whatever this one holds outside its book goes with it)
+                let cancelled = cancel.load(Ordering::SeqCst);
+                let recycle = !cancelled && nextsycl_serve::video::daemon::allocation_failure(&err.0);
+                emit(json!({"event": "result", "job": job, "ok": false, "error": err.0, "cancelled": cancelled, "recycle": recycle}))
+            }
         }
         if abort.load(Ordering::SeqCst) {
             break;

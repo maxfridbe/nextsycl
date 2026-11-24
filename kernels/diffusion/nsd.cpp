@@ -165,6 +165,9 @@ struct Ctx {
     std::mutex mem_mu;
     std::unordered_map<void*, size_t> mem;
     size_t mem_used = 0, mem_cap = 0;
+    // the card's memory kept free whatever this context holds, every process and the memory outside the book (the
+    // runtime's, oneDNN's reordered weights and kernels) counted: the box's rule, 1.5 GiB (NSD_MEM_RESERVE_MB)
+    size_t reserve = (size_t) 1536 << 20;
     std::string name;
 
     // A scratch buffer of at least n elements; counted against the same cap as nsd_alloc. NULL (with the reason in
@@ -246,7 +249,9 @@ void init(Ctx& c) {
     const uint64_t total = c.q.get_device().get_info<sycl::info::device::global_mem_size>();
     double frac = 0.94;                            // of the card, for nsd_alloc and the kernels' scratch together
     if (const char* e = std::getenv("NSD_MEM_FRACTION")) frac = std::min(0.97, std::max(0.05, std::atof(e)));
-    c.mem_cap = (size_t) ((double) total * frac);
+    if (const char* e = std::getenv("NSD_MEM_RESERVE_MB")) c.reserve = (size_t) std::max(0, std::atoi(e)) << 20;
+    // the cap: the share of the card, and never into the memory kept free (on every card, shared or not)
+    c.mem_cap = (size_t) std::min((double) total * frac, (double) (total > c.reserve ? total - c.reserve : 0));
 #ifdef NSD_SDPA_NO_FALLBACK
     // built against a oneDNN with container/onednn-sdpa-no-fallback.patch: ask it to refuse, not to fall back
     setenv("_ONEDNN_GRAPH_SDPA_NO_FALLBACK", "1", 1);
@@ -321,18 +326,87 @@ uint64_t nsd_mem_used(void* ctx) {
     std::lock_guard<std::mutex> l(c.mem_mu);
     return c.mem_used;
 }
-
-void* nsd_alloc(void* ctx, uint64_t bytes) try {
+uint64_t nsd_mem_scratch(void* ctx) {
     auto& c = *static_cast<Ctx*>(ctx);
     std::lock_guard<std::mutex> l(c.mem_mu);
-    if (c.mem_used + bytes > c.mem_cap) {
-        g_err = "nsd_alloc: " + std::to_string(bytes >> 20) + " MiB would pass the device memory cap (" +
-                std::to_string(c.mem_used >> 20) + " of " + std::to_string(c.mem_cap >> 20) + " MiB in use)";
+    return c.xq_cap + c.rs_cap * 4 + c.gmax_cap * 4 + c.xr_cap * 4 + c.acc_cap * 4 + c.inv_cap * 4 + c.wq_cap * 2 + c.yq_cap * 4 +
+           c.hq_cap * 2 + c.hk_cap * 2 + c.hv_cap * 2 + c.sc_cap * 2 + c.ao_cap * 4 + c.part_cap * 4 + c.rowv_cap * 4 + c.gn_cap * 4 +
+           c.sq_cap + c.sk_cap + c.ss_cap * 4;
+}
+
+// The card's free memory, every process counted; 0 when the driver cannot tell
+static uint64_t card_free(Ctx& c) {
+    try {
+        const auto dev = c.q.get_device();
+        if (!dev.has(sycl::aspect::ext_intel_free_memory)) return 0;
+        return dev.get_info<sycl::ext::intel::info::device::free_memory>();
+    } catch (const std::exception&) { return 0; }
+}
+
+// Gives back what the context keeps between calls (nsd_trim's work): the kernels' scratch, the per-shape primitives
+// with their reordered weights, and oneDNN's own primitive cache (its kernels live on the card). Never inside a kernel
+// call (they hold scratch pointers): from nsd_alloc and nsd_trim, which the host calls between kernels.
+static void evict(Ctx& c) {
+    c.q.wait();
+    if (c.cq) c.cq->wait();
+    auto drop = [&c](auto*& p, size_t& cap) {
+        if (p) sycl::free(p, c.q);
+        std::lock_guard<std::mutex> l(c.mem_mu);
+        c.mem_used -= cap * sizeof(*p);
+        p = nullptr;
+        cap = 0;
+    };
+    drop(c.xq, c.xq_cap); drop(c.rs, c.rs_cap); drop(c.gmax, c.gmax_cap); drop(c.xr, c.xr_cap); drop(c.acc, c.acc_cap);
+    drop(c.inv, c.inv_cap); drop(c.wq, c.wq_cap); drop(c.yq, c.yq_cap); drop(c.hq, c.hq_cap); drop(c.hk, c.hk_cap);
+    drop(c.hv, c.hv_cap); drop(c.sc, c.sc_cap); drop(c.ao, c.ao_cap); drop(c.part, c.part_cap); drop(c.rowv, c.rowv_cap);
+    drop(c.gn, c.gn_cap); drop(c.sq, c.sq_cap); drop(c.sk, c.sk_cap); drop(c.ss, c.ss_cap);
+    c.sdpa.clear(); c.sdpa_b.clear(); c.sdpa_qk.clear(); c.attn.clear(); c.gemm.clear(); c.rot.clear(); c.lin.clear();
+    c.conv3.clear(); c.conv3_w.clear(); c.conv2.clear(); c.conv3x.clear();
+    const int cap = dnnl::get_primitive_cache_capacity();
+    dnnl::set_primitive_cache_capacity(0);
+    dnnl::set_primitive_cache_capacity(cap);
+    const int gcap = dnnl::graph::get_compiled_partition_cache_capacity();
+    dnnl::graph::set_compiled_partition_cache_capacity(0);
+    dnnl::graph::set_compiled_partition_cache_capacity(gcap);
+}
+
+// An allocation is refused (an error, never a stall: the xe driver over-commits) when it would pass the book's cap or
+// leave the card less than `reserve` free - the latter seen by asking the card, so memory outside the book counts.
+// Either way the context's caches go first, and a device refusal is tried once more after them.
+void* nsd_alloc(void* ctx, uint64_t bytes) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    const size_t n = bytes ? bytes : 1;
+    auto over_cap = [&] { std::lock_guard<std::mutex> l(c.mem_mu); return c.mem_used + bytes > c.mem_cap; };
+    // the card is asked for allocations of a MiB and up (a query costs more than a small buffer's worth of room)
+    auto short_of = [&]() -> uint64_t {
+        if (bytes < (1u << 20)) return 0;
+        const uint64_t f = card_free(c);
+        return f && f < bytes + c.reserve ? f : 0;
+    };
+    bool evicted = false;
+    if (over_cap() || short_of()) { evict(c); evicted = true; }
+    auto used_mib = [&] { std::lock_guard<std::mutex> l(c.mem_mu); return std::to_string(c.mem_used >> 20); };
+    if (over_cap()) {
+        g_err = "nsd_alloc: " + std::to_string(bytes >> 20) + " MiB would pass the device memory cap (" + used_mib() + " of " +
+                std::to_string(c.mem_cap >> 20) + " MiB in use, the caches given back)";
         return nullptr;
     }
-    void* p = sycl::malloc_device(bytes ? bytes : 1, c.q);
-    if (!p) { g_err = "nsd_alloc: the device refused " + std::to_string(bytes >> 20) + " MiB"; return nullptr; }
-    if (c.poison) c.q.memset(p, 0xff, bytes ? bytes : 1).wait();
+    if (const uint64_t f = short_of()) {
+        g_err = "nsd_alloc: " + std::to_string(bytes >> 20) + " MiB would leave the card " + std::to_string((f - std::min<uint64_t>(f, bytes)) >> 20) +
+                " MiB free, under the " + std::to_string(c.reserve >> 20) + " MiB kept free (" + used_mib() +
+                " MiB in this engine's book, the caches given back)";
+        return nullptr;
+    }
+    void* p = sycl::malloc_device(n, c.q);
+    if (!p && !evicted) { evict(c); p = sycl::malloc_device(n, c.q); }
+    if (!p) {
+        const uint64_t f = card_free(c);
+        g_err = "nsd_alloc: the device refused " + std::to_string(bytes >> 20) + " MiB (" + used_mib() + " MiB in this engine's book" +
+                (f ? ", " + std::to_string(f >> 20) + " MiB free on the card" : std::string()) + ")";
+        return nullptr;
+    }
+    if (c.poison) c.q.memset(p, 0xff, n).wait();
+    std::lock_guard<std::mutex> l(c.mem_mu);
     c.mem.emplace(p, bytes);
     c.mem_used += bytes;
     return p;
@@ -413,22 +487,7 @@ int nsd_upload_wait(void* ctx) try {
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
 int nsd_trim(void* ctx) try {
-    auto& c = *static_cast<Ctx*>(ctx);
-    c.q.wait();
-    if (c.cq) c.cq->wait();
-    auto drop = [&c](auto*& p, size_t& cap) {
-        if (p) sycl::free(p, c.q);
-        std::lock_guard<std::mutex> l(c.mem_mu);
-        c.mem_used -= cap * sizeof(*p);
-        p = nullptr;
-        cap = 0;
-    };
-    drop(c.xq, c.xq_cap); drop(c.rs, c.rs_cap); drop(c.gmax, c.gmax_cap); drop(c.xr, c.xr_cap); drop(c.acc, c.acc_cap);
-    drop(c.inv, c.inv_cap); drop(c.wq, c.wq_cap); drop(c.yq, c.yq_cap); drop(c.hq, c.hq_cap); drop(c.hk, c.hk_cap);
-    drop(c.hv, c.hv_cap); drop(c.sc, c.sc_cap); drop(c.ao, c.ao_cap); drop(c.part, c.part_cap); drop(c.rowv, c.rowv_cap);
-    drop(c.gn, c.gn_cap); drop(c.sq, c.sq_cap); drop(c.sk, c.sk_cap); drop(c.ss, c.ss_cap);
-    c.sdpa.clear(); c.sdpa_b.clear(); c.sdpa_qk.clear(); c.attn.clear(); c.gemm.clear(); c.rot.clear(); c.lin.clear();
-    c.conv3.clear(); c.conv3_w.clear(); c.conv2.clear(); c.conv3x.clear();
+    evict(*static_cast<Ctx*>(ctx));
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
@@ -441,10 +500,20 @@ void nsd_destroy(void* ctx) {
         std::fprintf(stderr, "h3sycl: int8 linear, %lld row chunks: rotation %.1f ms, row scales %.1f, quantize %.1f, int8 GEMM %.1f\n",
                      (long long) c->lin_calls, c->lin_ms[0], c->lin_ms[1], c->lin_ms[2], c->lin_ms[3]);
     for (void* p : {(void*) c->xq, (void*) c->rs, (void*) c->gmax, (void*) c->xr, (void*) c->acc, c->had[0], c->had[1], c->had[2],
-                    (void*) c->inv, (void*) c->wq, (void*) c->yq, (void*) c->hq, (void*) c->hk, (void*) c->hv, (void*) c->sc, (void*) c->ao, (void*) c->part, (void*) c->rowv})
+                    (void*) c->inv, (void*) c->wq, (void*) c->yq, (void*) c->hq, (void*) c->hk, (void*) c->hv, (void*) c->sc, (void*) c->ao, (void*) c->part, (void*) c->rowv,
+                    (void*) c->gn, (void*) c->sq, (void*) c->sk, (void*) c->ss})
         if (p) sycl::free(p, c->q);
     for (auto& [p, n] : c->mem) sycl::free(p, c->q);
     delete c;
+    // oneDNN's process-wide caches keep this context's primitives - and through them its engine, its SYCL context and
+    // that context's kernels and memory - after the context is gone: a context made for one clip (the vision tower's,
+    // every ref2va clip) would stay on the card for good. Emptied here; the live contexts' own maps keep theirs.
+    const int cap = dnnl::get_primitive_cache_capacity();
+    dnnl::set_primitive_cache_capacity(0);
+    dnnl::set_primitive_cache_capacity(cap);
+    const int gcap = dnnl::graph::get_compiled_partition_cache_capacity();
+    dnnl::graph::set_compiled_partition_cache_capacity(0);
+    dnnl::graph::set_compiled_partition_cache_capacity(gcap);
 }
 
 // Rotation, row scale and quantization in one kernel, for groups of 256 (the int8_convrot checkpoints): reads the

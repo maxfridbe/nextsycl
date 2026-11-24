@@ -100,6 +100,10 @@ impl Device {
     pub fn mem_used(&self) -> u64 {
         unsafe { (self.api.mem_used)(self.ctx) }
     }
+    /// The part of `mem_used` that is the kernels' scratch: grown to the largest call so far, reused by the next ones
+    pub fn mem_scratch(&self) -> u64 {
+        unsafe { (self.api.mem_scratch)(self.ctx) }
+    }
     pub fn mem_cap(&self) -> u64 {
         unsafe { (self.api.mem_cap)(self.ctx) }
     }

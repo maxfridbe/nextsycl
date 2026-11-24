@@ -1558,6 +1558,10 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     }
     let shape = Shape { t: lt, h: c.height / 16, w: c.width / 16, audio_t: at };
     ctl.say(format!("clip   : {}x{}, {frames} frames ({:.2} s), {} steps, seed {}", c.width, c.height, frames as f64 / 24.0, c.steps, c.seed));
+    // a clip too long for the card even without its text and references is refused before anything loads
+    if c.mpeg.is_none() && c.refine.is_none() {
+        fit_clip(e, frames, c.width, c.height, 0, c.vaes.video, false, ctl)?;
+    }
     // MPEG-Diffusion: the denoiser runs at half resolution, the full-res rows join it after the switch (mpeg.rs)
     let run_shape = match &c.mpeg {
         Some(_) => {
@@ -1702,6 +1706,13 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
             Some(net)
         }
     };
+    // the card's room for the sequence, before any of it is made: refused here with the longest clip that fits, or
+    // the MLP in row chunks when that is what fits
+    if c.mpeg.is_none() {
+        let tokens = cond.layout(ids.len(), run_shape)?.tokens();
+        let other = tokens - clip_rows(run_shape);
+        cond.mlp_rows = fit_clip(e, frames, c.width, c.height, other, c.vaes.video, true, ctl)?;
+    }
     // vision blocks run on the video tables (tag 0), the rest on the text ones
     let tags = presented.has_vision().then(|| presented.tags.clone());
     let mut d = Denoiser::new(&e.model, &e.outer, text, tags, run_shape, schedule, &cond)?;
@@ -1857,7 +1868,67 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     rep["sample_seconds"] = json!(sample_secs);
     rep["total_seconds"] = json!(total);
     ctl.say(format!("clip   : {} in {total:.1} s", out.display()));
+    ctl.say(memory_line(&e.dev, "after the clip"));
+    trim_if_grown(&e.dev, ctl)?;
     Ok(rep)
+}
+
+/// After a clip: the kernels' caches given back when they hold more than `budget::OUTSIDE_LIMIT` of the card outside the
+/// book (every clip's sequence is a new length and makes new primitives; they would otherwise pile up until the card
+/// refuses memory)
+fn trim_if_grown(dev: &Device, ctl: &mut Ctl) -> Result<()> {
+    let total = crate::device::Device::list().ok().and_then(|l| l.into_iter().find(|g| g.index == dev.index)).map(|g| g.mem_bytes);
+    if let (Some(total), Some(free)) = (total, dev.mem_free()) {
+        let outside = crate::budget::outside_book(total, free, dev.mem_used());
+        if crate::budget::should_trim(outside) {
+            let t0 = Instant::now();
+            dev.trim()?;
+            ctl.say(format!("memory : {:.2} GiB outside the book: the kernels' caches given back in {:.1} s ({})", gib(outside), t0.elapsed().as_secs_f64(),
+                            memory_line(dev, "now").trim_start_matches("memory : now: ")));
+        }
+    }
+    Ok(())
+}
+
+/// The clip's own rows in the sequence: its video's 2x2 patches and its sound's two rows a latent frame
+fn clip_rows(s: Shape) -> usize {
+    s.t * (s.h / 2) * (s.w / 2) + 2 * s.audio_t
+}
+
+/// The card's memory as the engine sees it: its book, the cap, the card's free memory
+pub fn memory_line(dev: &Device, when: &str) -> String {
+    let free = dev.mem_free().map_or("-".into(), |f| format!("{:.2}", gib(f)));
+    format!("memory : {when}: {:.2} GiB in the book (cap {:.2}), {free} GiB free on the card", gib(dev.mem_used()), gib(dev.mem_cap()))
+}
+
+/// Whether a clip of `frames` at `width` x `height`, with `other` tokens beside it, fits on the card now (the kernels'
+/// caches given back first when that is what it takes): the MLP's rows at a time it runs with (None: all at once), or
+/// the refusal with the longest clip that fits. `say`: report the plan.
+#[allow(clippy::too_many_arguments)]
+fn fit_clip(e: &Engine, frames: usize, width: usize, height: usize, other: usize, vae: &Path, say: bool, ctl: &mut Ctl) -> Result<Option<usize>> {
+    use crate::budget;
+    let dev = &e.dev;
+    let cfg = &e.model.cfg;
+    let vae_file = std::fs::metadata(vae).map_or(0, |m| m.len());
+    let tokens = budget::clip_tokens(frames as f64 / 24.0, width, height, other);
+    let r = budget::reserve();
+    let room = || budget::room(dev.mem_cap(), dev.mem_used(), dev.mem_free(), r, dev.mem_scratch());
+    let mut have = room();
+    if budget::plan(cfg, tokens, vae_file, have).is_none() {
+        dev.trim()?;
+        have = room();
+    }
+    match budget::plan(cfg, tokens, vae_file, have) {
+        Some(p) => {
+            if say {
+                ctl.say(format!("memory : {tokens} tokens need about {:.1} GiB beside the model{}, {:.1} GiB can be had ({})", gib(p.need),
+                                if p.mlp_rows < tokens { format!(" with the MLP {} rows at a time", p.mlp_rows) } else { String::new() }, gib(have),
+                                memory_line(dev, "now").trim_start_matches("memory : now: ")));
+            }
+            Ok((p.mlp_rows < tokens).then_some(p.mlp_rows))
+        }
+        None => Err(Error(budget::too_long(cfg, frames, width, height, other, vae_file, have))),
+    }
 }
 
 /// A refine pass over a draft too long for one card: overlapping windows, each keeping the frames it shares with the

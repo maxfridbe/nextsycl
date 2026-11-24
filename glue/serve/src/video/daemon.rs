@@ -136,6 +136,24 @@ fn cancel_overdue(since: Option<f64>, grace: f64) -> bool {
 /// What run_job answers for a job sent back to the queue
 const MOVED: &str = "moved to another card";
 
+/// Whether a job's error is the card refusing memory (the kernels' `nsd_alloc`, the core's allocations, the runtime's
+/// out-of-memory): the worker's process may be holding memory it cannot give back, so the daemon recycles it. A clip
+/// refused up front as too long for the card (it says "too long for") is not: a fresh worker could not run it either.
+pub fn allocation_failure(err: &str) -> bool {
+    const MARKS: [&str; 7] = ["nsd_alloc:", "the device refused", "would pass the device memory cap", "would leave the card",
+                              "a scratch buffer of", "OUT_OF_DEVICE_MEMORY", "out of device memory"];
+    !err.contains("too long for") && MARKS.iter().any(|m| err.contains(m))
+}
+
+/// Whether the worker that sent this failed result is ended after it (a graceful exit: it unloads, its process and all
+/// its memory go) so the next job on the card starts a fresh one - 2026-11-23: a B70 worker refused memory on every
+/// clip after its 30th until it was unloaded by hand. A worker says so itself (`"recycle": true`); an older one's
+/// error is read. A cancel never recycles.
+fn recycle_after(ev: &Value) -> bool {
+    ev["ok"] != true && ev["cancelled"] != true
+        && (ev["recycle"] == true || ev["error"].as_str().is_some_and(allocation_failure))
+}
+
 /// The cards the door says a pin or hold has taken. A door that does not answer: none (the job waits where it lands, as it did).
 fn door_blocked(door: &str) -> Vec<usize> {
     http::call_for(&http::Target::Tcp(door.to_string()), "GET", "/video/blocked", None, 5).ok()
@@ -574,6 +592,11 @@ impl Daemon {
                 Ok(ev) => match ev["event"].as_str() {
                     Some("log") => self.log_job(id, ev["line"].as_str().unwrap_or("").to_string()),
                     Some("result") if ev["job"].as_u64() == Some(id) => {
+                        if recycle_after(&ev) {
+                            self.log_job(id, "engine : the card refused memory - the engine process is recycled: it exits, the next job starts a fresh one"
+                                .to_string());
+                            self.end_worker(k, proc, false);
+                        }
                         return if ev["ok"].as_bool() == Some(true) {
                             Ok(ev["value"].clone())
                         } else {
@@ -1094,6 +1117,30 @@ mod chat_hook_tests {
 
     fn seat(gpu: usize, shared: bool, free: bool) -> Seat {
         Seat { gpu, shared, free }
+    }
+
+    #[test]
+    fn a_worker_the_card_refused_memory_is_recycled() {
+        // 2026-11-23's errors, as an older worker sent them (no flag): every one recycles
+        for e in ["nsd_alloc: the device refused 28 MiB", "nsd_alloc: the device refused 2281 MiB",
+                  "nsd_alloc: 2066 MiB would pass the device memory cap (28000 of 30700 MiB in use)",
+                  "nsd_alloc: 224 MiB would leave the card 1200 MiB free, under the 1536 MiB kept free (20000 MiB in this engine's book)",
+                  "a scratch buffer of 900 MiB would pass the device memory cap (29000 of 30700 MiB in use)",
+                  "allocating 100 bytes on B70: UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY"] {
+            assert!(allocation_failure(e), "{e}");
+            assert!(recycle_after(&json!({"event": "result", "job": 1, "ok": false, "error": e})), "{e}");
+        }
+        // the worker's own word
+        assert!(recycle_after(&json!({"event": "result", "job": 1, "ok": false, "error": "anything", "recycle": true})));
+        // a clip refused up front as too long: a fresh worker cannot run it either - the worker stays
+        let long = "328 frames at 832x480 are too long for this card: the clip needs about 12.1 GiB, 9.8 GiB can be had; at most 260 frames (10.8 s) fit";
+        assert!(!allocation_failure(long));
+        assert!(!recycle_after(&json!({"event": "result", "job": 1, "ok": false, "error": long})));
+        // other failures, a success, a cancel: the worker stays
+        assert!(!recycle_after(&json!({"event": "result", "job": 1, "ok": false, "error": "ref_images: no such file"})));
+        assert!(!recycle_after(&json!({"event": "result", "job": 1, "ok": true, "value": {}})));
+        assert!(!recycle_after(&json!({"event": "result", "job": 1, "ok": false, "error": "nsd_alloc: the device refused 28 MiB", "cancelled": true})));
+        assert!(!recycle_after(&json!({"event": "result", "job": 1, "ok": false, "error": "cancelled", "recycle": false})));
     }
 
     #[test]

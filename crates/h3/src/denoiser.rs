@@ -383,6 +383,20 @@ pub enum RefIn {
     Video { latent: Vec<f32>, t: usize, h: usize, w: usize, audio: Option<(Vec<f32>, usize)> },
 }
 
+impl Conditions {
+    /// The sequence a denoiser for these conditions holds: `text_len` text tokens, the keyframes and references, the
+    /// clip of `shape` (its length, `tokens()`, is what the card's memory goes by - before anything is allocated)
+    pub fn layout(&self, text_len: usize, shape: Shape) -> Result<Layout> {
+        let kfs: Vec<crate::layout::Keyframe> = self
+            .keyframes
+            .iter()
+            .map(|k| crate::layout::Keyframe { frame_index: k.frame_index as f64, video_latent_t: k.video.as_ref().map(|v| v.1), audio_latent_t: k.audio.as_ref().map(|a| a.1) })
+            .collect();
+        let refs: Vec<crate::layout::RefBlock> = self.refs.iter().map(RefIn::block).collect();
+        Layout::new(text_len, shape.t, shape.h, shape.w, shape.audio_t, &kfs, &refs)
+    }
+}
+
 impl RefIn {
     fn block(&self) -> crate::layout::RefBlock {
         use crate::layout::RefBlock;
@@ -482,13 +496,7 @@ impl<'a> Denoiser<'a> {
     pub fn new(blocks: &'a Blocks, outer: &'a Outer, text: Tensor, text_tags: Option<Vec<i32>>, shape: Shape, schedule: Schedule, cond: &Conditions) -> Result<Denoiser<'a>> {
         let cfg = &blocks.cfg;
         let dev = text.buf.device().clone();
-        let kfs: Vec<crate::layout::Keyframe> = cond
-            .keyframes
-            .iter()
-            .map(|k| crate::layout::Keyframe { frame_index: k.frame_index as f64, video_latent_t: k.video.as_ref().map(|v| v.1), audio_latent_t: k.audio.as_ref().map(|a| a.1) })
-            .collect();
-        let refs: Vec<crate::layout::RefBlock> = cond.refs.iter().map(RefIn::block).collect();
-        let layout = Layout::new(text.shape[0], shape.t, shape.h, shape.w, shape.audio_t, &kfs, &refs)?;
+        let layout = cond.layout(text.shape[0], shape)?;
         // the keyframes' rows: patches (or stereo rows) through the projections once, the augmentation noise drawn
         // from the seed afresh for every keyframe (the reference restarts the same stream each time; audio rows
         // from seed + 1)

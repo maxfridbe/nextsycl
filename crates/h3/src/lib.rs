@@ -7,6 +7,7 @@
 //! engine of the models built on H3 (`image/ph3image`, P-H3-Image: one latent frame of the same denoiser).
 
 pub mod audio;
+pub mod budget;
 pub mod control;
 pub mod denoiser;
 pub mod device;
