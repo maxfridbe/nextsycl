@@ -1698,7 +1698,7 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     let c_steps = pi.map_or(c.steps, |p| p.steps);
     if let Some(p) = pi {
         let i = &c.inputs;
-        if !i.ref_images.is_empty() || !i.ref_videos.is_empty() || !i.ref_audio.is_empty() {
+        if !p.refs && (!i.ref_images.is_empty() || !i.ref_videos.is_empty() || !i.ref_audio.is_empty()) {
             return Err(Error("pi-H3 is H3's FL2VA model distilled: a prompt, a first frame, a last frame - no reference pictures, clips or voices \
                               (ref2va needs the full H3 models)".into()));
         }

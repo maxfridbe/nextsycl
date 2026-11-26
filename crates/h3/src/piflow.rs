@@ -71,6 +71,9 @@ pub struct Adapter {
     pub diffusers: bool,
     /// blocks whose matrices it replaced
     pub replaced: Vec<usize>,
+    /// EXPERIMENTAL (H3_PI_REFS=1): reference pictures, clips and voices are let through - the adapter over the Ref2VA
+    /// denoiser, which it was not trained on (docs/ports/pi-h3.md "Over Ref2VA")
+    pub refs: bool,
 }
 
 impl Adapter {
@@ -219,7 +222,7 @@ pub fn apply(e: &mut Engine, path: &Path, steps: Option<usize>, log: &mut dyn Fn
         }
     }
     e.dev.wait()?;
-    Ok(Adapter { path: path.to_path_buf(), steps, lora, dwd, has_dwd, diffusers, replaced })
+    Ok(Adapter { path: path.to_path_buf(), steps, lora, dwd, has_dwd, diffusers, replaced, refs: false })
 }
 
 #[cfg(test)]
