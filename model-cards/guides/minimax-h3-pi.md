@@ -45,4 +45,7 @@ well as on Ref2VA; a locked camera pushes in, the details of a place picture go,
 looser. 5.5x (2 steps) and 3.4x (4 steps) faster than Ref2VA at 15 steps. Use them to look at a shot fast; render the
 film's clips with `minimax-h3-ref2va`.
 
+Dialogue: lip sync holds - measured with SyncNet and Whisper on four talking shots (docs/ports/pi-h3.md "Lip sync"), every
+pi card as in sync and as intelligible as its base at 15 steps; write the line in the prompt as for H3.
+
 Everything in the MiniMax H3 guide about prompts (speech rate, sound, hands, negations, chaining clips) holds here.

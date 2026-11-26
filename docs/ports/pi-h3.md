@@ -277,6 +277,53 @@ holds, the camera, place pictures and carried guides drift. Ref2VA's inputs (ref
 ControlNet and masked runs are refused. Not for the films' final renders, where Ref2VA at 15-20 steps keeps the camera,
 the place and the cut's carried frames.
 
+## Lip sync
+
+H3 makes the picture and the sound together, so a talking shot's mouth has to match the voice it makes. Four talking shots,
+832x480, each with the same seed on every model (`reference/pi-h3/lipsync.py`, `lipreport.py`; B65, one run at a time):
+**A** a close-up of a woman saying one line (5.2 s), **B** a medium shot of a man at a desk (5.2 s), **C** a two-person
+exchange on a park bench, both in three-quarter profile (6.6 s), **D** a man from a reference picture (`<Picture 1>`) on a
+ship's deck (5.2 s). The prompts carry the spoken line in `<d>[English] ...</d>` as the H3 guide says. A, B and D were run
+again with a second seed (A2, B2, D2). A, B, C ran on FL2VA H3 at 15 steps, pi-H3 4 and 2 steps, Ref2VA at 15 steps and
+the experimental pi-H3 over Ref2VA; D only on the Ref2VA three.
+
+- **Sync**: SyncNet (Chung & Zisserman; joonson/syncnet_python 907c0b57, `syncnet_v2.model` and the S3FD face detector
+  from ByteDance/LatentSync-1.5 @32a20d29, sha256 961e8696... / d54a87c2...), the pipeline's face crop on S3FD boxes, the
+  AV offset (frames at 25 fps) and confidence (median distance less the best; a good sync is offset within +-2 and
+  confidence above ~3, studio footage 5-10). Checked: the same clip with its sound delayed 200 ms moved the offset by 5
+  frames (-1 to -6). In the two-shot each speaker is scored only over its own line (spans from that clip's Whisper words).
+- **Intelligibility**: Whisper large-v3-turbo (this repo's engine, `nextsycl audio transcribe` in the build copy, B65),
+  word error rate against the scripted line (jiwer, lower case, no punctuation; "harbor" = "harbour").
+
+| shot | H3 FL2VA 15 | pi 4 | pi 2 | Ref2VA 15 | pi 4 over Ref2VA | pi 2 over Ref2VA |
+|---|---|---|---|---|---|---|
+| A | -1 / 5.83 | -2 / 5.07 | -1 / 4.92 | -1 / 6.33 | -1 / 5.50 | 0 / 6.22 |
+| A2 | -1 / 7.42 | -2 / 4.74 | 0 / 6.19 | 0 / 8.64 | 0 / 6.97 | 0 / 7.97 |
+| B | -2 / 7.70 | -2 / 5.14 | -1 / 6.84 | -1 / 3.38 | -1 / 6.86 | -1 / 6.83 |
+| B2 | -2 / 5.12 | -2 / 5.09 | -1 / 6.47 | -2 / 3.87 | -1 / 7.07 | -1 / 7.28 |
+| C her line | -1 / 4.85 | -1 / 3.45 | -2 / 4.54 | 12 / 1.57 (no lock) | -1 / 2.96 | -2 / 4.56 |
+| C his line | -1 / 2.56 | -2 / 4.73 | -1 / 5.89 | 0 / 2.00 | -1 / 3.60 | -2 / 4.60 |
+| D (reference) | | | | -1 / 7.45 | -1 / 9.29 | -1 / 8.74 |
+| D2 (reference) | | | | -1 / 9.14 | -1 / 8.87 | -2 / 9.44 |
+| mean confidence, one speaker | 6.52 (A-B2) | 5.01 | 6.11 | 6.47 (A-D2) | 7.43 | 7.75 |
+| word error rate | 0 everywhere | 0 | 0 | 0 | 0 | 0 |
+| time a clip, B65 (s) | 160-223 | 48-74 | 30-46 | 159-223 | 47-67 | 29-46 |
+
+(offset in frames / confidence). Every clip of every model was heard word for word by Whisper (WER 0.00 on all 36), and
+every offset but one is within 0 to -2 frames (0-80 ms, the sound a hair late, the same on every model, so a property of
+H3 rather than of the distillation). The one miss is Ref2VA's own 15-step two-shot: her line has no SyncNet lock (offset
+12, confidence 1.6) - both speakers are in profile, the hardest case for SyncNet, and the pi versions of the same shot lock.
+pi-H3 4 steps on FL2VA scores lowest of the six on the single-speaker shots (5.0 against the base's 6.5) but well inside a
+good sync; the run-to-run spread of one model is as large (Ref2VA 3.4-8.6 over seeds and shots). The mouth sheets look
+alike: the same closures on "table", "meeting" and "pocket" and the same openings on "harbour" and "dark" in every row; the
+pi rows are warmer and darker in colour (the DWD head's look, above) and the faces differ between models as any seed does.
+
+Verdict: pi-H3's lip sync is as good as its base's. On FL2VA, 2 steps matches H3 at 15 steps (6.1 vs 6.5) and 4 steps is
+a little lower (5.0) but in sync; over Ref2VA both pi cards score at or above Ref2VA at 15 steps (7.4 / 7.8 vs 6.5),
+including the shot with a reference picture of the speaker. Intelligibility is perfect on all of them. Four shots and two
+seeds are a small sample, profile two-shots are poorly measured by SyncNet, and no shot here had a voice reference
+(`<Audio 1>`) or a long line.
+
 ## Open
 
 - Ref2VA: the adapters over the Ref2VA denoiser keep the subject references but drift in camera and place ("Over Ref2VA");
