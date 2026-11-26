@@ -30,7 +30,7 @@ cards; `SHA256SUMS` beside them).
 |---|---|
 | a prompt (H3's three-field format) | yes |
 | a first frame, a last frame, both (`first_frame`, `last_frame`) | yes - what the adapters were distilled for (pi-H3's README: "text, first-frame, and last-frame conditioning") |
-| reference pictures, clips, voices (`ref_images`, `ref_videos`, `ref_audios`: **ref2va**) | **no.** The adapters are trained on the FL2VA transformer, not Ref2VA's (`transformer_ref`); LakonLab and ComfyUI-piFlow load them only into the FL2VA model. The engine and the studio refuse references with pi-H3 (a 400 that names REF2VA) |
+| reference pictures, clips, voices (`ref_images`, `ref_videos`, `ref_audios`: **ref2va**) | **no.** The adapters are trained on the FL2VA transformer, not Ref2VA's (`transformer_ref`); LakonLab and ComfyUI-piFlow load them only into the FL2VA model. The engine and the studio refuse references with pi-H3 (a 400 that names REF2VA). Experimentally, `H3_PI_REFS=1` over the Ref2VA denoiser lets them through: the subject holds, the camera and the place drift ("Over Ref2VA" below) |
 | motion guides, a carried sound, a soundtrack (`guide_clip`, `first_audio`, `soundtrack`) | they run (the same keyframe rows as a first frame) but were not checked against pi-H3's reference |
 | ControlNet, masked regeneration, MPEG-Diffusion, a refine pass, knots, other samplers | refused |
 | extra LoRAs (`loras`) | run beside the adapter's |
@@ -193,9 +193,93 @@ mounts say.
 - **DWD's norm folds into the expansion**: one timestep for every video row, so the LayerNorm's scale and shift become
   feature_expand's weights and bias for the clip - one product instead of a norm, a modulation and a product.
 
+## Over Ref2VA (experimental)
+
+The platform's films use reference pictures (ref2va), which the FL2VA adapters were not trained for. The experiment: the
+2- and 4-step DWD adapters loaded over the **Ref2VA** denoiser (`minimax_h3_ref2va_pruned_int8_convrot`) with two
+experimental engine options - `H3_PI_REFS=1` lets references through, `H3_PI_CURVE=<the FL2VA checkpoint>` puts FL2VA's
+timestep curve under the adapter's AdaLN projections - in registry entries of the build copy only (no card).
+
+### What the adapter replaces, and how far Ref2VA is from FL2VA there
+
+`reference/pi-h3/ref2va_diff.py`, both bases un-rotated, relative distances:
+
+| Part | Ref2VA vs FL2VA | adapter vs FL2VA |
+|---|---|---|
+| AdaLN projections on the curve [96768, 8], 50 blocks | 1.86 (median) - **but in another basis**: the modulation they give, W c(t) + b at t = 0.007 / 0.13 / 0.5 / 0.9 / 0.999, differs by 0.035 (median; max 0.053) | modulation 0.003 (median), up to 0.21 (blocks 46-49, the last steps' t) |
+| `adaln_t_table` (the 8-point curve) | 0.018 | (none in the adapter: FL2VA's) |
+| blocks 46-49 out_proj / fc1 / fc2 (replaced) | 0.020-0.034 | 0.028-0.24 (block 49's fc2 the most) |
+| the other blocks' matrices (LoRA'd) | 0.025-0.036 | the LoRA update 0.006-0.016 |
+| final layer (replaced) | AdaLN 1.92 in the basis / bias 0.033, norm 0.033, video_out 0.050, audio_out 0.078 | 0.028-0.079 |
+
+So Ref2VA is a fine-tune of FL2VA about 3% away in every matrix - two to five times the adapter's LoRA updates (0.6-1.6%),
+which were trained against FL2VA's matrices. The AdaLN projections look 186% apart only because each pruned checkpoint
+fits its own 8-coordinate curve; what they produce is 3.5% apart. The adapter replaces every projection, so its own (and
+FL2VA's curve, `H3_PI_CURVE`) is used throughout: the timestep conditioning is wholly the distilled model's, the matrices
+Ref2VA's plus the FL2VA-trained LoRAs.
+
+### The runs
+
+Five shots of the platform's recent ref2va jobs (two films: the space skimmer chase - four shots with a subject and a
+place picture, keyframes and motion guides - and a singer on a ship's deck - a person's picture, a motion guide; 10.125 s,
+832x480 / 896x512), copied read-only, each run on the B65 with its own prompt, references, keyframes and seed as
+production made it: Ref2VA at its served 15 steps, pi-H3 2 steps over Ref2VA, 4 steps over Ref2VA. Production's own clip
+of each (Ref2VA, made on the B70) is scored too: the spread of Ref2VA against itself.
+
+**Reference similarity** (`reference/pi-h3/refsim.py`: DINOv3 ViT-H+/16 CLS and SigLIP so400m pooled, each frame of 30, 60
+... 240 against each reference picture, cosine averaged over frames and references):
+
+| Shot (references) | Ref2VA (production, B70) | Ref2VA 15 steps (B65) | pi 2 steps | pi 4 steps |
+|---|---|---|---|---|
+| skimmer 222002 (ship) | 0.739 / 0.798 | 0.675 / 0.778 | 0.747 / 0.802 | 0.743 / 0.793 |
+| skimmer 214805 (ship, place) | 0.598 / 0.766 | 0.597 / 0.785 | 0.605 / 0.777 | 0.607 / 0.768 |
+| skimmer 124128 (ship, place) | 0.570 / 0.705 | 0.564 / 0.700 | 0.583 / 0.727 | 0.610 / 0.733 |
+| skimmer 123702 (ship, place) | 0.586 / 0.685 | 0.585 / 0.694 | 0.586 / 0.723 | 0.588 / 0.727 |
+| singer 212510 (the man) | **0.937 / 0.897** | **0.917 / 0.888** | 0.871 / 0.880 | 0.891 / 0.882 |
+
+(DINOv3 / SigLIP.) The ship's own picture alone: Ref2VA 0.662-0.758, pi 0.704-0.765 (DINOv3).
+
+**The motion guide** (PSNR of the first 22 frames against the guide clip's last 22, which they carry in): Ref2VA 40.4 /
+30.3 / 35.2 dB (shots 124128 / 123702 / 212510), pi 2 steps 33.8 / 27.2 / 29.5, pi 4 steps 37.1 / 29.2 / 32.6.
+
+**Time** (B65, the whole job): Ref2VA 442 / 445 / 496 / 497 / 588 s; pi 2 steps 78 / 78 / 94 / 98 / 107 s (5.5x); pi 4
+steps 133 / 133 / 154 / 155 / 173 s (3.4x). Card peak 26.0-27.5 GB for all three.
+
+**Sound**: present in every clip, -11.9 to -14.8 LUFS (Ref2VA -12.5 to -14.5); the singer's song has the same two sung
+phrases with their harmonics at the same places in all three versions (spectrograms stacked).
+
+**By eye** (contact sheets on hardac1, `~/src/pih3/look/sheet_<shot>.png`: the references, then frames 30 / 100 / 170 / 240
+of each version):
+
+- **The subject holds.** The skimmer's design (wings, twin engines, cyan and magenta edge lights) is the reference's in
+  every pi frame; the singer's face, hair and purple shirt stay his.
+- **The scene and the camera drift.** Ref2VA keeps the locked chase camera and the place picture (the ringed planet with
+  its moons comes back in shot 123702's last frames); pi pushes in toward the planet, the rings and moons drop out, the
+  night-side city lights turn to a daylit surface of high-contrast "swirl" clouds - a texture pi adds where Ref2VA's
+  planet is photographic. On the singer, Ref2VA holds the medium shot as asked ("one continuous shot", the frame
+  matching the reference); pi moves the camera in to a closer shot and puffs his hair up (the DINOv3 drop: framing, not
+  identity).
+- **The carried frames are looser** (2-6 dB below Ref2VA), the 4-step adapter closer than the 2-step.
+
+### Verdict
+
+pi-H3 over Ref2VA **keeps the subject references** - the scores are inside the spread between two Ref2VA runs of the same
+shot for the skimmer, a few points under for the singer, and by eye the ship and the man are theirs - at 5.5x (2 steps)
+and 3.4x (4 steps) the speed. It **follows the prompt's camera and the place reference less**: shots drift toward a
+closer, livelier framing, the place picture's details go, and the motion guide is carried in less exactly. The
+mismatch has a cause in the weights: Ref2VA's matrices are ~3% from FL2VA's, the adapter's LoRAs ~1%, so its distilled
+corrections are applied to a model they were not fitted to.
+
+Proposed, not added: two **experimental** cards, `minimax-h3-pi-4step-ref2va` (and `-2step-ref2va`), over the Ref2VA files
+with `H3_PI_REFS: '1'` and `H3_PI_CURVE: '{curve}'` (a `curve` role naming the FL2VA denoiser file), for drafts of
+reference shots - a fast first look where the subject matters and the exact framing does not - not for the films' final
+renders, where Ref2VA at 15-20 steps keeps the camera, the place and the cut's carried frames. Five shots of two films are
+a small sample: a person in a busier scene, several people, and dialogue would need their own look before relying on it.
+
 ## Open
 
-- Ref2VA: not possible with these adapters (see above); a Ref2VA pi-H3 would need adapters trained on `transformer_ref`.
+- Ref2VA: the adapters over the Ref2VA denoiser keep the subject references but drift in camera and place ("Over Ref2VA");
+  adapters trained on `transformer_ref` would be the real fix.
 - Guide clips, a carried sound and a soundtrack run but were not compared with a pi-H3 reference.
 - The DWD head reads the last hidden states through host memory (1.5 GB at 1344x768 x 10 s): kept on the card it would
   save that copy at the cost of room during the last step.
