@@ -1,0 +1,38 @@
+# MiniMax H3 pi-H3 2-step, VAE decoder (int8 denoiser + Lakonik's 2-step adapter without DWD; H3's video decoder)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# Lakonik/pi-H3's `pi_h3_2step_adapter` (Diffusers layout, float16): rank-64 LoRAs on every block, every block's AdaLN
+# projection and the final layer, merged into our int8 FL2VA denoiser at load (crates/h3/src/piflow.rs); 2 steps of
+# LakonLab's Euler (max_raw_t 0.93, final step 0.6), then H3's video decoder on the latents. The DWD cards
+# (minimax-h3-pi-2step) are the recommended ones; this one keeps the decoder's look. Conditioning: a prompt, a first frame,
+# a last frame - NOT reference pictures, clips or voices (ref2va).
+id: minimax-h3-pi-2step-vae
+kind: video
+arch: minimax-h3
+title: 'MiniMax H3 pi-H3, 2 steps, VAE decoder (int8: text, first and last frame to video with sound; no reference pictures)'
+about: Lakonik's pi-H3 2-step adapter (no DWD) on the int8 FL2VA H3 - 2 denoiser steps, H3's video and audio decoders; a prompt, a first frame and a last frame (no ref2va references)
+license: minimax-h3-community
+commercial: true
+license_note: 'pi-H3''s adapters are Model Derivatives of MiniMax H3 (Hansheng Chen et al.; LakonLab), distributed under the MiniMax H3 Community License Agreement, as are H3''s denoiser, VAEs and the Qwen3-VL-32B text encoder as MiniMax ships it (Comfy-Org''s repack; the GGUF unsloth''s): not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; products show "Powered by MiniMax H3"; its Acceptable Use Policy; outputs may not improve another model. Keep pi-H3''s NOTICE with copies. The encoder underneath is Qwen3-VL-32B (Apache-2.0); the Qwen2.5 tokenizer files come from ComfyUI''s GPL-3.0 repository. Not an official MiniMax product.'
+gpus: '0'
+defaults:
+  steps: 2
+  seconds: 5.0
+  size: 832x480
+env:
+  H3_PI_STEPS: '2'
+files:
+  denoiser: h3-denoiser-int8
+  text-encoder: h3-te-32b-q4km
+  tokenizer: h3-tokenizer-vocab
+  tokenizer-merges: h3-tokenizer-merges
+  tokenizer-config: h3-tokenizer-config
+  vae: h3-vae
+  audio-vae: h3-audio-vae
+  vision: h3-te-visual
+  adapter:
+    key: pi-h3-2step-vae-fp16
+    url: https://huggingface.co/Lakonik/pi-H3/resolve/4a864589b0fac3d14768f932c930c4dcf1a17b56/pi_h3_2step_adapter/diffusion_pytorch_model.safetensors
+    size: 503383808
+    sha256: 2602688b12e2763fdbc1ad7e0c626b83942fbda511050f266a49dbcdc1db5f02
+    path: pi-h3/pi_h3_2step_adapter/diffusion_pytorch_model.safetensors
+guide: guides/minimax-h3-pi.md

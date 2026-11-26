@@ -1,0 +1,40 @@
+# MiniMax H3 pi-H3 2-step DWD (int8: video with sound in 2 steps, the frames straight from the denoiser - no VAE decode)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# Lakonik/pi-H3 (Stanford / Luma AI; LakonLab): MiniMax H3's FL2VA model distilled with pi-Flow v2 to 2 steps, with DWD
+# ("Decoding Without a Decoder") - at the last step the denoiser's own hidden states become the frames through a head of 8
+# Sol-H3 decoder layers, so H3's video decoder never runs. The adapter (ComfyUI's int8 ConvRot file) is merged into our
+# int8 FL2VA denoiser at load (crates/h3/src/piflow.rs, dwd.rs; docs/ports/pi-h3.md): rank-64 LoRAs on 46 blocks, every
+# block's AdaLN projection, blocks 46-49 and the final layer whole, the DWD head (int8). LakonLab's Euler from the noise
+# itself on max_raw_t 0.93 / final step 0.6 (shift 12, the audio's 3), no CFG. Conditioning: a prompt, a first frame, a
+# last frame (first_frame / last_frame) - NOT reference pictures, clips or voices (ref2va: the minimax-h3-ref2va card).
+id: minimax-h3-pi-2step
+kind: video
+arch: minimax-h3
+title: 'MiniMax H3 pi-H3, 2 steps (int8 + DWD: text, first and last frame to video with sound; no reference pictures)'
+about: Lakonik's pi-H3 2-step DWD adapter on the int8 FL2VA H3 - 2 denoiser steps, the frames from the denoiser's last hidden states (no VAE decode), stereo sound from H3's audio decoder; a prompt, a first frame and a last frame (no ref2va references)
+license: minimax-h3-community
+commercial: true
+license_note: 'pi-H3''s adapters are Model Derivatives of MiniMax H3 (Hansheng Chen et al.; LakonLab), distributed under the MiniMax H3 Community License Agreement, as are H3''s denoiser, VAEs and the Qwen3-VL-32B text encoder as MiniMax ships it (Comfy-Org''s repack; the GGUF unsloth''s): not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; products show "Powered by MiniMax H3"; its Acceptable Use Policy; outputs may not improve another model. Keep pi-H3''s NOTICE with copies. The encoder underneath is Qwen3-VL-32B (Apache-2.0); the Qwen2.5 tokenizer files come from ComfyUI''s GPL-3.0 repository. Not an official MiniMax product.'
+gpus: '0'
+defaults:
+  steps: 2
+  seconds: 5.0
+  size: 832x480
+env:
+  H3_PI_STEPS: '2'
+files:
+  denoiser: h3-denoiser-int8
+  text-encoder: h3-te-32b-q4km
+  tokenizer: h3-tokenizer-vocab
+  tokenizer-merges: h3-tokenizer-merges
+  tokenizer-config: h3-tokenizer-config
+  vae: h3-vae
+  audio-vae: h3-audio-vae
+  vision: h3-te-visual
+  adapter:
+    key: pi-h3-2step-dwd-int8
+    url: https://huggingface.co/Lakonik/pi-H3/resolve/4a864589b0fac3d14768f932c930c4dcf1a17b56/pi_h3_2step_dwd_adapter_int8_convrot.safetensors
+    size: 2192176240
+    sha256: ef98527409eee4eaec8183265f4ee22d265680524237fae7149dbc203e11e739
+    path: pi-h3/pi_h3_2step_dwd_adapter_int8_convrot.safetensors
+guide: guides/minimax-h3-pi.md

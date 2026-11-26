@@ -138,6 +138,9 @@ fn clip_model(row: &Value, all: &[Value]) -> Option<String> {
     } else if engine == "MPEG" {
         // asked for by name: its own model whatever the clip carries (the studio refuses references with it)
         id_with("mpeg")
+    } else if crate::video::studio::queue::pi_steps(&engine).is_some() {
+        // pi-H3's (PI2, PI4, PI2-VAE, PI4-VAE): the model whose id the studio names so
+        on.iter().find(|m| crate::video::studio::queue::quant_of(&s(m, "id")) == engine).map(|m| s(m, "id"))
     } else if engine == "REF2VA" || row["ref_images"].is_array() || row["ref_videos"].is_array() {
         id_with("ref2va")
     } else if engine.is_empty() || engine == "INT8" || engine == "Q8_0" {
@@ -808,6 +811,11 @@ mod tests {
         let all = vec![json!({"id": "minimax-h3", "kind": "video"}), json!({"id": "minimax-h3-ref2va", "kind": "video"})];
         assert_eq!(clip_model(&json!({"engine": "INT8"}), &all).as_deref(), Some("minimax-h3"));
         assert_eq!(clip_model(&json!({"engine": "REF2VA"}), &all).as_deref(), Some("minimax-h3-ref2va"));
+        let pis: Vec<Value> = ["minimax-h3", "minimax-h3-pi-2step-vae", "minimax-h3-pi-2step", "minimax-h3-pi-4step"].iter()
+            .map(|id| json!({"id": id, "kind": "video", "arch": "minimax-h3", "enabled": true})).collect();
+        assert_eq!(clip_model(&json!({"engine": "PI2"}), &pis).as_deref(), Some("minimax-h3-pi-2step"));
+        assert_eq!(clip_model(&json!({"engine": "PI2-VAE"}), &pis).as_deref(), Some("minimax-h3-pi-2step-vae"));
+        assert_eq!(clip_model(&json!({"engine": "PI4"}), &pis).as_deref(), Some("minimax-h3-pi-4step"));
         assert_eq!(clip_model(&json!({}), &[]), None);
         // no engine: the daemon's default, wherever it stands in the registry
         let all = vec![json!({"id": "minimax-h3-ref2va", "kind": "video"}), json!({"id": "minimax-h3-q6k", "kind": "video"}), json!({"id": "minimax-h3", "kind": "video"})];

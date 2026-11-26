@@ -170,6 +170,16 @@ pub fn hv15_rules(engine: &str) -> Option<(f64, f64)> {
 /// HunyuanVideo-1.5's frame counts: 4k + 1, 5 s is 121 (what it was trained on), at most 10 s
 pub const HV15_FRAMES: (u64, u64) = (5, 241);
 
+/// pi-H3's engines (PI2, PI4: the DWD adapters; PI2-VAE, PI4-VAE: decoded by H3's VAE): the steps each adapter was
+/// distilled for - its default and its most (the engine runs those whatever a request asks) - or None
+pub fn pi_steps(engine: &str) -> Option<f64> {
+    match engine {
+        "PI2" | "PI2-VAE" => Some(2.0),
+        "PI4" | "PI4-VAE" => Some(4.0),
+        _ => None,
+    }
+}
+
 /// The request rules of the engines on HunyuanVideo-1.5's code (HV15..., MovieRoll's MR...): default and most steps,
 /// the frames (least, most) on a grid of `grid` frames + 1, the default canvas
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -331,6 +341,32 @@ fn ignored_keys() -> Vec<String> {
 /// references and the ControlNet besides
 pub const MPEG_NOT: [&str; 8] = ["ref_audios", "sampler", "schedule", "knots", "speed", "source", "regen", "regen_box"];
 
+/// The common keys pi-H3's engines refuse (crates/h3/src/jobs.rs `generate`: the FL2VA model distilled - a prompt, a
+/// first frame, a last frame; its own sampler); references and the ControlNet besides
+pub const PI_NOT: [&str; 8] = ["ref_audios", "sampler", "schedule", "knots", "speed", "source", "regen", "regen_box"];
+
+/// A queue item for a pi-H3 engine (PI2, PI4, PI2-VAE, PI4-VAE): what the distilled model does not take, refused here
+/// (a 400) rather than by the engine when the clip starts
+fn pi_check(it: &Map<String, Value>, engine: &str) -> Result<(), RpcError> {
+    let set = |k: &str| !it.get(k).is_none_or(|v| v.is_null() || v.as_str() == Some("") || v.as_array().is_some_and(|a| a.is_empty()));
+    if set("ref_images") || set("ref_videos") || set("ref_audios") {
+        return Err(RpcError::param(&format!("engine {engine} (pi-H3) is H3's FL2VA model distilled: a prompt, a first frame and a last frame - no reference \
+                                             pictures, clips or voices (ref_images, ref_videos, ref_audios need engine REF2VA)")));
+    }
+    for (k, what) in [("control_video", "a ControlNet"), ("control_mask", "a ControlNet mask"), ("source", "a masked run (source)"), ("regen", "a masked run (regen)"),
+                      ("knots", "knots"), ("speed", "a speed preset")] {
+        if set(k) {
+            return Err(RpcError::param(&format!("engine {engine} (pi-H3) takes no {k} ({what}): INT8 does")));
+        }
+    }
+    let euler = it.get("sampler").and_then(Value::as_str).is_none_or(|s| nextsycl_diffusion::Sampler::parse(s) == Some(nextsycl_diffusion::Sampler::Euler));
+    let shift = it.get("schedule").and_then(Value::as_str).is_none_or(|s| nextsycl_diffusion::Schedule::parse(s) == Some(nextsycl_diffusion::Schedule::Shift));
+    if !euler || !shift {
+        return Err(RpcError::param(&format!("engine {engine} (pi-H3) runs its own Euler schedule: no other sampler or schedule")));
+    }
+    Ok(())
+}
+
 /// A queue item for engine MPEG: what its two-track sampler does not run, refused here (a 400) rather than by the
 /// engine when the clip starts. Keyframes (first_frame, last_frame, guide_clip) and sound (first_audio, soundtrack)
 /// it takes.
@@ -373,6 +409,12 @@ pub fn inputs_of(quant: &str) -> Value {
                                              "control_end"].iter()).collect::<Vec<_>>(),
                "chosen": "by engine: a fast draft (half resolution, then full resolution on the subject the model picks); canvas sides multiples of 64",
                "ignored": ignored_keys()})
+    } else if pi_steps(quant).is_some() {
+        // pi-H3 (minimax-h3-pi-*): the FL2VA model in 2 or 4 steps; a prompt, a first and a last frame
+        json!({"takes": common.iter().filter(|k| !PI_NOT.contains(k)).collect::<Vec<_>>(),
+               "not": PI_NOT.iter().chain(["ref_images", "ref_videos", "control_video", "control_mask", "control_source", "control_strength", "control_start",
+                                           "control_end"].iter()).collect::<Vec<_>>(),
+               "chosen": "by engine: H3 in 2 or 4 steps (pi-H3); its steps are fixed", "ignored": ignored_keys()})
     } else if quant == "REF2VA" {
         json!({"takes": common.iter().chain(["ref_images", "ref_videos", "ref_image_size", "ref_video_sound", "te_pictures"].iter()).collect::<Vec<_>>(),
                "not": ["control_video", "control_mask", "control_source", "control_strength", "control_start", "control_end"],
@@ -443,6 +485,15 @@ pub fn quant_of(id: &str) -> &'static str {
             "480p-t2v-q8" => "HV15-CFG",
             "480p-i2v-step-distilled-q8" => "HV15-I2V",
             _ => "HV15",
+        };
+    }
+    // pi-H3's (H3 in 2 or 4 steps: minimax-h3-pi-2step, -pi-4step, and the -vae ones decoded by H3's VAE)
+    if let Some(rest) = id.strip_prefix("minimax-h3-pi-") {
+        return match rest {
+            "2step" => "PI2",
+            "4step" => "PI4",
+            "2step-vae" => "PI2-VAE",
+            _ => "PI4-VAE",
         };
     }
     // MovieRoll's (films up to 60 s on HunyuanVideo-1.5's code)
@@ -611,8 +662,16 @@ impl Studio {
             },
             None => it.insert("clip".into(), Value::Null),
         };
-        let (dsteps, max_steps) = hv.map_or((10.0, 40.0), |r| r.steps);
-        it.insert("steps".into(), num(p, "steps", dsteps, 1.0, max_steps, true)?);
+        // pi-H3: the adapter's own steps, whatever is asked (the engine runs them)
+        let (dsteps, max_steps) = match pi_steps(&requested) {
+            Some(n) => (n, n),
+            None => hv.map_or((10.0, 40.0), |r| r.steps),
+        };
+        let steps = match pi_steps(&requested) {
+            Some(n) => json!(n as i64),
+            None => num(p, "steps", dsteps, 1.0, max_steps, true)?,
+        };
+        it.insert("steps".into(), steps);
         it.insert("seed".into(), num(p, "seed", 0.0, -2147483648.0, 2147483648.0, true)?);
         it.insert("te".into(), json!(te));
         it.insert("title".into(), title_of(p));
@@ -684,6 +743,10 @@ impl Studio {
         // pictures and clips as references: the Ref2VA denoiser, the one trained for them (not when MPEG is asked for: its
         // two-track sampler runs the FL2VA denoiser)
         if it["ref_images"].is_array() || it["ref_videos"].is_array() {
+            if it["engine"].as_str().is_some_and(|e| pi_steps(e).is_some()) {
+                return Err(RpcError::param("pi-H3 (engines PI2, PI4) is H3's FL2VA model distilled: reference pictures and clips need engine REF2VA; drop them \
+                                            for pi-H3"));
+            }
             if it["engine"] == "MPEG" {
                 return Err(RpcError::param("REF2VA is not supported by MPEG yet: ref_images and ref_videos need engine REF2VA (or INT8 to have it chosen); drop them for MPEG"));
             }
@@ -809,6 +872,9 @@ impl Studio {
         it.insert("ref_image_size".into(), ris.map_or(Value::Null, |v| json!(v)));
         if it["engine"] == "MPEG" {
             mpeg_check(&it)?;
+        }
+        if let Some(e) = it["engine"].as_str().filter(|e| pi_steps(e).is_some()).map(str::to_string) {
+            pi_check(&it, &e)?;
         }
         Ok(Value::Object(it))
     }
@@ -1039,6 +1105,33 @@ mod tests {
         assert!(roll_events(Some(&json!([{"prompt": "", "seconds": 5}]))).is_err());
         assert!(roll_events(Some(&json!([{"prompt": "x", "seconds": 61}]))).is_err());
         assert!(roll_events(None).is_err());
+    }
+
+    /// pi-H3's models by id, their fixed steps, and what they refuse
+    #[test]
+    fn pi_engines_have_their_own_rules() {
+        use super::*;
+        assert_eq!(quant_of("minimax-h3-pi-2step"), "PI2");
+        assert_eq!(quant_of("minimax-h3-pi-4step"), "PI4");
+        assert_eq!(quant_of("minimax-h3-pi-2step-vae"), "PI2-VAE");
+        assert_eq!(quant_of("minimax-h3-pi-4step-vae"), "PI4-VAE");
+        assert_eq!((pi_steps("PI2"), pi_steps("PI4-VAE"), pi_steps("INT8")), (Some(2.0), Some(4.0), None));
+        let item = |extra: Value| {
+            let mut m = json!({"engine": "PI2", "first_frame": "a.png", "last_frame": "b.png"});
+            for (k, v) in extra.as_object().unwrap() {
+                m[k] = v.clone();
+            }
+            m.as_object().unwrap().clone()
+        };
+        assert!(pi_check(&item(json!({})), "PI2").is_ok());
+        assert!(pi_check(&item(json!({"sampler": "euler"})), "PI2").is_ok());
+        for bad in [json!({"ref_images": ["r.png"]}), json!({"ref_audios": ["v.wav"]}), json!({"control_video": "c.mp4"}), json!({"knots": "1000,0"}),
+                    json!({"sampler": "lcm"})] {
+            assert!(pi_check(&item(bad.clone()), "PI2").is_err(), "{bad}");
+        }
+        let i = inputs_of("PI4");
+        assert!(i["not"].as_array().unwrap().iter().any(|k| k == "ref_images"));
+        assert!(i["takes"].as_array().unwrap().iter().any(|k| k == "last_frame"));
     }
 
     #[test]
