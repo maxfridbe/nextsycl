@@ -642,6 +642,10 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
     let mut z = lat.video;
     let mut report = json!({});
     let latent_up = if vaes.pixel.is_some() || lat.paste.is_some() || lat.dwd.is_some() { None } else { vaes.upscale };
+    if lat.dwd.is_some() && vaes.upscale.is_some() && vaes.pixel.is_none() {
+        ctl.say("upscale: the DWD head made the frames - no latents to enlarge before a decode; the latent upscaler is skipped (pixel_upscaler enlarges frames)"
+            .to_string());
+    }
     if let Some((up, s)) = latent_up {
         let t0 = Instant::now();
         let u = crate::upscale::Upscaler::load(dev, &Checkpoint::open(up)?)?;

@@ -15,6 +15,10 @@
 //! layer norm with `W diag(1 + scale)` and `b + W shift` - float32 on the card, the expansion rounded to bfloat16 as
 //! the reference rounds its features. The layers run on the H3 video silo's kernels (`fastvae::install`); without the
 //! silo there is no head, and a clip is decoded by the VAE from its last latents.
+//!
+//! The 8 layers' matrices (0.6 GB in int8) go to the card only for the decode, after the denoiser's buffers are given
+//! back: read from the adapter file (in the page cache after the first clip) each time, so the denoiser has that room
+//! during sampling - what lets 1344x768 x 10 s fit a 32 GB card.
 
 use std::time::Instant;
 
@@ -33,7 +37,11 @@ const EPS: f32 = 1e-5;
 const BLOCK: usize = 5;
 
 pub struct DwdHead {
-    sol: Sol,
+    /// the adapter file and the GPU: the layers are loaded from it for each decode
+    path: std::path::PathBuf,
+    index: usize,
+    threads: usize,
+    layers: usize,
     /// dwd_norm_out.linear: [2 hidden, t_dim] and its bias, float32 on the host - (scale, shift) of silu(e(t))
     norm_w: Vec<f32>,
     norm_b: Vec<f32>,
@@ -67,9 +75,10 @@ impl DwdHead {
         if ck.entries.keys().any(|k| k.starts_with("dwd_linear_head.") || k.starts_with("first_frame_dwd_linear_head.")) {
             return Err(Error(format!("{}: a DWD head with linear heads (only the Sol pixel refiner is ported)", ck.path.display())));
         }
+        // the silo there (its kernels on this GPU), and the layers as the file has them, checked once by loading them
         let Some((gpu, dev, k)) = Sol::open(index)? else { return Ok(None) };
         let mut bytes = 0u64;
-        let sol = Sol::load(gpu, dev, k, ck, "dwd_pixel_refiner.", threads, &mut bytes)?;
+        let layers = Sol::load(gpu, dev, k, ck, "dwd_pixel_refiner.", threads, &mut bytes)?.layers();
         let (ns, norm_w) = f32_of(ck, "dwd_norm_out.linear.weight", &mut bytes)?;
         let (_, norm_b) = f32_of(ck, "dwd_norm_out.linear.bias", &mut bytes)?;
         let (es, expand_w) = f32_of(ck, "dwd_pixel_refiner.feature_expand.weight", &mut bytes)?;
@@ -80,23 +89,24 @@ impl DwdHead {
                                      ck.path.display())));
         }
         let form = if ck.quant("dwd_pixel_refiner.blocks.0.attn.to_qkv")?.is_some() { "int8" } else { "bfloat16" };
-        sol.dev.wait()?;
-        Ok(Some(DwdHead { sol, norm_w, norm_b, expand_w, expand_b, hidden, t_dim, load_seconds: t0.elapsed().as_secs_f64(), load_bytes: bytes, form }))
+        Ok(Some(DwdHead { path: ck.path.clone(), index, threads, layers, norm_w, norm_b, expand_w, expand_b, hidden, t_dim, load_seconds: t0.elapsed().as_secs_f64(),
+                          load_bytes: bytes, form }))
     }
 
     pub fn layers(&self) -> usize {
-        self.sol.layers()
+        self.layers
     }
 
     /// The GPU it runs on
     pub fn gpu(&self) -> usize {
-        self.sol.gpu()
+        self.index
     }
 
     /// Bytes on the card a decode of t x h x w latent pixels needs beyond the weights: the fast decoder's plus the folded
     /// expansion and a block's features
     pub fn need_bytes(t: usize, h: usize, w: usize) -> usize {
-        crate::fastvae::FastDecoder::need_bytes(t, h, w) + EXPAND * DIM * 4 * 5376 + BLOCK.min(t) * h * w * (5376 + 2 * DIM) * 4
+        // the layers' matrices (int8 0.6 GB; bfloat16 twice that, counted so) besides
+        crate::fastvae::FastDecoder::need_bytes(t, h, w) + (1usize << 30) + EXPAND * DIM * 4 * 5376 + BLOCK.min(t) * h * w * (5376 + 2 * DIM) * 4
     }
 
     /// The video rows' final hidden states [t h2 w2, hidden] (float32, the rows' (t, y, x) order; t = 0 a block's first)
@@ -108,8 +118,11 @@ impl DwdHead {
         if hidden.len() != t * h2 * w2 * c || temb.len() != self.t_dim {
             return Err(Error(format!("dwd: {} hidden values and a {}-value curve point for {t}x{h2}x{w2} tokens of {c}", hidden.len(), temb.len())));
         }
-        let dev = &self.sol.dev;
-        let k = self.sol.k;
+        // the layers on the card for this decode (dropped with it)
+        let Some((gpu, dev, k)) = Sol::open(self.index)? else { return Err(Error("dwd: the H3 video silo's kernels are gone".into())) };
+        let mut bytes = 0u64;
+        let sol = Sol::load(gpu, dev, k, &Checkpoint::open(&self.path)?, "dwd_pixel_refiner.", self.threads, &mut bytes)?;
+        let dev = &sol.dev;
         // the norm's scale and shift at this timestep, folded into the expansion (float64 sums)
         let silu: Vec<f64> = temb.iter().map(|v| *v as f64 / (1.0 + (-*v as f64).exp())).collect();
         let mods: Vec<f64> = (0..2 * c).map(|o| self.norm_b[o] as f64 + self.norm_w[o * self.t_dim..(o + 1) * self.t_dim].iter().zip(&silu).map(|(a, b)| *a as f64 * b).sum::<f64>())
@@ -168,13 +181,13 @@ impl DwdHead {
                 let pt = Tensor::from_bytes(dev, DType::I32, &[pos.len()], &pos.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 // SAFETY: n * 4 rows of DIM bfloat16 values from ev into ov at the rows the table names (all inside ov).
                 k.check(unsafe {
-                    (k.rows)(self.sol.queue(), ev.buf.ptr(), DIM as i64, std::ptr::null(), ov.buf.ptr(), DIM as i64, pt.buf.ptr().cast(), (n * EXPAND) as i64, DIM as i64)
+                    (k.rows)(sol.queue(), ev.buf.ptr(), DIM as i64, std::ptr::null(), ov.buf.ptr(), DIM as i64, pt.buf.ptr().cast(), (n * EXPAND) as i64, DIM as i64)
                 }, "rows (dwd)")?;
                 crate::fastvae::widen(dev, &ov, &xv, n * EXPAND)?;
             }
         }
         drop(expand);
-        self.sol.run(&x, t, h, w, tick)
+        sol.run(&x, t, h, w, tick)
     }
 }
 
