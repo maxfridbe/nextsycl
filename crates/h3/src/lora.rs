@@ -9,6 +9,9 @@
 //!   scale `lora_alpha / lora_rank` from the file's metadata (1 without). Time-embedder keys are HyperFlow's
 //!   (hyperflow.rs) and left out here.
 //!
+//! Either layout may also come without its root (`blocks.N...`, `transformer_blocks.N...`: pi-H3's adapter files,
+//! piflow.rs).
+//!
 //! Applied beside the int8 weights at run time - `out += strength * alpha / r * B (A x)` - rather than merged into
 //! them: merging would mean expanding every touched matrix, adding, and quantizing again, which costs time and
 //! precision; the side path costs two thin matrix products per touched layer. A set too large to sit on the card
@@ -88,8 +91,9 @@ struct Pair {
     sb: [usize; 2],
 }
 
-/// The pairs of one block (or refiner block) by linear, in either layout
-fn block_pairs(ck: &Checkpoint, diffusers: bool, prefix: &str, i: usize, scale: f32) -> Result<[Vec<Pair>; 4]> {
+/// The pairs of one block (or refiner block) by linear, in either layout; `root`: what the file's keys begin with
+/// (`diffusion_model.`, `transformer.`, or nothing)
+fn block_pairs(ck: &Checkpoint, diffusers: bool, root: &str, prefix: &str, i: usize, scale: f32) -> Result<[Vec<Pair>; 4]> {
     let mut out: [Vec<Pair>; 4] = std::array::from_fn(|_| Vec::new());
     let pair = |p: &str| -> Result<Option<Pair>> {
         let (ka, kb) = (format!("{p}.lora_A.weight"), format!("{p}.lora_B.weight"));
@@ -110,13 +114,13 @@ fn block_pairs(ck: &Checkpoint, diffusers: bool, prefix: &str, i: usize, scale: 
     };
     if !diffusers {
         for (j, l) in LINEARS.iter().enumerate() {
-            if let Some(p) = pair(&format!("diffusion_model.{prefix}.{i}.{l}"))? {
+            if let Some(p) = pair(&format!("{root}{prefix}.{i}.{l}"))? {
                 out[j].push(p);
             }
         }
         return Ok(out);
     }
-    let p = format!("transformer.{prefix}.{i}");
+    let p = format!("{root}{prefix}.{i}");
     // q, k, v: each its own LoRA on qkv's outputs, B zero outside its third
     for (part, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
         if let Some(mut x) = pair(&format!("{p}.attn.{name}"))? {
@@ -164,7 +168,13 @@ impl LoraSet {
 
     /// As `load`; `on_host`: the blocks' LoRAs kept in host memory (`device_block` sends a block's when it runs).
     pub fn load_to(dev: &Arc<Device>, ck: &Checkpoint, strength: f32, blocks: usize, refiner: usize, on_host: bool) -> Result<LoraSet> {
-        let diffusers = ck.entries.keys().any(|k| k.starts_with("transformer."));
+        let diffusers = ck.entries.keys().any(|k| k.starts_with("transformer.") || k.starts_with("transformer_blocks."));
+        let rooted = |r: &str| ck.entries.keys().any(|k| k.starts_with(r));
+        let root = match diffusers {
+            true if rooted("transformer.") => "transformer.",
+            false if rooted("diffusion_model.") => "diffusion_model.",
+            _ => "",
+        };
         let meta_scale = match (ck.metadata.get("lora_alpha"), ck.metadata.get("lora_rank")) {
             (Some(a), Some(r)) => match (a.parse::<f32>(), r.parse::<f32>()) {
                 (Ok(a), Ok(r)) if r > 0.0 => a / r,
@@ -177,7 +187,7 @@ impl LoraSet {
         let mut set = LoraSet::empty(blocks, refiner);
         let mut host_blocks: Vec<HostBlock> = Vec::new();
         for i in 0..blocks {
-            let pairs = block_pairs(ck, diffusers, block_prefix, i, scale)?;
+            let pairs = block_pairs(ck, diffusers, root, block_prefix, i, scale)?;
             let mut hb: HostBlock = std::array::from_fn(|_| Vec::new());
             for (j, ps) in pairs.into_iter().enumerate() {
                 for p in ps {
@@ -192,7 +202,7 @@ impl LoraSet {
             }
             host_blocks.push(hb);
             // an AdaLN branch on the timestep curve (ComfyUI layout only: the curve is that form's)
-            let p = format!("diffusion_model.blocks.{i}.adaln_proj.linear");
+            let p = format!("{root}blocks.{i}.adaln_proj.linear");
             let (ka, kb) = (format!("{p}.lora_A.weight"), format!("{p}.lora_B.weight"));
             if !diffusers && ck.entries.contains_key(&ka) {
                 let (a, b) = (host(ck, &ka)?, host(ck, &kb)?);
@@ -221,7 +231,7 @@ impl LoraSet {
             }
         }
         for i in 0..refiner {
-            for (j, ps) in block_pairs(ck, diffusers, refiner_prefix, i, scale)?.into_iter().enumerate() {
+            for (j, ps) in block_pairs(ck, diffusers, root, refiner_prefix, i, scale)?.into_iter().enumerate() {
                 for p in ps {
                     set.max_rank = set.max_rank.max(p.sa[0]);
                     set.layers += 1;
@@ -323,7 +333,7 @@ mod tests {
         let meta = std::collections::BTreeMap::from([("lora_alpha".to_string(), "2".to_string()), ("lora_rank".to_string(), "1".to_string())]);
         crate::safetensors::write_f32(&p, &t, &meta).unwrap();
         let ck = Checkpoint::open(&p).unwrap();
-        let pairs = block_pairs(&ck, true, "transformer_blocks", 0, 2.0).unwrap();
+        let pairs = block_pairs(&ck, true, "transformer.", "transformer_blocks", 0, 2.0).unwrap();
         assert_eq!(pairs[0].len(), 3);
         assert_eq!(pairs[0][1].sb, [6, 1]);
         assert_eq!(pairs[0][1].b, vec![0.0, 0.0, 4.0, 4.0, 0.0, 0.0]);

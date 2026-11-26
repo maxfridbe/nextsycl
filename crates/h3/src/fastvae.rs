@@ -21,6 +21,9 @@
 //! window has run. bfloat16 matrices and activations, the residual in float32, the head in float32 (the release's
 //! reference engine). Its kernels beyond the shared ones are the H3 video engine's silo (kernels/video/h3/silo), bound by
 //! the engine and handed over with `install`; without them the job keeps the full H3 decoder.
+//!
+//! The layers and the pixel head are `Sol`, shared with pi-H3's DWD head (dwd.rs): the last 8 layers of the same
+//! decoder fed from the denoiser's last hidden states instead of the latents, in bfloat16 or int8 ConvRot.
 
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::path::Path;
@@ -30,7 +33,7 @@ use std::time::Instant;
 use crate::device::{Device, Tensor};
 use crate::dit::rotations;
 use crate::dtype::DType;
-use crate::ops::{self, Linear, Rows};
+use crate::ops::{self, Int8Linear, Linear, Rows};
 use crate::safetensors::Checkpoint;
 use crate::{Error, Result};
 
@@ -80,7 +83,7 @@ pub fn kernels() -> Option<&'static Kernels> {
 }
 
 impl Kernels {
-    fn check(&self, rc: c_int, what: &str) -> Result<()> {
+    pub(crate) fn check(&self, rc: c_int, what: &str) -> Result<()> {
         if rc == 0 {
             return Ok(());
         }
@@ -89,32 +92,59 @@ impl Kernels {
     }
 }
 
+/// A linear of a layer: bfloat16 (the fast decoder's float32 file, a DWD adapter's float16 one) or int8 ConvRot (a DWD
+/// adapter's ComfyUI int8 file)
+enum Lin {
+    F(Linear),
+    I8(Int8Linear),
+}
+
+impl Lin {
+    fn forward(&self, x: &Tensor, out: &Tensor) -> Result<()> {
+        match self {
+            Lin::F(l) => l.forward(x, out),
+            Lin::I8(l) => l.forward(x, out),
+        }
+    }
+}
+
 struct Layer {
     n1: Tensor,
     n2: Tensor,
     s1: Tensor,
     s2: Tensor,
-    qkv: Linear,
-    out: Linear,
-    w1: Linear,
-    w2: Linear,
+    qkv: Lin,
+    out: Lin,
+    w1: Lin,
+    w2: Lin,
 }
 
-pub struct FastDecoder {
-    /// the GPU whose queue the decoder's context and the silo's kernels share (held as long as the context)
+/// The decoder's layers and its pixel head, on a context on nextsycl-core's queue of one GPU (the silo's kernels run
+/// there): the residual stream of a clip's t x h x w tokens in, frames out. The fast decoder runs all 24; pi-H3's DWD head
+/// the last 8 with its own weights and a one-frame head for the first latent of every block.
+pub(crate) struct Sol {
+    /// the GPU whose queue the context and the silo's kernels share (held as long as the context)
     gpu: Arc<nextsycl_core::Gpu>,
-    dev: Arc<Device>,
-    k: &'static Kernels,
+    pub(crate) dev: Arc<Device>,
+    pub(crate) k: &'static Kernels,
     layers: Vec<Layer>,
-    /// de-normalization, the 1x1x1 convolution and the embedding folded into one [DIM, 24] float32 map
-    embed: Linear,
     /// the global tokens' start (registers + a zero token), bfloat16-rounded, float32 [GLOBALS, DIM]
     g0: Vec<f32>,
     norm_out_w: Tensor,
     norm_out_b: Tensor,
+    /// [3 x 4 x 16 x 16, DIM]: a latent frame's 4 frames
     proj_out: Linear,
+    /// [3 x 1 x 16 x 16, DIM]: the first latent frame of a block's one frame (the DWD head); without it the first
+    /// latent's frame is the last of `proj_out`'s 4 (the decoder drops 3)
+    first_out: Option<Linear>,
     ones: Tensor,
     inv_freq: Vec<f32>,
+}
+
+pub struct FastDecoder {
+    sol: Sol,
+    /// de-normalization, the 1x1x1 convolution and the embedding folded into one [DIM, 24] float32 map
+    embed: Linear,
     pub load_seconds: f64,
     pub load_bytes: u64,
 }
@@ -252,61 +282,163 @@ fn rope_table(h: usize, w: usize, s: usize, inv_freq: &[f32]) -> Vec<f32> {
     rotations(&pos, inv_freq)
 }
 
-impl FastDecoder {
-    /// The fast decoder's weights (float32 in the release; bfloat16 on the card) on GPU `index`, in a context on
-    /// nextsycl-core's queue of that GPU (the silo's kernels run there); the latent statistics from the H3 VAE's
-    /// checkpoint `vae` (the release takes them from its config: the same numbers). None when the engine has no silo.
-    pub fn load(index: usize, path: &Path, vae: &Path, threads: usize) -> Result<Option<FastDecoder>> {
+/// What `Sol::open` gives: the GPU (its queue held), a context on that queue, the silo's kernels
+pub(crate) type Opened = (Arc<nextsycl_core::Gpu>, Arc<Device>, &'static Kernels);
+
+/// [h0: q k v][h1: q k v] ... -> [q of every head][k ...][v ...] (as the full decoder loads it): the source row of each
+/// output row
+fn qkv_rows() -> Vec<usize> {
+    (0..3).flat_map(|part| (0..HEADS).map(move |h| h * 3 + part)).flat_map(|src| src * HEAD_DIM..(src + 1) * HEAD_DIM).collect()
+}
+
+/// The rows of a row-major [rows, width] buffer of `size`-byte elements in `order`
+fn rows_in(v: &[u8], size: usize, width: usize, order: &[usize]) -> Vec<u8> {
+    let row = width * size;
+    order.iter().flat_map(|r| v[r * row..(r + 1) * row].iter().copied()).collect()
+}
+
+impl Sol {
+    /// A context on nextsycl-core's queue of GPU `index` and the silo's kernels: None without the silo (or when its
+    /// kernels do not run on that GPU)
+    pub(crate) fn open(index: usize) -> Result<Option<Opened>> {
         let Some(k) = kernels() else { return Ok(None) };
-        let t0 = Instant::now();
         let gpu = nextsycl_core::Gpu::open(index).map_err(|e| Error(e.0))?;
         // SAFETY: the plain check of a live queue.
         if unsafe { (k.supported)(gpu.queue()) } != 1 {
             return Ok(None);
         }
-        // SAFETY: the GPU's live queue, held beside the context (`gpu` lives as long as the decoder).
+        // SAFETY: the GPU's live queue, held beside the context (`gpu` lives as long as the Sol that keeps it).
         let dev = unsafe { Device::on_queue(gpu.queue(), index) }?;
-        let ck = Checkpoint::open(path)?;
-        let mut bytes = 0u64;
-        let mut read = |name: &str| -> Result<(Vec<usize>, Vec<f32>)> {
+        Ok(Some((gpu, dev, k)))
+    }
+
+    /// The layers under `prefix` (`blocks.N.*`, or a DWD adapter's `dwd_pixel_refiner.blocks.N.*`), the final norm, the
+    /// projection(s) and the registers, from `ck`: float matrices as bfloat16, int8 ConvRot ones as they are. `bytes`
+    /// counts what was read.
+    pub(crate) fn load(gpu: Arc<nextsycl_core::Gpu>, dev: Arc<Device>, k: &'static Kernels, ck: &Checkpoint, prefix: &str, threads: usize, bytes: &mut u64)
+                       -> Result<Sol> {
+        let counted = std::cell::Cell::new(0u64);
+        let read = |name: &str| -> Result<(Vec<usize>, Vec<f32>)> {
             let e = ck.get(name)?;
-            bytes += e.bytes as u64;
+            counted.set(counted.get() + e.bytes as u64);
             Ok((e.shape.clone(), crate::dtype::bytes_to_f32(&ck.read(name)?, e.dtype)?))
         };
-        let n = ck.entries.keys().filter_map(|k| k.strip_prefix("blocks.")?.split('.').next()?.parse::<usize>().ok()).max().map_or(0, |m| m + 1);
+        let blocks = format!("{prefix}blocks.");
+        let n = ck.entries.keys().filter_map(|k| k.strip_prefix(blocks.as_str())?.split('.').next()?.parse::<usize>().ok()).max().map_or(0, |m| m + 1);
         if n == 0 {
-            return Err(Error(format!("{}: no decoder blocks (the fast H3 VAE's blocks.N.*)", path.display())));
+            return Err(Error(format!("{}: no decoder layers ({blocks}N.*)", ck.path.display())));
         }
         let mut layers = Vec::with_capacity(n);
         for i in 0..n {
-            let p = format!("blocks.{i}");
-            let mut lin = |l: &str, regroup: bool| -> Result<Linear> {
-                let (shape, mut w) = read(&format!("{p}.{l}.weight"))?;
-                let (_, mut b) = read(&format!("{p}.{l}.bias"))?;
-                if regroup {
-                    // [h0: q k v][h1: q k v] ... -> [q of every head][k ...][v ...] (as the full decoder loads it)
-                    let k = shape[1];
-                    let order: Vec<usize> = (0..3).flat_map(|part| (0..HEADS).map(move |h| h * 3 + part)).collect();
-                    let mut w2 = Vec::with_capacity(w.len());
-                    let mut b2 = Vec::with_capacity(b.len());
-                    for src in &order {
-                        w2.extend_from_slice(&w[src * HEAD_DIM * k..(src + 1) * HEAD_DIM * k]);
-                        b2.extend_from_slice(&b[src * HEAD_DIM..(src + 1) * HEAD_DIM]);
-                    }
-                    (w, b) = (w2, b2);
+            let p = format!("{blocks}{i}");
+            let lin = |l: &str, regroup: bool| -> Result<Lin> {
+                let name = format!("{p}.{l}");
+                let (_, mut b) = read(&format!("{name}.bias"))?;
+                let order = regroup.then(qkv_rows);
+                if let Some(o) = &order {
+                    b = o.iter().map(|r| b[*r]).collect();
                 }
-                Ok(Linear { weight: Tensor::from_bytes(&dev, DType::BF16, &shape, &bf16_bytes(&w, threads))?, bias: Some(f32_tensor(&dev, &[b.len()], &b)?) })
+                let bias = Some(f32_tensor(&dev, &[b.len()], &b)?);
+                if let Some(q) = ck.quant(&name)? {
+                    // int8 [N, K] with a scale a row: the rows regrouped on the host, the bytes as they are
+                    let (we, se) = (ck.get(&format!("{name}.weight"))?, ck.get(&format!("{name}.weight_scale"))?);
+                    if we.dtype != DType::I8 || se.dtype != DType::F32 {
+                        return Err(Error(format!("{name}: int8 weights with float32 scales expected")));
+                    }
+                    let (shape, kk) = (we.shape.clone(), we.shape[1]);
+                    let (mut w, mut s) = (ck.read(&format!("{name}.weight"))?, ck.read(&format!("{name}.weight_scale"))?);
+                    counted.set(counted.get() + (w.len() + s.len()) as u64);
+                    if let Some(o) = &order {
+                        w = rows_in(&w, 1, kk, o);
+                        s = rows_in(&s, 4, 1, o);
+                    }
+                    return Ok(Lin::I8(Int8Linear { weight: Tensor::from_bytes(&dev, DType::I8, &shape, &w)?, scale: Tensor::from_bytes(&dev, DType::F32, &[shape[0]], &s)?,
+                                                   bias, group: q.convrot.then_some(q.group) }));
+                }
+                let (shape, mut w) = read(&format!("{name}.weight"))?;
+                if let Some(o) = &order {
+                    let kk = shape[1];
+                    w = o.iter().flat_map(|r| w[r * kk..(r + 1) * kk].iter().copied()).collect();
+                }
+                Ok(Lin::F(Linear { weight: Tensor::from_bytes(&dev, DType::BF16, &shape, &bf16_bytes(&w, threads))?, bias }))
             };
             let qkv = lin("attn.to_qkv", true)?;
             let out = lin("attn.to_out", false)?;
             let w1 = lin("ff.w1", false)?;
             let w2 = lin("ff.w2", false)?;
-            let mut vec1 = |k: &str| -> Result<Tensor> {
+            let vec1 = |k: &str| -> Result<Tensor> {
                 let (_, v) = read(&format!("{p}.{k}"))?;
                 f32_tensor(&dev, &[1, v.len()], &v)
             };
             layers.push(Layer { n1: vec1("norm1.weight")?, n2: vec1("norm2.weight")?, s1: vec1("scale1")?, s2: vec1("scale2")?, qkv, out, w1, w2 });
         }
+        let (_, reg) = read(&format!("{prefix}register_tokens"))?;
+        let mut g0: Vec<f32> = reg.iter().map(|v| crate::dtype::bf16_to_f32(crate::dtype::f32_to_bf16(*v))).collect();
+        g0.resize(GLOBALS * DIM, 0.0);
+        let (_, nw) = read(&format!("{prefix}norm_out.weight"))?;
+        let (_, nb) = read(&format!("{prefix}norm_out.bias"))?;
+        let lin32 = |name: &str| -> Result<Linear> {
+            let (ps, pw) = read(&format!("{prefix}{name}.weight"))?;
+            let (_, pb) = read(&format!("{prefix}{name}.bias"))?;
+            Ok(Linear { weight: f32_tensor(&dev, &ps, &pw)?, bias: Some(f32_tensor(&dev, &[pb.len()], &pb)?) })
+        };
+        let proj_out = lin32("proj_out")?;
+        let first_out = match ck.entries.contains_key(&format!("{prefix}first_frame_proj_out.weight")) {
+            true => Some(lin32("first_frame_proj_out")?),
+            false => None,
+        };
+        let per = OUT_C * PATCH * PATCH;
+        if proj_out.outputs() != per * PATCH_T || first_out.as_ref().is_some_and(|f| f.outputs() != per) {
+            return Err(Error(format!("{}: a pixel head of {} (first frame {:?}) outputs, {} / {per} expected", ck.path.display(), proj_out.outputs(),
+                                     first_out.as_ref().map(|f| f.outputs()), per * PATCH_T)));
+        }
+        *bytes += counted.get();
+        let inv_freq: Vec<f32> = (0..ROT_DIM / 6).map(|i| 1.0 / 100f32.powf(i as f32 * 6.0 / ROT_DIM as f32)).collect();
+        Ok(Sol {
+            norm_out_w: f32_tensor(&dev, &[DIM], &nw)?,
+            norm_out_b: f32_tensor(&dev, &[DIM], &nb)?,
+            proj_out,
+            first_out,
+            ones: f32_tensor(&dev, &[HEAD_DIM], &[1.0; HEAD_DIM])?,
+            g0,
+            layers,
+            inv_freq,
+            k,
+            dev,
+            gpu,
+        })
+    }
+
+    pub(crate) fn layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// The GPU it runs on (its index)
+    pub(crate) fn gpu(&self) -> usize {
+        self.gpu.index
+    }
+
+    /// nextsycl-core's queue of that GPU, the silo's kernels' first argument
+    pub(crate) fn queue(&self) -> *mut c_void {
+        self.gpu.queue()
+    }
+}
+
+impl FastDecoder {
+    /// The fast decoder's weights (float32 in the release; bfloat16 on the card) on GPU `index`, in a context on
+    /// nextsycl-core's queue of that GPU (the silo's kernels run there); the latent statistics from the H3 VAE's
+    /// checkpoint `vae` (the release takes them from its config: the same numbers). None when the engine has no silo.
+    pub fn load(index: usize, path: &Path, vae: &Path, threads: usize) -> Result<Option<FastDecoder>> {
+        let t0 = Instant::now();
+        let Some((gpu, dev, k)) = Sol::open(index)? else { return Ok(None) };
+        let ck = Checkpoint::open(path)?;
+        let mut bytes = 0u64;
+        let sol = Sol::load(gpu, dev.clone(), k, &ck, "", threads, &mut bytes)?;
+        let mut read = |name: &str| -> Result<(Vec<usize>, Vec<f32>)> {
+            let e = ck.get(name)?;
+            bytes += e.bytes as u64;
+            Ok((e.shape.clone(), crate::dtype::bytes_to_f32(&ck.read(name)?, e.dtype)?))
+        };
         // e = We (Wc (z std + mean) + bc) + be = A z + c
         let (_, wc) = read("post_quant_conv.weight")?;
         let (_, bc) = read("post_quant_conv.bias")?;
@@ -327,40 +459,17 @@ impl FastDecoder {
             c[d] = (be[d] as f64 + (0..LATENT_C).map(|o| we[d * LATENT_C + o] as f64 * inner[o]).sum::<f64>()) as f32;
         }
         let embed = Linear { weight: f32_tensor(&dev, &[DIM, LATENT_C], &a)?, bias: Some(f32_tensor(&dev, &[DIM], &c)?) };
-        let (_, reg) = read("register_tokens")?;
-        let mut g0: Vec<f32> = reg.iter().map(|v| crate::dtype::bf16_to_f32(crate::dtype::f32_to_bf16(*v))).collect();
-        g0.resize(GLOBALS * DIM, 0.0);
-        let (_, nw) = read("norm_out.weight")?;
-        let (_, nb) = read("norm_out.bias")?;
-        let (ps, pw) = read("proj_out.weight")?;
-        let (_, pb) = read("proj_out.bias")?;
-        let inv_freq: Vec<f32> = (0..ROT_DIM / 6).map(|i| 1.0 / 100f32.powf(i as f32 * 6.0 / ROT_DIM as f32)).collect();
-        let d = FastDecoder {
-            norm_out_w: f32_tensor(&dev, &[DIM], &nw)?,
-            norm_out_b: f32_tensor(&dev, &[DIM], &nb)?,
-            proj_out: Linear { weight: f32_tensor(&dev, &ps, &pw)?, bias: Some(f32_tensor(&dev, &[pb.len()], &pb)?) },
-            ones: f32_tensor(&dev, &[HEAD_DIM], &[1.0; HEAD_DIM])?,
-            embed,
-            g0,
-            layers,
-            inv_freq,
-            k,
-            dev: dev.clone(),
-            gpu,
-            load_seconds: 0.0,
-            load_bytes: bytes,
-        };
         dev.wait()?;
-        Ok(Some(FastDecoder { load_seconds: t0.elapsed().as_secs_f64(), ..d }))
+        Ok(Some(FastDecoder { sol, embed, load_seconds: t0.elapsed().as_secs_f64(), load_bytes: bytes }))
     }
 
     pub fn layers(&self) -> usize {
-        self.layers.len()
+        self.sol.layers()
     }
 
     /// The GPU it runs on (its index)
     pub fn gpu(&self) -> usize {
-        self.gpu.index
+        self.sol.gpu()
     }
 
     /// The bytes on the card a decode of t x h x w latents needs beyond the weights (the residual stream, the window's
@@ -375,11 +484,52 @@ impl FastDecoder {
     /// Normalized latents [24, t, h, w] (t = 0 a block's first) -> pixels [3, frames, 16 h, 16 w] in [0, 1] and the frame
     /// count (4 t less 3 a block). `tick` between temporal windows (cancel checks).
     pub fn decode(&self, z: &[f32], t: usize, h: usize, w: usize, tick: &mut dyn FnMut() -> Result<()>) -> Result<(Vec<f32>, usize)> {
+        let dev = &self.sol.dev;
+        let hw = h * w;
+        let n_all = t * hw;
+        let nmax = BLOCK.min(t) * hw;
+        // the residual stream: the tokens
+        let x = Tensor::new(dev, DType::F32, &[n_all, DIM])?;
+        {
+            let mut rows = vec![0f32; nmax * LATENT_C];
+            let e = Tensor::new(dev, DType::BF16, &[nmax, DIM])?;
+            for f0 in (0..t).step_by(BLOCK) {
+                let f1 = (f0 + BLOCK).min(t);
+                let n = (f1 - f0) * hw;
+                for c in 0..LATENT_C {
+                    for i in 0..n {
+                        rows[i * LATENT_C + c] = z[c * n_all + f0 * hw + i];
+                    }
+                }
+                let input = f32_tensor(dev, &[n, LATENT_C], &rows[..n * LATENT_C])?;
+                // SAFETY: views of live tensors, dropped before them.
+                let (ev, xv) = unsafe { (e.rows_view(0, n)?, x.rows_view(f0 * hw, n)?) };
+                self.embed.forward(&input, &ev)?;
+                // the embedding rounded to bfloat16 (the release's), widened into the stream
+                widen(dev, &ev, &xv, n)?;
+            }
+        }
+        self.sol.run(&x, t, h, w, tick)
+    }
+}
+
+/// bfloat16 rows [n, DIM] -> float32 rows [n, DIM] (both on `dev`), and a wait
+pub(crate) fn widen(dev: &Device, src: &Tensor, dst: &Tensor, n: usize) -> Result<()> {
+    // SAFETY: bfloat16 [n, DIM] -> float32 [n, DIM], both on this device.
+    let rc = unsafe { (dev.api.dequant)(dev.ctx, src.buf.ptr().cast_const(), 30, (n * DIM) as i64, dst.buf.ptr(), DType::F32.kernel_code()?) };
+    dev.check(rc)?;
+    dev.wait()
+}
+
+impl Sol {
+    /// The layers and the head on the residual stream `x` (float32 [t h w, DIM], tokens in (t, y, x) order; t = 0 a
+    /// block's first), in place -> pixels [3, frames, 16 h, 16 w] in [0, 1] and the frame count (4 t less 3 a block).
+    /// `tick` between temporal windows (cancel checks).
+    pub(crate) fn run(&self, x: &Tensor, t: usize, h: usize, w: usize, tick: &mut dyn FnMut() -> Result<()>) -> Result<(Vec<f32>, usize)> {
         let dev = &self.dev;
         let k = self.k;
         let qu = self.gpu.queue();
         let hw = h * w;
-        let n_all = t * hw;
         let nb = t.div_ceil(BLOCK);
         let gs = nb * GLOBALS;
         let prof = std::env::var_os("NSD_PROFILE").is_some();
@@ -422,30 +572,10 @@ impl FastDecoder {
                   f32_tensor(dev, &[BLOCK * hw, ROT_DIM], &rope_table(h, w, WINDOW / 2, &self.inv_freq))?];
         let cs_g = f32_tensor(dev, &[gs, ROT_DIM], &rotations(&vec![0.0; gs * 3], &self.inv_freq))?;
 
-        // the residual stream: tokens, then the global rows
-        let x = Tensor::new(dev, DType::F32, &[n_all, DIM])?;
-        {
-            let mut rows = vec![0f32; nmax * LATENT_C];
-            let e = Tensor::new(dev, DType::BF16, &[nmax, DIM])?;
-            for f0 in (0..t).step_by(BLOCK) {
-                let f1 = (f0 + BLOCK).min(t);
-                let n = (f1 - f0) * hw;
-                for c in 0..LATENT_C {
-                    for i in 0..n {
-                        rows[i * LATENT_C + c] = z[c * n_all + f0 * hw + i];
-                    }
-                }
-                let input = f32_tensor(dev, &[n, LATENT_C], &rows[..n * LATENT_C])?;
-                // SAFETY: views of live tensors, dropped before them.
-                let (ev, xv) = unsafe { (e.rows_view(0, n)?, x.rows_view(f0 * hw, n)?) };
-                self.embed.forward(&input, &ev)?;
-                // the embedding rounded to bfloat16 (the release's), widened into the stream
-                // SAFETY: bfloat16 [n, DIM] -> float32 [n, DIM], both on this device.
-                let rc = unsafe { (dev.api.dequant)(dev.ctx, ev.buf.ptr().cast_const(), 30, (n * DIM) as i64, xv.buf.ptr(), DType::F32.kernel_code()?) };
-                dev.check(rc)?;
-                dev.wait()?;
-            }
+        if x.dtype != DType::F32 || x.elements() != t * hw * DIM {
+            return Err(Error(format!("sol: a stream {:?} {:?} for {t}x{h}x{w} tokens", x.dtype, x.shape)));
         }
+        // the global rows beside the stream
         let g = f32_tensor(dev, &[gs, DIM], &(0..nb).flat_map(|_| self.g0.iter().copied()).collect::<Vec<f32>>())?;
 
         // a window's buffers
@@ -607,18 +737,32 @@ impl FastDecoder {
         let (fh, fw) = (h * PATCH, w * PATCH);
         let plane = fh * fw;
         let mut px = vec![0f32; OUT_C * frames * plane];
-        let per = OUT_C * PATCH_T * PATCH * PATCH;
         let normed = Tensor::new(dev, DType::F32, &[hw, DIM])?;
-        let head = Tensor::new(dev, DType::F32, &[hw, per])?;
+        let head = Tensor::new(dev, DType::F32, &[hw, OUT_C * PATCH_T * PATCH * PATCH])?;
+        let head1 = match &self.first_out {
+            Some(_) => Some(Tensor::new(dev, DType::F32, &[hw, OUT_C * PATCH * PATCH])?),
+            None => None,
+        };
         for ti in 0..t {
             tick()?;
             // SAFETY: a view of the live stream.
             let xv = unsafe { x.rows_view(ti * hw, hw)? };
             ops::layer_norm(&xv, DIM, Some(&self.norm_out_w), Some(&self.norm_out_b), EPS, &normed)?;
-            self.proj_out.forward(&normed, &head)?;
-            let v = head.to_f32()?;
             let lt = ti % BLOCK;
-            for pt in 0..PATCH_T {
+            // the first latent of a block: its one frame from its own projection (DWD), or the last of the four
+            let (v, nt, pt0) = match (&self.first_out, &head1) {
+                (Some(f), Some(h1)) if lt == 0 => {
+                    f.forward(&normed, h1)?;
+                    (h1.to_f32()?, 1, PATCH_T - 1)
+                }
+                _ => {
+                    self.proj_out.forward(&normed, &head)?;
+                    (head.to_f32()?, PATCH_T, 0)
+                }
+            };
+            let per = OUT_C * nt * PATCH * PATCH;
+            for j in 0..nt {
+                let pt = pt0 + j;
                 if lt == 0 && pt < TRIM {
                     continue;
                 }
@@ -629,7 +773,7 @@ impl FastDecoder {
                         for ch in 0..OUT_C {
                             for py in 0..PATCH {
                                 let dst = (ch * frames + fo) * plane + (yi * PATCH + py) * fw + xi * PATCH;
-                                let src = (ch * PATCH_T + pt) * PATCH * PATCH + py * PATCH;
+                                let src = (ch * nt + j) * PATCH * PATCH + py * PATCH;
                                 px[dst..dst + PATCH].copy_from_slice(&tok[src..src + PATCH]);
                             }
                         }

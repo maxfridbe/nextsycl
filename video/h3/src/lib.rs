@@ -24,7 +24,7 @@ pub const ARCH: &str = "minimax-h3";
 
 /// The files it takes, by role (the denoiser at load; the others go into each job, where a job does not name its own)
 pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "vae", "audio-vae", "vision", "controlnet", "ic-lora", "hyperflow", "adaln", "sharp-lora",
-                             "silence", "fast-vae", "mpeg-maps", "region-head"];
+                             "silence", "fast-vae", "mpeg-maps", "region-head", "adapter"];
 
 /// A role and the job key it fills
 const ROLE_KEYS: &[(&str, &str)] = &[("text-encoder", "te"), ("tokenizer", "tokenizer"), ("vae", "vae"), ("audio-vae", "audio_vae"),
@@ -44,6 +44,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "threads", env: "H3_THREADS", value: "N", help: "threads reading the checkpoint at load (default 8)", at: At::Load },
     EngineOption { name: "resident-blocks", env: "H3_RESIDENT_BLOCKS", value: "N", help: "keep only the first N denoiser blocks on the card and stream the rest from the int8 file as they run (the card for the activations: Open-H3-Regenerate-2K's 2560x1440 sequences; default all)", at: At::Load },
     EngineOption { name: "te-pin", env: "H3_TE_PIN", value: "0|1", help: "keep the text encoder in pinned host memory between clips (default 1)", at: At::Load },
+    EngineOption { name: "pi-steps", env: "H3_PI_STEPS", value: "2|4", help: "with a pi-H3 adapter (the card's adapter file): the steps it was distilled for (default: from the file's name)", at: At::Load },
     EngineOption { name: "regen-vae", env: "H3_REGEN_VAE", value: "fast|standard", help: "regen2k's decoder: Open-H3-Regenerate-2K's fast decoder (the card's fast-vae file; the H3 video silo's kernels) or the H3 video decoder (default standard)", at: At::Load },
     EngineOption { name: "vae-attn-per-tile", env: "H3_VAE_ATTN_PER_TILE", value: "0|1", help: "the video decoder's attention a tile at a time", at: At::Load },
     EngineOption { name: "attn", env: "NSD_ATTN", value: "sage|onednn", help: "long sequences' attention: SageAttention (int8 q, k) or oneDNN's", at: At::Load },
@@ -111,6 +112,19 @@ fn load(files: &ModelFiles, gpus: &[Arc<Gpu>], o: &LoadOptions, log: &mut dyn Fn
     };
     let resident = o.setting("H3_RESIDENT_BLOCKS").and_then(|v| v.parse().ok());
     let mut e = jobs::Engine::load_resident(dev, denoiser, None, resident, threads, log).map_err(ve)?;
+    // pi-H3: the adapter merged into the model (its DWD head runs on this engine's silo)
+    if let Some(adapter) = files.get("adapter") {
+        match silo::install() {
+            Ok(Some(p)) => log(format!("silo   : {} (the DWD head's kernels)", p.display())),
+            Ok(None) => log("silo   : none - a DWD adapter's clips are decoded by the VAE".to_string()),
+            Err(x) => log(format!("silo   : {x} - a DWD adapter's clips are decoded by the VAE")),
+        }
+        let steps = o.setting("H3_PI_STEPS").and_then(|v| v.parse().ok());
+        let t0 = std::time::Instant::now();
+        let a = nextsycl_h3::piflow::apply(&mut e, adapter, steps, log).map_err(ve)?;
+        log(format!("pi-h3  : {} applied in {:.1} s", a.describe(), t0.elapsed().as_secs_f64()));
+        e.pi = Some(a);
+    }
     if mpeg {
         for role in ["mpeg-maps", "region-head"] {
             if files.get(role).is_none() {

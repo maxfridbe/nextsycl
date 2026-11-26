@@ -420,7 +420,7 @@ pub fn regen2k(e: &Engine, s: &RegenSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     // 3. the frames, the draft's length and sound (the sampling's kernel scratch given back first: the fast decoder runs in
     // a context of its own and needs the room)
     dev.trim()?;
-    let rep = jobs::decode_latents(dev, e.threads, Latents { video: joined, t: lt, h: uh, w: uw, audio: None, paste: None },
+    let rep = jobs::decode_latents(dev, e.threads, Latents { video: joined, t: lt, h: uh, w: uw, audio: None, paste: None, dwd: None },
                                    &Vaes { video: s.vae, audio: None, upscale: None, pixel: None, fast: s.fast_vae }, Some(out), None, ctl)?;
     note_peak(dev);
     finish(out, s.draft, real, frames, (tw, th), s.keep_h, ctl)?;

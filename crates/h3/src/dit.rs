@@ -187,6 +187,40 @@ impl Block {
         &self.k_norm
     }
 
+    /// An adapter's AdaLN projection on the timestep curve in place of the block's ([rows, t_dim], the same shape), and its
+    /// bias where it has one (pi-H3's adapters tune every block's projection, the bias of their four fully tuned blocks)
+    pub fn set_adaln(&mut self, w: Vec<f32>, b: Option<Vec<f32>>) -> Result<()> {
+        if w.len() != self.adaln_w.len() || b.as_ref().is_some_and(|b| b.len() != self.adaln_b.len()) {
+            return Err(Error(format!("an AdaLN projection of {} values (bias {:?}) for the block's {} ({})", w.len(), b.as_ref().map(Vec::len),
+                                     self.adaln_w.len(), self.adaln_b.len())));
+        }
+        self.adaln_w = w;
+        if let Some(b) = b {
+            self.adaln_b = b;
+        }
+        Ok(())
+    }
+
+    /// An adapter's matrix in place of one of the block's four (`linears` order: qkv, out, fc1, fc2), the same size;
+    /// a block left in the file (`Blocks::load_streamed`) takes none
+    pub fn set_linear(&mut self, j: usize, w: Weight) -> Result<()> {
+        let slot = match j {
+            0 => &mut self.qkv,
+            1 => &mut self.out_proj,
+            2 => &mut self.fc1,
+            3 => &mut self.fc2,
+            _ => return Err(Error(format!("a block has four matrices, not {}", j + 1))),
+        };
+        if matches!(slot, Weight::Streamed(_)) {
+            return Err(Error("a block streamed from the file takes no replacement matrix".into()));
+        }
+        if slot.size() != w.size() {
+            return Err(Error(format!("a [{}, {}] matrix in place of a [{}, {}] one", w.size().0, w.size().1, slot.size().0, slot.size().1)));
+        }
+        *slot = w;
+        Ok(())
+    }
+
     /// The four block matrices, in product order: qkv, out, fc1, fc2
     pub fn linears(&self) -> [&Weight; 4] {
         [&self.qkv, &self.out_proj, &self.fc1, &self.fc2]

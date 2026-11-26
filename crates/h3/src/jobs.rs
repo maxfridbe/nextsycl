@@ -16,7 +16,7 @@ use crate::rng::Rng;
 use crate::safetensors::Checkpoint;
 use crate::denoiser::{self, Conditions, Denoiser, KeyframeIn, Outer, RefIn, Schedule, Shape, TextRefiner};
 use crate::vision::{Frames, Piece};
-use crate::{dit, reference, Error, Result};
+use crate::{dit, reference, Ctx, Error, Result};
 use serde_json::{json, Value};
 
 pub fn gib(bytes: u64) -> f64 {
@@ -30,6 +30,8 @@ pub struct Engine {
     pub model: dit::Blocks,
     pub outer: Outer,
     pub threads: usize,
+    /// a pi-H3 adapter applied to the model at load (piflow.rs): its LoRAs, step count and DWD head
+    pub pi: Option<crate::piflow::Adapter>,
 }
 
 impl Engine {
@@ -57,7 +59,7 @@ impl Engine {
                     model.load_seconds));
         let outer = Outer::load(&dev, &ck)?;
         denoiser::check_fits(&model.cfg, &outer)?;
-        Ok(Engine { dev, ck, model, outer, threads })
+        Ok(Engine { dev, ck, model, outer, threads, pi: None })
     }
 
     fn inv_freq(&self) -> Result<Vec<f32>> {
@@ -420,9 +422,36 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
         }
     }
     let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, schedule, &cond)?;
+    // a pi-H3 run (reference/pi-h3/ref.py): the adapter's LoRAs, the start from the noise itself, the DWD head's input kept
+    let pure = dump.metadata.get("pure_noise").is_some_and(|v| v == "1");
+    d.pure_noise = pure;
+    if let Some(p) = e.pi.as_ref() {
+        ctl.say(format!("pi-h3  : {}", p.describe()));
+        d.base_lora = Some(&p.lora);
+        if p.dwd.is_some() {
+            d.dwd = Some(denoiser::DwdCapture { at: sigmas[sigmas.len() - 2], ..Default::default() });
+        }
+    }
     let steps = sigmas.len() - 1;
     let nblocks = e.model.blocks.len();
     ctl.say(format!("tokens : {}", d.tokens()));
+    // the reference's block outputs at the first step (`tap.N`: the video rows after block N, reference/pi-h3/ref.py
+    // --taps): the same first call here, the stream after each of those blocks compared - where a difference starts
+    let mut taps: Vec<usize> = dump.entries.keys().filter_map(|k| k.strip_prefix("tap.")?.parse().ok()).collect();
+    taps.sort_unstable();
+    for b in taps {
+        let s0 = sigmas[0];
+        let s0_a = crate::layout::time_shift_sigma(s0 as f64, schedule.shift_video as f64, schedule.shift_audio as f64) as f32;
+        let (xv, xa): (Vec<f32>, Vec<f32>) = match pure {
+            true => (noise_v.clone(), noise_a.clone()),
+            false => (noise_v.iter().map(|n| n * s0).collect(), noise_a.iter().map(|n| n * s0_a).collect()),
+        };
+        d.capture = Some((b, Vec::new()));
+        d.net(&xv, &xa, s0, &mut |_| Ok(()))?;
+        let got = d.capture.take().map(|c| c.1).unwrap_or_default();
+        let (rel, cos) = reference::compare(&got, &f32s(&format!("tap.{b}"))?);
+        ctl.say(format!("tap    : after block {b:2}: the video rows' stream against the reference's: rel err {rel:.2e}, cosine {cos:.6}"));
+    }
     let mut per_step = Vec::new();
     let mut worst = 1f64;
     let mut t_step = Instant::now();
@@ -442,9 +471,18 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
                 let key = format!("x0.{:02}", i + 1);
                 let (mut cv, mut ca) = (f64::NAN, f64::NAN);
                 if dump.entries.contains_key(&format!("{key}.video")) {
-                    cv = reference::compare(dv, &f32s(&format!("{key}.video"))?).1;
+                    let want = f32s(&format!("{key}.video"))?;
+                    cv = reference::compare(dv, &want).1;
                     ca = reference::compare(da, &f32s(&format!("{key}.audio"))?).1;
                     worst = worst.min(cv).min(ca);
+                    if i == 0 {
+                        // the first call starts from the same x on both sides: its velocity (x - x0) / sigma compared too - the
+                        // denoised estimate's error at a sigma near 1 is the velocity's, magnified
+                        let s0 = if pure { 1.0 } else { sigmas[0] };
+                        let v = |x0: &[f32]| -> Vec<f32> { noise_v.iter().zip(x0).map(|(n, d)| (n * s0 - d) / sigmas[0]).collect() };
+                        let (rel, cos) = reference::compare(&v(dv), &v(&want));
+                        lines.push(format!("  step 1: the video velocity against the reference's: rel err {rel:.2e}, cosine {cos:.6}"));
+                    }
                 }
                 lines.push(format!("  step {}/{steps}  sigma {:.4}  {secs:6.2} s   cosine to the reference: video {cv:.5}  audio {ca:.5}", i + 1, sigmas[i]));
                 per_step.push(json!({"step": i + 1, "seconds": secs, "cosine_video": cv, "cosine_audio": ca}));
@@ -472,6 +510,64 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
     let cv = reference::compare(&v, &f32s("samples.video")?);
     let ca = reference::compare(&a, &f32s("samples.audio")?);
     ctl.say(format!("latents: video rel err {:.2e} cosine {:.5}; audio rel err {:.2e} cosine {:.5}", cv.0, cv.1, ca.0, ca.1));
+    let mut report = json!({});
+    // DWD: the last step's hidden states and the head's frames against the reference's; then the head alone on the
+    // reference's own hidden states and curve point (teacher-forced: the head's parity apart from the sampler's drift)
+    if let (Some(head), Some(cap)) = (e.pi.as_ref().and_then(|p| p.dwd.as_ref()), d.dwd.take()) {
+        let cancel = ctl.cancel;
+        let mut tick = || if cancel.load(Ordering::Relaxed) { Err(Error("cancelled".into())) } else { Ok(()) };
+        let (h2, w2) = (shape.h / 2, shape.w / 2);
+        let frames_cmp = |px: &[f32], frames: usize, want: &[f32]| -> (f64, f64, f64) {
+            let plane = px.len() / (3 * frames);
+            let mut ours = vec![0f32; px.len()];
+            for c in 0..3 {
+                for fi in 0..frames {
+                    for i in 0..plane {
+                        ours[(fi * plane + i) * 3 + c] = px[(c * frames + fi) * plane + i];
+                    }
+                }
+            }
+            let (rel, cos) = reference::compare(&ours, want);
+            let mse = ours.iter().zip(want).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>() / ours.len().max(1) as f64;
+            (rel, cos, 10.0 * (1.0 / mse.max(1e-20)).log10())
+        };
+        if dump.entries.contains_key("dwd.hidden") {
+            let want = f32s("dwd.hidden")?;
+            let (rel, cos) = reference::compare(&cap.hidden, &want);
+            ctl.say(format!("dwd    : the last step's final hidden states (video rows): rel err {rel:.2e}, cosine {cos:.6}"));
+            let tw = f32s("dwd.temb")?;
+            ctl.say(format!("dwd    : the curve point {:?} (the reference's {:?})", cap.temb, tw));
+            report["dwd_hidden_cosine"] = json!(cos);
+        }
+        let t0 = Instant::now();
+        let (px, frames) = head.decode(&cap.hidden, &cap.temb, shape.t, h2, w2, &mut tick)?;
+        ctl.say(format!("dwd    : {frames} frames in {:.1} s", t0.elapsed().as_secs_f64()));
+        if dump.entries.contains_key("images") {
+            let want = f32s("images")?;
+            if want.len() == px.len() {
+                let (rel, cos, psnr) = frames_cmp(&px, frames, &want);
+                ctl.say(format!("check  : the frames (the run's own hidden states) against the reference's: rel err {rel:.2e}, cosine {cos:.6}, PSNR {psnr:.1} dB"));
+                report["dwd_psnr"] = json!(psnr);
+                report["dwd_cosine"] = json!(cos);
+            } else {
+                ctl.say(format!("check  : the reference's frames have {} values, ours {}", want.len(), px.len()));
+            }
+            if dump.entries.contains_key("dwd.hidden") {
+                let (px2, f2) = head.decode(&f32s("dwd.hidden")?, &f32s("dwd.temb")?, shape.t, h2, w2, &mut tick)?;
+                if f2 == frames && want.len() == px2.len() {
+                    let (rel, cos, psnr) = frames_cmp(&px2, f2, &want);
+                    ctl.say(format!("check  : the head on the reference's hidden states: rel err {rel:.2e}, cosine {cos:.6}, PSNR {psnr:.1} dB"));
+                    report["dwd_head_psnr"] = json!(psnr);
+                    report["dwd_head_cosine"] = json!(cos);
+                }
+            }
+        }
+        if let Some(p) = out {
+            let o = p.with_extension("dwd.mp4");
+            crate::media::write_mp4(&o, &crate::media::Frames { px: &px, count: frames, height: shape.h * 16, width: shape.w * 16, fps: 24 }, None, ctl.log)?;
+            ctl.say(format!("written: {}", o.display()));
+        }
+    }
     if let Some(p) = out {
         let mut t = BTreeMap::new();
         t.insert("samples.video".to_string(), (dump.get("samples.video")?.shape.clone(), v));
@@ -481,7 +577,11 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
     }
     let secs = t_all.elapsed().as_secs_f64();
     ctl.say(format!("total  : {secs:.1} s"));
-    Ok(json!({"tokens": d.tokens(), "steps": per_step, "cosine_video": cv.1, "cosine_audio": ca.1, "worst_step_cosine": worst, "seconds": secs}))
+    for (k, v) in [("tokens", json!(d.tokens())), ("steps", json!(per_step)), ("cosine_video", json!(cv.1)), ("cosine_audio", json!(ca.1)),
+                   ("worst_step_cosine", json!(worst)), ("seconds", json!(secs))] {
+        report[k] = v;
+    }
+    Ok(report)
 }
 
 /// The decoders' checkpoints: video, and audio (optional: a silent clip without it).
@@ -510,7 +610,7 @@ pub fn decode(dev: &Arc<Device>, threads: usize, latents: &Path, vaes: &Vaes, ou
         Some(k) => Some((crate::dtype::bytes_to_f32(&lat.read(k)?, lat.get(k)?.dtype)?, lat.get(k)?.shape[3])), // [1, 32, 2, T]
         None => None,
     };
-    decode_latents(dev, threads, Latents { video, t: shape[2], h: shape[3], w: shape[4], audio, paste: None }, vaes, out, check, ctl)
+    decode_latents(dev, threads, Latents { video, t: shape[2], h: shape[3], w: shape[4], audio, paste: None, dwd: None }, vaes, out, check, ctl)
 }
 
 /// A clip's finished latents: video [24, t, h, w], and audio [32, 2, T] with its T.
@@ -523,6 +623,8 @@ pub struct Latents {
     /// MPEG-Diffusion's paste (mpeg.rs): the half-res track decoded too, enlarged and pasted under the full-res frames
     /// outside the region
     pub paste: Option<crate::mpeg::Paste>,
+    /// the frames already made (pi-H3's DWD head: [3, frames, H, W] in [0, 1], and their count): no video decoder
+    pub dwd: Option<(Vec<f32>, usize)>,
 }
 
 /// Latents in memory -> frames and sound (and an .mp4); see `decode`.
@@ -539,7 +641,7 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
     let (t, mut h, mut w) = (lat.t, lat.h, lat.w);
     let mut z = lat.video;
     let mut report = json!({});
-    let latent_up = if vaes.pixel.is_some() || lat.paste.is_some() { None } else { vaes.upscale };
+    let latent_up = if vaes.pixel.is_some() || lat.paste.is_some() || lat.dwd.is_some() { None } else { vaes.upscale };
     if let Some((up, s)) = latent_up {
         let t0 = Instant::now();
         let u = crate::upscale::Upscaler::load(dev, &Checkpoint::open(up)?)?;
@@ -569,7 +671,7 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
     }
     let cancel = ctl.cancel;
     // the fast decoder when asked for, its silo there and the card the room
-    let fast = match vaes.fast {
+    let fast = match vaes.fast.filter(|_| lat.dwd.is_none()) {
         Some(fp) => {
             let need = crate::fastvae::FastDecoder::need_bytes(t, h, w) as u64 + (7u64 << 29);
             match dev.mem_free() {
@@ -596,8 +698,16 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
     let mut tiles = 0usize;
     // the video decoder, when it decoded the clip (MPEG-Diffusion's half-res track below reuses it)
     let mut std_dec = None;
-    let (px, frames) = match &fast {
-        Some(d) => {
+    let dwd_frames = lat.dwd;
+    let (px, frames) = match (dwd_frames, &fast) {
+        // pi-H3's DWD head made the frames at the last step
+        (Some(f), _) => {
+            ctl.say(format!("latents: video {t}x{h}x{w} - the frames are the DWD head's, no video decoder"));
+            t0 = Instant::now();
+            report["vae"] = json!("dwd");
+            f
+        }
+        (None, Some(d)) => {
             ctl.say(format!("latents: video {t}x{h}x{w}"));
             t0 = Instant::now();
             let r = d.decode(&z, t, h, w, &mut || {
@@ -610,7 +720,7 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
             report["vae"] = json!("fast");
             r
         }
-        None => {
+        (None, None) => {
             let ck = Checkpoint::open(vae)?;
             let dec = crate::vae::VideoDecoder::load(dev, &ck, threads)?;
             ctl.say(format!("vae    : {} loaded, {:.2} GiB in {:.1} s", vae.display(), gib(dec.load_bytes), dec.load_seconds));
@@ -954,6 +1064,9 @@ pub struct ClipSpec<'a> {
     pub mpeg: Option<crate::mpeg::Spec<'a>>,
     /// write the keyframes' rows as the denoiser is given them here (`cond_dump`: the conditioning checks)
     pub cond_dump: Option<&'a Path>,
+    /// the merge gate's quick run (tooling/gate.sh `--logits-out`, `--gen-out`): the finished latents (video, then sound) and
+    /// the frames (DWD's, else none) written as bytes to hash, and two `[prompt ...]` speed lines
+    pub gate: Option<(&'a Path, &'a Path)>,
 }
 
 /// The request's `exposure_fix` settings
@@ -1557,7 +1670,28 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         return Err(Error("a soundtrack is the clip's whole sound: not with first_audio or a source".into()));
     }
     let shape = Shape { t: lt, h: c.height / 16, w: c.width / 16, audio_t: at };
-    ctl.say(format!("clip   : {}x{}, {frames} frames ({:.2} s), {} steps, seed {}", c.width, c.height, frames as f64 / 24.0, c.steps, c.seed));
+    // pi-H3 (piflow.rs): the adapted model runs its own steps, LakonLab's schedule from the noise itself, Euler, and with
+    // DWD makes the frames at the last step; it is the FL2VA model distilled (text, a first and a last frame)
+    let pi = e.pi.as_ref();
+    let c_steps = pi.map_or(c.steps, |p| p.steps);
+    if let Some(p) = pi {
+        let i = &c.inputs;
+        if !i.ref_images.is_empty() || !i.ref_videos.is_empty() || !i.ref_audio.is_empty() {
+            return Err(Error("pi-H3 is H3's FL2VA model distilled: a prompt, a first frame, a last frame - no reference pictures, clips or voices \
+                              (ref2va needs the full H3 models)".into()));
+        }
+        if c.mpeg.is_some() || c.refine.is_some() || i.source.is_some() || i.control_video.is_some() || i.control_mask.is_some() {
+            return Err(Error("pi-H3 takes no MPEG-Diffusion, refine pass, masked regeneration or ControlNet (not what it was distilled for)".into()));
+        }
+        ctl.say(format!("pi-h3  : {}", p.describe()));
+        if c.steps != p.steps {
+            ctl.say(format!("pi-h3  : {} steps asked; this adapter runs the {} it was distilled for", c.steps, p.steps));
+        }
+        if c.sampler != nextsycl_diffusion::Sampler::Euler || c.knots.len() >= 2 || c.schedule != nextsycl_diffusion::Schedule::Shift {
+            ctl.say("pi-h3  : the sampler, schedule and knots asked are set aside: LakonLab's Euler on its own schedule".to_string());
+        }
+    }
+    ctl.say(format!("clip   : {}x{}, {frames} frames ({:.2} s), {c_steps} steps, seed {}", c.width, c.height, frames as f64 / 24.0, c.seed));
     // a clip too long for the card even without its text and references is refused before anything loads
     if c.mpeg.is_none() && c.refine.is_none() {
         fit_clip(e, frames, c.width, c.height, 0, c.vaes.video, false, ctl)?;
@@ -1717,6 +1851,10 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     let tags = presented.has_vision().then(|| presented.tags.clone());
     let mut d = Denoiser::new(&e.model, &e.outer, text, tags, run_shape, schedule, &cond)?;
     d.lora = lora.as_ref();
+    if let Some(p) = pi {
+        d.base_lora = Some(&p.lora);
+        d.pure_noise = true;
+    }
     if let (Some(net), Some((h, ch))) = (control.as_ref(), hint.as_ref()) {
         d.set_control(net, h, *ch)?;
     }
@@ -1736,8 +1874,10 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         }
         _ => crate::noise::clip_noise(c.seed, n_v, 32 * 2 * shape.audio_t),
     };
-    // H3's own schedule (the video shift), or one of ComfyUI's at that shift
-    let sigmas = if let Some(r) = &c.refine {
+    // H3's own schedule (the video shift), or one of ComfyUI's at that shift; pi-H3's own
+    let sigmas = if let Some(p) = pi {
+        crate::piflow::schedule(p.steps, crate::piflow::max_raw_t(p.steps).unwrap_or(1.0), crate::piflow::FINAL_STEP_SIZE_SCALE, schedule.shift_video)
+    } else if let Some(r) = &c.refine {
         r.sigmas.clone()
     } else if c.knots.len() >= 2 {
         c.knots.iter().map(|k| denoiser::shifted(k / 1000.0, schedule.shift_video)).collect()
@@ -1746,7 +1886,10 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     } else {
         nextsycl_diffusion::samplers::sigmas_for(c.sampler, c.schedule, c.steps as u32, schedule.shift_video)
     };
-    if c.knots.len() >= 2 {
+    if pi.is_some() {
+        ctl.say(format!("sampler: euler from the noise itself on pi-Flow's schedule {:?} (shift {}; the audio at shift {})", sigmas, schedule.shift_video,
+                        schedule.shift_audio));
+    } else if c.knots.len() >= 2 {
         ctl.say(format!("sampler: {} on the knots {:?} ({} steps, shift {})", c.sampler.name(), c.knots, sigmas.len() - 1, schedule.shift_video));
     } else if c.sampler != nextsycl_diffusion::Sampler::Euler || c.schedule != nextsycl_diffusion::Schedule::Shift {
         ctl.say(format!("sampler: {} on the {} schedule ({} levels)", c.sampler.name(), c.schedule.name(), sigmas.len()));
@@ -1756,6 +1899,10 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         _ => noise_v,
     };
     ctl.say(format!("tokens : {} in the denoiser", d.tokens()));
+    // DWD: the last step's call keeps the video rows' hidden states for the head
+    if pi.is_some_and(|p| p.dwd.is_some()) {
+        d.dwd = Some(denoiser::DwdCapture { at: sigmas[sigmas.len() - 2], ..Default::default() });
+    }
     if let Some(p) = c.cond_dump {
         write_cond_dump(p, &d, &cond, sigmas[0])?;
         ctl.say(format!("dump   : the keyframes' rows written to {}", p.display()));
@@ -1808,7 +1955,8 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         let mut times = Vec::new();
         let mut t_step = Instant::now();
         let preview = out.with_extension("preview.png");
-        let r = denoiser::sample_with(&mut d, c.sampler, &noise_v, &noise_a, &sigmas, inpaint.as_ref(), c.seed, &mut |_, dv, _| {
+        let sampler = if pi.is_some() { nextsycl_diffusion::Sampler::Euler } else { c.sampler };
+        let r = denoiser::sample_with(&mut d, sampler, &noise_v, &noise_a, &sigmas, inpaint.as_ref(), c.seed, &mut |_, dv, _| {
             times.push(t_step.elapsed().as_secs_f64());
             t_step = Instant::now();
             // the shot so far: the denoised estimate's middle frame (a failed write costs the preview only)
@@ -1832,6 +1980,7 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         (v, a)
     };
     let sample_secs = t0.elapsed().as_secs_f64();
+    let dwd_cap = d.dwd.take();
     drop(d);
     // the next clip's latent anchor: the last latent frame, before any upscaling
     {
@@ -1854,7 +2003,50 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     if c.refine.as_ref().is_some_and(|r| r.window) {
         return Ok(json!({"sample_seconds": sample_secs}));
     }
-    let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video: v, t: shape.t, h: shape.h, w: shape.w, audio: Some((a, shape.audio_t)), paste }, &c.vaes, Some(out), None, Some(out), exposure.as_ref(), ctl)?;
+    // DWD: the frames from the last step's hidden states, the video decoder skipped (without the room for the head, the
+    // VAE decodes the last latents)
+    let mut dwd_secs = None;
+    let dwd = match (pi.and_then(|p| p.dwd.as_ref()), dwd_cap) {
+        (Some(head), Some(cap)) if !cap.hidden.is_empty() => {
+            let need = crate::dwd::DwdHead::need_bytes(shape.t, shape.h, shape.w) as u64;
+            match e.dev.mem_free() {
+                Some(free) if free < need + (3u64 << 29) => {
+                    ctl.say(format!("dwd    : the head needs about {:.1} GiB, {:.1} GiB free: the video decoder instead", gib(need), gib(free)));
+                    None
+                }
+                _ => {
+                    let t0 = Instant::now();
+                    let cancel = ctl.cancel;
+                    let r = head.decode(&cap.hidden, &cap.temb, shape.t, shape.h / 2, shape.w / 2, &mut || match cancel.load(Ordering::Relaxed) {
+                        true => Err(Error("cancelled".into())),
+                        false => Ok(()),
+                    })?;
+                    let secs = t0.elapsed().as_secs_f64();
+                    ctl.say(format!("dwd    : {} frames of {}x{} from the last step's hidden states in {secs:.1} s", r.1, shape.w * 16, shape.h * 16));
+                    dwd_secs = Some(secs);
+                    Some(r)
+                }
+            }
+        }
+        _ => None,
+    };
+    if let Some((lo, go)) = c.gate {
+        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        std::fs::write(lo, [bytes(&v), bytes(&a)].concat()).ctx(format!("writing {}", lo.display()))?;
+        std::fs::write(go, dwd.as_ref().map(|(px, _)| px.iter().map(|x| (x * 255.0).round() as u8).collect::<Vec<u8>>()).unwrap_or_default())
+            .ctx(format!("writing {}", go.display()))?;
+        let tokens = clip_rows(run_shape);
+        ctl.say(format!("[prompt {tokens} clip tokens x {steps} steps in {sample_secs:.2} s ({:.1} tok/s)]", (tokens * steps) as f64 / sample_secs));
+        if let (Some((_, f)), Some(sec)) = (&dwd, dwd_secs) {
+            ctl.say(format!("[prompt {f} frames of {}x{} by the DWD head in {sec:.2} s ({:.1} tok/s)] (the second: thousands of pixels a second)", shape.w * 16,
+                            shape.h * 16, (*f * shape.w * shape.h * 256) as f64 / 1000.0 / sec));
+        }
+    }
+    let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video: v, t: shape.t, h: shape.h, w: shape.w, audio: Some((a, shape.audio_t)), paste, dwd },
+                                       &c.vaes, Some(out), None, Some(out), exposure.as_ref(), ctl)?;
+    if let Some(p) = pi {
+        rep["pi"] = json!({"adapter": p.path.display().to_string(), "steps": p.steps, "dwd": dwd_secs.is_some(), "dwd_seconds": dwd_secs});
+    }
     if let Some(m) = mpeg_report {
         rep["mpeg"] = m;
     }
@@ -1988,7 +2180,7 @@ fn generate_windows(e: &Engine, mut c: ClipSpec, out: &Path, ctl: &mut Ctl) -> R
         ("samples.video".to_string(), (vec![1, 24, lt, h, w], video.clone())),
         ("samples.audio".to_string(), (vec![1, 32, 2, draft_at], draft_a.clone())),
     ]), &BTreeMap::new())?;
-    let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video, t: lt, h, w, audio: Some((draft_a, draft_at)), paste: None }, &c.vaes, Some(out), None, Some(out), None, ctl)?;
+    let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video, t: lt, h, w, audio: Some((draft_a, draft_at)), paste: None, dwd: None }, &c.vaes, Some(out), None, Some(out), None, ctl)?;
     let total = t_all.elapsed().as_secs_f64();
     rep["windows"] = json!(plan.len());
     rep["sample_seconds"] = json!(sampled);
@@ -2196,6 +2388,7 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                 // the conditioning checks: the keyframes' rows as the denoiser gets them (and, with mpeg, the switch's
                 // two-track rows beside it: <cond_dump>.switch.safetensors)
                 cond_dump: s("cond_dump").map(Path::new),
+                gate: s("logits-out").zip(s("gen-out")).map(|(l, g)| (Path::new(l), Path::new(g))),
             };
             // "PATH[:STRENGTH][,PATH[:STRENGTH]...]"
             let lora: Vec<(&Path, f32)> = s("lora")

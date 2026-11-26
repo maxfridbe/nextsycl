@@ -101,6 +101,19 @@ impl Outer {
         })
     }
 
+    /// An adapter's final layer in place of the checkpoint's (pi-H3's adapters tune it whole): the norm's weight
+    /// (float32 [hidden]), the AdaLN projection on the curve [2 * hidden, t_dim] and its bias, the two output linears
+    /// (float32 weights) - each the shape of the one it replaces
+    pub fn set_final(&mut self, norm: Tensor, w: Vec<f32>, b: Vec<f32>, video_out: Linear, audio_out: Linear) -> Result<()> {
+        let same = |a: &Linear, b: &Linear| a.weight.shape == b.weight.shape && a.weight.dtype == b.weight.dtype;
+        if norm.shape != self.final_norm.shape || w.len() != self.final_w.len() || b.len() != self.final_b.len() || !same(&video_out, &self.video_out)
+            || !same(&audio_out, &self.audio_out) {
+            return Err(Error("the adapter's final layer does not fit the checkpoint's".into()));
+        }
+        (self.final_norm, self.final_w, self.final_b, self.video_out, self.audio_out) = (norm, w, b, video_out, audio_out);
+        Ok(())
+    }
+
     /// The final layer's shift and scale tables [R, hidden] for the timestep embeddings [R, t_dim].
     fn final_tables(&self, cfg: &Config, t_emb: &[f32]) -> (Vec<f32>, Vec<f32>) {
         let (c, td) = (cfg.hidden, cfg.t_dim);
@@ -451,10 +464,44 @@ pub struct Denoiser<'a> {
     /// (block, taps): the next two-track call (`net_two_track`) keeps that block's raw qkv and attention output as
     /// float32 ("qkv" [rows, 3 H D], "att" [rows, H D]) - the reference checks of docs/ports/mpeg-diffusion.md
     pub taps: Option<(usize, Taps)>,
+    /// LoRAs of the loaded model itself (pi-H3's adapter, `piflow::Adapter`), run beside a request's `lora` in every
+    /// call
+    pub base_lora: Option<&'a crate::lora::LoraSet>,
+    /// the sampler starts from the noise itself rather than the noise at the first level's scale (pi-H3: LakonLab's
+    /// pipeline draws the latents and steps from there, whatever the first sigma)
+    pub pure_noise: bool,
+    /// DWD (pi-H3): the call at this noise level keeps the video rows' final hidden states and their timestep's curve point
+    pub dwd: Option<DwdCapture>,
+}
+
+/// What a DWD head decodes: the video rows' hidden states after the last block at the last step, float32 [video rows,
+/// hidden] in the rows' (t, y, x) order, and the curve point [t_dim] of their timestep (`dwd::DwdHead::decode`)
+#[derive(Default)]
+pub struct DwdCapture {
+    /// the noise level of the call to keep (the schedule's last before 0)
+    pub at: f32,
+    pub hidden: Vec<f32>,
+    pub temb: Vec<f32>,
 }
 
 /// Named float32 copies of a block's buffers (`Denoiser::taps`)
 pub type Taps = Vec<(String, Vec<f32>)>;
+
+/// A block's LoRAs: the model's own (`base`, kept for its life) and a request's, as one list a linear (views of the
+/// model's tensors: they live as long as the engine, past the call this is made for)
+fn with_base(base: &crate::lora::BlockLora, other: Option<&crate::lora::BlockLora>) -> Result<crate::lora::BlockLora> {
+    let view = |t: &Tensor| -> Result<Tensor> {
+        // SAFETY: a view of the whole tensor; the model's LoRA set outlives the Denoiser that uses it.
+        unsafe { t.rows_view(0, t.shape[0]) }
+    };
+    let mut out: crate::lora::BlockLora = std::array::from_fn(|_| Vec::new());
+    for (j, o) in out.iter_mut().enumerate() {
+        for l in base[j].iter().chain(other.map(|b| b[j].as_slice()).unwrap_or(&[])) {
+            o.push(ops::Lora { a: view(&l.a)?, b: view(&l.b)? });
+        }
+    }
+    Ok(out)
+}
 
 /// The final layer on `n` rows of the stream `x` from row `start`: norm, the timestep's shift and scale (`t_rows`:
 /// each row's timestep index into the tables), the output linear; float32 [n, outputs], in chunks of rows
@@ -583,6 +630,9 @@ impl<'a> Denoiser<'a> {
             hyperflow: None,
             capture: None,
             taps: None,
+            base_lora: None,
+            pure_noise: false,
+            dwd: None,
         })
     }
 
@@ -759,6 +809,12 @@ impl<'a> Denoiser<'a> {
                 _ => None,
             };
             let lora = staged.as_ref().or_else(|| self.lora.and_then(|l| l.blocks.get(i)));
+            // the model's own LoRAs (pi-H3's adapter) beside the request's
+            let merged = match self.base_lora.and_then(|b| b.blocks.get(i)) {
+                Some(b) => Some(with_base(b, lora)?),
+                None => None,
+            };
+            let lora = merged.as_ref().or(lora);
             self.blocks.block(i, &self.x, &step, &self.scratch, lora, None)?;
             if let Some((b, states)) = self.capture.as_mut().filter(|(b, _)| *b == i) {
                 let _ = b;
@@ -775,6 +831,21 @@ impl<'a> Denoiser<'a> {
                     c.net.step(k, &c.stream, &self.x, &c.skip, cs, &self.scratch, (&c.audio, &c.zeros))?;
                 }
             }
+        }
+
+        // DWD: the video rows' final hidden states (to the host, in chunks of rows) and their timestep's curve point
+        if let Some(c) = self.dwd.as_mut().filter(|c| c.at == sigma) {
+            let mut hidden = Vec::with_capacity(nv * cfg.hidden);
+            let chunk = Tensor::new(&dev, DType::BF16, &[FINAL_CHUNK.min(nv), cfg.hidden])?;
+            let mut done = 0;
+            while done < nv {
+                let m = FINAL_CHUNK.min(nv - done);
+                chunk.copy_rows(0, &self.x, ts_video.start + done, m)?;
+                hidden.extend_from_slice(&chunk.to_f32()?[..m * cfg.hidden]);
+                done += m;
+            }
+            c.hidden = hidden;
+            c.temb = t_emb[ts.video_index * cfg.t_dim..(ts.video_index + 1) * cfg.t_dim].to_vec();
         }
 
         // final layer, per stream, in chunks of rows
@@ -1009,10 +1080,10 @@ pub fn sample_masked(
     on_step: OnStep,
     between: &mut dyn FnMut(usize, usize) -> Result<()>,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
-    let s0 = sigmas[0];
+    let (s0, s0_a) = start_scales(d, sigmas[0]);
     let scale = d.schedule.audio_scale;
     let mut xv: Vec<f32> = noise_v.iter().map(|n| n * s0).collect();
-    let mut xa: Vec<f32> = noise_a.iter().map(|n| n * s0).collect();
+    let mut xa: Vec<f32> = noise_a.iter().map(|n| n * s0_a).collect();
     for i in 0..sigmas.len() - 1 {
         let (s, next) = (sigmas[i], sigmas[i + 1]);
         let (dv, da) = estimate(d, &xv, &xa, s, inpaint, noise_v, &mut |b| between(i, b))?;
@@ -1024,6 +1095,18 @@ pub fn sample_masked(
     }
     xa.iter_mut().for_each(|x| *x /= scale);
     Ok((xv, xa))
+}
+
+/// What the starting noise is multiplied by, video and audio as the sampler carries them: the first level (ComfyUI's
+/// start, `sigma0 n` in both streams' own spaces), or with `pure_noise` the noise itself in both (LakonLab's) - the audio
+/// then carried at `sigma0 / sigma0_audio`, the sampler's audio being the audio latent times sigma / sigma_audio
+fn start_scales(d: &Denoiser, s0: f32) -> (f32, f32) {
+    if !d.pure_noise {
+        return (s0, s0);
+    }
+    let sc = d.schedule;
+    let sa = time_shift_sigma(s0.max(1e-6) as f64, sc.shift_video as f64, sc.shift_audio as f64) as f32;
+    (1.0, s0.max(1e-6) / sa)
 }
 
 /// The denoised estimates at (x, sigma), as the sampler sees them; with a masked run the kept parts put back (as
@@ -1085,8 +1168,8 @@ pub fn sample_with(
     }
     let scale = d.schedule.audio_scale;
     let nv = noise_v.len();
-    let s0 = sigmas[0];
-    let x: Vec<f32> = noise_v.iter().chain(noise_a).map(|n| n * s0).collect();
+    let (s0, s0_a) = start_scales(d, sigmas[0]);
+    let x: Vec<f32> = noise_v.iter().map(|n| n * s0).chain(noise_a.iter().map(|n| n * s0_a)).collect();
     let step = std::cell::Cell::new(0usize);
     let last = std::cell::RefCell::new((Vec::new(), Vec::new()));
     let failed = std::cell::RefCell::new(None::<Error>);
