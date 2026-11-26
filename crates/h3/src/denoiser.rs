@@ -809,8 +809,12 @@ impl<'a> Denoiser<'a> {
                 _ => None,
             };
             let lora = staged.as_ref().or_else(|| self.lora.and_then(|l| l.blocks.get(i)));
-            // the model's own LoRAs (pi-H3's adapter) beside the request's
-            let merged = match self.base_lora.and_then(|b| b.blocks.get(i)) {
+            // the model's own LoRAs (pi-H3's adapter, kept in host memory: to the card for their block) beside the request's
+            let base_staged = match self.base_lora {
+                Some(b) if b.on_host() => b.device_block(&dev, i)?,
+                _ => None,
+            };
+            let merged = match base_staged.as_ref().or_else(|| self.base_lora.and_then(|b| b.blocks.get(i))) {
                 Some(b) => Some(with_base(b, lora)?),
                 None => None,
             };

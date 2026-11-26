@@ -197,8 +197,9 @@ pub fn apply(e: &mut Engine, path: &Path, steps: Option<usize>, log: &mut dyn Fn
         e.outer.set_final(norm, names.host("final_layer.adaln_proj.linear.weight")?, names.host("final_layer.adaln_proj.linear.bias")?, lin("final_layer.video_out")?,
                           lin("final_layer.audio_out")?)?;
     }
-    // the LoRAs, on the card for the engine's life
-    let lora = LoraSet::load(&e.dev, &ck, 1.0, n, 2)?;
+    // the LoRAs in host memory (0.4 GB in bfloat16), each block's sent to the card as it runs: the card's room goes to the
+    // sequence (the copies cost ~0.1 s a step)
+    let lora = LoraSet::load_to(&e.dev, &ck, 1.0, n, 2, true)?;
     if lora.max_rank > crate::dit::MAX_LORA_RANK {
         return Err(Error(format!("LoRA rank {} is over {}", lora.max_rank, crate::dit::MAX_LORA_RANK)));
     }
