@@ -64,6 +64,7 @@ for a chat model. Measured speeds: tg (token generation, decode) / pp (prompt pr
 | `animateanymesh` | **AnimateAnyMesh** a mesh set in motion by a sentence, as morph targets (`model3d.rig` with a prompt) | a 7.6K-vertex humanoid, 16 frames: 2.8 s |
 | `unimate` | **UniMate** the skeleton of a rigged mesh set in motion by a sentence, as a glTF skeletal animation (`model3d.rig` with a prompt; weights CC BY-NC) | a 28-joint humanoid, 60 frames: 13 s |
 | `minimax-h3` | **MiniMax H3** video with sound | 896x672, 4.5 s: ~90 s |
+| `minimax-h3-pi-2step` (also `-pi-4step`, `-pi-2step-vae`, `-pi-4step-vae`) | **pi-H3** MiniMax H3 in 2 or 4 steps, the frames from the denoiser (DWD, no VAE decode); text, first and last frame - no reference pictures | B70, 2 steps: 832x480 5 s 32 s, 1344x768 10 s 166 s (H3 at 15 steps: 114 s / 1091 s) |
 | `hunyuanvideo-1.5-480p-t2v-distilled-q8` (also `-480p-t2v-q8`, `-480p-i2v-step-distilled-q8`) | **HunyuanVideo-1.5** silent 480p video from text, or from a picture (8 steps) | 848x480, 5 s, 50 steps: B70 11.3 min (12.8 s a step), B65 18.0 min; with 30 steps + step caching + int8 attention 3.1 / 4.9 min |
 | `movieroll-distilled-t2v-q8` (also `-i2v-q8`, `movieroll-base-t2v-q8`) | **MovieRoll** silent films at 480p by rolling diffusion (a minute from a prompt; video.roll: as long as its events go) - events, steered while it runs (video.roll), watchable as it is made (HLS) | 864x480, 60 s, 4 events: B70 15.7 min, B65 23.6 min (10 s: 2.6 / 3.9 min) |
 | `minimax-music3-int8` | **MiniMax Music 3** songs | a minute of song: 89 s |

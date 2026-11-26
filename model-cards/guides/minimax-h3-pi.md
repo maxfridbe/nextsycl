@@ -30,6 +30,8 @@ non_diegetic_music: <a score, or "None.">
 - **Length and size**: as H3 - frames 17k + 5 at 24 fps (up to ~15 s), sides multiples of 32, up to 1344x768.
 - **Upscaling**: a DWD clip has no latents to enlarge before decoding - use the pixel upscaler (ESRGAN), the
   default; the latent upscaler is skipped.
+- **Speed** (B70, from the prompt to the clip): 2 steps 832x480 x 5 s 32 s, x 10 s 43 s, 1344x768 x 5 s 63 s, x 10 s
+  166 s; 4 steps about 1.3-1.8x that; H3 at 15 steps takes 3.6-6.6x the 2-step time (the B65 ~1.2-1.5x the B70).
 - **Draft, then final**: a 2-step clip is a quick look; the 4-step one holds detail and motion better. For dialogue
   and close-ups the full `minimax-h3` (8-20 steps) is still the reference.
 

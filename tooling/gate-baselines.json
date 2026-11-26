@@ -180,6 +180,37 @@
           "recorded": "2d646fc (2026-11-23)"
         }
       }
+    },
+    "video/h3": {
+      "run": "dist/nextsycl video job denoise --model minimax-h3-pi-2step --gpu {gpu} --dump /var/mnt/4TBSSD/nsref-pih3/out/dwd2.safetensors --here",
+      "mounts": [
+        "/var/mnt/4TBSSD/nextsycl-models",
+        "/var/mnt/2TBSSD/minimaxh3/models",
+        "/var/mnt/4TBSSD/nsref-pih3/out"
+      ],
+      "timeout_s": 900,
+      "gpus": [
+        "1"
+      ],
+      "cards": {
+        "arc-pro-b65-160u-32g": {
+          "exact": "4789d7d6901960da",
+          "pp": 1880.3,
+          "tg": 6528.3,
+          "device": {
+            "name": "Intel(R) Arc(TM) Pro B65 Graphics",
+            "units": 160,
+            "mhz": 2400,
+            "vram_mb": 32656,
+            "sub_groups": [
+              16,
+              32
+            ]
+          },
+          "host": "hardac1",
+          "recorded": "cdb35b0 (2026-11-25)"
+        }
+      }
     }
   }
 }

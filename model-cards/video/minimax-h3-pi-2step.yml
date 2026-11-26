@@ -16,6 +16,7 @@ license: minimax-h3-community
 commercial: true
 license_note: 'pi-H3''s adapters are Model Derivatives of MiniMax H3 (Hansheng Chen et al.; LakonLab), distributed under the MiniMax H3 Community License Agreement, as are H3''s denoiser, VAEs and the Qwen3-VL-32B text encoder as MiniMax ships it (Comfy-Org''s repack; the GGUF unsloth''s): not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; products show "Powered by MiniMax H3"; its Acceptable Use Policy; outputs may not improve another model. Keep pi-H3''s NOTICE with copies. The encoder underneath is Qwen3-VL-32B (Apache-2.0); the Qwen2.5 tokenizer files come from ComfyUI''s GPL-3.0 repository. Not an official MiniMax product.'
 gpus: '0'
+vram_gib: 22.4                   # 832x480 x 5 s (the card's own peak, B70 and B65 alike); 1344x768 x 10 s: 30.3 (docs/ports/pi-h3.md)
 defaults:
   steps: 2
   seconds: 5.0

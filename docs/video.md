@@ -10,6 +10,10 @@ and studio: added to `NS_VIDEO_ENGINES`, `video.generate` takes it as `engine: "
 diffusion - a minute from one prompt, any length from video.roll's events on HunyuanVideo-1.5's engine) runs behind them too - video.generate as engine `MR` / `MR-I2V` / `MR-BASE` (the
 prompt as its events), and video.roll / video.rollAppend / video.rollEnd for a film steered while it runs and watchable
 as it is made (an HLS playlist beside the clip) (docs/ports/movieroll.md).
+**pi-H3** (cards `minimax-h3-pi-2step`, `-4step`, and `-2step-vae`, `-4step-vae`: Lakonik's 2- and 4-step adapters of
+H3's FL2VA model, the DWD ones making the frames from the denoiser without the VAE decoder) is the H3 engine with an
+`adapter` file - video.generate as engine `PI2` / `PI4` / `PI2-VAE` / `PI4-VAE`: a prompt, a first and a last frame,
+sound; **no reference pictures (ref2va)** (docs/ports/pi-h3.md).
 
 ```sh
 nextsycl models pull minimax-h3 [--dir DIR] [--from DIR]      # --from: adopt copies already on the machine
@@ -61,6 +65,7 @@ What a clip can be made from (ComfyUI's H3 nodes, each checked against them wher
 | video inpainting | a mask (white: regenerate; a picture or a video) over a source video, through the same ControlNet | `control_mask`, `control_source` |
 | regenerate a stretch / box, extend | a clip's latents kept outside the seconds and box asked for | `source`, `regen`, `regen_box` |
 | a 768p draft at 2560x1440 (Open-H3-Regenerate-2K-IC) | the draft as `<Video 1>` on the Ref2VA denoiser + HyperFlow 8-step + LMS Sharp + the IC LoRA, 3 steps from the upscaled draft; its sound kept (the `regen2k` job, the `minimax-h3-regen2k-ic` model; docs/ports/open-h3-regenerate-2k.md) | `regen2k`, `regen_sampler`, `regen_resolution`, `sharp` |
+| text, first / last frame to video+audio in 2 or 4 steps (pi-H3) | Lakonik's pi-Flow adapters merged into the int8 FL2VA denoiser; the DWD cards' frames from the denoiser's last hidden states (no VAE decode); not ref2va (the `minimax-h3-pi-*` models; docs/ports/pi-h3.md) | the model id (engine `PI2`, `PI4`, `PI2-VAE`, `PI4-VAE`); `first_frame`, `last_frame` |
 | text to video+audio on two tracks (MPEG-Diffusion) | 16 of 20 steps at half resolution, then full-resolution tokens on the region a head on block 25 picks (people, faces), the rest the half-res track enlarged; ~2x faster at 1344x768 on the B70 (3 s: 216.6 s -> 100-111 s; 6 s: 577.7 s -> 220-237 s, sampling + decode), the region softer than a full-res render (the `minimax-h3-mpeg` model; docs/ports/mpeg-diffusion.md) | the model id; `mpeg: false` runs it at full resolution |
 
 ![the video studio](screenshots/video-studio.webp)
