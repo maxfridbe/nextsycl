@@ -312,7 +312,12 @@ pub fn bench_blocks(e: &Engine, tokens: usize, blocks: Option<usize>, ctl: &mut 
 /// A whole sampling run against a run dump of the reference pipeline (reference/h3x.py, H3X_DUMP_RUN): the same
 /// text conditioning, starting noise and schedule; every step's denoised estimate compared with the reference's,
 /// then the finished latents. `out`: where to write the latents (for the reference's decoders).
-pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) -> Result<Value> {
+///
+/// `gate`: the merge gate's quick run (tooling/gate.sh `--logits-out`, `--gen-out`) - the finished latents and the DWD
+/// frames written as bytes to hash, and two `[prompt ...]` speed lines. A replayed dump is the deterministic H3 run: the
+/// generate job's clips differ a little run to run (its latents cosine ~0.999 for the base model at 8 steps; a distilled
+/// model carries that further), the denoise job's do not.
+pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, gate: Option<(&Path, &Path)>, ctl: &mut Ctl) -> Result<Value> {
     let t_all = Instant::now();
     let dump = Checkpoint::open(dump_path)?;
     let f32s = |name: &str| -> Result<Vec<f32>> { crate::dtype::bytes_to_f32(&dump.read(name)?, dump.get(name)?.dtype) };
@@ -507,6 +512,13 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
         }
         r?
     };
+    let sample_secs: f64 = per_step.iter().filter_map(|s| s["seconds"].as_f64()).sum();
+    if let Some((lo, _)) = gate {
+        let bytes = |x: &[f32]| x.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        std::fs::write(lo, [bytes(&v), bytes(&a)].concat()).ctx(format!("writing {}", lo.display()))?;
+        let tokens = d.tokens();
+        ctl.say(format!("[prompt {tokens} tokens x {steps} steps in {sample_secs:.2} s ({:.1} tok/s)]", (tokens * steps) as f64 / sample_secs));
+    }
     let cv = reference::compare(&v, &f32s("samples.video")?);
     let ca = reference::compare(&a, &f32s("samples.audio")?);
     ctl.say(format!("latents: video rel err {:.2e} cosine {:.5}; audio rel err {:.2e} cosine {:.5}", cv.0, cv.1, ca.0, ca.1));
@@ -541,6 +553,12 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
         }
         let t0 = Instant::now();
         let (px, frames) = head.decode(&cap.hidden, &cap.temb, shape.t, h2, w2, &mut tick)?;
+        if let Some((_, go)) = gate {
+            let sec = t0.elapsed().as_secs_f64();
+            std::fs::write(go, px.iter().map(|x| (x * 255.0).round() as u8).collect::<Vec<u8>>()).ctx(format!("writing {}", go.display()))?;
+            ctl.say(format!("[prompt {frames} frames of {}x{} by the DWD head in {sec:.2} s ({:.1} tok/s)] (the second: thousands of pixels a second)", shape.w * 16,
+                            shape.h * 16, (frames * shape.w * shape.h * 256) as f64 / 1000.0 / sec));
+        }
         ctl.say(format!("dwd    : {frames} frames in {:.1} s", t0.elapsed().as_secs_f64()));
         if dump.entries.contains_key("images") {
             let want = f32s("images")?;
@@ -2260,7 +2278,8 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
         "denoise" => {
             let dump = spec.get("dump").and_then(|d| d.as_str()).ok_or("denoise needs \"dump\": a run dump the engine can read")?;
             let out = spec.get("out").and_then(|d| d.as_str()).map(Path::new);
-            denoise(e, Path::new(dump), out, ctl)
+            let s = |k: &str| spec.get(k).and_then(|d| d.as_str()).map(Path::new);
+            denoise(e, Path::new(dump), out, s("logits-out").zip(s("gen-out")), ctl)
         }
         "decode" => {
             let s = |k: &str| spec.get(k).and_then(|d| d.as_str()).map(Path::new);
