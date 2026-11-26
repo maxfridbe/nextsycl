@@ -548,10 +548,15 @@ pub(crate) fn capabilities(m: &Value) -> (Vec<&'static str>, Vec<&'static str>) 
         // a draft made again at 2K (its card: does regen2k): video.generate with regen2k naming the draft, nothing else
         "video" if m["does"].as_array().is_some_and(|a| a.iter().any(|x| x == "regen2k")) => (vec!["regenerate_2k", "video_to_video", "sound"], vec!["video.generate"]),
         "video" => {
-            let mut c = vec!["text_to_video", "image_to_video", "sound", "chain", "first_last_frame", "voice_reference"];
-            if s(m, "id").contains("ref2va") {
+            // pi-H3 (minimax-h3-pi-*): no ControlNet or masks, voices only over Ref2VA (its experimental -ref2va cards)
+            let (id, pi) = (s(m, "id"), s(m, "id").starts_with("minimax-h3-pi-"));
+            let mut c = vec!["text_to_video", "image_to_video", "sound", "chain", "first_last_frame"];
+            if !pi || id.contains("ref2va") {
+                c.push("voice_reference");
+            }
+            if id.contains("ref2va") {
                 c.extend(["reference_images", "reference_videos"]);
-            } else {
+            } else if !pi {
                 c.extend(["controlnet", "inpaint"]);
             }
             (c, vec!["video.generate"])
@@ -2100,6 +2105,11 @@ mod tests {
     fn a_recogniser_transcribes_and_speaks_nothing() {
         let (caps, _) = capabilities(&json!({"id": "minimax-h3-regen2k-ic", "kind": "video", "arch": "minimax-h3", "does": ["regen2k"]}));
         assert_eq!(caps, vec!["regenerate_2k", "video_to_video", "sound"], "a 2K regeneration makes no clip from a prompt alone");
+        // pi-H3: no ControlNet or masks; references and voices only over Ref2VA (the experimental -ref2va cards)
+        let (caps, _) = capabilities(&json!({"id": "minimax-h3-pi-2step", "kind": "video", "arch": "minimax-h3"}));
+        assert!(!caps.iter().any(|c| ["controlnet", "inpaint", "reference_images", "voice_reference"].contains(c)), "{caps:?}");
+        let (caps, _) = capabilities(&json!({"id": "minimax-h3-pi-4step-ref2va", "kind": "video", "arch": "minimax-h3"}));
+        assert!(caps.contains(&"reference_images") && caps.contains(&"voice_reference") && !caps.contains(&"controlnet"), "{caps:?}");
         let (caps, methods) = capabilities(&json!({"id": "haru-4b", "kind": "audio", "arch": "haru", "speech": ["realtime", "lockstep"]}));
         assert_eq!((caps, methods), (vec!["realtime", "lockstep"], vec![]), "a live conversation only: no audio.speak");
         let (caps, methods) = capabilities(&json!({"id": "sophon", "kind": "audio", "arch": "sophon-realtime", "speech": ["clone", "realtime"]}));

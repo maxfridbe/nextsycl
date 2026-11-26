@@ -1,0 +1,41 @@
+# MiniMax H3 pi-H3 4-step over Ref2VA - EXPERIMENTAL (fast drafts of reference shots)
+# model card (model-cards/README.md): what `nextsycl models search | pull` offers and what the registry entry gets
+# Lakonik/pi-H3's 4-step DWD adapter (trained on the FL2VA denoiser) merged at load into the int8 **Ref2VA** denoiser, so
+# reference pictures, clips and voices (<Picture i> / <Video k> / <Audio j>) go through: H3_PI_REFS lets them in,
+# H3_PI_CURVE puts FL2VA's timestep curve (its adaln_t_table, read from the FL2VA denoiser file, the curve role) under the
+# adapter's AdaLN projections. Measured on five production ref2va shots (docs/ports/pi-h3.md "Over Ref2VA"): the subject
+# holds (DINOv3 / SigLIP to the references within Ref2VA's own run-to-run spread on the skimmer shots, a few points under on
+# a singer); the camera, place pictures and carried guides drift (pushes in where the prompt locks the camera, a place
+# picture's details dropped, the guide's frames 2-6 dB looser); 4 steps, the frames from the DWD head. Ref2VA's matrices
+# are ~3% from FL2VA's, the adapter's LoRA corrections ~1%: it runs on a model it was not fitted to. Not for final renders.
+# On a box without the minimax-h3 card the curve role downloads the FL2VA denoiser (21 GB) for one 32 KB tensor.
+id: minimax-h3-pi-4step-ref2va
+kind: video
+arch: minimax-h3
+title: 'MiniMax H3 pi-H3, 4 steps over Ref2VA - EXPERIMENTAL (fast drafts of reference shots: the subject holds, the camera, place pictures and carried guides drift)'
+about: 'EXPERIMENTAL: Lakonik''s pi-H3 4-step DWD adapter over the int8 Ref2VA H3 - fast drafts of reference shots; the subject holds, the camera, place pictures and carried guides drift. Reference pictures, clips and voices, first and last frames, guides; sound; no ControlNet or masked runs'
+license: minimax-h3-community
+commercial: true
+license_note: 'pi-H3''s adapters are Model Derivatives of MiniMax H3 (Hansheng Chen et al.; LakonLab), distributed under the MiniMax H3 Community License Agreement, as are H3''s denoisers, VAEs and the Qwen3-VL-32B text encoder as MiniMax ships it (Comfy-Org''s repack; the GGUF unsloth''s): not licensed in the European Union, the United Kingdom, the Republic of Korea or the United States of America; written authorization from MiniMax above US$20 million yearly revenue; products show "Powered by MiniMax H3"; its Acceptable Use Policy; outputs may not improve another model. Keep pi-H3''s NOTICE with copies. The encoder underneath is Qwen3-VL-32B (Apache-2.0); the Qwen2.5 tokenizer files come from ComfyUI''s GPL-3.0 repository. Not an official MiniMax product.'
+gpus: '0'
+vram_gib: 26.1                   # 832x480 x 10.1 s with a reference picture, a keyframe and a guide (the B65's own peak)
+defaults:
+  steps: 4
+  seconds: 5.0
+  size: 832x480
+env:
+  H3_PI_STEPS: '4'
+  H3_PI_REFS: '1'
+  H3_PI_CURVE: '{curve}'
+files:
+  denoiser: h3-denoiser-ref2va-int8
+  text-encoder: h3-te-32b-q4km
+  tokenizer: h3-tokenizer-vocab
+  tokenizer-merges: h3-tokenizer-merges
+  tokenizer-config: h3-tokenizer-config
+  vae: h3-vae
+  audio-vae: h3-audio-vae
+  vision: h3-te-visual
+  adapter: pi-h3-4step-dwd-int8
+  curve: h3-denoiser-int8
+guide: guides/minimax-h3-pi.md

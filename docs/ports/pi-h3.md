@@ -270,11 +270,12 @@ closer, livelier framing, the place picture's details go, and the motion guide i
 mismatch has a cause in the weights: Ref2VA's matrices are ~3% from FL2VA's, the adapter's LoRAs ~1%, so its distilled
 corrections are applied to a model they were not fitted to.
 
-Proposed, not added: two **experimental** cards, `minimax-h3-pi-4step-ref2va` (and `-2step-ref2va`), over the Ref2VA files
-with `H3_PI_REFS: '1'` and `H3_PI_CURVE: '{curve}'` (a `curve` role naming the FL2VA denoiser file), for drafts of
-reference shots - a fast first look where the subject matters and the exact framing does not - not for the films' final
-renders, where Ref2VA at 15-20 steps keeps the camera, the place and the cut's carried frames. Five shots of two films are
-a small sample: a person in a busier scene, several people, and dialogue would need their own look before relying on it.
+Added as two **experimental** cards, `minimax-h3-pi-4step-ref2va` and `minimax-h3-pi-2step-ref2va` (engines `PI4-REF2VA`,
+`PI2-REF2VA`): the Ref2VA files with `H3_PI_REFS: '1'` and `H3_PI_CURVE: '{curve}'` (a `curve` role naming the FL2VA
+denoiser file - `models pull` finds it on a box that has `minimax-h3`), for fast drafts of reference shots: the subject
+holds, the camera, place pictures and carried guides drift. Ref2VA's inputs (reference pictures, clips, voices) are taken;
+ControlNet and masked runs are refused. Not for the films' final renders, where Ref2VA at 15-20 steps keeps the camera,
+the place and the cut's carried frames.
 
 ## Open
 

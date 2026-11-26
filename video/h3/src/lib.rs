@@ -24,7 +24,7 @@ pub const ARCH: &str = "minimax-h3";
 
 /// The files it takes, by role (the denoiser at load; the others go into each job, where a job does not name its own)
 pub const ROLES: &[&str] = &["denoiser", "text-encoder", "tokenizer", "vae", "audio-vae", "vision", "controlnet", "ic-lora", "hyperflow", "adaln", "sharp-lora",
-                             "silence", "fast-vae", "mpeg-maps", "region-head", "adapter"];
+                             "silence", "fast-vae", "mpeg-maps", "region-head", "adapter", "curve"];
 
 /// A role and the job key it fills
 const ROLE_KEYS: &[(&str, &str)] = &[("text-encoder", "te"), ("tokenizer", "tokenizer"), ("vae", "vae"), ("audio-vae", "audio_vae"),

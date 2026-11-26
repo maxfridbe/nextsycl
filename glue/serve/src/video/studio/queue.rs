@@ -174,10 +174,15 @@ pub const HV15_FRAMES: (u64, u64) = (5, 241);
 /// distilled for - its default and its most (the engine runs those whatever a request asks) - or None
 pub fn pi_steps(engine: &str) -> Option<f64> {
     match engine {
-        "PI2" | "PI2-VAE" => Some(2.0),
-        "PI4" | "PI4-VAE" => Some(4.0),
+        "PI2" | "PI2-VAE" | "PI2-REF2VA" => Some(2.0),
+        "PI4" | "PI4-VAE" | "PI4-REF2VA" => Some(4.0),
         _ => None,
     }
+}
+
+/// pi-H3 over the Ref2VA denoiser (PI2-REF2VA, PI4-REF2VA; EXPERIMENTAL): references go through
+pub fn pi_refs(engine: &str) -> bool {
+    pi_steps(engine).is_some() && engine.ends_with("-REF2VA")
 }
 
 /// The request rules of the engines on HunyuanVideo-1.5's code (HV15..., MovieRoll's MR...): default and most steps,
@@ -349,7 +354,7 @@ pub const PI_NOT: [&str; 8] = ["ref_audios", "sampler", "schedule", "knots", "sp
 /// (a 400) rather than by the engine when the clip starts
 fn pi_check(it: &Map<String, Value>, engine: &str) -> Result<(), RpcError> {
     let set = |k: &str| !it.get(k).is_none_or(|v| v.is_null() || v.as_str() == Some("") || v.as_array().is_some_and(|a| a.is_empty()));
-    if set("ref_images") || set("ref_videos") || set("ref_audios") {
+    if !pi_refs(engine) && (set("ref_images") || set("ref_videos") || set("ref_audios")) {
         return Err(RpcError::param(&format!("engine {engine} (pi-H3) is H3's FL2VA model distilled: a prompt, a first frame and a last frame - no reference \
                                              pictures, clips or voices (ref_images, ref_videos, ref_audios need engine REF2VA)")));
     }
@@ -409,6 +414,14 @@ pub fn inputs_of(quant: &str) -> Value {
                                              "control_end"].iter()).collect::<Vec<_>>(),
                "chosen": "by engine: a fast draft (half resolution, then full resolution on the subject the model picks); canvas sides multiples of 64",
                "ignored": ignored_keys()})
+    } else if pi_refs(quant) {
+        // pi-H3 over Ref2VA (minimax-h3-pi-*-ref2va, EXPERIMENTAL): Ref2VA's inputs in 2 or 4 steps; no ControlNet or masks
+        json!({"takes": common.iter().filter(|k| !PI_NOT.contains(k) || **k == "ref_audios")
+                   .chain(["ref_images", "ref_videos", "ref_image_size", "ref_video_sound", "te_pictures"].iter()).collect::<Vec<_>>(),
+               "not": PI_NOT.iter().filter(|k| **k != "ref_audios").chain(["control_video", "control_mask", "control_source", "control_strength", "control_start",
+                                                                            "control_end"].iter()).collect::<Vec<_>>(),
+               "chosen": "by engine: EXPERIMENTAL - fast drafts of reference shots (pi-H3 over Ref2VA): the subject holds, the camera, place pictures and \
+                          carried guides drift; its steps are fixed", "ignored": ignored_keys()})
     } else if pi_steps(quant).is_some() {
         // pi-H3 (minimax-h3-pi-*): the FL2VA model in 2 or 4 steps; a prompt, a first and a last frame
         json!({"takes": common.iter().filter(|k| !PI_NOT.contains(k)).collect::<Vec<_>>(),
@@ -493,6 +506,8 @@ pub fn quant_of(id: &str) -> &'static str {
             "2step" => "PI2",
             "4step" => "PI4",
             "2step-vae" => "PI2-VAE",
+            "2step-ref2va" => "PI2-REF2VA",
+            "4step-ref2va" => "PI4-REF2VA",
             _ => "PI4-VAE",
         };
     }
@@ -743,18 +758,21 @@ impl Studio {
         // pictures and clips as references: the Ref2VA denoiser, the one trained for them (not when MPEG is asked for: its
         // two-track sampler runs the FL2VA denoiser)
         if it["ref_images"].is_array() || it["ref_videos"].is_array() {
-            if it["engine"].as_str().is_some_and(|e| pi_steps(e).is_some()) {
-                return Err(RpcError::param("pi-H3 (engines PI2, PI4) is H3's FL2VA model distilled: reference pictures and clips need engine REF2VA; drop them \
-                                            for pi-H3"));
+            if it["engine"].as_str().is_some_and(|e| pi_steps(e).is_some() && !pi_refs(e)) {
+                return Err(RpcError::param("pi-H3 (engines PI2, PI4) is H3's FL2VA model distilled: reference pictures and clips need engine REF2VA \
+                                            (or the experimental PI2-REF2VA / PI4-REF2VA); drop them for pi-H3"));
             }
             if it["engine"] == "MPEG" {
                 return Err(RpcError::param("REF2VA is not supported by MPEG yet: ref_images and ref_videos need engine REF2VA (or INT8 to have it chosen); drop them for MPEG"));
             }
-            let _ = self.engines(); // the daemon's list (a model added since the studio started)
-            if !engine_known("REF2VA") {
-                return Err(RpcError::param("reference pictures and clips need the Ref2VA denoiser (nextsycl models pull minimax-h3-ref2va, then add it to NS_VIDEO_ENGINES)"));
+            // pi-H3 over Ref2VA keeps its engine (it is a Ref2VA model)
+            if !it["engine"].as_str().is_some_and(pi_refs) {
+                let _ = self.engines(); // the daemon's list (a model added since the studio started)
+                if !engine_known("REF2VA") {
+                    return Err(RpcError::param("reference pictures and clips need the Ref2VA denoiser (nextsycl models pull minimax-h3-ref2va, then add it to NS_VIDEO_ENGINES)"));
+                }
+                it.insert("engine".into(), json!("REF2VA"));
             }
-            it.insert("engine".into(), json!("REF2VA"));
         }
         for k in ["ref_video_sound", "te_pictures"] {
             it.insert(k.into(), p.get(k).filter(|v| v.is_boolean()).cloned().unwrap_or(Value::Null));
@@ -1132,6 +1150,22 @@ mod tests {
         let i = inputs_of("PI4");
         assert!(i["not"].as_array().unwrap().iter().any(|k| k == "ref_images"));
         assert!(i["takes"].as_array().unwrap().iter().any(|k| k == "last_frame"));
+        // over Ref2VA (experimental): references and voices through, ControlNet and masks still refused
+        assert_eq!(quant_of("minimax-h3-pi-2step-ref2va"), "PI2-REF2VA");
+        assert_eq!(quant_of("minimax-h3-pi-4step-ref2va"), "PI4-REF2VA");
+        assert_eq!((pi_steps("PI2-REF2VA"), pi_steps("PI4-REF2VA")), (Some(2.0), Some(4.0)));
+        assert!(pi_refs("PI4-REF2VA") && !pi_refs("PI4") && !pi_refs("REF2VA"));
+        for ok in [json!({"ref_images": ["r.png"]}), json!({"ref_videos": ["c.mp4"], "ref_audios": ["v.wav"]})] {
+            assert!(pi_check(&item(ok.clone()), "PI2-REF2VA").is_ok(), "{ok}");
+        }
+        for bad in [json!({"control_video": "c.mp4"}), json!({"control_mask": "m.png"}), json!({"source": "s.mp4"}), json!({"knots": "1000,0"})] {
+            assert!(pi_check(&item(bad.clone()), "PI4-REF2VA").is_err(), "{bad}");
+        }
+        let i = inputs_of("PI4-REF2VA");
+        for k in ["ref_images", "ref_videos", "ref_audios", "last_frame"] {
+            assert!(i["takes"].as_array().unwrap().iter().any(|x| x == k), "{k}");
+        }
+        assert!(i["not"].as_array().unwrap().iter().any(|k| k == "control_video"));
     }
 
     #[test]

@@ -20,7 +20,7 @@ non_diegetic_music: <a score, or "None.">
 | a prompt | yes | `prompt` |
 | a first frame | yes | `first_frame` (a picture, or a clip: its last frame) |
 | a last frame | yes | `last_frame` |
-| reference pictures, clips, voices (`<Picture 1>`, `<Video 1>`, `<Audio 1>`: ref2va) | **no** - refused | the full `minimax-h3-ref2va` model |
+| reference pictures, clips, voices (`<Picture 1>`, `<Video 1>`, `<Audio 1>`: ref2va) | **no** - refused (the experimental `-ref2va` cards below take them) | the full `minimax-h3-ref2va` model |
 | a motion guide, a carried sound, a soundtrack (`guide_clip`, `first_audio`, `soundtrack`) | runs (the same keyframe rows as a first frame), not checked against pi-H3's reference | |
 | ControlNet, masked regeneration, MPEG-Diffusion, a refine pass | **no** - refused | the full models |
 | extra LoRAs | run beside the adapter's | `loras` |
@@ -34,5 +34,15 @@ non_diegetic_music: <a score, or "None.">
   166 s; 4 steps about 1.3-1.8x that; H3 at 15 steps takes 3.6-6.6x the 2-step time (the B65 ~1.2-1.5x the B70).
 - **Draft, then final**: a 2-step clip is a quick look; the 4-step one holds detail and motion better. For dialogue
   and close-ups the full `minimax-h3` (8-20 steps) is still the reference.
+
+## Over Ref2VA (EXPERIMENTAL: `minimax-h3-pi-2step-ref2va`, `-4step-ref2va`)
+
+**Fast drafts of reference shots; the subject holds, the camera, place pictures and carried guides drift.** The same
+adapters loaded over H3's Ref2VA denoiser (they were trained on FL2VA's), so the reference inputs work: `<Picture i>`,
+`<Video k>`, `<Audio j>` (`ref_images`, `ref_videos`, `ref_audios`) beside a first and a last frame and guides; ControlNet
+and masked runs stay refused. Measured on production shots: the referenced subject (a ship, a singer) stays itself as
+well as on Ref2VA; a locked camera pushes in, the details of a place picture go, a guide's carried frames are 2-6 dB
+looser. 5.5x (2 steps) and 3.4x (4 steps) faster than Ref2VA at 15 steps. Use them to look at a shot fast; render the
+film's clips with `minimax-h3-ref2va`.
 
 Everything in the MiniMax H3 guide about prompts (speech rate, sound, hands, negations, chaining clips) holds here.

@@ -142,7 +142,8 @@ fn clip_model(row: &Value, all: &[Value]) -> Option<String> {
         // pi-H3's (PI2, PI4, PI2-VAE, PI4-VAE): the model whose id the studio names so
         on.iter().find(|m| crate::video::studio::queue::quant_of(&s(m, "id")) == engine).map(|m| s(m, "id"))
     } else if engine == "REF2VA" || row["ref_images"].is_array() || row["ref_videos"].is_array() {
-        id_with("ref2va")
+        // Ref2VA itself, not a pi-H3 model over it (minimax-h3-pi-*-ref2va)
+        on.iter().find(|m| crate::video::studio::queue::quant_of(&s(m, "id")) == "REF2VA").map(|m| s(m, "id")).or_else(|| id_with("ref2va"))
     } else if engine.is_empty() || engine == "INT8" || engine == "Q8_0" {
         None
     } else {
@@ -811,11 +812,14 @@ mod tests {
         let all = vec![json!({"id": "minimax-h3", "kind": "video"}), json!({"id": "minimax-h3-ref2va", "kind": "video"})];
         assert_eq!(clip_model(&json!({"engine": "INT8"}), &all).as_deref(), Some("minimax-h3"));
         assert_eq!(clip_model(&json!({"engine": "REF2VA"}), &all).as_deref(), Some("minimax-h3-ref2va"));
-        let pis: Vec<Value> = ["minimax-h3", "minimax-h3-pi-2step-vae", "minimax-h3-pi-2step", "minimax-h3-pi-4step"].iter()
+        let pis: Vec<Value> = ["minimax-h3", "minimax-h3-pi-4step-ref2va", "minimax-h3-ref2va", "minimax-h3-pi-2step-vae", "minimax-h3-pi-2step", "minimax-h3-pi-4step"].iter()
             .map(|id| json!({"id": id, "kind": "video", "arch": "minimax-h3", "enabled": true})).collect();
         assert_eq!(clip_model(&json!({"engine": "PI2"}), &pis).as_deref(), Some("minimax-h3-pi-2step"));
         assert_eq!(clip_model(&json!({"engine": "PI2-VAE"}), &pis).as_deref(), Some("minimax-h3-pi-2step-vae"));
         assert_eq!(clip_model(&json!({"engine": "PI4"}), &pis).as_deref(), Some("minimax-h3-pi-4step"));
+        // over Ref2VA: its own model even with references (not Ref2VA's)
+        assert_eq!(clip_model(&json!({"engine": "PI4-REF2VA", "ref_images": ["r.png"]}), &pis).as_deref(), Some("minimax-h3-pi-4step-ref2va"));
+        assert_eq!(clip_model(&json!({"engine": "REF2VA", "ref_images": ["r.png"]}), &pis).as_deref(), Some("minimax-h3-ref2va"));
         assert_eq!(clip_model(&json!({}), &[]), None);
         // no engine: the daemon's default, wherever it stands in the registry
         let all = vec![json!({"id": "minimax-h3-ref2va", "kind": "video"}), json!({"id": "minimax-h3-q6k", "kind": "video"}), json!({"id": "minimax-h3", "kind": "video"})];
