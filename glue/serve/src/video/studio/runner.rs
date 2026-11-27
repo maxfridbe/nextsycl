@@ -875,6 +875,9 @@ pub fn failure(state: &str, error: &str, log: &[String], hung: Option<u64>) -> V
     let has = |ps: &[&str]| ps.iter().any(|p| text.contains(p));
     let (code, retryable, hint) = if state == "cancelled" || error.starts_with("cancelled") {
         ("cancelled", false, "stopped by video.cancel")
+    } else if error.starts_with("no_room") {
+        // the card shared with other work right now (the clip fits it empty), or no room came within the worker's wait
+        ("no_room", true, "the card is shared with other work right now; the same request fits once it is gone - another card or a later try")
     } else if error.contains("too long for") {
         ("too_long", false, "the clip does not fit on the card: fewer frames (the message says the most that fit), a smaller canvas or a smaller engine")
     } else if crate::video::daemon::allocation_failure(error) {
@@ -970,6 +973,9 @@ mod tests {
         // too long for the card: the same request never fits
         let f = failure("failed", "736 frames at 832x480 (87084 tokens) are too long for this card: ...; at most 600 frames (25.00 s) fit", &[], None);
         assert_eq!((f["code"].as_str(), f["retryable"].as_bool()), (Some("too_long"), Some(false)));
+        // fits the card empty, not now (the card shared): retryable, never too_long
+        let f = failure("failed", "no_room: the card is shared with other work right now (7.0 GiB of it held outside this engine): ...", &[], None);
+        assert_eq!((f["code"].as_str(), f["retryable"].as_bool()), (Some("no_room"), Some(true)));
         let f = failure("failed", "the engine process ended unexpectedly (signal: 9)", &[], None);
         assert_eq!((f["code"].as_str(), f["retryable"].as_bool()), (Some("engine_lost"), Some(true)));
         let f = failure("cancelled", "", &log("sampling"), None);

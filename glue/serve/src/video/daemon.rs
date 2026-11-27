@@ -154,11 +154,49 @@ fn recycle_after(ev: &Value) -> bool {
         && (ev["recycle"] == true || ev["error"].as_str().is_some_and(allocation_failure))
 }
 
-/// The cards the door says a pin or hold has taken. A door that does not answer: none (the job waits where it lands, as it did).
-fn door_blocked(door: &str) -> Vec<usize> {
-    http::call_for(&http::Target::Tcp(door.to_string()), "GET", "/video/blocked", None, 5).ok()
-        .and_then(|v| v["blocked"].as_array().map(|a| a.iter().filter_map(|g| g.as_u64()).map(|g| g as usize).collect()))
-        .unwrap_or_default()
+/// The door's word: the cards a pin or hold has taken (a door that does not answer: none - the job waits where it lands,
+/// as it did), and each card's free memory (gpu, MiB) as it last measured it (none: it does not
+/// say - a door from before, or no door)
+fn door_word(door: &str) -> (Vec<usize>, Vec<(usize, u64)>) {
+    let Ok(v) = http::call_for(&http::Target::Tcp(door.to_string()), "GET", "/video/blocked", None, 5) else { return (Vec::new(), Vec::new()) };
+    let blocked = v["blocked"].as_array().map(|a| a.iter().filter_map(|g| g.as_u64()).map(|g| g as usize).collect()).unwrap_or_default();
+    let free = v["cards"].as_array().into_iter().flatten()
+        .filter_map(|c| Some((c["gpu"].as_u64()? as usize, c["free_mb"].as_u64()?))).collect();
+    (blocked, free)
+}
+
+/// The activations a clip needs on its card beside its model (the worker's own wait before loading takes the same 8 GiB)
+const CLIP_WORK_MB: u64 = 8 << 10;
+
+/// The cards a job naming no GPU keeps off, while another free card can run it: those a pin or hold has (`blocked`), those
+/// whose worker answered no_room for it, and those without room for it now by the door's measure - a card's free memory,
+/// plus what this daemon's own worker there holds when that worker has another model (it goes for the job's), against
+/// the job's model (unless the worker there has it) and the clip's work. 2026-11-26: a pi clip went to the B70 beside
+/// ~7 GB of audio servers and was refused there while the B65 was empty.
+/// `slots`: (gpu, the worker's model, MiB it holds); `free`: the door's (gpu, free MiB); `model_mb`: the job's model.
+fn avoid_for(blocked: &[usize], no_room: &[usize], free: &[(usize, u64)], slots: &[(usize, Option<&str>, u64)], engine: &str, model_mb: u64) -> Vec<usize> {
+    let mut avoid: Vec<usize> = blocked.iter().chain(no_room).copied().collect();
+    for &(gpu, held, held_mb) in slots {
+        let Some(&(_, f)) = free.iter().find(|(g, _)| *g == gpu) else { continue };
+        let (room, need) = match held {
+            Some(h) if h == engine => (f, CLIP_WORK_MB),
+            Some(_) => (f + held_mb, model_mb + CLIP_WORK_MB),
+            None => (f, model_mb + CLIP_WORK_MB),
+        };
+        if room < need && !avoid.contains(&gpu) {
+            avoid.push(gpu);
+        }
+    }
+    avoid
+}
+
+/// The marker of a worker's refusal for want of room now (the card shared with other work; crates/h3 budget::NO_ROOM)
+const NO_ROOM: &str = "no_room:";
+
+/// Whether a job a worker refused for want of room goes back in the queue for another card: it names no GPU, and some
+/// served card has not refused it yet (else it fails - retryable for the studio and the platform)
+fn requeue_no_room(err: &str, names_gpu: bool, refused_on: &[usize], served: &[usize]) -> bool {
+    err.starts_with(NO_ROOM) && !names_gpu && served.iter().any(|g| !refused_on.contains(g))
 }
 
 /// The door's word on the chat model: held (answering or kept) unless it says otherwise; a door that does not answer
@@ -215,6 +253,9 @@ struct JobRec {
     progress: Option<(u64, u64)>,
     /// the GPU it runs or ran on
     gpu: Option<usize>,
+    /// cards whose worker answered "no_room" for it (the card shared with other work): it keeps off them while
+    /// another card can run it
+    no_room: Vec<usize>,
 }
 
 impl JobRec {
@@ -308,6 +349,8 @@ struct Hooks {
 struct Daemon {
     /// the cards the front door says a pin or hold has taken (refreshed every 3 s; none without a door)
     blocked: Mutex<Vec<usize>>,
+    /// each card's free memory by the door's last measure (gpu, MiB), refreshed with `blocked`
+    card_free: Mutex<Vec<(usize, u64)>>,
     opts: Options,
     /// the GPUs `h3d gpus` found at start
     found: Vec<Value>,
@@ -673,10 +716,24 @@ impl Daemon {
                     }
                     let gpu = s.slots[k].gpu;
                     let seats = Self::seats(&s);
-                    let takes = takes_unnamed(seats[k], &seats, &self.blocked.lock().unwrap());
-                    let mine = s.queue.iter().position(|id| match s.jobs[id].wants_gpu() {
-                        Some(g) => g == gpu,
-                        None => takes,
+                    let blocked = self.blocked.lock().unwrap().clone();
+                    let free = self.card_free.lock().unwrap().clone();
+                    let slots: Vec<(usize, Option<String>, u64)> = s.slots.iter().map(|o| {
+                        let held = self.opts.engine_of_path(o.info.get("model")).filter(|_| o.worker_pid.is_some());
+                        (o.gpu, held, (o.stats["gib_in_use"].as_f64().unwrap_or(0.0) * 1024.0) as u64)
+                    }).collect();
+                    let slots: Vec<(usize, Option<&str>, u64)> = slots.iter().map(|(g, h, m)| (*g, h.as_deref(), *m)).collect();
+                    let mine = s.queue.iter().position(|id| {
+                        let j = &s.jobs[id];
+                        match j.wants_gpu() {
+                            Some(g) => g == gpu,
+                            None => {
+                                let engine = self.opts.engine_path(job_engine(&j.spec));
+                                let model_mb = engine.as_ref().and_then(|(_, p)| std::fs::metadata(p).ok()).map_or(0, |m| m.len() >> 20);
+                                let name = engine.map(|(n, _)| n).unwrap_or_default();
+                                takes_unnamed(seats[k], &seats, &avoid_for(&blocked, &j.no_room, &free, &slots, &name, model_mb))
+                            }
+                        }
                     });
                     if let Some(pos) = mine {
                         let id = s.queue.remove(pos).unwrap();
@@ -712,7 +769,21 @@ impl Daemon {
                 Next::Run(id, spec, cancel) => {
                     let outcome = self.run_job(k, &mut proc, id, &spec, &cancel);
                     let mut s = self.s.lock().unwrap();
-                    if outcome.as_ref().err().is_some_and(|e| e == MOVED) {
+                    // refused for want of room now (the card shared): another card, while one has not refused it
+                    let served: Vec<usize> = s.slots.iter().map(|o| o.gpu).collect();
+                    let gpu = s.slots[k].gpu;
+                    let room_again = outcome.as_ref().err().is_some_and(|e| {
+                        let j = &s.jobs[&id];
+                        let mut on = j.no_room.clone();
+                        on.push(gpu);
+                        !cancel.load(Ordering::Relaxed) && requeue_no_room(e, j.wants_gpu().is_some(), &on, &served)
+                    });
+                    if room_again {
+                        let j = s.jobs.get_mut(&id).unwrap();
+                        j.no_room.push(gpu);
+                        j.log.push(format!("engine : GPU {gpu} is shared with other work right now (no room): back in the queue for another card"));
+                    }
+                    if room_again || outcome.as_ref().err().is_some_and(|e| e == MOVED) {
                         let j = s.jobs.get_mut(&id).unwrap();
                         j.state = "queued";
                         j.started = None;
@@ -835,7 +906,7 @@ impl Daemon {
                 s.next += 1;
                 s.jobs.insert(id, JobRec { id, spec: body, state: "queued", log: Vec::new(), result: None, error: None,
                                            cancel: Arc::new(AtomicBool::new(false)), created: now(), started: None,
-                                           finished: None, progress: None, gpu: None });
+                                           finished: None, progress: None, gpu: None, no_room: Vec::new() });
                 s.queue.push_back(id);
                 self.cv.notify_all();
                 (200, json!({"id": id}))
@@ -1000,6 +1071,7 @@ pub fn serve(opts: Options) -> Result<()> {
     let socket = opts.socket.clone();
     let d = Arc::new(Daemon {
         blocked: Mutex::new(Vec::new()),
+        card_free: Mutex::new(Vec::new()),
         opts,
         found,
         s: Mutex::new(Shared { jobs: BTreeMap::new(), queue: VecDeque::new(), next: 1, shutdown: false, slots }),
@@ -1009,8 +1081,9 @@ pub fn serve(opts: Options) -> Result<()> {
     if let Some(door) = d.opts.door.clone() {
         let me = d.clone();
         std::thread::spawn(move || loop {
-            let now_blocked = door_blocked(&door);
+            let (now_blocked, free) = door_word(&door);
             *me.blocked.lock().unwrap() = now_blocked;
+            *me.card_free.lock().unwrap() = free;
             me.cv.notify_all();
             std::thread::sleep(Duration::from_secs(3));
         });
@@ -1120,6 +1193,46 @@ mod chat_hook_tests {
     }
 
     #[test]
+    fn a_clip_goes_to_the_card_with_room_for_it() {
+        // 2026-11-26: GPU 0 (B70, unshared) held its worker with another model (20 GiB) and ~7 GB of audio servers, 5 GiB
+        // free; GPU 1 (B65, shared) empty. A pi clip (its model 19.5 GiB) went to GPU 0 and was refused
+        let s = [seat(0, false, true), seat(1, true, true)];
+        let slots = [(0, Some("minimax-h3"), 20 * 1024), (1, None, 0)];
+        let free = [(0, 5 * 1024), (1, 31 * 1024)];
+        let avoid = avoid_for(&[], &[], &free, &slots, "minimax-h3-pi-2step", 19_968);
+        assert_eq!(avoid, vec![0], "GPU 0 has 25 GiB with its worker gone, 27.5 needed");
+        assert!(!takes_unnamed(s[0], &s, &avoid), "the unshared card leaves it to the one with room");
+        assert!(takes_unnamed(s[1], &s, &avoid), "the empty shared card takes it");
+        // the worker there holds the job's model: 5 GiB free is under the clip's 8 GiB of work - still the other card
+        let same = [(0, Some("minimax-h3-pi-2step"), 20 * 1024), (1, None, 0)];
+        assert_eq!(avoid_for(&[], &[], &free, &same, "minimax-h3-pi-2step", 19_968), vec![0]);
+        // room on both: the old order (an unshared card first)
+        let roomy = [(0, 12 * 1024), (1, 31 * 1024)];
+        let avoid = avoid_for(&[], &[], &roomy, &same, "minimax-h3-pi-2step", 19_968);
+        assert!(avoid.is_empty());
+        assert!(takes_unnamed(s[0], &s, &avoid) && !takes_unnamed(s[1], &s, &avoid));
+        // no room anywhere: as if none were short (the job waits on one, as before)
+        let tight = [(0, 2 * 1024), (1, 2 * 1024)];
+        let avoid = avoid_for(&[], &[], &tight, &slots, "minimax-h3-pi-2step", 19_968);
+        assert_eq!(avoid, vec![0, 1]);
+        assert!(takes_unnamed(s[0], &s, &avoid));
+        // a door that does not say: nothing is avoided for room
+        assert!(avoid_for(&[], &[], &[], &slots, "x", 19_968).is_empty());
+        // a card whose worker answered no_room for this job is kept off too
+        assert_eq!(avoid_for(&[], &[0], &roomy, &same, "minimax-h3-pi-2step", 19_968), vec![0]);
+    }
+
+    #[test]
+    fn a_no_room_refusal_goes_to_another_card_once_each() {
+        let e = "no_room: the card is shared with other work right now (7.0 GiB of it held outside this engine): ...";
+        assert!(requeue_no_room(e, false, &[0], &[0, 1]), "GPU 1 has not refused it");
+        assert!(!requeue_no_room(e, false, &[0, 1], &[0, 1]), "every card refused it: it fails (retryable)");
+        assert!(!requeue_no_room(e, true, &[0], &[0, 1]), "a job naming its card stays on it");
+        assert!(!requeue_no_room("124 frames ... are too long for this card", false, &[0], &[0, 1]), "too_long is not requeued");
+        assert!(!allocation_failure(e), "not a memory refusal: the worker is kept");
+    }
+
+    #[test]
     fn a_worker_the_card_refused_memory_is_recycled() {
         // 2026-11-23's errors, as an older worker sent them (no flag): every one recycles
         for e in ["nsd_alloc: the device refused 28 MiB", "nsd_alloc: the device refused 2281 MiB",
@@ -1200,8 +1313,10 @@ mod chat_hook_tests {
     #[test]
     fn the_doors_word_on_blocked_cards_and_its_silence() {
         let (door, _) = fake(r#"{"blocked":[0]}"#);
-        assert_eq!(door_blocked(&door), vec![0]);
-        assert!(door_blocked(&closed_port()).is_empty(), "a silent door blocks nothing");
+        assert_eq!(door_word(&door), (vec![0], vec![]), "a door from before says no card's memory");
+        assert_eq!(door_word(&closed_port()), (vec![], vec![]), "a silent door blocks nothing");
+        let (door, _) = fake(r#"{"blocked":[],"cards":[{"gpu":0,"free_mb":5120,"total_mb":32768},{"gpu":1,"free_mb":31000,"total_mb":32768}]}"#);
+        assert_eq!(door_word(&door), (vec![], vec![(0, 5120), (1, 31000)]));
     }
 
     #[test]

@@ -139,6 +139,41 @@ pub fn too_long(cfg: &Config, frames: usize, width: usize, height: usize, other:
              {:.1} GiB can be had (the card keeps {:.1} GiB free); {most}", gib(need), gib(room), gib(reserve()))
 }
 
+/// The marker a refusal for want of room *now* starts with (the card shared with other processes): retryable, on
+/// another card or later - never `too_long`
+pub const NO_ROOM: &str = "no_room:";
+
+/// What a clip's check says
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Verdict {
+    /// it fits the room there is now
+    Fits(Plan),
+    /// it fits this card empty (the model loaded, nothing else on it) but not the room left now: other processes hold
+    /// part of the card - retryable
+    NoRoom,
+    /// not even this card empty holds it: too long for this kind of card, for good
+    TooLong,
+}
+
+/// The verdict on a `tokens`-long clip with `have` bytes to be had now and `empty` on this card with nothing but the
+/// model (`room` without the card's free memory: the book's cap less the model). 2026-11-26: a 124-frame pi clip on a
+/// B70 shared with two audio servers (~7 GB) was refused `too_long` - a permanent failure of the take - with an empty
+/// B65 beside it
+pub fn verdict(cfg: &Config, tokens: usize, vae_file: u64, have: u64, empty: u64) -> Verdict {
+    match plan(cfg, tokens, vae_file, have) {
+        Some(p) => Verdict::Fits(p),
+        None if plan(cfg, tokens, vae_file, empty).is_some() => Verdict::NoRoom,
+        None => Verdict::TooLong,
+    }
+}
+
+/// The refusal of a clip that fits the card empty but not now: what it needs, what can be had, what the others hold
+pub fn no_room(cfg: &Config, tokens: usize, vae_file: u64, have: u64, others: u64) -> String {
+    let need = denoise_bytes(cfg, tokens, tokens).min(denoise_bytes(cfg, tokens, MLP_CHUNK.min(tokens))).max(decode_bytes(vae_file));
+    format!("{NO_ROOM} the card is shared with other work right now ({:.1} GiB of it held outside this engine): the clip ({tokens} tokens) needs              about {:.1} GiB beside the model, {:.1} GiB can be had now; it fits this card once that work is gone - another card or a later try",
+            gib(others), gib(need), gib(have))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +289,23 @@ mod tests {
         let msg = too_long(&cfg, f + 17, 832, 480, other, VAE, r);
         assert!(msg.contains("too long for this card") && msg.contains(&format!("at most {f} frames")), "{msg}");
         assert!(!msg.contains("nsd_alloc"), "not an allocation failure: the daemon keeps the worker");
+    }
+
+    #[test]
+    fn a_shared_card_is_no_room_and_only_an_empty_card_too_small_is_too_long() {
+        let cfg = h3();
+        // 2026-11-26: PI2, 832x480, 5 s (14844 tokens) on a B70 with ~7 GB of audio servers: 5.8 GiB to be had now, the
+        // card empty would give ~12 GiB beside the model
+        let tokens = clip_tokens(5.0, 832, 480, 0);
+        let empty = 12 * GIB;
+        let now = (5.8 * GIB as f64) as u64;
+        assert_eq!(verdict(&cfg, tokens, VAE, now, empty), Verdict::NoRoom, "retryable: another card or later");
+        assert!(matches!(verdict(&cfg, tokens, VAE, empty, empty), Verdict::Fits(_)));
+        // the 30 s clip that no B70 holds even empty: too long, for good
+        let long = clip_tokens(30.0, 832, 480, 2835);
+        assert_eq!(verdict(&cfg, long, VAE, now, empty), Verdict::TooLong);
+        assert_eq!(verdict(&cfg, long, VAE, empty, empty), Verdict::TooLong);
+        let m = no_room(&cfg, tokens, VAE, now, 7 * GIB);
+        assert!(m.starts_with(NO_ROOM) && m.contains("shared") && !m.contains("too long for"), "{m}");
     }
 }

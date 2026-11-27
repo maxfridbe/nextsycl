@@ -2132,8 +2132,16 @@ fn fit_clip(e: &Engine, frames: usize, width: usize, height: usize, other: usize
         dev.trim()?;
         have = room();
     }
-    match budget::plan(cfg, tokens, vae_file, have) {
-        Some(p) => {
+    // this card with nothing on it but the model: what decides `too_long` (for good) against `no_room` (now)
+    let empty = budget::room(dev.mem_cap(), dev.mem_used(), None, r, dev.mem_scratch());
+    match budget::verdict(cfg, tokens, vae_file, have, empty) {
+        budget::Verdict::NoRoom => {
+            let total = Device::list().ok().and_then(|l| l.into_iter().find(|g| g.index == dev.index)).map_or(0, |g| g.mem_bytes);
+            let others = dev.mem_free().map_or(0, |f| budget::outside_book(total, f, dev.mem_used()));
+            Err(Error(budget::no_room(cfg, tokens, vae_file, have, others)))
+        }
+        budget::Verdict::TooLong => Err(Error(budget::too_long(cfg, frames, width, height, other, vae_file, empty))),
+        budget::Verdict::Fits(p) => {
             if say {
                 ctl.say(format!("memory : {tokens} tokens need about {:.1} GiB beside the model{}, {:.1} GiB can be had ({})", gib(p.need),
                                 if p.mlp_rows < tokens { format!(" with the MLP {} rows at a time", p.mlp_rows) } else { String::new() }, gib(have),
@@ -2141,7 +2149,6 @@ fn fit_clip(e: &Engine, frames: usize, width: usize, height: usize, other: usize
             }
             Ok((p.mlp_rows < tokens).then_some(p.mlp_rows))
         }
-        None => Err(Error(budget::too_long(cfg, frames, width, height, other, vae_file, have))),
     }
 }
 

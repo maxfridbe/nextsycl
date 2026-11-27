@@ -740,6 +740,8 @@ fn the_door_tells_the_studio_its_host_figure() {
     let b = start("video-host", vec![clip_model("clips")], None, None);
     let v = b.raw("GET", "/video/blocked", "", &json!({})).1;
     assert!(v["blocked"].is_array() && v["host_free_mb"].as_u64().is_some_and(|m| m > 0), "{v}");
+    // and each card's free memory, for the daemon's choice of a card
+    assert!(v["cards"].as_array().is_some_and(|c| c.iter().all(|c| c["gpu"].is_u64() && c["free_mb"].is_u64())), "{v}");
 }
 
 #[test]

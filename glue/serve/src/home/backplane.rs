@@ -364,7 +364,10 @@ impl Home {
         }).map(|c| c.index).collect();
         // host memory by the door's rule (the warm cache of what is loaded not counted as free): the studio decides a further
         // clip from it (video/studio/slots.rs), since a queued clip starts without passing here
-        json!({"blocked": blocked, "host_free_mb": self.host_free_now(&snap.cards)})
+        // and each card's free memory now (every process counted): the daemon keeps a clip off a card without room for it
+        // while another card has it (2026-11-26: a clip went to a B70 beside ~7 GB of audio servers, the B65 empty)
+        let cards: Vec<Value> = snap.cards.iter().filter(|c| c.total_mb > 0).map(|c| json!({"gpu": c.index, "free_mb": c.free(), "total_mb": c.total_mb})).collect();
+        json!({"blocked": blocked, "host_free_mb": self.host_free_now(&snap.cards), "cards": cards})
     }
 
     /// What the studio says of a clip before it is sent (None: it does not answer): `reentered` when it is a clip already
