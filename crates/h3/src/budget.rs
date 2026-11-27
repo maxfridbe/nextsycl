@@ -58,16 +58,18 @@ pub const MLP_CHUNK: usize = 8192;
 
 /// The MLP's row chunks a plan tries, widest first: each step down gives back half the chunk buffers (8192 rows hold
 /// 0.82 GiB, 4096 0.41, 2048 0.21) for a little more time - what lets 1344x768 x 243 frames (77,478 tokens) fit a 32 GB
-/// card beside pi-H3 (2026-11-26: refused at 8192 rows, 0.3 GiB short)
-pub const MLP_CHUNKS: [usize; 3] = [MLP_CHUNK, 4096, 2048];
+/// card beside pi-H3 (2026-11-26: refused at 8192 rows, 0.3 GiB short); 1024 rows 0.10
+pub const MLP_CHUNKS: [usize; 4] = [MLP_CHUNK, 4096, 2048, 1024];
 
 /// The narrowest chunk: the least a clip can need
-pub const MLP_CHUNK_MIN: usize = 2048;
+pub const MLP_CHUNK_MIN: usize = 1024;
 
 /// Card memory the kernels and the runtime take beside the buffers counted below, for any sequence: oneDNN's
 /// primitives and scratchpads, new shapes' kernels during the clip, the estimate's error. The card's reserve (1.5 GiB)
-/// is kept on top of it.
-pub const MARGIN: u64 = 512 << 20;
+/// is kept on top of it, and the kernels refuse an allocation that would reach into it (a retryable failure, the worker
+/// recycled - never a stall). 0.5 GiB went unused in all four measured runs (the count without it already at or over the
+/// peak): 0.25 GiB since 2026-11-27, when a 79,467-token speech pass was refused 0.1 GiB short
+pub const MARGIN: u64 = 256 << 20;
 
 /// The rest a token costs, measured: the final layer's and the sampler's per-row buffers, the rotation tables - the book
 /// above the loaded model at its peak against what `denoise_bytes` counts without it:
@@ -259,9 +261,9 @@ mod tests {
         let a = denoise_bytes(&cfg, 20_000, 20_000);
         let b = denoise_bytes(&cfg, 40_000, 40_000);
         assert!(b > a && (b - MARGIN) == 2 * (a - MARGIN), "linear in tokens");
-        // about 245 KB a token at once (242.5 measured)
+        // about 233 KB a token at once (242.5 measured with the attention-out buffer since given up, 10.75 KB of it)
         let per = (a - MARGIN) / 20_000;
-        assert!((240_000..250_000).contains(&per), "{per}");
+        assert!((228_000..238_000).contains(&per), "{per}");
         assert!(denoise_bytes(&cfg, 40_000, MLP_CHUNK) + 2 * GIB < b, "the MLP in chunks saves over 2 GiB at 40k tokens");
         // a short sequence: chunking changes nothing
         assert_eq!(denoise_bytes(&cfg, 4000, MLP_CHUNK), denoise_bytes(&cfg, 4000, 4000));
@@ -286,13 +288,14 @@ mod tests {
 
     #[test]
     fn the_measured_clips_fit_their_estimates() {
-        // the B70 runs of 2026-11-23 (the book above the model at the clip's peak): every estimate covers what was used,
-        // and none by more than the margin and 0.5 GiB
+        // the runs of 2026-11-23 (B70) and 2026-11-26 (B65), the book above the model at the clip's peak: every estimate
+        // covers what was used even without the margin, and none by more than the margin and 0.25 GiB. They ran with a
+        // separate attention-out buffer [tokens, hidden] (bfloat16) that `h` has taken over since: it is taken off
         let cfg = h3();
         for (tokens, rows, used_gib) in [(41_725, 41_725, 9.43), (47_779, 47_779, 10.78), (73_865, MLP_CHUNK, 11.43), (77_478, 4096, 11.62)] {
-            let used = (used_gib * GIB as f64) as u64;
+            let used = (used_gib * GIB as f64) as u64 - (2 * cfg.hidden * tokens) as u64;
             let est = denoise_bytes(&cfg, tokens, rows);
-            assert!(est >= used && est - used <= MARGIN + GIB / 2, "{tokens} tokens: estimate {est}, used {used}");
+            assert!(est - MARGIN >= used && est - used <= MARGIN + GIB / 4, "{tokens} tokens: estimate {est}, used {used}");
         }
     }
 
@@ -308,10 +311,26 @@ mod tests {
         let tokens = clip_tokens(10.125, 1344, 768, other);
         assert_eq!(tokens, 77_478, "the refusal's own count: the picture's tokens are in it");
         let room = (12.0 * GIB as f64) as u64;
-        assert!(denoise_bytes(&cfg, tokens, MLP_CHUNK) > room, "8192 rows: the refusal (12.3 GiB)");
-        let p = plan(&cfg, tokens, VAE, room).expect("it fits with narrower chunks");
-        assert!(p.mlp_rows < MLP_CHUNK && p.need <= room, "{p:?}");
+        let p = plan(&cfg, tokens, VAE, room).expect("it fits");
+        assert!(p.need <= room, "{p:?}");
         assert_eq!(max_frames(&cfg, 1344, 768, other, VAE, room).map(|f| f >= 243), Some(true));
+    }
+
+    #[test]
+    fn the_speech_film_passes_fit_a_fresh_card_with_up_to_four_anchors() {
+        // 2026-11-27, speech film d4319385 pass 3: 79,467 tokens refused no_room - 12.3 GiB needed, 12.2 to be had on a
+        // fresh B65 worker (13.73 GiB free less the 1.5 GiB reserve). Each further 1344x768 anchor picture brings its
+        // latent's 1008 tokens and its 1010 in the text encoder's prompt
+        let cfg = h3();
+        let room = (12.2 * GIB as f64) as u64;
+        for anchors in 1..=4usize {
+            let tokens = 79_467 + (anchors - 1) * (1008 + 1010 + 8);
+            let p = plan(&cfg, tokens, VAE, room).unwrap_or_else(|| panic!("{anchors} anchors, {tokens} tokens: refused"));
+            assert!(p.need <= room, "{anchors} anchors: {p:?}");
+        }
+        // the chunks step down as far as 1024 rows
+        let t = 85_545;
+        assert!(plan(&cfg, t, VAE, denoise_bytes(&cfg, t, 2048) - 1).is_some_and(|p| p.mlp_rows == 1024));
     }
 
     #[test]
@@ -336,7 +355,8 @@ mod tests {
         // card empty would give ~12 GiB beside the model
         let tokens = clip_tokens(5.0, 832, 480, 0);
         let empty = 12 * GIB;
-        let now = (5.8 * GIB as f64) as u64;
+        // (5.8 GiB then; under today's smaller margin the decoder's need is 5.75, so a little less room makes the case)
+        let now = (5.5 * GIB as f64) as u64;
         assert_eq!(verdict(&cfg, tokens, VAE, now, empty), Verdict::NoRoom, "retryable: another card or later");
         assert!(matches!(verdict(&cfg, tokens, VAE, empty, empty), Verdict::Fits(_)));
         // the 30 s clip that no B70 holds even empty: too long, for good

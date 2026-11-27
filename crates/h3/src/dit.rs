@@ -341,12 +341,13 @@ impl Step {
     }
 }
 
-/// The buffers a block writes between its kernels; one set serves every block.
+/// The buffers a block writes between its kernels; one set serves every block. `h` takes each half's output too (the
+/// attention's out_proj, the MLP's fc2): the normalized input it holds is read for the last time before those write -
+/// a [tokens, hidden] buffer less (0.8 GiB at 79k tokens), the same arithmetic.
 pub struct Scratch {
     pub(crate) h: Tensor,
     pub(crate) qkv: Tensor,
     pub(crate) att: Tensor,
-    pub(crate) proj: Tensor,
     pub(crate) fc1: Tensor,
     pub(crate) act: Tensor,
     /// a LoRA's middle product [tokens, rank]
@@ -377,7 +378,6 @@ impl Scratch {
             h: Tensor::new(dev, dtype, &[tokens, cfg.hidden])?,
             qkv: Tensor::new(dev, dtype, &[tokens, 3 * w])?,
             att: Tensor::new(dev, dtype, &[tokens, w])?,
-            proj: Tensor::new(dev, dtype, &[tokens, cfg.hidden])?,
             fc1: Tensor::new(dev, dtype, &[mr, 2 * cfg.ffn])?,
             act: Tensor::new(dev, dtype, &[mr, cfg.ffn])?,
             lora: Tensor::new(dev, dtype, &[tokens, MAX_LORA_RANK])?,
@@ -390,7 +390,7 @@ impl Scratch {
         let w = cfg.heads * cfg.head_dim;
         let mr = mlp_rows.min(tokens);
         let chunk = if mr < tokens { 2 * mr * cfg.hidden } else { 0 };
-        2 * (tokens * (2 * cfg.hidden + 4 * w + MAX_LORA_RANK) + mr * 3 * cfg.ffn + chunk)
+        2 * (tokens * (cfg.hidden + 4 * w + MAX_LORA_RANK) + mr * 3 * cfg.ffn + chunk)
     }
 }
 
@@ -602,10 +602,11 @@ impl Blocks {
             ops::attention(part(0), part(1), part(2), &s.att)?;
         }
         tap("att", &s.att)?;
-        self.mm(&b.out_proj, &s.att, &s.proj)?;
-        side(lora, 1, &s.att, &s.proj, &s.lora)?;
-        tap("attn_out", &s.proj)?;
-        ops::gate_add(x, &s.proj, &step.rows, gate_a)?;
+        // into h: its normalized input was last read by the qkv product (and its LoRA) above
+        self.mm(&b.out_proj, &s.att, &s.h)?;
+        side(lora, 1, &s.att, &s.h, &s.lora)?;
+        tap("attn_out", &s.h)?;
+        ops::gate_add(x, &s.h, &step.rows, gate_a)?;
         tap("x1", x)?;
         // MLP half
         ops::rms_norm_mod(x, &b.norm2, cfg.norm_eps, Some(&Mod { rows: &step.rows, scale: scale_m, shift: shift_m }), &s.h)?;
@@ -616,8 +617,9 @@ impl Blocks {
                 side(lora, 2, &s.h, &s.fc1, &s.lora)?;
                 tap("fc1", &s.fc1)?;
                 ops::swiglu(&s.fc1, &s.act)?;
-                self.mm(&b.fc2, &s.act, &s.proj)?;
-                side(lora, 3, &s.act, &s.proj, &s.lora)?;
+                // into h: fc1 (and its LoRA) read it last
+                self.mm(&b.fc2, &s.act, &s.h)?;
+                side(lora, 3, &s.act, &s.h, &s.lora)?;
             }
             Some((hc, pc)) => {
                 // a chunk of rows through the MLP (the last chunk's rows past the sequence are stale; never copied back)
@@ -631,13 +633,14 @@ impl Blocks {
                     ops::swiglu(&s.fc1, &s.act)?;
                     self.mm(&b.fc2, &s.act, pc)?;
                     side(lora, 3, &s.act, pc, &s.lora)?;
-                    s.proj.copy_rows(r0, pc, 0, m)?;
+                    // back into h's own rows: copied out above, and the later chunks read only the rows after them
+                    s.h.copy_rows(r0, pc, 0, m)?;
                     r0 += m;
                 }
             }
         }
-        tap("mlp", &s.proj)?;
-        ops::gate_add(x, &s.proj, &step.rows, gate_m)?;
+        tap("mlp", &s.h)?;
+        ops::gate_add(x, &s.h, &step.rows, gate_m)?;
         tap("x2", x)
     }
 }

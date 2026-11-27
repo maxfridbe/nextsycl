@@ -211,16 +211,16 @@ impl TextRefiner {
             ops::rms_rope(part(0), &b.q_norm, cfg.qk_eps, &no_rotation, 0)?;
             ops::rms_rope(part(1), &b.k_norm, cfg.qk_eps, &no_rotation, 0)?;
             ops::attention(part(0), part(1), part(2), &s.att)?;
-            b.out_proj.forward(&s.att, &s.proj)?;
-            crate::dit::side(lo, 1, &s.att, &s.proj, &s.lora)?;
-            ops::add(&x, &s.proj)?;
+            b.out_proj.forward(&s.att, &s.h)?;
+            crate::dit::side(lo, 1, &s.att, &s.h, &s.lora)?;
+            ops::add(&x, &s.h)?;
             ops::rms_norm_mod(&x, &b.norm2, cfg.norm_eps, None, &s.h)?;
             b.fc1.forward(&s.h, &s.fc1)?;
             crate::dit::side(lo, 2, &s.h, &s.fc1, &s.lora)?;
             ops::swiglu(&s.fc1, &s.act)?;
-            b.fc2.forward(&s.act, &s.proj)?;
-            crate::dit::side(lo, 3, &s.act, &s.proj, &s.lora)?;
-            ops::add(&x, &s.proj)?;
+            b.fc2.forward(&s.act, &s.h)?;
+            crate::dit::side(lo, 3, &s.act, &s.h, &s.lora)?;
+            ops::add(&x, &s.h)?;
         }
         ops::rms_norm_mod(&x, &self.final_norm, cfg.norm_eps, None, &x)?;
         Ok(x)
