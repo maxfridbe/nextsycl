@@ -52,7 +52,7 @@ pub const OPTIONS: &[EngineOption] = &[
     EngineOption { name: "attn", env: "NSD_ATTN", value: "sage|onednn", help: "long sequences' attention: SageAttention (int8 q, k) or oneDNN's", at: At::Load },
     EngineOption { name: "sage-min-s", env: "NSD_SAGE_MIN_S", value: "TOKENS", help: "the shortest sequence Sage takes (default 8192)", at: At::Load },
     EngineOption { name: "attn-rows", env: "NSD_ATTN_ROWS", value: "N", help: "query rows a fused attention call takes", at: At::Load },
-    EngineOption { name: "mem-fraction", env: "NSD_MEM_FRACTION", value: "F", help: "the share of the card the kernels may hold (default 0.94)", at: At::Load },
+    EngineOption { name: "mem-fraction", env: "NSD_MEM_FRACTION", value: "F", help: "the share of the card the kernels may hold, never past the card less its 1.5 GiB reserve (default 0.97)", at: At::Load },
     EngineOption { name: "profile", env: "NSD_PROFILE", value: "", help: "the kernels' and decoders' times by part, on stderr", at: At::Load },
     EngineOption { name: "mpeg", env: "H3_MPEG", value: "0|1", help: "MPEG-Diffusion: every clip from text alone made on two tracks - half resolution, then full-resolution tokens on a region the model picks (needs the mpeg-maps and region-head files; the minimax-h3-mpeg card)", at: At::Load },
     EngineOption { name: "mpeg-switch", env: "H3_MPEG_SWITCH", value: "N", help: "with mpeg: half-resolution steps before the region joins (default 16, of 20)", at: At::Load },

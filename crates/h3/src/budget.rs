@@ -19,6 +19,9 @@ pub fn reserve() -> u64 {
     std::env::var("NSD_MEM_RESERVE_MB").ok().and_then(|v| v.parse::<u64>().ok()).map_or(RESERVE, |m| m << 20)
 }
 
+/// The kernels' default share of the card (kernels/diffusion/nsd.cpp `init`; NSD_MEM_FRACTION overrides)
+pub const KERNEL_FRACTION: f64 = 0.97;
+
 /// The kernels' cap on their book for a card of `total` bytes: the share `frac` of it, never into the reserve (every
 /// card, shared or not - kernels/diffusion/nsd.cpp `init`)
 pub fn cap_for(total: u64, frac: f64, reserve: u64) -> u64 {
@@ -53,16 +56,28 @@ pub fn should_trim(outside: u64) -> bool {
 /// buffers 8192 rows instead of every token's)
 pub const MLP_CHUNK: usize = 8192;
 
+/// The MLP's row chunks a plan tries, widest first: each step down gives back half the chunk buffers (8192 rows hold
+/// 0.82 GiB, 4096 0.41, 2048 0.21) for a little more time - what lets 1344x768 x 243 frames (77,478 tokens) fit a 32 GB
+/// card beside pi-H3 (2026-11-26: refused at 8192 rows, 0.3 GiB short)
+pub const MLP_CHUNKS: [usize; 3] = [MLP_CHUNK, 4096, 2048];
+
+/// The narrowest chunk: the least a clip can need
+pub const MLP_CHUNK_MIN: usize = 2048;
+
 /// Card memory the kernels and the runtime take beside the buffers counted below, for any sequence: oneDNN's
 /// primitives and scratchpads, new shapes' kernels during the clip, the estimate's error. The card's reserve (1.5 GiB)
 /// is kept on top of it.
 pub const MARGIN: u64 = 512 << 20;
 
-/// The rest a token costs, measured: the final layer's and the sampler's per-row buffers, the rotation tables. On the
-/// B70 (2026-11-23, 832x480, 3 pictures, the book above the loaded model at its peak): 41725 tokens 9.43 GiB and
-/// 47779 tokens 10.78 GiB at once (242.5 KB a token against 233.7 counted), 73865 tokens with the MLP 8192 rows at a time
-/// 11.43 GiB (154 KB a token against 140.5 counted and 0.82 GiB of chunk buffers)
-pub const EXTRA_PER_TOKEN: usize = 12_000;
+/// The rest a token costs, measured: the final layer's and the sampler's per-row buffers, the rotation tables - the book
+/// above the loaded model at its peak against what `denoise_bytes` counts without it:
+///   the whole sequence at once (B70, 2026-11-23, 832x480, 3 pictures): 41725 tokens 9.43 GiB, 47779 10.78 GiB - 9.0 and
+///   8.5 KB a token beyond the count;
+///   the MLP in chunks: 73865 tokens at 8192 rows 11.43 GiB (B70, 832x480) - 13.7 KB; 77478 tokens at 4096 rows 11.62 GiB
+///   (B65, 2026-11-26, PI2-REF2VA 1344x768 x 243, a first frame, a soundtrack, a picture) - 14.8 KB.
+/// The chunked runs keep more beside the counted buffers, so each form has its own figure, a little over the most measured.
+pub const EXTRA_PER_TOKEN: usize = 10_000;
+pub const EXTRA_PER_TOKEN_CHUNKED: usize = 15_500;
 
 /// Bytes the denoiser holds for a `tokens`-long sequence with the MLP `mlp_rows` at a time: its stream and scratch
 /// (`Scratch::bytes`), and the kernels' scratch - the SageAttention path's int8 q and k, its 16-bit v and result
@@ -74,7 +89,8 @@ pub fn denoise_bytes(cfg: &Config, tokens: usize, mlp_rows: usize) -> u64 {
     let stream = 2 * tokens * cfg.hidden;
     let attention = 6 * w * tokens;
     let linears = (w * tokens).max(cfg.ffn * mr);
-    (Scratch::bytes(cfg, tokens, mlp_rows) + stream + attention + linears + EXTRA_PER_TOKEN * tokens) as u64 + MARGIN
+    let extra = if mr < tokens { EXTRA_PER_TOKEN_CHUNKED } else { EXTRA_PER_TOKEN };
+    (Scratch::bytes(cfg, tokens, mlp_rows) + stream + attention + linears + extra * tokens) as u64 + MARGIN
 }
 
 /// Bytes the video decoder holds: its weights (its file's size: they are kept in the file's type) and a batch of tiles'
@@ -107,7 +123,7 @@ pub struct Plan {
 /// The clip's plan within `room` bytes: the whole sequence at once, else the MLP in chunks, else None
 pub fn plan(cfg: &Config, tokens: usize, vae_file: u64, room: u64) -> Option<Plan> {
     let dec = decode_bytes(vae_file);
-    [tokens, MLP_CHUNK].into_iter().filter(|r| *r <= tokens).map(|mlp_rows| Plan { tokens, mlp_rows, need: denoise_bytes(cfg, tokens, mlp_rows).max(dec) })
+    std::iter::once(tokens).chain(MLP_CHUNKS).filter(|r| *r <= tokens).map(|mlp_rows| Plan { tokens, mlp_rows, need: denoise_bytes(cfg, tokens, mlp_rows).max(dec) })
         .find(|p| p.need <= room)
 }
 
@@ -130,7 +146,7 @@ pub fn max_frames(cfg: &Config, width: usize, height: usize, other: usize, vae_f
 /// The refusal of a clip that does not fit: what it needs, what can be had, the longest that fits
 pub fn too_long(cfg: &Config, frames: usize, width: usize, height: usize, other: usize, vae_file: u64, room: u64) -> String {
     let tokens = clip_tokens(frames as f64 / 24.0, width, height, other);
-    let need = denoise_bytes(cfg, tokens, MLP_CHUNK.min(tokens)).max(decode_bytes(vae_file));
+    let need = denoise_bytes(cfg, tokens, MLP_CHUNK_MIN.min(tokens)).max(decode_bytes(vae_file));
     let most = match max_frames(cfg, width, height, other, vae_file, room) {
         Some(f) => format!("at most {f} frames ({:.2} s) fit", f as f64 / 24.0),
         None => "not even the shortest clip fits".into(),
@@ -169,7 +185,7 @@ pub fn verdict(cfg: &Config, tokens: usize, vae_file: u64, have: u64, empty: u64
 
 /// The refusal of a clip that fits the card empty but not now: what it needs, what can be had, what the others hold
 pub fn no_room(cfg: &Config, tokens: usize, vae_file: u64, have: u64, others: u64) -> String {
-    let need = denoise_bytes(cfg, tokens, tokens).min(denoise_bytes(cfg, tokens, MLP_CHUNK.min(tokens))).max(decode_bytes(vae_file));
+    let need = denoise_bytes(cfg, tokens, tokens).min(denoise_bytes(cfg, tokens, MLP_CHUNK_MIN.min(tokens))).max(decode_bytes(vae_file));
     format!("{NO_ROOM} the card is shared with other work right now ({:.1} GiB of it held outside this engine): the clip ({tokens} tokens) needs              about {:.1} GiB beside the model, {:.1} GiB can be had now; it fits this card once that work is gone - another card or a later try",
             gib(others), gib(need), gib(have))
 }
@@ -196,6 +212,8 @@ mod tests {
         assert_eq!(cap_for(B70, 0.97, RESERVE), B70 - RESERVE, "a bigger share stops at the reserve");
         assert_eq!(cap_for(8 * GIB, 0.97, RESERVE), 8 * GIB - RESERVE);
         assert_eq!(cap_for(GIB, 0.94, RESERVE), 0, "a card smaller than the reserve gets nothing");
+        // the kernels' default share (0.97): the reserve decides on a 32 GB card - 30.39 GiB, 0.41 more than 0.94 gave
+        assert_eq!(cap_for(B70, KERNEL_FRACTION, RESERVE), B70 - RESERVE);
     }
 
     #[test]
@@ -252,13 +270,15 @@ mod tests {
     #[test]
     fn a_plan_takes_the_whole_sequence_then_chunks_then_refuses() {
         let cfg = h3();
-        let t = 30_000;
+        let t = 60_000; // long enough that the denoiser, not the decoder, is the need at every chunk
         let whole = denoise_bytes(&cfg, t, t);
         let p = plan(&cfg, t, VAE, whole).unwrap();
         assert_eq!((p.mlp_rows, p.need), (t, whole));
         let p = plan(&cfg, t, VAE, whole - 1).unwrap();
         assert_eq!(p.mlp_rows, MLP_CHUNK);
-        assert!(plan(&cfg, t, VAE, denoise_bytes(&cfg, t, MLP_CHUNK) - 1).is_none());
+        assert_eq!(plan(&cfg, t, VAE, denoise_bytes(&cfg, t, MLP_CHUNK) - 1).unwrap().mlp_rows, 4096, "then narrower chunks");
+        assert_eq!(plan(&cfg, t, VAE, denoise_bytes(&cfg, t, 4096) - 1).unwrap().mlp_rows, 2048);
+        assert!(plan(&cfg, t, VAE, denoise_bytes(&cfg, t, MLP_CHUNK_MIN) - 1).is_none());
         // a short clip: the decoder is the larger need
         let p = plan(&cfg, 5000, VAE, 30 * GIB).unwrap();
         assert_eq!(p.need, decode_bytes(VAE));
@@ -269,11 +289,29 @@ mod tests {
         // the B70 runs of 2026-11-23 (the book above the model at the clip's peak): every estimate covers what was used,
         // and none by more than the margin and 0.5 GiB
         let cfg = h3();
-        for (tokens, rows, used_gib) in [(41_725, 41_725, 9.43), (47_779, 47_779, 10.78), (73_865, MLP_CHUNK, 11.43)] {
+        for (tokens, rows, used_gib) in [(41_725, 41_725, 9.43), (47_779, 47_779, 10.78), (73_865, MLP_CHUNK, 11.43), (77_478, 4096, 11.62)] {
             let used = (used_gib * GIB as f64) as u64;
             let est = denoise_bytes(&cfg, tokens, rows);
             assert!(est >= used && est - used <= MARGIN + GIB / 2, "{tokens} tokens: estimate {est}, used {used}");
         }
+    }
+
+    #[test]
+    fn an_hd_speech_shot_fits_with_narrower_mlp_chunks() {
+        // 2026-11-26 jobs 17 and 18: PI2-REF2VA 1344x768 x 243 frames, a first frame, a soundtrack, one picture - 77,478
+        // tokens (1266 text and vision, the picture's 1008, the first frame's 1008, the soundtrack's 810 rows, the clip's
+        // 72 x 1008 and its 810 audio rows). 12.0 GiB to be had beside the pi model on an empty B70: refused at 8192 rows
+        let cfg = h3();
+        let (n, lt, at) = temporal_shape(10.125);
+        assert_eq!((n, lt, at), (243, 72, 405));
+        let other = 1266 + 1008 + 1008 + 2 * 405;
+        let tokens = clip_tokens(10.125, 1344, 768, other);
+        assert_eq!(tokens, 77_478, "the refusal's own count: the picture's tokens are in it");
+        let room = (12.0 * GIB as f64) as u64;
+        assert!(denoise_bytes(&cfg, tokens, MLP_CHUNK) > room, "8192 rows: the refusal (12.3 GiB)");
+        let p = plan(&cfg, tokens, VAE, room).expect("it fits with narrower chunks");
+        assert!(p.mlp_rows < MLP_CHUNK && p.need <= room, "{p:?}");
+        assert_eq!(max_frames(&cfg, 1344, 768, other, VAE, room).map(|f| f >= 243), Some(true));
     }
 
     #[test]

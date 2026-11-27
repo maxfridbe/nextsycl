@@ -247,7 +247,10 @@ void init(Ctx& c) {
     c.strm = dnnl::sycl_interop::make_stream(c.eng, c.q);
     c.name = c.q.get_device().get_info<sycl::info::device::name>();
     const uint64_t total = c.q.get_device().get_info<sycl::info::device::global_mem_size>();
-    double frac = 0.94;                            // of the card, for nsd_alloc and the kernels' scratch together
+    // of the card, for nsd_alloc and the kernels' scratch together: 0.97, so on a 32 GB card the reserve below decides
+    // (total - 1.5 GiB). It was 0.94 when the book was the only guard; since 2026-11-23 the card's own free memory is asked
+    // too, and 0.94 cost 0.4 GiB a 1344x768 x 243-frame clip needed (2026-11-26)
+    double frac = 0.97;
     if (const char* e = std::getenv("NSD_MEM_FRACTION")) frac = std::min(0.97, std::max(0.05, std::atof(e)));
     if (const char* e = std::getenv("NSD_MEM_RESERVE_MB")) c.reserve = (size_t) std::max(0, std::atoi(e)) << 20;
     // the cap: the share of the card, and never into the memory kept free (on every card, shared or not)
